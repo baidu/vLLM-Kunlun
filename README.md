@@ -32,7 +32,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
 ---
 ## Supported Models
 
-<h3>Generaltive Models</h3>
+<h3>Generative Models</h3>
 <table>
   <thead>
     <tr>
@@ -94,28 +94,28 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">Qwen3next</td>
+      <td class="model-name">Qwen3-next</td>
       <td class="status-progress">⚠️</td>
       <td></td>
       <td></td>
       <td></td>
-      <td><span class="status-coming">comming soon</span></td>
+      <td><span class="status-coming">coming soon</span></td>
     </tr>
     <tr>
-      <td class="model-name">Gpt oss</td>
+      <td class="model-name">GPT OSS</td>
       <td class="status-progress">⚠️</td>
       <td></td>
       <td></td>
       <td></td>
-      <td><span class="status-coming">comming soon</span></td>
+      <td><span class="status-coming">coming soon</span></td>
     </tr>
     <tr>
-      <td class="model-name">Deepseek v3/3.2</td>
+      <td class="model-name">DeepSeek-v3/3.2</td>
       <td class="status-progress">⚠️</td>
       <td></td>
       <td></td>
       <td></td>
-      <td><span class="status-coming">comming soon</span></td>
+      <td><span class="status-coming">coming soon</span></td>
     </tr>
   </tbody>
 </table>
@@ -142,7 +142,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">Qwen2.5VL</td>
+      <td class="model-name">Qwen2.5-VL</td>
       <td class="status-support">✅</td>
       <td></td>
       <td></td>
@@ -158,14 +158,6 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">InternVL3.5</td>
-      <td class="status-support">✅</td>
-      <td></td>
-      <td></td>
-      <td class="status-support">✅</td>
-      <td></td>
-    </tr>
-    <tr>
       <td class="model-name">InternS1</td>
       <td class="status-support">✅</td>
       <td></td>
@@ -174,20 +166,20 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">Qwen2.5 omini</td>
+      <td class="model-name">Qwen2.5-Omni</td>
       <td class="status-progress">⚠️</td>
       <td></td>
       <td></td>
       <td></td>
-      <td><span class="status-coming">comming soon</span></td>
+      <td><span class="status-coming">coming soon</span></td>
     </tr>
     <tr>
-      <td class="model-name">Qwen3vl</td>
+      <td class="model-name">Qwen3-VL</td>
       <td class="status-progress">⚠️</td>
       <td></td>
       <td></td>
       <td></td>
-      <td><span class="status-coming">comming soon</span></td>
+      <td><span class="status-coming">coming soon</span></td>
     </tr>
   </tbody>
 </table>
