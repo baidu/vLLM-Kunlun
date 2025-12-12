@@ -73,7 +73,7 @@ cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/python310_torch25_cuda
 ```
 ## Update xpytorch
 ```
-wget -O https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/0830/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKVeTJdcMAiNRKPTWBxHw6h%2F2025-12-12T04%3A58%3A43Z%2F-1%2Fhost%2Fd383c52e03642efbf96c19575b6fcd1c896399f60364761f6500c1f1efe68f84
+wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/0830/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKVeTJdcMAiNRKPTWBxHw6h%2F2025-12-12T04%3A58%3A43Z%2F-1%2Fhost%2Fd383c52e03642efbf96c19575b6fcd1c896399f60364761f6500c1f1efe68f84
 
 bash xpytorch-cp310-torch251-ubuntu2004-x64.run
 ```
