@@ -73,15 +73,14 @@ cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/python310_torch25_cuda
 ```
 ## Update xpytorch
 ```
-wget https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/0830/xpytorch-cp310-torch251-ubuntu2004-x64.run
+wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-02T05%3A01%3A27Z%2F-1%2Fhost%2Ff3cf499234f82303891aed2bcb0628918e379a21e841a3fac6bd94afef491ff7
 
 bash xpytorch-cp310-torch251-ubuntu2004-x64.run
 ```
 
 ## Install custom ops
 ```
-pip install \
-https://xtorch_ops
+pip install "https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xtorch_ops-0.1.2209%2B6752ad20-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-08T06%3A29%3A12Z%2F-1%2Fhost%2Fdd5f72fc72ded7d8f58f8a09755ca9caf84dc8aa7d2175f91cef1f0056896ecf"
 
 pip install \
 https://xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64.whl
