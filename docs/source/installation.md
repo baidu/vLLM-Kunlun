@@ -48,7 +48,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ## Install vLLM-kunlun
 ### Install vLLM 0.10.1.1
 ```
-conda activate python310_torch25_cuda
+conda activate vllm_kunlun_0.10.1.1
 
 pip install vllm==0.10.1.1 --no-build-isolation --no-deps 
 ```
