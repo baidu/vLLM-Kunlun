@@ -22,7 +22,7 @@ if [ $XPU_NUM -gt 0 ]; then
     done
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
-export build_image="wjie520/vllm_kunlun:v0.0.1"
+export build_image="quay.io/kunlun/vllm_kunlun:v0.10.1.1rc1"
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -53,7 +53,7 @@ The default working directory is `/workspace`. With the fully provisioned enviro
 
 ```
 #Set environment
-chmod +x /workspace/vllm-kunlun/setup_env.sh && source /workspace/vllm-kunlun/setup_env.sh
+chmod +x /workspace/vLLM-Kunlun/setup_env.sh && source /workspace/vLLM-Kunlun/setup_env.sh
 ```
 
 ## Usage

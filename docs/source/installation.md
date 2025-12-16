@@ -57,7 +57,7 @@ Navigate to the vllm-kunlun directory and build the package:
 ```
 git clone https://github.com/baidu/vLLM-Kunlun # TODO: replace with Github Url to install vllm-kunlun
 
-cd vllm-kunlun
+cd vLLM-Kunlun
 
 pip install -r requirements.txt
 
@@ -69,7 +69,7 @@ python setup.py install
 ### Replace eval_frame.py
 Copy the eval_frame.py patch:
 ```
-cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
+cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/vllm_kunlun_0.10.1.1/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
 ```
 ## Update xpytorch
 ```
