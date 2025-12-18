@@ -25,8 +25,9 @@ from vllm.distributed import (divide, get_ep_group, get_pp_group,
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm_kunlun.ops.fla import (fused_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule, chunk_gated_delta_rule)
-from vllm.model_executor.layers.fla.ops import (
-    RMSNormGated)
+# from vllm.model_executor.layers.fla.ops import (
+#     RMSNormGated)
+from vllm_kunlun.ops.fla import RMSNormGated
 from vllm_kunlun.ops.fused_moe.layer import FusedMoE
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -365,7 +366,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             group_size=None,
             norm_before_gate=True,
             device=current_platform.current_device(),
-            dtype=config.torch_dtype,
+            dtype=torch.get_default_dtype(),
         )
 
         self.out_proj = RowParallelLinear(self.value_dim,
