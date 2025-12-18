@@ -88,7 +88,7 @@ pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.
 ```
 ## Install the AIAK custom ops library
 ```
-pip install "https://cce-ai-models.bj.bcebos.com/v1/chenyili/xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKxPW2jzoJUuFZmI19s3yry%2F2025-12-05T06%3A37%3A39Z%2F-1%2Fhost%2F1002777dadd2afe4c1f047cbf0d94244d5b1f03295cd8f7a2802b92a13cd5035"
+pip install "https://cce-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20251218_182325/xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKxPW2jzoJUuFZmI19s3yry%2F2025-12-18T10%3A54%3A33Z%2F2592000%2Fhost%2F1d86beab0bd6e38a083f7b817c7c63b4635e490b89d688d8a303efe1f6bc77d3"
 ```
 ## Quick Start
 
