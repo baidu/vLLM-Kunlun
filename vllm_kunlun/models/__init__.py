@@ -13,6 +13,10 @@ def register_model():
     #     "vllm_kunlun.model_executor.models.demo_model:DemoModel")
 
     ModelRegistry.register_model(
+        "LlamaForCausalLM",
+        "vllm_kunlun.models.llama:LlamaForCausalLM")
+    
+    ModelRegistry.register_model(
         "Qwen2VLForConditionalGeneration",
         "vllm_kunlun.models.qwen2_vl:Qwen2VLForConditionalGeneration")
 
