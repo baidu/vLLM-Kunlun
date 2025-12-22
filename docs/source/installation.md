@@ -55,7 +55,7 @@ pip install vllm==0.11.0 --no-build-isolation --no-deps
 ### Build and Install
 Navigate to the vllm-kunlun directory and build the package:
 ```
-git clone vllm-kunlun
+git clone https://github.com/baidu/vLLM-Kunlun
 
 cd vllm-kunlun
 
@@ -84,7 +84,7 @@ pip install "https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/113
 
 ## Install the KLX3 custom Triton build
 ```
-pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKxPW2jzoJUuFZmI19s3yry%2F2025-11-05T02%3A47%3A29Z%2F-1%2Fhost%2Fd8c95dbd06187a3140ca3e681e00c6941c30e14bb1d4112a0c8bc3c93e5c9c3f"
+pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl"
 ```
 ## Install the AIAK custom ops library
 ```
