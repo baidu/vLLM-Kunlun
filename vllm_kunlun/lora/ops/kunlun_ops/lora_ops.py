@@ -20,7 +20,10 @@
 """kunlun_ops for lora"""
 
 import torch
+import xspeedgate_ops
+import time
 from torch._C import dtype
+import os
 
 
 def sgmv_shrink(
@@ -42,6 +45,9 @@ def sgmv_shrink(
     """
     sgmv_shrink
     """
+
+    if inputs.shape[0] <= 128:
+        return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling)
 
     expert_num = 9
     device = inputs.device
@@ -112,6 +118,9 @@ def sgmv_expand(inputs: torch.Tensor,
     """
     sgmv_expand
     """
+
+    if inputs.shape[0] <= 128:
+        return torch.ops.xspeedgate_ops.sgmv_expand_cluster(inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0)
 
 
     expert_num = 9
@@ -191,6 +200,9 @@ def sgmv_expand_slice(inputs: torch.Tensor,
     sgmv_expand_slice
     """
 
+    if inputs.shape[0] <= 128:
+        return torch.ops.xspeedgate_ops.sgmv_expand_cluster(inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, slice_offset)
+
     expert_num = 9
     device = inputs.device
 
@@ -262,51 +274,7 @@ def bgmv_shrink(
     """
     bgmv_shrink
     """
-
-    expert_num = 9
-
-    lora_ids = lora_indices_tensor.to(dtype=torch.int32, device=inputs.device)
-    lora_ids.masked_fill_(lora_ids < 0, expert_num - 1) 
-
-    torch.ops._C.gen_block_statistic(lora_ids.unsqueeze(1), block_statistic)
-
-    inputs_sorted = torch.empty_like(inputs, dtype=inputs.dtype, device=inputs.device)
-
-    torch.ops._C.moe_pre_sorted(
-        inputs, 
-        lora_ids.unsqueeze(1), 
-        block_statistic, 
-        inputs_sorted, 
-        moe_index, 
-        expert_m, 
-        sorted_tokens_num_lod
-    )
-
-    output_tensor.unsqueeze_(1)  # Change to [m, 1, r]
-    torch.ops._C.moe_fc(
-        x=inputs_sorted,
-        weight=lora_a_weights,
-        sorted_tokens_num_lod=sorted_tokens_num_lod,
-        sorted_tokens_idx=moe_index,
-        moe_topk=1,
-        y=output_tensor,
-        act=None,
-        x_perchannel_max=None,
-        w_perchannel_max=None,
-        topk_ids=None,
-        topk_w=None,
-        bias=None,
-        tgemm_type=None,
-        tweight_type=None,
-        scale_n=0,
-        scale_k=0,
-        use_pack_int4=False
-    )
-
-    output_tensor.squeeze_(1).mul_(scaling)
-
-    return output_tensor
-
+    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling)
 
 def bgmv_expand(inputs: torch.Tensor,
                 lora_b_weights: torch.Tensor,
@@ -319,63 +287,7 @@ def bgmv_expand(inputs: torch.Tensor,
     """"
         bgmv_expand
     """
-
-
-    expert_num = 9
-    device = inputs.device
-
-
-
-
-    lora_ids = lora_indices_tensor.to(dtype=torch.int32, device=inputs.device)
-    lora_ids.masked_fill_(lora_ids < 0, expert_num - 1) 
-
-    out = torch.zeros((inputs.shape[0], 1, slice_size), dtype=inputs.dtype, device=device)
-
-
-    torch.ops._C.moe_fc(
-        x=inputs,
-        weight=lora_b_weights,
-        sorted_tokens_num_lod=sorted_tokens_num_lod,
-        sorted_tokens_idx=moe_index,
-        moe_topk=1,
-        y=out,
-        act=None,
-        x_perchannel_max=None,
-        w_perchannel_max=None,
-        topk_ids=None,
-        topk_w=None,
-        bias=None,
-        tgemm_type=None,
-        tweight_type=None,
-        scale_n=0,
-        scale_k=0,
-        use_pack_int4=False
-    )
-
-
-
-
-
-
-    output_post = out.squeeze(1)
-    torch.ops._C.moe_post(output_post, moe_index.unsqueeze(1), normed_scale, normed_scale, output_post)
-
-
-    limit = output_tensor.shape[0]
-    if output_post.shape[0] == 1 and output_tensor.shape[0] != 1:
-        limit = 1
-
-    # LoRA adapter and model may add different amounts of padding to output
-    common_len = min(output_post.shape[1], output_tensor.shape[1])
-
-    if add_inputs:
-        output_tensor[:, :common_len] += output_post[:limit, :common_len]
-    else:
-        output_tensor[:, :common_len] = output_post[:limit, :common_len]
-
-    return output_tensor
-
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0)
 
 def bgmv_expand_slice(
     inputs: torch.Tensor,
@@ -393,51 +305,5 @@ def bgmv_expand_slice(
     """
         bgmv_expand_slice
     """
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset)
 
-    expert_num = 9
-    device = inputs.device
-
-
-
-
-    lora_ids = lora_indices_tensor.to(dtype=torch.int32, device=inputs.device)
-    lora_ids.masked_fill_(lora_ids < 0, expert_num - 1) 
-
-    out = torch.zeros((inputs.shape[0], 1, slice_size), dtype=inputs.dtype, device=device)
-
-    torch.ops._C.moe_fc(
-        x=inputs,
-        weight=lora_b_weights,
-        sorted_tokens_num_lod=sorted_tokens_num_lod,
-        sorted_tokens_idx=moe_index,
-        moe_topk=1,
-        y=out,
-        act=None,
-        x_perchannel_max=None,
-        w_perchannel_max=None,
-        topk_ids=None,
-        topk_w=None,
-        bias=None,
-        tgemm_type=None,
-        tweight_type=None,
-        scale_n=0,
-        scale_k=0,
-        use_pack_int4=False
-    )
-
-
-    output_post = out.squeeze(1)
-    torch.ops._C.moe_post(output_post, moe_index.unsqueeze(1), normed_scale, normed_scale, output_post)
-
-
-    slice_end = slice_offset + slice_size
-    actual_slice_size = min(slice_size, output_tensor.shape[1] - slice_offset)
-    limit = min(output_post.shape[0], output_tensor.shape[0])
-
-
-    if add_inputs:
-        output_tensor[:limit, slice_offset:slice_end] += output_post[:limit, :actual_slice_size]
-    else:
-        output_tensor[:limit, slice_offset:slice_end] = output_post[:limit, :actual_slice_size]
-
-    return output_tensor
