@@ -1,0 +1,74 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+title: "bug: <short summary>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        🐞 **Thanks for reporting a bug!**
+
+        To help us investigate and fix the issue efficiently, please provide as much
+        relevant information as possible. Clear and reproducible reports are highly appreciated.
+
+  - type: textarea
+    attributes:
+      label: Bug Description
+      description: |
+        Clearly and concisely describe the bug.
+        What happened? What is broken or behaving incorrectly?
+      placeholder: |
+        Example:
+        - vLLM crashes when loading model XXX
+        - Unexpected latency spike during decode stage
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Steps to Reproduce
+      description: |
+        Provide the exact steps to reproduce the issue.
+        Please include commands, configuration, and minimal repro if possible.
+      placeholder: |
+        Example:
+        1. Start vLLM with config XXX
+        2. Send request YYY
+        3. Observe error or incorrect behavior
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: |
+        Describe what you expected to happen instead.
+        This helps clarify whether the behavior is incorrect or just unexpected.
+      placeholder: |
+        Example:
+        - Model should load successfully
+        - Latency should remain stable under N requests
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Additional Context
+      description: |
+        Add any additional information that may help diagnose the issue.
+        This can include logs, stack traces, environment details, or related issues.
+      placeholder: |
+        - Logs / stack traces
+        - OS, CUDA, driver, hardware info
+        - vLLM / Kunlun version
+        - Related issues or PRs
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        👍 **Does this bug affect you as well?**
+
+        Please consider giving it a 👍.
+        We often prioritize issues that impact a larger portion of the community.

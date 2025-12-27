@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+
+contact_links:
+  - name: 📘 Documentation & Tutorials
+    url: https://vllm-kunlun.readthedocs.io
+    about: |
+      Please check the official documentation and tutorials first.
+      Many common questions, usage examples, and best practices are covered there.

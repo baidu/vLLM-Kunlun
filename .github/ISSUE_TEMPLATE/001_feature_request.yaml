@@ -1,0 +1,60 @@
+name: Feature Request
+description: Propose a new feature or enhancement
+labels: ["feature request"]
+title: "feature: <short summary>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        👋 **Thanks for taking the time to submit a feature request!**
+
+        Please help us understand your idea clearly by filling out the sections below.
+        Well-described proposals are easier to evaluate and more likely to be prioritized.
+
+  - type: textarea
+    attributes:
+      label: Feature Description
+      description: |
+        Describe the feature or enhancement you are proposing.
+        What should it do? What problem does it solve?
+        Please be as clear and specific as possible.
+      placeholder: |
+        Example:
+        - Add support for XXX
+        - Improve performance of YYY under ZZZ workload
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Motivation / Use Case
+      description: |
+        Why do you need this feature?
+        Describe the real-world use case, workload, or scenario where this feature is important.
+      placeholder: |
+        Example:
+        - This feature is required to support large-scale inference
+        - Needed to reduce TTFT/TPOT under high concurrency
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: Additional Context
+      description: |
+        Add any additional context that may help us evaluate this request.
+        This can include design ideas, references, benchmarks, logs, or related issues/PRs.
+      placeholder: |
+        - Related issues or PRs
+        - Links to papers or docs
+        - Performance numbers or expected impact
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        👍 **Community feedback matters!**
+
+        If you find this proposal useful, feel free to give it a 👍.
+        We often prioritize feature requests with strong community interest.
