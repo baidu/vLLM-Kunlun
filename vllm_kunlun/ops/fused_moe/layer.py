@@ -122,12 +122,12 @@ class UnquantizedFusedMoEMethod(VllmUnquantizedFusedMoEMethod):
             )
 
             router_logits = router_logits.float()
-            # torch.ops._C.moe_softmax_topk_norm(
-            #     x=router_logits,
-            #     normed_score=normed_score,
-            #     topk_index=topk_ids,
-            #     block_statistic=None,
-            #     stable=True)
+            torch.ops._C.moe_softmax_topk_norm(
+                x=router_logits,
+                normed_score=normed_score,
+                topk_index=topk_ids,
+                block_statistic=None,
+                stable=True)
 
             moe_expand = torch.empty((M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device) # [M, top_k, N], float
             expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)             # [E]
