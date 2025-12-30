@@ -43,32 +43,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-# from vllm.distributed import (
-#     get_ep_group,
-#     get_pp_group,
-#     get_tensor_model_parallel_rank,
-#     get_tensor_model_parallel_world_size,
-#     tensor_model_parallel_all_gather,
-# )
-
-
-# def update_uncontiguous_kv_cache(
-#     new_k: torch.Tensor,
-#     new_v: torch.Tensor,
-#     k_cache: torch.Tensor,
-#     v_cache: torch.Tensor,
-#     slot_mapping: torch.Tensor
-# ) -> None:
-#     """
-#     用于更新非连续KV Cache
-#     """
-#     # 将slot_mapping转换为物理位置
-#     block_size = k_cache.shape[2]
-#     block_indices = slot_mapping // block_size
-#     block_offsets = slot_mapping % block_size
-
-#     k_cache[block_indices, :, block_offsets, :] = new_k
-#     v_cache[block_indices, :, block_offsets, :] = new_v
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -227,7 +201,6 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # position embeddings are applied inside the attention backend
     input_positions: Optional[torch.Tensor] = None
 
-
     use_cascade: Optional[bool] = False
 
     seq_lens_tensor_cpu: Optional[torch.Tensor] = None
@@ -296,7 +269,6 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         input_positions = (None if self.input_positions is None else
                     self.input_positions[-self.num_prefills:])
 
-
         if self.kv_lod_cpu is None:
             kv_lod_cpu = None
             kv_lod_xpu = None
@@ -320,7 +292,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
             seq_lens_tensor=seq_lens_tensor,
-            seq_start_loc=None,
+            seq_start_loc = None,
             kv_lod_cpu=kv_lod_cpu,
             kv_lod_xpu=kv_lod_xpu,
             max_query_len=self.max_query_len,
@@ -502,10 +474,8 @@ class KunlunAttentionMetadataBuilder:
 
         seq_start_loc = list(accumulate(seq_lens, initial=0))
                 
-
         seq_start_loc_tensor = torch.empty(len(seq_start_loc), dtype=torch.int32, device=self.device)
         seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
-        
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)
@@ -514,12 +484,14 @@ class KunlunAttentionMetadataBuilder:
 
         num_scheduled_tokens = np.diff(common_attn_metadata.query_start_loc_cpu[:num_reqs + 1])
         tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
+
         if num_decode_tokens == 0:
             max_decode_seq_len = 0
         else:
             max_decode_seq_len = np.max(tmp_decode_scheduled_tokens)
 
         tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes: num_reqs]
+
         if num_prefill_tokens == 0:
             max_prefill_seq_len = 0
         else:
@@ -595,6 +567,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
