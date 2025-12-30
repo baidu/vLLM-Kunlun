@@ -12,7 +12,6 @@ from vllm.config import (
     CacheConfig,
     VllmConfig,
     get_current_vllm_config,
-    str_dtype_to_torch_dtype,
 )
 from vllm.distributed import (
     get_ep_group,
@@ -143,8 +142,7 @@ class MiMoV2MoE(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        dtype = getattr(config, "moe_router_dtype", "float32")
-        self.gate_dtype = str_dtype_to_torch_dtype(dtype)
+        self.gate_dtype = torch.float32
         self.gate = nn.Linear(
             config.hidden_size,
             config.n_routed_experts,
@@ -256,13 +254,11 @@ class MiMoV2Attention(nn.Module):
         )
 
         self.rotary_emb = get_rope(
-            head_size=self.head_dim,
+            self.head_dim,
+            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
-            rope_parameters={
-                "rope_type": "default",
-                "rope_theta": rope_theta,
-                "partial_rotary_factor": partial_rotary_factor,
-            },
+            base=self.rope_theta,
+            partial_rotary_factor=partial_rotary_factor
         )
 
         self.attention_sink_bias = (

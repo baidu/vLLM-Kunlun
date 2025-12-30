@@ -148,7 +148,6 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # [4, 6], it is [0, 4, 10].
     seq_start_loc: Optional[torch.Tensor] = None
 
-
     # Prefix cache loc
     kv_lod_cpu: Optional[torch.Tensor] = None
     kv_lod_xpu: Optional[torch.Tensor] = None
@@ -269,6 +268,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         input_positions = (None if self.input_positions is None else
                     self.input_positions[-self.num_prefills:])
 
+                    
         if self.kv_lod_cpu is None:
             kv_lod_cpu = None
             kv_lod_xpu = None
@@ -464,6 +464,7 @@ class KunlunAttentionMetadataBuilder:
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
+
         max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
         query_start_loc_host = common_attn_metadata.query_start_loc_cpu[:num_reqs + 1]
         query_start_loc = common_attn_metadata.query_start_loc_cpu[:num_reqs + 1].to(
@@ -471,14 +472,18 @@ class KunlunAttentionMetadataBuilder:
         
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-
+        
         seq_start_loc = list(accumulate(seq_lens, initial=0))
-                
+        
+
+
         seq_start_loc_tensor = torch.empty(len(seq_start_loc), dtype=torch.int32, device=self.device)
         seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
+
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)
+        
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
             split_decodes_and_prefills(common_attn_metadata)
 
@@ -491,7 +496,7 @@ class KunlunAttentionMetadataBuilder:
             max_decode_seq_len = np.max(tmp_decode_scheduled_tokens)
 
         tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes: num_reqs]
-
+        
         if num_prefill_tokens == 0:
             max_prefill_seq_len = 0
         else:
@@ -666,54 +671,84 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             prefill_query = query[num_decode_tokens:attn_metadata.num_actual_tokens]
             prefill_key = key[num_decode_tokens:attn_metadata.num_actual_tokens]
             prefill_value = value[num_decode_tokens:attn_metadata.num_actual_tokens]
- 
-            xtorch_ops.prefill_attention(
-                q=prefill_query,
-                k=prefill_key, # Key Cache (block_num, head, block_size, dim)
-                v=prefill_value,
-                out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
-                is_causal=True,
-                context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                alibi_slopes=self.alibi_slopes,
-                softmax_lse=None, 
-                swa_left = self.sliding_window if self.sliding_window is not None else -1,
-                swa_right = 0 if self.sliding_window is not None else -1,
-                sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
-            )
+
+            # For hybrid Attention (Qwen3-Next.)
+            if key_cache.is_contiguous():
+                tmp_block_tables = prefill_meta.block_tables
+            else:
+                # For hybrid Attention (Qwen3-Next)
+                tmp_block_tables = prefill_meta.block_tables * 2 
+                
+            # Prefix cache
+            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
+                xtorch_ops.prefill_attention(
+                    q=prefill_query,
+                    k=key_cache, # Key Cache [block_num, head, block_size, dim]
+                    v=value_cache,
+                    out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
+                    is_causal=True,
+                    is_prefix_cache=True, 
+                    block_table=tmp_block_tables, 
+                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                    alibi_slopes=self.alibi_slopes,
+                    softmax_lse=None
+                )
+            else:
+                xtorch_ops.prefill_attention(
+                    q=prefill_query,
+                    k=prefill_key,
+                    v=prefill_value,
+                    out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
+                    is_causal=True,
+                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                    alibi_slopes=self.alibi_slopes,
+                    softmax_lse=None, 
+                    swa_left = self.sliding_window if self.sliding_window is not None else -1,
+                    swa_right = 0 if self.sliding_window is not None else -1,
+                    sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
+                )
+
 
         if decode_meta := attn_metadata.decode_metadata:    
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
             decode_query = query[:num_decode_tokens]
-            # Kunlun Sliding Window Attention backend
-            decode_query = decode_query.unsqueeze(0)
-            batch_num = decode_meta.block_tables.shape[0]
-            max_num_blocks_per_seq = decode_meta.block_tables.shape[1]
+
+            # For hybrid Attention (Qwen3-Next
+            if key_cache.is_contiguous():
+                tmp_block_tables = decode_meta.block_tables
+            else:
+                tmp_block_tables = decode_meta.block_tables * 2 # only test in Qwen3-Next
+                
             xtorch_ops.speculative_attention(
-                out=output[:num_decode_tokens],         
-                q=decode_query,                            
+                out=output[:num_decode_tokens],
+                # Only MLA support q len > 1 right now         
+                q=decode_query.unsqueeze(0),                
                 k_cache=key_cache,                  
                 v_cache=value_cache,                        
                 context_lens_cpu=decode_meta.seq_lens_tensor_cpu, 
                 context_lens_xpu=decode_meta.seq_lens_tensor,  
-                batch_num=batch_num,                       
-                qlen=1,                                   
-                max_context_len=32768,                  
+                batch_num=decode_meta.block_tables.shape[0],   
+                # TODO (@xyDong23): Support MTP(q lens >1)                   
+                qlen=1,     
+                # TODO (@xyDong23): Support max_context_len to (262144)                           
+                max_context_len=131072,                  
                 head_num=self.num_heads,                      
                 head_dim=self.head_size,                   
                 scale=0.0,                                 
                 kv_head_num=self.num_kv_heads,                   
-                block_size=128,                            
-                max_num_blocks_per_seq=max_num_blocks_per_seq, 
+                block_size=key_cache.shape[2],                            
+                max_num_blocks_per_seq=decode_meta.block_tables.shape[1], 
                 max_window_size=self.sliding_window if self.sliding_window is not None else -1, 
-                block_tables=decode_meta.block_tables,          
+                block_tables=tmp_block_tables,          
                 sink = self.sinks.to(torch.float32) if self.sinks is not None else None          
             )
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
-
-
 def use_cascade_attention(
     common_prefix_len: int,
     query_lens: np.ndarray,
@@ -735,7 +770,7 @@ def use_cascade_attention(
     # NOTE(woosuk): This is the common case. We should return False as soon as
     # possible to avoid any unnecessary computation.
     return False
-
+    
     if common_prefix_len < 256:
         return False
     # Cascade attention is currently not supported with these variants.
