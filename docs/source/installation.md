@@ -11,7 +11,7 @@ This document describes how to install vllm-kunlun manually.
   - vLLM (same version as vllm-kunlun)
 
 ## Setup environment using container
-We provide a clean, minimal base image for your use`iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32`.You can pull it using the `docker pull` command.
+We provide a clean, minimal base image for your use`wjie520/vllm_kunlun:v0.0.1`.You can pull it using the `docker pull` command.
 ### Container startup script
 
 :::::{tab-set}
@@ -31,7 +31,7 @@ if [ $XPU_NUM -gt 0 ]; then
     done
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
-export build_image="iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32"
+export build_image="wjie520/vllm_kunlun:v0.0.1"
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -48,7 +48,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ## Install vLLM-kunlun
 ### Install vLLM 0.11.0
 ```
-conda activate python310_torch25_cuda
+conda activate vllm_kunlun_0.10.1.1
 
 pip install vllm==0.11.0 --no-build-isolation --no-deps
 ```
@@ -57,7 +57,7 @@ Navigate to the vllm-kunlun directory and build the package:
 ```
 git clone https://github.com/baidu/vLLM-Kunlun
 
-cd vllm-kunlun
+cd vLLM-Kunlun
 
 pip install -r requirements.txt
 
@@ -69,7 +69,7 @@ python setup.py install
 ### Replace eval_frame.py
 Copy the eval_frame.py patch:
 ```
-cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
+cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/vllm_kunlun_0.10.1.1/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
 ```
 ## Install the KL3-customized build of PyTorch
 ```
@@ -132,7 +132,7 @@ python -m vllm.entrypoints.openai.api_server \
                                                 "vllm.linear_attention", 
                                                 "vllm.plamo2_mamba_mixer", 
                                                 "vllm.gdn_attention", 
-                                                "vllm.sparse_attn_indexer"]}' \  
+                                                "vllm.sparse_attn_indexer"]}'
 
 ```
 ::::
