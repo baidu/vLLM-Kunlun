@@ -82,9 +82,9 @@ def register_model():
         "LlamaForCausalLM",
         "vllm_kunlun.models.llama:LlamaForCausalLM")
 
-    # ModelRegistry.register_model(
-    #     "MiMoV2FlashForCausalLM",
-    #     "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
+    ModelRegistry.register_model(
+        "MiMoV2FlashForCausalLM",
+        "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
     
 def register_quant_method():
     """to do"""

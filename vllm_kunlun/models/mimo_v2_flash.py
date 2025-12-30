@@ -22,13 +22,13 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm_kunlun.ops.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm_kunlun.ops.linear import QKVParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -43,8 +43,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import MixtureOfExperts, SupportsPP
-from .utils import (
+from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
+from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
@@ -53,8 +53,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-
 from vllm_kunlun.ops.activation import SiluAndMul
 logger = init_logger(__name__)
 
@@ -118,7 +116,6 @@ class MiMoV2MoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.n_routed_experts
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -170,12 +167,13 @@ class MiMoV2MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             scoring_func="sigmoid",
         )
+        self.register_buffer("kunlun_linear_weights", torch.zeros(
+            config.num_local_experts,config.hidden_size,dtype=torch.float))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, "MiMoV2MoE only supports 1D or 2D inputs"
@@ -183,23 +181,14 @@ class MiMoV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if self.is_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-
         if self.gate_dtype is not None:
             gate_input = hidden_states.to(self.gate_dtype)
         else:
             gate_input = hidden_states
         router_logits = self.gate(gate_input)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=router_logits, linear_weights=self.gate.weight
         )
-
-        if self.is_sequence_parallel:
-            final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0
-            )
-            final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
@@ -314,7 +303,7 @@ class MiMoV2Attention(nn.Module):
         attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
             ..., : self.v_head_dim
         ].reshape(-1, self.num_heads * self.v_head_dim)
-\
+
         output, _ = self.o_proj(attn_output)
         return output
 
