@@ -29,7 +29,6 @@ def vllm_kunlun_forward_cuda(
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """forward_cuda"""
-        
         if x.is_contiguous() == False:
             # kunlun does not support uncontiguous input and they do not think it is a bug 
             # so we must make it contiguous() manually
@@ -58,9 +57,8 @@ def vllm_kunlun_forward_cuda(
         )
         return out
 
-# RMSNorm.forward_cuda = vllm_kunlun_forward_cuda
-# RMSNorm.forward = vllm_kunlun_forward_cuda
-
+RMSNorm.forward_cuda = vllm_kunlun_forward_cuda
+RMSNorm.forward = vllm_kunlun_forward_cuda
 
 class KunlunGemmaRMSNorm(OriGemmaRMSNorm):
     @staticmethod

@@ -21,7 +21,6 @@ import os
 from vllm.model_executor.layers.rotary_embedding import (
     RotaryEmbedding, YaRNScalingRotaryEmbedding, DynamicNTKScalingRotaryEmbedding, MRotaryEmbedding)
 from typing import Optional, Tuple
-import xtorch_ops
 
 def vllm_kunlun_compute_cos_sin_cache(self) -> torch.Tensor:
     """Compute the cos and sin cache."""
