@@ -186,7 +186,6 @@ class KunlunPlatform(Platform):
                 logger.info(
                     "Forcing kv cache block size to 64 for FlashMLA backend.")
 
-
         if (envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
                 and parallel_config.data_parallel_size > 1
                 and vllm_config.compilation_config.use_cudagraph):
@@ -225,7 +224,6 @@ class KunlunPlatform(Platform):
         Returns:
             str: Class name of the attention backend.
         """
-
         if use_v1:
             return "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
         elif not use_mla:                     

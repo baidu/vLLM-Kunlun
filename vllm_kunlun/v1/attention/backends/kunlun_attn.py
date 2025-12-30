@@ -43,32 +43,32 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import (
-    get_ep_group,
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+# from vllm.distributed import (
+#     get_ep_group,
+#     get_pp_group,
+#     get_tensor_model_parallel_rank,
+#     get_tensor_model_parallel_world_size,
+#     tensor_model_parallel_all_gather,
+# )
 
 
-def update_uncontiguous_kv_cache(
-    new_k: torch.Tensor,
-    new_v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor
-) -> None:
-    """
-    用于更新非连续KV Cache
-    """
-    # 将slot_mapping转换为物理位置
-    block_size = k_cache.shape[2]
-    block_indices = slot_mapping // block_size
-    block_offsets = slot_mapping % block_size
+# def update_uncontiguous_kv_cache(
+#     new_k: torch.Tensor,
+#     new_v: torch.Tensor,
+#     k_cache: torch.Tensor,
+#     v_cache: torch.Tensor,
+#     slot_mapping: torch.Tensor
+# ) -> None:
+#     """
+#     用于更新非连续KV Cache
+#     """
+#     # 将slot_mapping转换为物理位置
+#     block_size = k_cache.shape[2]
+#     block_indices = slot_mapping // block_size
+#     block_offsets = slot_mapping % block_size
 
-    k_cache[block_indices, :, block_offsets, :] = new_k
-    v_cache[block_indices, :, block_offsets, :] = new_v
+#     k_cache[block_indices, :, block_offsets, :] = new_k
+#     v_cache[block_indices, :, block_offsets, :] = new_v
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -174,6 +174,11 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # [4, 6], it is [0, 4, 10].
     seq_start_loc: Optional[torch.Tensor] = None
 
+
+    # Prefix cache loc
+    kv_lod_cpu: Optional[torch.Tensor] = None
+    kv_lod_xpu: Optional[torch.Tensor] = None
+
     # (batch_size,) A tensor of context lengths (tokens that are computed
     # so far).
     context_lens_tensor: Optional[torch.Tensor] = None
@@ -221,6 +226,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # Input positions for rotrary embeddings since for MLA the rotary
     # position embeddings are applied inside the attention backend
     input_positions: Optional[torch.Tensor] = None
+
 
     use_cascade: Optional[bool] = False
 
@@ -290,6 +296,19 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         input_positions = (None if self.input_positions is None else
                     self.input_positions[-self.num_prefills:])
 
+
+        if self.kv_lod_cpu is None:
+            kv_lod_cpu = None
+            kv_lod_xpu = None
+        else:
+            start = -(self.num_prefills + 1)
+            base_cpu = self.kv_lod_cpu[start]
+            kv_lod_cpu = self.kv_lod_cpu[start:] - base_cpu
+
+            base_xpu = self.kv_lod_xpu[start]
+            kv_lod_xpu = self.kv_lod_xpu[start:] - base_xpu
+
+
         # Construct & cache prefill-phase attention metadata structure
         self._cached_prefill_metadata = KunlunMetadata(
             num_actual_tokens=self.num_actual_tokens,
@@ -302,6 +321,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             seq_lens=seq_lens,
             seq_lens_tensor=seq_lens_tensor,
             seq_start_loc=None,
+            kv_lod_cpu=kv_lod_cpu,
+            kv_lod_xpu=kv_lod_xpu,
             max_query_len=self.max_query_len,
             max_kv_len=self.max_kv_len,
             max_prefill_seq_len=self.max_prefill_seq_len,
@@ -464,14 +485,13 @@ class KunlunAttentionMetadataBuilder:
     def build(self, common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata):
         """build"""
-        num_reqs=common_attn_metadata.num_reqs
-        num_actual_tokens=common_attn_metadata.num_actual_tokens
-        max_query_len=common_attn_metadata.max_query_len
-        common_prefix_len=common_prefix_len
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        max_query_len = common_attn_metadata.max_query_len
+        common_prefix_len = common_prefix_len
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        
         max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
         query_start_loc_host = common_attn_metadata.query_start_loc_cpu[:num_reqs + 1]
         query_start_loc = common_attn_metadata.query_start_loc_cpu[:num_reqs + 1].to(
@@ -482,36 +502,24 @@ class KunlunAttentionMetadataBuilder:
 
         seq_start_loc = list(accumulate(seq_lens, initial=0))
                 
-        # 验证序列长度信息并在需要时修正
-        if len(seq_start_loc) != num_reqs + 1:
-            # print(f"WARNING: Sequence start locations length mismatch: {len(seq_start_loc)} vs {num_reqs + 1}")
-            # 使用 query_start_loc 的值
-            seq_start_loc = query_start_loc_host.tolist()
-            
-        if seq_start_loc[-1] != num_actual_tokens:
-            # print(f"WARNING: Total tokens mismatch: {seq_start_loc[-1]} vs {num_actual_tokens}")
-            # 使用 query_start_loc 的值
-            seq_start_loc = query_start_loc_host.tolist()
-           
-        # seq_start_loc_tensor = async_tensor_h2d(seq_start_loc, torch.int32,
-        #                                         self.device, self.runner.pin_memory)
+
         seq_start_loc_tensor = torch.empty(len(seq_start_loc), dtype=torch.int32, device=self.device)
         seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
-
+        
+        kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
+        kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
+        kv_lod_xpu = kv_lod_cpu.to(self.device)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
             split_decodes_and_prefills(common_attn_metadata)
-        # num_decodes = self._num_decodes
-        # num_prefills = self._num_prefills
+
         num_scheduled_tokens = np.diff(common_attn_metadata.query_start_loc_cpu[:num_reqs + 1])
         tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
-        # num_decode_tokens = np.sum(tmp_decode_scheduled_tokens)
         if num_decode_tokens == 0:
             max_decode_seq_len = 0
         else:
             max_decode_seq_len = np.max(tmp_decode_scheduled_tokens)
 
         tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes: num_reqs]
-        # num_prefill_tokens = np.sum(tmp_prefill_scheduled_tokens)
         if num_prefill_tokens == 0:
             max_prefill_seq_len = 0
         else:
@@ -529,6 +537,8 @@ class KunlunAttentionMetadataBuilder:
             num_decode_tokens=num_decode_tokens,
             seq_lens_tensor=seq_lens,
             seq_lens_tensor_cpu=seq_lens_cpu,
+            kv_lod_xpu=kv_lod_xpu,
+            kv_lod_cpu=kv_lod_cpu,
             max_query_len=max_prefill_seq_len,
             max_prefill_seq_len=max_prefill_seq_len,
             max_decode_seq_len=max_decode_seq_len,
@@ -539,7 +549,6 @@ class KunlunAttentionMetadataBuilder:
             use_cuda_graph=False,
             use_cascade=use_cascade,
         )
-
         return attn_metadata
 
     def can_run_in_cudagraph(
@@ -586,7 +595,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
-        
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
@@ -597,6 +605,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             raise ValueError(
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
+
         self.sinks = sinks
         if sinks is not None:
             assert sinks.shape[0] == num_heads, (
@@ -663,11 +672,13 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         value_cache,
                         updated_slot_mapping)
                 else:
-                    update_uncontiguous_kv_cache(
+                    cast_key_cache = key_cache.squeeze(1).unsqueeze(-2)
+                    cast_value_cache = value_cache.squeeze(1).unsqueeze(-2)
+                    xtorch_ops.reshape_and_cache_flash(
                         key,
                         value,
-                        key_cache,
-                        value_cache,
+                        cast_key_cache,
+                        cast_value_cache,
                         updated_slot_mapping)
 
         assert attn_type == AttentionType.DECODER
@@ -682,27 +693,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             prefill_query = query[num_decode_tokens:attn_metadata.num_actual_tokens]
             prefill_key = key[num_decode_tokens:attn_metadata.num_actual_tokens]
             prefill_value = value[num_decode_tokens:attn_metadata.num_actual_tokens]
-            # print("prefill_value",prefill_value.shape)
-            # assert prefill_query.shape[0] == num_prefill_tokens
-            # if get_tensor_model_parallel_rank() == 0:
-            #     print("q before prefill_attention", prefill_query)
-            # if get_tensor_model_parallel_rank() == 0:
-            #     print("q before prefill_attention", prefill_query)
-            #     torch.save(prefill_query, "/home/dongxinyu03/ut_fa/prefill_query.pt")
-            #     torch.save(prefill_key, "/home/dongxinyu03/ut_fa/prefill_key.pt")
-            #     torch.save(prefill_value, "/home/dongxinyu03/ut_fa/prefill_value.pt")
-            #     torch.save(prefill_meta.query_start_loc_host, "/home/dongxinyu03/ut_fa/query_start_loc_host.pt")
-            #     torch.save(prefill_meta.query_start_loc, "/home/dongxinyu03/ut_fa/query_start_loc.pt")
-
-
-            #     torch.save(self.alibi_slopes, "/home/dongxinyu03/ut_fa/alibi_slopes.pt")
-            #     torch.save(self.sliding_window , "/home/dongxinyu03/ut_fa/self.sliding_window .pt")
-            #     torch.save(self.sinks, "/home/dongxinyu03/ut_fa/sinks.pt")
-            # if get_tensor_model_parallel_rank() == 0:
-            #     print("prefill_query",prefill_query)
-            #     print("prefill_key",prefill_key)
-            #     print("prefill_value",prefill_value)
-            #     print("prefill_query shape", prefill_query.shape)
+ 
             xtorch_ops.prefill_attention(
                 q=prefill_query,
                 k=prefill_key, # Key Cache (block_num, head, block_size, dim)
@@ -717,21 +708,13 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 swa_right = 0 if self.sliding_window is not None else -1,
                 sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
             )
-            # if get_tensor_model_parallel_rank() == 0:
-                # print("output",output)
-            # if get_tensor_model_parallel_rank() == 0:
-            #     print("output", output)
+
         if decode_meta := attn_metadata.decode_metadata:    
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
             decode_query = query[:num_decode_tokens]
             # Kunlun Sliding Window Attention backend
             decode_query = decode_query.unsqueeze(0)
-            # kv_head_num = value_cache.shape[1]
-            # head_num = decode_query.shape[2]
-            # head_dim = decode_query.shape[3]  
-            # print("key_cache",key_cache.shape)
-            # print("value_cache",value_cache.shape)
             batch_num = decode_meta.block_tables.shape[0]
             max_num_blocks_per_seq = decode_meta.block_tables.shape[1]
             xtorch_ops.speculative_attention(
@@ -778,6 +761,8 @@ def use_cascade_attention(
     # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.
     # NOTE(woosuk): This is the common case. We should return False as soon as
     # possible to avoid any unnecessary computation.
+    return False
+
     if common_prefix_len < 256:
         return False
     # Cascade attention is currently not supported with these variants.
