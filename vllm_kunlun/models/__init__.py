@@ -1,5 +1,5 @@
 from vllm import ModelRegistry
-import vllm_kunlun.models.config
+
 
 def register_model():
     # from .demo_model import DemoModel  # noqa: F401
