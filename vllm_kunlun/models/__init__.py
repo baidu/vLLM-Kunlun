@@ -1,5 +1,5 @@
 from vllm import ModelRegistry
-
+import vllm_kunlun.models.config
 
 def register_model():
     # from .demo_model import DemoModel  # noqa: F401
@@ -82,6 +82,9 @@ def register_model():
         "LlamaForCausalLM",
         "vllm_kunlun.models.llama:LlamaForCausalLM")
 
-
+    # ModelRegistry.register_model(
+    #     "MiMoV2FlashForCausalLM",
+    #     "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
+    
 def register_quant_method():
     """to do"""

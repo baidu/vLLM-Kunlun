@@ -1,3 +1,20 @@
+#
+# Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
+#
+# This file is a part of the vllm-kunlun project.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """kunlun custom op entry"""
 import torch_xmlir
 import torch
@@ -177,51 +194,10 @@ class KunlunOps:
         """
         query_x = query.contiguous()
         key_x = key.contiguous()
-        query_x_dim = query_x.dim()
-        if not is_neox_style:
-            if cos_sin_cache.dtype == torch.float16:
-                cos_sin_cache = cos_sin_cache.to(torch.float32)
-            positions = positions.to(torch.int)
-            if positions.dim() == 1:
-                positions = positions.unsqueeze(0)
-                query_x = query_x.unsqueeze(0)
-                key_x = key_x.unsqueeze(0)
 
-            xtorch_ops.rotary_embedding_gptj(
-                positions,
-                query_x,
-                key_x,
-                head_size,
-                cos_sin_cache)
-            query.data = query_x
-            key.data  = key_x
-            if query_x_dim != query_x.dim():
-                query_x = query_x.unsqueeze(0)
-                key_x = key_x.unsqueeze(0)
-            return query, key
-        
-        # TODO: need opt
-        if cos_sin_cache.dim() == 4:
-            max_seq_len = cos_sin_cache.shape[2]
-            head_dim = cos_sin_cache.shape[3]
-            cos_sin_cache = cos_sin_cache.squeeze(0).squeeze(0)  # 移除前两个维度 [1,1,L,D] -> [L,D]
-            cos_sin_cache = cos_sin_cache.view(max_seq_len, 1, head_dim)
-    
-        # 重塑 query 和 key 的形状
         num_tokens = query_x.shape[0]
         num_heads = query_x.shape[1] // head_size
         num_kv_heads = key_x.shape[1] // head_size
-        
-        # # [num_tokens, num_heads * head_size] -> [num_tokens, num_heads, head_size]
-        # query_x = query_x.view(num_tokens, num_heads, head_size)
-        # # [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
-        # key_x = key_x.view(num_tokens, num_kv_heads, head_size)
-
-        # # 确保形状正确
-        # assert query_x.shape == (num_tokens, num_heads, head_size), \
-        #     f"Expected query shape [{num_tokens}, {num_heads}, {head_size}], got {query_x.shape}"
-        # assert key_x.shape == (num_tokens, num_kv_heads, head_size), \
-        #     f"Expected key shape [{num_tokens}, {num_kv_heads}, {head_size}], got {key_x.shape}"
 
         torch.ops._C.rotary_embedding(
             positions,
@@ -234,8 +210,6 @@ class KunlunOps:
         query_x = query_x.view(num_tokens, num_heads * head_size)
         key_x = key_x.view(num_tokens, num_kv_heads * head_size)
 
-        # query.data = query_x
-        # key.data  = key_x
         return query_x, key_x
 
     # Rotary embedding
@@ -433,6 +407,121 @@ class KunlunOps:
 
         return out
 
+    def _dbg(x):
+        if torch.is_tensor(x):
+            return (type(x), x.device, x.dtype, x.shape, x.is_contiguous())
+        return (type(x), x)
+    @staticmethod
+    def fused_moe(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        linear_weights: torch.Tensor,
+        moe_top_k: int,
+        renormalize: bool,
+        inplace: bool = False,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        w1_bias: Optional[torch.Tensor] = None,
+        w2_bias: Optional[torch.Tensor] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """fused_moe"""
+        global_num_experts = linear_weights.shape[0]
+        M, N = hidden_states.shape
+        hidden_dim = w2.shape[1]
+        normed_score = torch.empty(M,
+                            moe_top_k,
+                            dtype=torch.float32,
+                            device=hidden_states.device)
+        topk_ids = torch.empty(M,
+                        moe_top_k,
+                        dtype=torch.int32,
+                        device=hidden_states.device)
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks, global_num_experts, dtype=torch.int32, device=hidden_states.device
+        )
+
+        torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                topk_index=topk_ids,
+                norm_score=normed_score,
+                block_static=block_statistic,
+                bias=e_score_correction_bias,
+                scale=1.0,
+                n_group=num_expert_group,
+                topk_group=1,
+            )
+
+        moe_expand = torch.empty((M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device) # [M*top_k, N], float
+        expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)             # [E]
+        sorted_tokens_num_lod = torch.zeros(global_num_experts + 1, dtype=torch.int32, device=hidden_states.device)  # [E+1]
+        sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=hidden_states.device)
+        
+        torch.ops._C.gen_block_statistic(topk_ids,block_statistic)
+
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod)
+
+        y = torch.empty(M,moe_top_k,
+                w1.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+
+        moe_expand = moe_expand.view(M * moe_top_k, hidden_dim)
+
+        torch.ops._C.moe_fc(
+            x=moe_expand,
+            weight=w1,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y)
+
+        d = y.shape[-1] // 2
+        output_shape = (y.shape[:-1] + (d, ))
+        out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
+        torch.ops._C.swiglu(y, out1)
+
+        out = torch.empty(M,moe_top_k,
+                w2.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+
+        out1 = out1.reshape(-1, out1.shape[-1])
+
+        torch.ops._C.moe_fc(
+            x=out1,
+            weight=w2,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out)
+
+        dequant_scale = torch.ones([M, moe_top_k], dtype = torch.float32, device=out.device)
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=hidden_states.device)
+        sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
+
+        torch.ops._C.moe_post(
+            x=out,
+            moe_index=sorted_tokens_idx,
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output
+        )
+        
+        return output
+
     @staticmethod
     def fused_moe_ep(
         hidden_states: torch.Tensor,
@@ -485,42 +574,6 @@ class KunlunOps:
                 out[selected_token] = up_gate @ w2_weight[i].T
         output = (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2)).sum(dim=1).to(x.dtype)
 
-        return output
-
-    @staticmethod
-    def fused_moe(
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        gating_output: torch.Tensor,
-        linear_weights: torch.Tensor,
-        topk: int,
-        renormalize: bool,
-        inplace: bool = False,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
-        """fused_moe"""
-        output = torch.empty(hidden_states.shape, dtype=hidden_states.dtype,
-                            device=hidden_states.device)
-        expert_num = linear_weights.shape[0]
-
-        torch.ops._C.moe_ffn_block(
-            x=hidden_states,
-            gate_w=linear_weights,
-            inter_w=w1,
-            output_w=w2,
-            expert_num=expert_num,
-            moe_top_k=topk,
-            topk_group=topk_group,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            expert_group_num=num_expert_group,
-            out=output,
-        )
         return output
 
     @staticmethod

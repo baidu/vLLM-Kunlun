@@ -8,14 +8,8 @@ from typing import List, Optional, Tuple
 from vllm.platforms import current_platform
 
 
-if current_platform.is_kunlun():
-    from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-else:
-    from vllm import _custom_ops as ops
-    from vllm.triton_utils.importing import HAS_TRITON
+from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
-    if HAS_TRITON:
-        from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512

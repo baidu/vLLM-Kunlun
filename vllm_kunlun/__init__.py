@@ -17,6 +17,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             "vllm.model_executor.layers.fused_moe.layer": "vllm_kunlun.ops.fused_moe.layer",
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe": "vllm_kunlun.ops.quantization.compressed_tensors_moe",
             "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
+            "vllm.v1.kv_cache_interface": "vllm_kunlun.v1.kv_cache_interface",
+            "vllm.v1.worker.utils": "vllm_kunlun.v1.worker.utils"
             "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner"
         }
 
@@ -50,6 +52,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
         relative_mappings = {
             ("compressed_tensors_moe", "compressed_tensors"): "vllm_kunlun.ops.quantization.compressed_tensors_moe",
             ("layer", "fused_moe"): "vllm_kunlun.ops.fused_moe.layer",
+            ("v1", "kv_cache_interface"): "vllm_kunlun.v1.kv_cache_interface",
+            ("worker", "utils"): "vllm_kunlun.v1.worker.utils"
         }
 
         if level == 1:

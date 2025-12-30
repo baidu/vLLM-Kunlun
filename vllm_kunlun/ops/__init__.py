@@ -15,8 +15,9 @@
 # This file is a part of the vllm-ascend project.
 #
 
-# import vllm_kunlun.ops.linear
 import vllm_kunlun.ops.rotary_embedding
 import vllm_kunlun.ops.layernorm
 import vllm_kunlun.ops.quantization.awq
 import vllm_kunlun.ops.quantization.gptq
+import vllm_kunlun.ops.quantization.kernels.scaled_mm.cutlass
+import vllm_kunlun.ops.vocab_parallel_embedding
