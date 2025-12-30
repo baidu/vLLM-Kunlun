@@ -143,14 +143,11 @@ def vllm_kunlun_mrope_forward_cuda(
 
         return query, key
 
-# RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
-# RotaryEmbedding.forward = vllm_kunlun_forward_cuda
-# RotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
+RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
+RotaryEmbedding.forward = vllm_kunlun_forward_cuda
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
 MRotaryEmbedding.forward = vllm_kunlun_mrope_forward_cuda
-# MRotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
 YaRNScalingRotaryEmbedding._compute_inv_freq = RotaryEmbedding._compute_inv_freq
-# YaRNScalingRotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
 
 
 def Split_Norm_Rope(
