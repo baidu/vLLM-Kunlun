@@ -47,8 +47,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.sequence import IntermediateTensors
 
 from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
-from .qwen2 import Qwen2MLP as Qwen3MLP
-from .qwen2 import Qwen2Model
+from vllm.model_executor.models.qwen2 import Qwen2MLP as Qwen3MLP
+from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 

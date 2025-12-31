@@ -42,8 +42,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
-from .qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
-from .qwen3_vl import (Qwen3_VisionTransformer, Qwen3VLDummyInputsBuilder,
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
+from vllm.model_executor.models.qwen3_vl import (Qwen3_VisionTransformer, Qwen3VLDummyInputsBuilder,
                        Qwen3VLForConditionalGeneration,
                        Qwen3VLMultiModalProcessor, Qwen3VLProcessingInfo)
 from vllm.model_executor.models.utils import is_pp_missing_parameter, maybe_prefix

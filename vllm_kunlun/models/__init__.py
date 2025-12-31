@@ -5,7 +5,6 @@ def register_model():
     # from .demo_model import DemoModel  # noqa: F401
     from .qwen2_vl import Qwen2VLForConditionalGeneration #noqa: F401
     from .qwen2_5_vl import Qwen2_5_VLForConditionalGeneration #noqa: F401
-    from .qwen3 import Qwen3ForCausalLM #noqa: F401
     from .qwen3_moe import Qwen3MoeForCausalLM #noqa: F401
     from .qwen3_vl import Qwen3VLForConditionalGeneration
     from .qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
@@ -49,10 +48,6 @@ def register_model():
     ModelRegistry.register_model(
         "InternLM2ForCausalLM",
         "vllm_kunlun.models.internlm2:InternLM2ForCausalLM")   
-
-    ModelRegistry.register_model(
-        "Qwen2ForCausalLM",
-        "vllm_kunlun.models.qwen2:Qwen2ForCausalLM")
     
     ModelRegistry.register_model(
         "InternVLChatModel",
@@ -77,11 +72,6 @@ def register_model():
     ModelRegistry.register_model(
         "SeedOssForCausalLM",
         "vllm_kunlun.models.seed_oss:SeedOssForCausalLM")
-
-    ModelRegistry.register_model(
-        "LlamaForCausalLM",
-        "vllm_kunlun.models.llama:LlamaForCausalLM")
-
 
 def register_quant_method():
     """to do"""
