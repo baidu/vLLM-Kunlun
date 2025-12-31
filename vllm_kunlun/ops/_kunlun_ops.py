@@ -177,51 +177,10 @@ class KunlunOps:
         """
         query_x = query.contiguous()
         key_x = key.contiguous()
-        query_x_dim = query_x.dim()
-        if not is_neox_style:
-            if cos_sin_cache.dtype == torch.float16:
-                cos_sin_cache = cos_sin_cache.to(torch.float32)
-            positions = positions.to(torch.int)
-            if positions.dim() == 1:
-                positions = positions.unsqueeze(0)
-                query_x = query_x.unsqueeze(0)
-                key_x = key_x.unsqueeze(0)
 
-            xtorch_ops.rotary_embedding_gptj(
-                positions,
-                query_x,
-                key_x,
-                head_size,
-                cos_sin_cache)
-            query.data = query_x
-            key.data  = key_x
-            if query_x_dim != query_x.dim():
-                query_x = query_x.unsqueeze(0)
-                key_x = key_x.unsqueeze(0)
-            return query, key
-        
-        # TODO: need opt
-        if cos_sin_cache.dim() == 4:
-            max_seq_len = cos_sin_cache.shape[2]
-            head_dim = cos_sin_cache.shape[3]
-            cos_sin_cache = cos_sin_cache.squeeze(0).squeeze(0)  # 移除前两个维度 [1,1,L,D] -> [L,D]
-            cos_sin_cache = cos_sin_cache.view(max_seq_len, 1, head_dim)
-    
-        # 重塑 query 和 key 的形状
         num_tokens = query_x.shape[0]
         num_heads = query_x.shape[1] // head_size
         num_kv_heads = key_x.shape[1] // head_size
-        
-        # # [num_tokens, num_heads * head_size] -> [num_tokens, num_heads, head_size]
-        # query_x = query_x.view(num_tokens, num_heads, head_size)
-        # # [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
-        # key_x = key_x.view(num_tokens, num_kv_heads, head_size)
-
-        # # 确保形状正确
-        # assert query_x.shape == (num_tokens, num_heads, head_size), \
-        #     f"Expected query shape [{num_tokens}, {num_heads}, {head_size}], got {query_x.shape}"
-        # assert key_x.shape == (num_tokens, num_kv_heads, head_size), \
-        #     f"Expected key shape [{num_tokens}, {num_kv_heads}, {head_size}], got {key_x.shape}"
 
         torch.ops._C.rotary_embedding(
             positions,
@@ -234,8 +193,6 @@ class KunlunOps:
         query_x = query_x.view(num_tokens, num_heads * head_size)
         key_x = key_x.view(num_tokens, num_kv_heads * head_size)
 
-        # query.data = query_x
-        # key.data  = key_x
         return query_x, key_x
 
     # Rotary embedding
@@ -481,7 +438,7 @@ class KunlunOps:
                 cur_token = repeat_x[selected_token]
                 up_gate = torch.empty(selected_token.sum(), up_gate_size//2, 
                         dtype=cur_token.dtype, device=cur_token.device)
-                torch.ops._C.swiglu(cur_token@ w13_weight[i].T, up_gate)
+                torch.ops._C.silu_and_mul(up_gate, cur_token@ w13_weight[i].T)
                 out[selected_token] = up_gate @ w2_weight[i].T
         output = (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2)).sum(dim=1).to(x.dtype)
 

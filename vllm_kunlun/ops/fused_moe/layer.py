@@ -160,7 +160,7 @@ class UnquantizedFusedMoEMethod(VllmUnquantizedFusedMoEMethod):
             d = y.shape[-1] // 2
             output_shape = (y.shape[:-1] + (d, ))
             out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-            torch.ops._C.swiglu(y, out1)
+            torch.ops._C.silu_and_mul(out1, y)
 
             out = torch.empty(M,top_k,
                     layer.w2_weight.shape[1],

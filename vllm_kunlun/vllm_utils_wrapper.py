@@ -323,27 +323,6 @@ def rms_norm_dynamic_per_token_quant_xpu(
 )->None:
     pass
 
-@custom_op("_C::silu_and_mul", mutates_args=())
-def silu_and_mul(
-    result : torch.Tensor,
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    epsilon: float
-)->None:
-    pass
-@impl("_C::silu_and_mul", "CUDA")
-def silu_and_mul_xpu(
-    result : torch.Tensor,
-    input: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    epsilon: float
-)->None:
-    pass
-
 @custom_op("_C::silu_and_mul_quant", mutates_args=())
 def silu_and_mul_quant(
     result : torch.Tensor,
@@ -592,39 +571,39 @@ if hasattr(torch.ops.custom_ops, "fc_fusion"):
                         ) -> None:
         pass
 
-@custom_op("_C::swiglu", mutates_args=())
-def swiglu(
+@custom_op("_C::silu_and_mul", mutates_args=())
+def silu_and_mul(
+    out: torch.Tensor,
     x: torch.Tensor,
-    y: torch.Tensor,
     axis: int=-1,
     turn: bool=True
 ) -> None:
     xtorch_ops.swiglu(
-        x,
-        y,
+        x=x,
+        y=out,
     )
 
 
-@impl("_C::swiglu", "CUDA")
-def swiglu_cuda(
+@impl("_C::silu_and_mul", "CUDA")
+def silu_and_mul_cuda(
+    out: torch.Tensor,
     x: torch.Tensor,
-    y: torch.Tensor,
     axis: int=-1,
     turn: bool=True
 ) -> None:
     xtorch_ops.swiglu(
-        x,
-        y,
+        x=x,
+        y=out,
     )
 
-def _fake_swiglu(
+def _fake_silu_and_mul(
+    out: torch.Tensor,
     x: torch.Tensor,
-    y: torch.Tensor,
     axis: int=-1,
     turn: bool=True):
     return None
 
-swiglu.register_fake(_fake_swiglu)
+silu_and_mul.register_fake(_fake_silu_and_mul)
 
 
 

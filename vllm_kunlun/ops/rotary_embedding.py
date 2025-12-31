@@ -70,7 +70,7 @@ def vllm_kunlun_forward_cuda(
                                          self.is_neox_style, self.rotary_dim,
                                          offsets)
         else:
-            ops.rotary_embedding(positions, query, key, self.head_size,
+            query, key = ops.rotary_embedding(positions, query, key, self.head_size,
                                  self.cos_sin_cache, self.is_neox_style)
         return query, key
 
@@ -143,8 +143,8 @@ def vllm_kunlun_mrope_forward_cuda(
 
         return query, key
 
-# RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
-# RotaryEmbedding.forward = vllm_kunlun_forward_cuda
+RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
+RotaryEmbedding.forward = vllm_kunlun_forward_cuda
 # RotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
 MRotaryEmbedding.forward = vllm_kunlun_mrope_forward_cuda
