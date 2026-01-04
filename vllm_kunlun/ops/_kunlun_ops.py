@@ -463,10 +463,12 @@ class KunlunOps:
                     bias=e_score_correction_bias,
                     scale=1.0,
                     n_group=num_expert_group,
-                    topk_group=1,
+                    topk_group=topk_group,
                 )
 
-        if w1_bias is not None:
+        if w1_bias is not None or w2_bias is not None: 
+            # Rignt now this branch is for gpt oss
+            # TODO (@xyDong23): faster here using moe_fc kernel
             normed_score = normed_score.to(hidden_states.dtype)
             out = torch.zeros(M * moe_top_k, N, dtype=hidden_states.dtype, device=hidden_states.device)
             repeat_x = hidden_states.repeat_interleave(moe_top_k, dim=0)
@@ -479,10 +481,12 @@ class KunlunOps:
                     up_gate = torch.empty(selected_token.sum(), up_gate_size//2, 
                             dtype=cur_token.dtype, device=cur_token.device)
                     groupgemm1 = cur_token@ w1[i].T
+                    # Add w13 bias
                     if w1_bias is not None:
                         groupgemm1 = groupgemm1 + w1_bias[i]
                     up_gate = torch.ops._C.swigluoai_and_mul(groupgemm1)
                     groupgemm2 = up_gate @ w2[i].T
+                    # Add w2 bias
                     if w2_bias is not None:
                         groupgemm2 = groupgemm2 + w2_bias[i]
                     out[selected_token] = groupgemm2
@@ -511,7 +515,7 @@ class KunlunOps:
                     device=hidden_states.device)
 
             moe_expand = moe_expand.view(M * moe_top_k, hidden_dim)
-            # w1_bias = w1_bias.to(torch.float)
+
             torch.ops._C.moe_fc(
                 x=moe_expand,
                 weight=w1,
@@ -519,15 +523,12 @@ class KunlunOps:
                 sorted_tokens_idx=sorted_tokens_idx,
                 moe_topk=moe_top_k,
                 y=y,
-                # bias=w1_bias
             )
-            y = y + w1_bias[topk_ids]
-            # y.add_(w1_bias[topk_ids])
-            # d = y.shape[-1] // 2
-            # output_shape = (y.shape[:-1] + (d, ))
-            # out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-            # torch.ops._C.swiglu(y, out1)
-            out1 = torch.ops._C.swigluoai_and_mul(y)
+
+            d = y.shape[-1] // 2
+            output_shape = (y.shape[:-1] + (d, ))
+            out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
+            torch.ops._C.silu_and_mul(out1, y)
             
             out = torch.empty(M,moe_top_k,
                     w2.shape[1],
@@ -536,7 +537,6 @@ class KunlunOps:
 
             out1 = out1.reshape(-1, out1.shape[-1])
 
-            # w2_bias = w2_bias.to(torch.float)
             torch.ops._C.moe_fc(
                 x=out1,
                 weight=w2,
@@ -544,11 +544,8 @@ class KunlunOps:
                 sorted_tokens_idx=sorted_tokens_idx,
                 moe_topk=moe_top_k,
                 y=out,
-                # bias=w2_bias
             )
 
-            out = out+w2_bias[topk_ids]
-            
             dequant_scale = torch.ones([M, moe_top_k], dtype = torch.float32, device=out.device)
             output = torch.empty([M, N], dtype=hidden_states.dtype, device=hidden_states.device)
             sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
