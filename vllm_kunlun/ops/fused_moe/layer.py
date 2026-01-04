@@ -103,62 +103,23 @@ class UnquantizedFusedMoEMethod(VllmUnquantizedFusedMoEMethod):
                              topk_group=topk_group
                              )
         else:
-            # return ops.fused_moe(x,
-            #                  layer.w13_weight,
-            #                  layer.w2_weight,
-            #                  router_logits,
-            #                  linear_weights,
-            #                  top_k,
-            #                  renormalize=renormalize,
-            #                  inplace=True,
-            #                  use_grouped_topk=use_grouped_topk,
-            #                  num_expert_group=num_expert_group,
-            #                  topk_group=topk_group,
-            #                  scoring_func=scoring_func,
-            #                  e_score_correction_bias=e_score_correction_bias,
-            #                  w1_bias = layer.w13_bias,
-            #                  w2_bias = layer.w2_bias,
-            #                  )
-            from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-            batch, hidden_size  = x.shape
-            num_local_experts, up_gate_size, _ = layer.w13_weight.shape
-
-            router_logits =  x.to(linear_weights.dtype)@linear_weights.T
-            
-            topk_weights = torch.empty(batch,
-                                top_k,
-                                dtype=router_logits.dtype,
-                                device=router_logits.device)
-            topk_ids = torch.empty(batch,
-                                top_k,
-                                dtype=torch.int32,
-                                device=router_logits.device)
-            block_static = torch.empty(0, dtype=torch.int32,device=router_logits.device)
-            torch.ops._C.moe_softmax_topk(router_logits, topk_weights, topk_ids, block_static)
-
-            if renormalize:
-                topk_weights = topk_weights / topk_weights.sum(1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
-            out = torch.zeros(batch * top_k, hidden_size, dtype=x.dtype, device=x.device)
-            repeat_x = x.repeat_interleave(top_k, dim=0)
-            topk_ids_flat = topk_ids.flatten()
-            for i in range(num_local_experts):
-                experts_id = self.moe.ep_rank * num_local_experts + i
-                selected_token = topk_ids_flat == experts_id
-                if selected_token.sum():
-                    cur_token = repeat_x[selected_token]
-                    up_gate = torch.empty(selected_token.sum(), up_gate_size//2, 
-                            dtype=cur_token.dtype, device=cur_token.device)
-                    groupgemm1 = cur_token@layer.w13_weight[i].T
-                    if layer.w13_bias is not None:
-                        groupgemm1 = groupgemm1 + layer.w13_bias[i]
-                    up_gate = torch.ops._C.swigluoai_and_mul(groupgemm1)
-                    groupgemm2 = up_gate @ layer.w2_weight[i].T
-                    if layer.w2_bias is not None:
-                        groupgemm2 = groupgemm2 + layer.w2_bias[i]
-                    out[selected_token] = groupgemm2
-            ret = (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2)).sum(dim=1).to(x.dtype)
-            return ret
+            return ops.fused_moe(x,
+                             layer.w13_weight,
+                             layer.w2_weight,
+                             router_logits,
+                             linear_weights,
+                             self.moe.ep_rank,
+                             top_k,
+                             renormalize=renormalize,
+                             inplace=True,
+                             use_grouped_topk=use_grouped_topk,
+                             num_expert_group=num_expert_group,
+                             topk_group=topk_group,
+                             scoring_func=scoring_func,
+                             e_score_correction_bias=e_score_correction_bias,
+                             w1_bias = layer.w13_bias,
+                             w2_bias = layer.w2_bias,
+                             )
 
 class FusedMoE(VllmFusedMoE):
     """FusedMoE"""
