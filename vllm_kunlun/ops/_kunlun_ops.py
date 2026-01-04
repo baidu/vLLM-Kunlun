@@ -608,7 +608,7 @@ class KunlunOps:
                 cur_token = repeat_x[selected_token]
                 up_gate = torch.empty(selected_token.sum(), up_gate_size//2, 
                         dtype=cur_token.dtype, device=cur_token.device)
-                torch.ops._C.swiglu(cur_token@ w13_weight[i].T, up_gate)
+                torch.ops._C.silu_and_mul(up_gate, cur_token@ w13_weight[i].T)
                 out[selected_token] = up_gate @ w2_weight[i].T
         output = (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2)).sum(dim=1).to(x.dtype)
 
