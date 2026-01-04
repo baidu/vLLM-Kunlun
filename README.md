@@ -36,7 +36,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
 <table>
   <thead>
     <tr>
-      <th width="20%">Model</th>
+      <th width="30%">Model</th>
       <th width="12%">Support</th>
       <th width="15%">Quantization</th>
       <th width="10%">LoRA</th>
@@ -66,6 +66,14 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td class="status-support">✅</td>
       <td class="status-support">✅</td>
       <td class="status-support">✅</td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">MiMo-V2-Flash</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td></td>
       <td class="status-support">✅</td>
       <td></td>
     </tr>
