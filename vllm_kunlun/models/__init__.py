@@ -76,6 +76,10 @@ def register_model():
     ModelRegistry.register_model(
         "MiMoV2FlashForCausalLM",
         "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
+
+    ModelRegistry.register_model(
+        "GptOssForCausalLM",
+        "vllm_kunlun.models.gpt_oss:GptOssForCausalLM")   
     
 def register_quant_method():
     """to do"""
