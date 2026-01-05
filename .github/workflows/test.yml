@@ -10,13 +10,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: astral/uv:python3.10-bookworm-slim
+    container: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - name: setup uv
-        run: |
-          uv python install 3.10
-          uv python list
+      - name: Install dependencies
+        run: pip install pytest
       - name: Test
-        run: uv run pytest test.py
+        run: pytest test.py
