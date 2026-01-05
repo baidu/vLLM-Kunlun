@@ -196,7 +196,9 @@ class FusedMoE(VllmFusedMoE):
         self.moe_config = moe
         self.quant_config = quant_config
         self.has_bias=has_bias
-
+        self.register_parameter("w13_bias", None)
+        self.register_parameter("w2_bias", None)
+        
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
         quant_method: Optional[QuantizeMethodBase] = None
