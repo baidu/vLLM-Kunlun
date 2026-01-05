@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v6
       - name: setup uv
         run: |
-          uv venv -p 3.10.10
-          uv run python list
+          uv python install 3.10.10
+          uv python list
       - name: Test
         run: uv run pytest test.py
