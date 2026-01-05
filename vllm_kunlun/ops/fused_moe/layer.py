@@ -69,7 +69,8 @@ class UnquantizedFusedMoEMethod(VllmUnquantizedFusedMoEMethod):
                             num_expert_group=num_expert_group,
                             custom_routing_function=custom_routing_function,
                             linear_weights=linear_weights,
-                            e_score_correction_bias=e_score_correction_bias)
+                            e_score_correction_bias=e_score_correction_bias,
+                            scoring_func=scoring_func)
 
     def forward_kunlun(
             self,
