@@ -21,7 +21,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm_kunlun.ops.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -185,8 +185,7 @@ class MiMoV2MoE(nn.Module):
             gate_input = hidden_states
         router_logits = self.gate(gate_input)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits, linear_weights=self.gate.weight
-        )
+            hidden_states=hidden_states, router_logits=router_logits)
 
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 

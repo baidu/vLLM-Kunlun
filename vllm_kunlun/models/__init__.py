@@ -76,6 +76,14 @@ def register_model():
     ModelRegistry.register_model(
         "MiMoV2FlashForCausalLM",
         "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
+
+    ModelRegistry.register_model(
+        "DeepseekV3ForCausalLM",
+        "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM")
     
+    ModelRegistry.register_model(
+        "DeepseekV32ForCausalLM",
+        "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM")
+
 def register_quant_method():
     """to do"""

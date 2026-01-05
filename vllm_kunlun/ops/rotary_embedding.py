@@ -19,7 +19,9 @@ import torch
 import xspeedgate_ops
 import os
 from vllm.model_executor.layers.rotary_embedding import (
-    RotaryEmbedding, YaRNScalingRotaryEmbedding, DynamicNTKScalingRotaryEmbedding, MRotaryEmbedding)
+    RotaryEmbedding, YaRNScalingRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding, MRotaryEmbedding,
+    DeepseekScalingRotaryEmbedding)
 from typing import Optional, Tuple
 
 def vllm_kunlun_compute_cos_sin_cache(self) -> torch.Tensor:
@@ -143,11 +145,15 @@ def vllm_kunlun_mrope_forward_cuda(
 
         return query, key
 
+DeepseekScalingRotaryEmbedding_forward = DeepseekScalingRotaryEmbedding.forward
+DeepseekScalingRotaryEmbedding_forward_cuda = DeepseekScalingRotaryEmbedding.forward_cuda
 RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
 RotaryEmbedding.forward = vllm_kunlun_forward_cuda
+DeepseekScalingRotaryEmbedding.forward = DeepseekScalingRotaryEmbedding_forward
+DeepseekScalingRotaryEmbedding.forward_cuda = DeepseekScalingRotaryEmbedding_forward_cuda
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
 MRotaryEmbedding.forward = vllm_kunlun_mrope_forward_cuda
-YaRNScalingRotaryEmbedding._compute_inv_freq = RotaryEmbedding._compute_inv_freq
+# YaRNScalingRotaryEmbedding._compute_inv_freq = RotaryEmbedding._compute_inv_freq
 
 
 def Split_Norm_Rope(

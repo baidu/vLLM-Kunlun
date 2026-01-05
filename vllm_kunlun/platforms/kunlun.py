@@ -177,6 +177,8 @@ class KunlunPlatform(Platform):
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
+            use_sparse = hasattr(vllm_config.model_config.hf_config,
+                                 "index_topk")
             use_flashmla = (envs.VLLM_ATTENTION_BACKEND is None \
                 or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA")
             from vllm.attention.ops.flashmla import is_flashmla_supported
@@ -185,6 +187,11 @@ class KunlunPlatform(Platform):
                 cache_config.block_size = 64
                 logger.info(
                     "Forcing kv cache block size to 64 for FlashMLA backend.")
+            if use_sparse and cache_config.block_size != 64:
+                cache_config.block_size = 64
+                logger.info(
+                    "Forcing kv cache block size to 64 for FlashMLASparse "
+                    "backend.")
 
         if (envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
                 and parallel_config.data_parallel_size > 1
@@ -224,6 +231,14 @@ class KunlunPlatform(Platform):
         Returns:
             str: Class name of the attention backend.
         """
+        if use_mla:
+            if use_sparse:
+                logger.info_once("Using Sparse MLA backend on V1 engine.")
+                # return ("vllm.v1.attention.backends.mla.flashmla_sparse."
+                #         "FlashMLASparseBackend")
+                return ("vllm_kunlun.v1.attention.backends.mla.flashmla_sparse."
+                        "FlashMLASparseBackend")
+            return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
         if use_v1:
             return "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
         elif not use_mla:                     
