@@ -34,7 +34,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
@@ -50,18 +50,16 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
-        if k is None and p is None:
+        if (k is None and p is None) or generators:
             # We prefer `random_sample` over `flashinfer_sample` when sorting is
             # not needed. This is because `random_sample` does not require
             # CPU-GPU synchronization while `flashinfer_sample` does.
-            probs = logits.softmax(dim=-1, dtype=torch.float32)
-            return random_sample(probs, generators), None
-        if generators:
-            logger.warning_once("FlashInfer 0.2.3+ does not support "
-                                "per-request generators. Falling back to "
-                                "PyTorch-native implementation.")
+            if generators:
+                logger.warning_once("FlashInfer 0.2.3+ does not support "
+                                    "per-request generators. Falling back to "
+                                    "PyTorch-native implementation.")
             return self.forward_native(logits, generators, k, p)
         # flashinfer sampling functions expect contiguous logits.
         # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
@@ -153,14 +151,21 @@ def random_sample(
         if os.getenv('FAST_RANDOM_SAMPLE') == "1":
             q.uniform_()
             q = -torch.log(q)
-            q = q.clamp(min=1e-4)
+            q = q.clamp(min=1e-12)
         else:
             q.exponential_()
     if generators:
         # TODO(woosuk): This can be slow because we handle each request
         # one by one. Optimize this.
-        for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
+        if os.getenv('FAST_RANDOM_SAMPLE') == "1":
+            for i, generator in generators.items():
+                q[i].uniform_(generator=generator)
+            q = -torch.log(q)
+            q = q.clamp(min=1e-12)
+        else:
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
