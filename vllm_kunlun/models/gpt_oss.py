@@ -16,7 +16,7 @@ from vllm.distributed import (get_ep_group, get_pp_group,
                               get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_gather)
-from vllm_kunlun.ops.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
@@ -176,7 +176,7 @@ class MLPBlock(torch.nn.Module):
             x = sequence_parallel_chunk(x)
 
         g = self.router(x)
-        x = self.experts(hidden_states=x, router_logits=g, linear_weights=self.router.weight)
+        x = self.experts(hidden_states=x, router_logits=g)
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
