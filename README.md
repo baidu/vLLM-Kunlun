@@ -126,7 +126,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">DeekSeek R1</td>
+      <td class="model-name">DeepSeek-R1</td>
       <td class="status-support">✅</td>
       <td class="status-support">✅</td>
       <td></td>
@@ -134,7 +134,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">DeekSeek V3</td>
+      <td class="model-name">DeepSeek-V3</td>
       <td class="status-support">✅</td>
       <td class="status-support">✅</td>
       <td></td>
@@ -142,7 +142,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
     </tr>
     <tr>
-      <td class="model-name">DeekSeek V3.2</td>
+      <td class="model-name">DeepSeek-V3.2</td>
       <td class="status-support">✅</td>
       <td class="status-support">✅</td>
       <td></td>
