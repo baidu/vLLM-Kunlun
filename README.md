@@ -46,6 +46,22 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
   </thead>
   <tbody>
     <tr>
+      <td class="model-name">Qwen2</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">Qwen2.5</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
       <td class="model-name">Qwen3</td>
       <td class="status-support">✅</td>
       <td></td>
@@ -75,6 +91,38 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td></td>
       <td></td>
       <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">Llama2</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">Llama3</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">Llama3.1</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td class="model-name">gpt-oss</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td></td>
+      <td></td>
       <td></td>
     </tr>
   </tbody>

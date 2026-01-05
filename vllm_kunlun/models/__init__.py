@@ -78,9 +78,13 @@ def register_model():
         "vllm_kunlun.models.mimo_v2_flash:MiMoV2FlashForCausalLM")
 
     ModelRegistry.register_model(
+        "GptOssForCausalLM",
+        "vllm_kunlun.models.gpt_oss:GptOssForCausalLM")   
+
+    ModelRegistry.register_model(
         "DeepseekV3ForCausalLM",
         "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM")
-    
+
     ModelRegistry.register_model(
         "DeepseekV32ForCausalLM",
         "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM")

@@ -153,8 +153,6 @@ DeepseekScalingRotaryEmbedding.forward = DeepseekScalingRotaryEmbedding_forward
 DeepseekScalingRotaryEmbedding.forward_cuda = DeepseekScalingRotaryEmbedding_forward_cuda
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
 MRotaryEmbedding.forward = vllm_kunlun_mrope_forward_cuda
-# YaRNScalingRotaryEmbedding._compute_inv_freq = RotaryEmbedding._compute_inv_freq
-
 
 def Split_Norm_Rope(
     qkv: torch.Tensor,
