@@ -26,6 +26,9 @@ jobs:
           cat /etc/os-release
           pwd
           echo $PATH 
+          source ~/.bashrc
+          python --version
+          
       # - name: Test
       #   env:  
       #       XPU_VISIBLE_DEVICES: "0"
