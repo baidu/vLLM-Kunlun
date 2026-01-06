@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: p800
+    runs-on: p800_82
     timeout-minutes: 60
     #: iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.37_base
     steps:
