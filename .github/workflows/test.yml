@@ -23,19 +23,19 @@ jobs:
           pwd
       - name: Test
         env:  
+            XPU_VISIBLE_DEVICES: "0"
+            XFT_USE_FAST_SWIGLU: "1"
+            XPU_USE_FAST_SWIGLU: "1"
+            XMLIR_CUDNN_ENABLED: "1"
+            XPU_USE_DEFAULT_CTX: "1"
+            XMLIR_FORCE_USE_XPU_GRAPH: "1"
+            XPU_USE_MOE_SORTED_THRES: "128"
+            VLLM_USE_V1: "1"
+            XMLIR_ENABLE_MOCK_TORCH_COMPILE: "false"
+            USE_ORI_ROPE: "1"
         run: |
-          unset XPU_DUMMY_EVENT
-          export XPU_VISIBLE_DEVICES=0
-          export XFT_USE_FAST_SWIGLU=1 
-          export XPU_USE_FAST_SWIGLU=1 
-          export XMLIR_CUDNN_ENABLED=1
-          export XPU_USE_DEFAULT_CTX=1
-          export XMLIR_FORCE_USE_XPU_GRAPH=1 
-          export XPU_USE_MOE_SORTED_THRES=128 
           export VLLM_HOST_IP=$(hostname -i)
-          export XMLIR_ENABLE_MOCK_TORCH_COMPILE=false 
-          VLLM_USE_V1=1
-          USE_ORI_ROPE=1
+          unset XPU_DUMMY_EVENT
           source /root/.bashrc
           python test.py
       
