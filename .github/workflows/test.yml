@@ -23,6 +23,6 @@ jobs:
           pwd
       - name: Test
         run: |
-        source /root/.bashrc
-        pytest -sv test.py
+          source /root/.bashrc
+          pytest -sv test.py
       
