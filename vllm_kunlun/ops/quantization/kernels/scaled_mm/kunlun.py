@@ -1,7 +1,7 @@
 #
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-# Author: Tang Shiwen, Li Wei
-# Email: tangshiwen@baidu.com, liwei157@baidu.com
+# Author: Liwei, Tang Shiwen
+# Email: liwei157@baidu.com, tangshiwen@baidu.com
 # This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

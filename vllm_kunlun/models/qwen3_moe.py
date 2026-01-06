@@ -173,10 +173,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        kunlun_linear_weights = self.gate.get_weights()
         final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits,
-                                           linear_weights=kunlun_linear_weights)
+                                           router_logits=router_logits)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
