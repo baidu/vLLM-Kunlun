@@ -9,12 +9,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    container: pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
+    runs-on: p800
+    timeout-minutes: 60
+    container: iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.37_base
     steps:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Install dependencies
         run: pip install pytest
       - name: Test
-        run: pytest test.py
+        run: pytest -sv test.py
