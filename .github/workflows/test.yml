@@ -9,7 +9,7 @@ on:
 env:
   ACTIONS_STEP_DEBUG: "true"
   ACTIONS_RUNNER_DEBUG: "true"
-  
+
 jobs:
   test:
     runs-on: p800_82
@@ -22,10 +22,9 @@ jobs:
       #   run: pip install pytest
       - name: check env
         run: |
-          xpu-smi
           cat /etc/os-release
           pwd
-          vllm --version
+          echo $PATH 
       # - name: Test
       #   env:  
       #       XPU_VISIBLE_DEVICES: "0"
