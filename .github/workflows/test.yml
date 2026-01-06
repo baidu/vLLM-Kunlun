@@ -20,6 +20,7 @@ jobs:
       - name: check env
         run: |
           cat /etc/os-release
+          pwd
       - name: Test
         run: pytest -sv test.py
       
