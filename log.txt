@@ -1,0 +1,254 @@
+Run set -euxo pipefail
++ cat /etc/os-release
+NAME="Ubuntu"
+VERSION="20.04.6 LTS (Focal Fossa)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 20.04.6 LTS"
+VERSION_ID="20.04"
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+VERSION_CODENAME=focal
++ pwd
++ echo /root/.BCloud/bin:/root/miniconda/envs/python310_torch25_cuda/bin:/root/miniconda/condabin:/opt/linux-bcecmd-0.3.3:/usr/local/go/bin:/bin:/opt/cmake-3.22.2/bin:/usr/local/cuda-11.7/bin:/root/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin:/binnexport
++ source /home/hongweijie/.bashrc
+++ case $- in
+++ return
++ python --version
+UBUNTU_CODENAME=focal
+/home/hongweijie/vllm_kunlun/vllm_kunlun
+/root/.BCloud/bin:/root/miniconda/envs/python310_torch25_cuda/bin:/root/miniconda/condabin:/opt/linux-bcecmd-0.3.3:/usr/local/go/bin:/bin:/opt/cmake-3.22.2/bin:/usr/local/cuda-11.7/bin:/root/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin:/binnexport
+Python 3.10.15
++ echo 'vllm run.....'
+vllm run.....
++ vllm --version
+/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+XCCL /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch_xmlir/libbkcl.so loaded
+SYMBOL_REWRITE torch success
+INFO 01-06 20:38:30 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 01-06 20:38:30 [__init__.py:38] - kunlun -> vllm_kunlun:register
+INFO 01-06 20:38:30 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 01-06 20:38:30 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 01-06 20:38:30 [__init__.py:38] - kunlun -> vllm_kunlun:register
+INFO 01-06 20:38:30 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 01-06 20:38:30 [__init__.py:220] No platform detected, vLLM is running on UnspecifiedPlatform
+WARNING 01-06 20:38:30 [_custom_ops.py:20] Failed to import from vllm._C with ImportError('libcudart.so.12: cannot open shared object file: No such file or directory')
+/home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/__init__.py:127: UserWarning: [vllm_kunlun] bitsandbytes_loader patch failed: ImportError("cannot import name 'ModelConfig' from partially initialized module 'vllm.config' (most likely due to a circular import) (/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/config/__init__.py)")
+  warnings.warn(f"[vllm_kunlun] bitsandbytes_loader patch failed: {e!r}")
+[vllm_kunlun] V1sampler top p & k patched -> /home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/v1/sample/ops/topk_topp_sampler.py
+[vllm_kunlun] V1sampler top p & k patched -> /home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/v1/sample/ops/topk_topp_sampler.py
+INFO 01-06 20:38:31 [__init__.py:207] Platform plugin kunlun is activated
+[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.CompressedTensorsMoEMethod       --> vllm_xpu.model_executor.layers.quantization.compressed_tensors_moe.py:CompressedTensorsMoEMethod
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen2_vl:Qwen2VLForConditionalGeneration.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen2_5_vl:Qwen2_5_VLForConditionalGeneration.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen3ForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3:Qwen3ForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_next:Qwen3NextForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture GlmForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.glm:GlmForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture GptOssForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.gpt_oss:GptOssForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture InternLM2ForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.internlm2:InternLM2ForCausalLM.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture InternVLChatModel is already registered, and will be overwritten by the new model class vllm_kunlun.models.internvl:InternVLChatModel.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture InternS1ForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.interns1:InternS1ForConditionalGeneration.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_vl:Qwen3VLForConditionalGeneration.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_vl_moe:Qwen3VLMoeForConditionalGeneration.
+WARNING 01-06 20:38:38 [registry.py:582] Model architecture SeedOssForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.seed_oss:SeedOssForCausalLM.
+0.11.0
++ unset XPU_DUMMY_EVENT
++ export XPU_VISIBLE_DEVICES=0
++ XPU_VISIBLE_DEVICES=0
++ export XFT_USE_FAST_SWIGLU=1
++ XFT_USE_FAST_SWIGLU=1
++ export XPU_USE_FAST_SWIGLU=1
++ XPU_USE_FAST_SWIGLU=1
++ export XMLIR_CUDNN_ENABLED=1
++ XMLIR_CUDNN_ENABLED=1
++ export XPU_USE_DEFAULT_CTX=1
++ XPU_USE_DEFAULT_CTX=1
++ export XMLIR_FORCE_USE_XPU_GRAPH=1
++ XMLIR_FORCE_USE_XPU_GRAPH=1
++ export XPU_USE_MOE_SORTED_THRES=128
++ XPU_USE_MOE_SORTED_THRES=128
+++ hostname -i
++ export VLLM_HOST_IP=10.129.68.82
++ VLLM_HOST_IP=10.129.68.82
++ export XMLIR_ENABLE_MOCK_TORCH_COMPILE=false
++ XMLIR_ENABLE_MOCK_TORCH_COMPILE=false
++ export VLLM_USE_V1=1
++ VLLM_USE_V1=1
++ export USE_ORI_ROPE=1
++ USE_ORI_ROPE=1
++ vllm serve /home/hongweijie/Qwen3-0.6B --host 0.0.0.0 --port 8356 --gpu-memory-utilization 0.9 --trust-remote-code --max-model-len 32768 --tensor-parallel-size 1 --dtype float16 --max_num_seqs 128 --max_num_batched_tokens 32768 --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --distributed-executor-backend mp --served-model-name Qwen3-VL-30B-A3B-Instruct --compilation-config '{"splitting_ops": ["vllm.unified_attention", "vllm.unified_attention_with_output","vllm.unified_attention_with_output_kunlun","vllm.mamba_mixer2", "vllm.mamba_mixer", "vllm.short_conv", "vllm.linear_attention", "vllm.plamo2_mamba_mixer", "vllm.gdn_attention", "vllm.sparse_attn_indexer"]}'
+/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+XCCL /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch_xmlir/libbkcl.so loaded
+SYMBOL_REWRITE torch success
+INFO 01-06 20:38:42 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 01-06 20:38:42 [__init__.py:38] - kunlun -> vllm_kunlun:register
+INFO 01-06 20:38:42 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 01-06 20:38:42 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 01-06 20:38:42 [__init__.py:38] - kunlun -> vllm_kunlun:register
+INFO 01-06 20:38:42 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 01-06 20:38:42 [__init__.py:220] No platform detected, vLLM is running on UnspecifiedPlatform
+WARNING 01-06 20:38:42 [_custom_ops.py:20] Failed to import from vllm._C with ImportError('libcudart.so.12: cannot open shared object file: No such file or directory')
+/home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/__init__.py:127: UserWarning: [vllm_kunlun] bitsandbytes_loader patch failed: ImportError("cannot import name 'ModelConfig' from partially initialized module 'vllm.config' (most likely due to a circular import) (/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/config/__init__.py)")
+  warnings.warn(f"[vllm_kunlun] bitsandbytes_loader patch failed: {e!r}")
+[vllm_kunlun] V1sampler top p & k patched -> /home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/v1/sample/ops/topk_topp_sampler.py
+[vllm_kunlun] V1sampler top p & k patched -> /home/linyuqi01/workspace/vLLM-Kunlun/vllm_kunlun/v1/sample/ops/topk_topp_sampler.py
+INFO 01-06 20:38:43 [__init__.py:207] Platform plugin kunlun is activated
+[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.CompressedTensorsMoEMethod       --> vllm_xpu.model_executor.layers.quantization.compressed_tensors_moe.py:CompressedTensorsMoEMethod
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen2_vl:Qwen2VLForConditionalGeneration.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen2_5_vl:Qwen2_5_VLForConditionalGeneration.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen3ForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3:Qwen3ForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_next:Qwen3NextForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture GlmForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.glm:GlmForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture GptOssForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.gpt_oss:GptOssForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture InternLM2ForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.internlm2:InternLM2ForCausalLM.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture InternVLChatModel is already registered, and will be overwritten by the new model class vllm_kunlun.models.internvl:InternVLChatModel.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture InternS1ForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.interns1:InternS1ForConditionalGeneration.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_vl:Qwen3VLForConditionalGeneration.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_kunlun.models.qwen3_vl_moe:Qwen3VLMoeForConditionalGeneration.
+WARNING 01-06 20:38:50 [registry.py:582] Model architecture SeedOssForCausalLM is already registered, and will be overwritten by the new model class vllm_kunlun.models.seed_oss:SeedOssForCausalLM.
+(APIServer pid=37564) INFO 01-06 20:38:50 [api_server.py:1839] vLLM API server version 0.11.0
+(APIServer pid=37564) INFO 01-06 20:38:50 [utils.py:233] non-default args: {'model_tag': '/home/hongweijie/Qwen3-0.6B', 'host': '0.0.0.0', 'port': 8356, 'model': '/home/hongweijie/Qwen3-0.6B', 'trust_remote_code': True, 'dtype': 'float16', 'max_model_len': 32768, 'served_model_name': ['Qwen3-VL-30B-A3B-Instruct'], 'distributed_executor_backend': 'mp', 'block_size': 128, 'enable_prefix_caching': False, 'max_num_batched_tokens': 32768, 'max_num_seqs': 128, 'enable_chunked_prefill': False, 'compilation_config': {"level":null,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":[],"splitting_ops":["vllm.unified_attention","vllm.unified_attention_with_output","vllm.unified_attention_with_output_kunlun","vllm.mamba_mixer2","vllm.mamba_mixer","vllm.short_conv","vllm.linear_attention","vllm.plamo2_mamba_mixer","vllm.gdn_attention","vllm.sparse_attn_indexer"],"use_inductor":true,"compile_sizes":null,"inductor_compile_config":{},"inductor_passes":{},"cudagraph_mode":null,"use_cudagraph":true,"cuda
+(APIServer pid=37564) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+(APIServer pid=37564) [WARNING  | transformers.configuration_utils]: The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] Error in inspecting model architecture 'Qwen3ForCausalLM'
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] Traceback (most recent call last):
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 966, in _run_in_subprocess
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     returned.check_returncode()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/subprocess.py", line 457, in check_returncode
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     raise CalledProcessError(self.returncode, self.args, self.stdout,
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] subprocess.CalledProcessError: Command '['/root/miniconda/envs/python310_torch25_cuda/bin/python', '-m', 'vllm.model_executor.models.registry']' returned non-zero exit status 1.
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] 
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] The above exception was the direct cause of the following exception:
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] 
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] Traceback (most recent call last):
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 546, in _try_inspect_model_cls
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return model.inspect_model_cls()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/logging_utils/log_time.py", line 22, in _wrapper
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     result = func(*args, **kwargs)
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 509, in inspect_model_cls
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     mi = _run_in_subprocess(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 969, in _run_in_subprocess
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     raise RuntimeError(f"Error raised in subprocess:\n"
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] RuntimeError: Error raised in subprocess:
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py:6: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   import pkg_resources
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] XCCL /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch_xmlir/libbkcl.so loaded
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] SYMBOL_REWRITE torch success
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] /root/miniconda/envs/python310_torch25_cuda/lib/python3.10/runpy.py:126: RuntimeWarning: 'vllm.model_executor.models.registry' found in sys.modules after import of package 'vllm.model_executor.models', but prior to execution of 'vllm.model_executor.models.registry'; this may result in unpredictable behaviour
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   warn(RuntimeWarning(msg))
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] Traceback (most recent call last):
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return _run_code(code, main_globals, None,
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/runpy.py", line 86, in _run_code
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     exec(code, run_globals)
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 990, in <module>
+(APIServer pid=37564) Traceback (most recent call last):
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/bin/vllm", line 8, in <module>
+(APIServer pid=37564)     sys.exit(main())
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/cli/main.py", line 54, in main
+(APIServer pid=37564)     args.dispatch_function(args)
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/cli/serve.py", line 57, in cmd
+(APIServer pid=37564)     uvloop.run(run_server(args))
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/uvloop/__init__.py", line 82, in run
+(APIServer pid=37564)     return loop.run_until_complete(wrapper())
+(APIServer pid=37564)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/uvloop/__init__.py", line 61, in wrapper
+(APIServer pid=37564)     return await main
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1884, in run_server
+(APIServer pid=37564)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 1902, in run_server_worker
+(APIServer pid=37564)     async with build_async_engine_client(
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=37564)     return await anext(self.gen)
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 180, in build_async_engine_client
+(APIServer pid=37564)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=37564)     return await anext(self.gen)
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 206, in build_async_engine_client_from_engine_args
+(APIServer pid=37564)     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/engine/arg_utils.py", line 1142, in create_engine_config
+(APIServer pid=37564)     model_config = self.create_model_config()
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/engine/arg_utils.py", line 994, in create_model_config
+(APIServer pid=37564)     return ModelConfig(
+(APIServer pid=37564)   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/pydantic/_internal/_dataclasses.py", line 123, in __init__
+(APIServer pid=37564)     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+(APIServer pid=37564) pydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig
+(APIServer pid=37564)   Value error, Model architectures ['Qwen3ForCausalLM'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ...rocessor_plugin': None}), input_type=ArgsKwargs]
+(APIServer pid=37564)     For further information visit https://errors.pydantic.dev/2.11/v/value_error
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     _run()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/models/registry.py", line 979, in _run
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     load_general_plugins()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/plugins/__init__.py", line 72, in load_general_plugins
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     func()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 113, in register_model
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     _reg()
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/models/__init__.py", line 6, in register_model
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from .qwen2_vl import Qwen2VLForConditionalGeneration #noqa: F401
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/models/qwen2_vl.py", line 54, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/model_loader/__init__.py", line 12, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.model_loader.bitsandbytes_loader import (
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/model_loader/bitsandbytes_loader.py", line 25, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.layers.fused_moe import FusedMoE
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/fused_moe/__init__.py", line 8, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.layers.fused_moe.layer import (
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/fused_moe/layer.py", line 28, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.layers.fused_moe.fused_moe import (
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/fused_moe/fused_moe.py", line 16, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py", line 13, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.layers.fused_moe.utils import (  # yapf: disable
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/fused_moe/utils.py", line 9, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/home/hongweijie/vllm_kunlun/vllm_kunlun/vllm_kunlun/__init__.py", line 70, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     return OLD_IMPORT_HOOK(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/xpytorch_import_hook.py", line 136, in _custom_import
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     module = builtins.__origin__import__(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/model_executor/layers/quantization/utils/fp8_utils.py", line 202, in <module>
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     direct_register_custom_op(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/vllm/utils/__init__.py", line 2662, in direct_register_custom_op
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     schema_str = torch.library.infer_schema(op_func,
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch/_library/infer_schema.py", line 106, in infer_schema
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     error_fn(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]   File "/root/miniconda/envs/python310_torch25_cuda/lib/python3.10/site-packages/torch/_library/infer_schema.py", line 58, in error_fn
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548]     raise ValueError(
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] ValueError: infer_schema(func): Parameter block_size has unsupported type list[int]. The valid types are: dict_keys([<class 'torch.Tensor'>, typing.Optional[torch.Tensor], typing.Sequence[torch.Tensor], typing.List[torch.Tensor], typing.Sequence[typing.Optional[torch.Tensor]], typing.List[typing.Optional[torch.Tensor]], <class 'int'>, typing.Optional[int], typing.Sequence[int], typing.List[int], typing.Optional[typing.Sequence[int]], typing.Optional[typing.List[int]], <class 'float'>, typing.Optional[float], typing.Sequence[float], typing.List[float], typing.Optional[typing.Sequence[float]], typing.Optional[typing.List[float]], <class 'bool'>, typing.Optional[bool], typing.Sequence[bool], typing.List[bool], typing.Optional[typing.Sequence[bool]], typing.Optional[typing.List[bool]], <class 'str'>, typing.Optional[str], typing.Union[int, float, bool], typing.Union[int, float, bool, NoneType], typing.Sequence[typing.Union[int, float, bool]
+(APIServer pid=37564) ERROR 01-06 20:39:02 [registry.py:548] 
