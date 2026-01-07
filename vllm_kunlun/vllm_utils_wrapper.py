@@ -10,7 +10,7 @@ import inspect
 import typing
 from torch.library import register_fake
 import vllm_kunlun._kunlun
-
+import vllm.envs as envs
 
 def patch_annotations_for_schema(func):
     """patch_annotations_for_schema"""
@@ -128,19 +128,25 @@ def vllm_kunlun_weak_ref_tensors(
         return tuple(vllm_kunlun_weak_ref_tensor(t) for t in tensors)
     raise ValueError("Invalid type for tensors")
 
-
-# import vllm.utils as vu
-
-# vu.direct_register_custom_op = direct_register_custom_op
-
-# import vllm.utils as vu
-
-# vu.direct_register_custom_op = direct_register_custom_op
+vllm_port=envs.VLLM_PORT
+def _get_open_port() -> int:
+    global vllm_port
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", vllm_port))
+            vllm_port += 1
+            return vllm_port
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
 
 _wrapped = SimpleNamespace(**_orig.__dict__)
 _wrapped.direct_register_custom_op = direct_register_custom_op
 _wrapped.weak_ref_tensor = vllm_kunlun_weak_ref_tensor
 _wrapped.weak_ref_tensors = vllm_kunlun_weak_ref_tensors
+_wrapped._get_open_port = _get_open_port
 
 import sys
 
