@@ -28,8 +28,9 @@ jobs:
           echo $PATH 
           source ~/.bashrc
           python --version
-          echo "vllm run....."
+          echo "print env ...."
           env | sort
+          echo "vllm run....."
           # vllm --version
           # unset XPU_DUMMY_EVENT
           # export XPU_VISIBLE_DEVICES=0
