@@ -9,6 +9,11 @@ on:
 env:
   ACTIONS_STEP_DEBUG: "true"
   ACTIONS_RUNNER_DEBUG: "true"
+  LD_LIBRARY_PATH: /usr/local/cuda-11.7/
+  CLAUDE_CODE_SSE_PORT: 65242
+  COLORTERM: truecolor
+  CONDA_DEFAULT_ENV: python310_torch25_cuda
+  CONDA_EXE: /root/miniconda/bin/conda
 
 jobs:
   test:
