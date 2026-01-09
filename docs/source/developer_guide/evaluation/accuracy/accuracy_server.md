@@ -1,8 +1,8 @@
-## Overall accuracy test
+# Overall accuracy test
 
-### EvalScope
+## EvalScope
 
-#### 1.Download and install
+### 1.Download and install
 
 EvalScope supports use in Python environments. Users can install EvalScope via pip or from source code. Here are examples of both installation methods:
 
@@ -15,7 +15,7 @@ cd evalscope
 pip install -e '.[perf]'
 ```
 
-#### 2.Dataset preparation script
+### 2.Dataset preparation script
 
 ```python
 from evalscope.collections import CollectionSchema, DatasetInfo, WeightedSampler
@@ -104,7 +104,7 @@ Dataset composition visualization:
 └─────────────────┴─────────────────────┘
 ```
 
-#### 3.Test
+### 3.Test
 
 ```python
 from dotenv import dotenv_values
@@ -178,9 +178,9 @@ else
 fi
 ```
 
-#### 4.Common problem fixes
+### 4.Common problem fixes
 
-##### 4.1 NLTK resource missing fix
+#### 4.1 NLTK resource missing fix
 
 ```bash
 Resource punkt_tab not found.
@@ -225,7 +225,7 @@ python fix_nltk.py
 bash run_accuracy_test.sh
 ```
 
-#### 5.Results Display
+### 5.Results Display
 
 ```bash
 +-------------+---------------------+--------------+---------------+-------+

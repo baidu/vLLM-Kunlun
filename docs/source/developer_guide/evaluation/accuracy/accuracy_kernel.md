@@ -1,10 +1,10 @@
-## Operator accuracy test
+# Operator accuracy test
 
-### torch_xray
+## torch_xray
 
 torch_xray is an operator precision analysis tool that can dump module-level input-output precision comparisons and automatically construct operator unit tests.
 
-#### 1.Download and install
+### 1.Download and install
 
 ***\*python3.10:\****
 
@@ -20,9 +20,9 @@ bos:/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/torch_xray-999.9.
 
 Note that the same installation package must be used when using it in different environments.
 
-#### 2.Use
+### 2.Use
 
-##### Dump module-level inputs and outputs and compare their precision.
+#### Dump module-level inputs and outputs and compare their precision.
 
 Below is a sample code snippet used to dump the input and output of the vision module and compare the errors in the vllm framework.
 
@@ -50,7 +50,7 @@ The results directory will generate an h5 file and a csv file.
 -rw-r--r-- 1 root root        71 Oct 31 13:11 globalrank-0_localrank-0_summary.csv
 ```
 
-##### Data processing
+#### Data processing
 
 ```bash
 summary xxx.h5 sum.txt
@@ -91,7 +91,7 @@ The generated h5 file is processed using the summary command to generate a txt f
 +-------+------+------+-----------------------------------------------------------+-------------+-------------+--------------+-------------+
 ```
 
-##### Accuracy Comparison
+#### Accuracy Comparison
 
 ```bash
 # The results are stored in result.csv
@@ -103,7 +103,7 @@ The `compare` command is used to process the H5 files generated on the GPU and X
 If you encounter a "no matched keys" problem, please refer to the instructions at the end of this article for a solution.
 
 
-##### Example of results
+#### Example of results
 
 ```bash
 +-------+--------+-----------------------------------------------------------+--------+-----------+-------------+-------------+--------+
@@ -141,11 +141,11 @@ If you encounter a "no matched keys" problem, please refer to the instructions a
 
 Generally, the main focus is on Min Err/Max Err.
 
-##### Indicator Explanation
+#### Indicator Explanation
 
 To be improved...
 
-#### The dump operator is tested and run.
+### The dump operator is tested and run.
 
 ```bash
 X_DEBUG=0x102 # trace operator name、arguments shape、dtype、data_range
@@ -199,13 +199,13 @@ This is the file directory.
 │       ├── dump.json # Information needed to generate unit tests, such as input/output size and dtype.
 ```
 
-##### Generate unit test
+#### Generate unit test
 
 jprof --cpu_init --blacklist --factory=load dump.json
 
 Create a pytests directory in the current directory to store unit tests.
 
-##### Run unit test
+#### Run unit test
 
 The GPU only needs to copy the XPU's pytests directory and execute it.
 
@@ -216,14 +216,14 @@ Since the unit test program defaults to finding the actual dumped tensors using 
 pytest --detail_compare_path=./xxx.csv proc_xxx/pytests/ --seed 42
 ```
 
-##### Results Comparison
+#### Results Comparison
 
 ```bash
 # After obtaining two result CSV files, compare them and generate result.csv.
 summary_diff_check  ./xpu.csv ./gpu.csv ./result.csv
 ```
 
-##### Example of results
+#### Example of results
 
 ```bash
 +------------+-----------------------+-------------+-------------+-----------+----------+---------+---------+----------+
@@ -242,9 +242,9 @@ summary_diff_check  ./xpu.csv ./gpu.csv ./result.csv
 
 The main focus is on the values ​​of gpu_1e-1, xpu_1e-1, etc., which represent the number of elements whose error between the gpu/xpu result and the cpu result exceeds the order of 1e-n. This serves as the primary basis for determining whether there is a problem with the operator's precision.
 
-#### Replenish
+### Replenish
 
-##### Bypassing the issue of differing naming conventions between Kunlun Card and GPU modules, which prevents diff calculation.
+#### Bypassing the issue of differing naming conventions between Kunlun Card and GPU modules, which prevents diff calculation.
 
 ```bash
 #

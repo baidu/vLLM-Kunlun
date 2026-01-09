@@ -1,8 +1,8 @@
-## Operator performance
+# Operator performance
 
-### XProfiler
+## XProfiler
 
-#### 1.Download and install
+### 1.Download and install
 
 - The download link for the x86_64 platform installation package xre-Linux-x86_64 is:
 
@@ -16,7 +16,7 @@
 
 After downloading and extracting, you can directly execute `xpu-installer` and `install_rt.sh` to install.
 
-#### 2.Start using
+### 2.Start using
 
 XProfiler supports three modes: 1) fork mode; 2) time mode; and 3) daemon mode. After execution, XProfiler will generate two types of JSON files:
 
@@ -26,7 +26,7 @@ XProfiler supports three modes: 1) fork mode; 2) time mode; and 3) daemon mode. 
 
 The specific modes will be introduced below.
 
-##### fork mode
+#### fork mode
 
 The fork pattern is used to track the entire time period from the start to the end of a user program. This pattern is suitable for most inference tasks and is the simplest to use. An example is shown below:
 
@@ -40,7 +40,7 @@ The fork pattern is used to track the entire time period from the start to the e
 
 More parameters can be found in the command-line parameters section later.
 
-##### time mode
+#### time mode
 
 The time mode is used to track user programs for a period of time. This method is suitable for tasks that need to run for a long time.
 
@@ -63,7 +63,7 @@ export XPU_TRACING_OUTPUT_NAME=<xprofiler execution directory>/xprofiler.sock
 python xxx.py
 ```
 
-##### deamon mode
+#### deamon mode
 
 The daemon mode is used to track the event timeline of a specified code segment, eliminating interference from redundant information. The startup command is the same as in fork mode.
 
@@ -106,7 +106,7 @@ python xxx.py
 
 Note: If you want to specify a particular card to run on, you must import the XPU_VISIBLE_DEVICES environment variable in the terminal in steps 2 and 3; otherwise, you will not be able to capture the data.
 
-##### More parameters
+#### More parameters
 
 | parameters                 | Example                                 | default value | describe                                                                                                                                                                                           |
 | -------------------------- | --------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -124,23 +124,23 @@ Note: If you want to specify a particular card to run on, you must import the XP
 | -E or --cache-trace        | -E                                      | off           | Get bandwidth statistics events.                                                                                                                                                                   |
 | -u or --debug              | -u44:open log，debug level-u0:close log | 33            | Debug the interface and enable driver event/device event logging.。                                                                                                                                |
 
-#### 3.View Results
+### 3.View Results
 
 The generated xprofiler.trace.json file can be viewed and analyzed using a visual interface. Two tools are introduced here.
 
-##### Chrome browser
+#### Chrome browser
 
 Enter chrome://tracing/ in your browser (you may need to enable developer tools the first time you access this site), and click "load" in the top left corner to import the file. Interface display.
 
 ![img](https://rte.weiyun.baidu.com/wiki/attach/image/api/imageDownloadAddress?attachId=89aef70f112a4394adcac8b03ef994db&docGuid=WFoZOcuqnSXJIE)
 
-##### prefetto ui
+#### prefetto ui
 
 Search directly, or visit[Perfetto UI](https://ui.perfetto.dev/#!/viewer?local_cache_key)，The interface is as follows。
 
 ![img](https://rte.weiyun.baidu.com/wiki/attach/image/api/imageDownloadAddress?attachId=895a715344e9473c9ee93518c3064b27&docGuid=WFoZOcuqnSXJIE)
 
-#### 4.Performance Analysis
+### 4.Performance Analysis
 
 With various performance data available, analysis and optimization can then be performed based on the results.
 

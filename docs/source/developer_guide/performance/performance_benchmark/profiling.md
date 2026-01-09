@@ -1,18 +1,18 @@
-## Profiling
+# Profiling
 
 
 
-### 🔧 Action Plan（Three Phases）
-#### Phase 1️⃣: Multi-Device Log Redirection Configuration
-##### Background
+## 🔧 Action Plan（Three Phases）
+### Phase 1️⃣: Multi-Device Log Redirection Configuration
+#### Background
 By default, kernel logs from all 8 XPU devices are interleaved and emitted to [stdout], resulting in:
 - It becomes impossible to distinguish which log originates from which device.
 - Timestamps become interleaved, making it difficult to analyze the temporal relationships.
 - Single-device bottlenecks are masked by global aggregation.
 
-##### Solution
+#### Solution
 During model initialization, create separate log files for each device.
-##### Code Explanation (embedded in qwen2.py)
+#### Code Explanation (embedded in qwen2.py)
 ```python
 import os  # ← Ensure this is imported at the top of the file
 from vllm.distributed import get_tensor_model_parallel_rank  # ← Import function to get the tensor model parallel rank
@@ -54,14 +54,14 @@ class Qwen2Model(nn.Module):
         # ========== End of log redirection code ==========
 
 ```
-##### ⚠️ Common Issues
+#### ⚠️ Common Issues
 **Q1**:Why not use Python's `logging` module?
 **A**:The XPU runtime kernel logs are emitted from the C++ layer and cannot be captured by Python’s `logging` module. Redirection via low-level file descriptors is required.
 **Q1**:Will logs be lost if the model fails to load??
 **A**:The `try-except` block ensures that if log redirection fails, it falls back to the default behavior without affecting model startup.
 
-#### Phase 2️⃣: Profiling Environment Activation
-##### 🚀 vLLM Launch
+### Phase 2️⃣: Profiling Environment Activation
+#### 🚀 vLLM Launch
 ```bash
 unset XPU_DUMMY_EVENT
 export XPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -103,7 +103,7 @@ USE_ORI_ROPE=1 VLLM_USE_V1=1 python -m vllm.entrypoints.openai.api_server \
 ```
 
 
-##### 🚀 Client Load Testing
+#### 🚀 Client Load Testing
 ```bash
 #!/bin/bash
 
@@ -176,7 +176,7 @@ echo "=========================================================="
 
 ```
 
-#### Phase 3️⃣: Log Analysis and Bottleneck Identification
+### Phase 3️⃣: Log Analysis and Bottleneck Identification
 ```text
 xpu_logs/
 ├─ rank_0.log
@@ -189,7 +189,7 @@ xpu_logs/
 └─ rank_7.log
 
 ```
-##### 🔍 Script Workflow (op_log.py)
+#### 🔍 Script Workflow (op_log.py)
 **Input**:Raw Kernel Logs (Sample Format)
 ```
 [XPURT_PROF] void xblas_xpu3::fc_cdnn_infer<float16,...> 123456 ns
@@ -399,7 +399,7 @@ done
 ```
 ::::
 :::::
-##### 📈 Output Example (analysis_rank0.log)
+#### 📈 Output Example (analysis_rank0.log)
 ```
 Filename: xpu_logs/rank_0.log
 -xpu option: 2
@@ -410,7 +410,7 @@ void xblas_xpu3::fc_cdnn_infer<float16, float16, float16, float16, float, 
 void kl3_all_reduce<float16>                                                                                                                          176134    14782.525712413793       27.506              
 void kl3_all_reduce_butterfly<float16>                                                                                                                164864    4197.28395862069         7.81           
 ```
-##### 🚨 Troubleshooting Guide
+#### 🚨 Troubleshooting Guide
 |Symptom|Cause|Solution|
 |-|-|-|
 |`xpu_logs` directory is empty|XPUAPI_DEBUG not enabled|Verify that the environment variable is correctly set|
