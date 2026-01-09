@@ -225,10 +225,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        kunlun_linear_weights = self.gate.get_weights()
         final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits,
-                                           linear_weights=kunlun_linear_weights)
+                                           router_logits=router_logits)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
