@@ -177,7 +177,7 @@ echo "=========================================================="
 ```
 
 #### Phase 3️⃣: Log Analysis and Bottleneck Identification
-```lua
+```text
 xpu_logs/
 ├─ rank_0.log
 ├─ rank_1.log
