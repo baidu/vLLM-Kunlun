@@ -1,7 +1,7 @@
 ![vLLM Kunlun Logo](vllm_kunlun/patches/vLLM_Kunlun.jpg)
 
 <p align="center">
-  <a href="https://vllm-kunlun.readthedocs.io"><b>  Documentation</b></a> |
+  <a href="https://vllm-kunlun.readthedocs.io/en/latest/"><b>  Documentation</b></a> |
   <a href="https://vllm-kunlun.readthedocs.io/en/latest/quick_start.html"><b>  Quick Start</b></a> |
   <a href="https://join.slack.com/t/vllm-kunlun/shared_invite/zt-3iinb8u5z-FcqZKbNNdMJ_32fHmipzvw"><b>  Slack</b></a>
 </p>
@@ -192,7 +192,7 @@ Please use the following recommended versions to get started quickly:
 
 | Version | Release type | Doc |
 |----------|---------------|-----|
-| v0.11.0 | Latest stable version | [QuickStart](./docs/_build/html/quick_start.html) and [Installation](./docs/_build/html/installation.html) for more details |
+| v0.11.0 | Latest stable version | [QuickStart](https://vllm-kunlun.readthedocs.io/en/latest/quick_start.html) and [Installation](https://vllm-kunlun.readthedocs.io/en/latest/installation.html) for more details |
 
 ---
 
@@ -208,7 +208,7 @@ We opened the project at Dec 8, 2025. We love open source and collaboration ❤�
 
 ## Sponsors 👋
 
-We sincerely appreciate the [**KunLunXin**](https://www.kunlunxin.com/) team for their support in providing GPU resources, which enabled efficient model adaptation debugging, comprehensive end-to-end testing, and broader model compatibility.
+We sincerely appreciate the [**KunLunXin**](https://www.kunlunxin.com/) team for their support in providing XPU resources, which enabled efficient model adaptation debugging, comprehensive end-to-end testing, and broader model compatibility.
 
 ## License
 
