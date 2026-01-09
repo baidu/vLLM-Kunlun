@@ -20,9 +20,8 @@ We will support the kunlun4 M100 platform in early 2026.
 
 ### 2. How to get our docker containers?
 
-**base**:`docker pull iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32`.
+**base**:`docker pull wjie520/vllm_kunlun:v0.0.1`.
 
-**full**:`docker pull wjie520/vllm_kunlun:v0.0.1`.
 
 ### 3. How vllm-kunlun work with vLLM?
 

@@ -17,9 +17,10 @@ docker run -itd \
         -v /usr/local/bin/:/usr/local/bin/ \
         -v /lib/x86_64-linux-gnu/libxpunvidia-ml.so.1:/lib/x86_64-linux-gnu/libxpunvidia-ml.so.1 \
         iregistry.baidu-int.com/hac_test/aiak-inference-llm:xpu_dev_20251113_221821 bash
-        
+
 docker exec -it glm-vllm-01011 /bin/bash
 ```
+
 ### Offline Inference on multi XPU
 
 Start the server in a container:
@@ -30,7 +31,7 @@ import os
 from vllm import LLM, SamplingParams
 
 def main():
-    
+
     model_path = "/data/GLM-4.5"
 
     llm_params = {
@@ -50,7 +51,7 @@ def main():
             "content": [
                 {
                     "type": "text",
-                    "text": "你好，请问你是谁?"
+                    "text": "Hello, who are you?"
                 }
             ]
         }
@@ -68,8 +69,8 @@ def main():
 
     response = outputs[0].outputs[0].text
     print("=" * 50)
-    print("输入内容:", messages)
-    print("模型回复:\n", response)
+    print("Input content:", messages)
+    print("Model response:\n", response)
     print("=" * 50)
 
 if __name__ == "__main__":
@@ -83,12 +84,10 @@ If you run this script successfully, you can see the info shown below:
 
 ```bash
 ==================================================
-输入内容: [{'role': 'user', 'content': [{'type': 'text', 'text': '你好，请问你是谁?'}]}]
-模型回复:
+Input content: [{'role': 'user', 'content': [{'type': 'text', 'text': 'Hello, who are you?'}]}]
+Model response:
  <think>
-嗯，用户问了一个相当身份的直接问题。这个问题看似简单，但背后可能
-有几种可能性意—ta或许初次测试我的可靠性，或者单纯想确认对话方。从AI助手的常见定位，用户给出清晰平的方式明确身份，同时为后续可能
-的留出生进行的空间。\n\n用户用“你”这个“您”，语气更倾向非正式交流，所以回复风格可以轻松些。不过既然是初次回复，保持适度的专业性比较好稳妥。提到
+Well, the user asked a rather direct question about identity. This question seems simple, but there could be several underlying intentions—perhaps they are testing my reliability for the first time, or they simply want to confirm the identity of the conversational partner. From the common positioning of AI assistants, the user has provided a clear and flat way to define identity while leaving room for potential follow-up questions.\n\nThe user used "you" instead of "your", which leans towards a more informal tone, so the response style can be a bit more relaxed. However, since this is the initial response, it is better to maintain a moderate level of professionalism. Mentioning
 ==================================================
 ```
 
@@ -114,8 +113,9 @@ python -m vllm.entrypoints.openai.api_server \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name GLM-4.5 \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention_with_output_kunlun", "vllm.unified_attention", "vllm.unified_attention_with_output", "vllm.mamba_mixer2"]}'  > log_glm_plugin.txt 2>&1 & 
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention_with_output_kunlun", "vllm.unified_attention", "vllm.unified_attention_with_output", "vllm.mamba_mixer2"]}'  > log_glm_plugin.txt 2>&1 &
 ```
+
 If your service start successfully, you can see the info shown below:
 
 ```bash
@@ -132,7 +132,7 @@ curl http://localhost:8989/v1/chat/completions \
   -d '{
     "model": "GLM-4.5",
     "messages": [
-      {"role": "user", "content": "你好，请问你是谁?"}
+      {"role": "user", "content": "Hello, who are you?"}
     ],
     "max_tokens": 100,
     "temperature": 0.7
@@ -142,7 +142,7 @@ curl http://localhost:8989/v1/chat/completions \
 If you query the server successfully, you can see the info shown below (client):
 
 ```bash
-{"id":"chatcmpl-6af7318de7394bc4ae569e6324a162fa","object":"chat.completion","created":1763101638,"model":"GLM-4.5","choices":[{"index":0,"message":{"role":"assistant","content":"\n<think>用户问“你好，请问你是谁？”，这是一个应该是个了解我的身份。首先，我需要确认用户的需求是什么。可能他们是第一次使用这个服务，或者之前没有接触过类似的AI助手，所以想确认我的背景和能力。 \n\n接下来，我要确保回答清晰明了，同时友好关键点：我是谁，由谁开发，能做什么。需要避免使用专业术语，保持口语化，让不同容易理解。 \n\n然后，用户可能有潜在的需求，比如想了解我能","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning_content":null},"logprobs":null,"finish_reason":"length","stop_reason":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":11,"total_tokens":111,"completion_tokens":100,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_tr
+{"id":"chatcmpl-6af7318de7394bc4ae569e6324a162fa","object":"chat.completion","created":1763101638,"model":"GLM-4.5","choices":[{"index":0,"message":{"role":"assistant","content":"\n<think>The user asked, \"Hello, who are you?\" This is a question about my identity. First, I need to confirm the user's intent. They might be using this service for the first time or have never interacted with similar AI assistants before, so they want to know my background and capabilities.\n\nNext, I should ensure my answer is clear and friendly, focusing on key points: who I am, who developed me, and what I can do. I should avoid technical jargon and keep the response conversational so it's easy to understand.\n\nAdditionally, the user may have potential needs, such as wanting to know what I am capable of.","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning_content":null},"logprobs":null,"finish_reason":"length","stop_reason":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":11,"total_tokens":111,"completion_tokens":100,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_tr
 ```
 
 Logs of the vllm server:

@@ -34,9 +34,9 @@ The fork pattern is used to track the entire time period from the start to the e
 /xxxx/xxxx/xprofiler -r500 --xpu=0 python test.py
 ```
 
-* --r: Sets the trace time resolution in nanoseconds (ns). The default is 100. If an "out of space error" occurs, try increasing the -r value to 500.
+- --r: Sets the trace time resolution in nanoseconds (ns). The default is 100. If an "out of space error" occurs, try increasing the -r value to 500.
 
-* --xpu: Specifies the acquisition device ID, supporting multi-card configuration. --xpu=all enables all cards; the default is card 0.
+- --xpu: Specifies the acquisition device ID, supporting multi-card configuration. --xpu=all enables all cards; the default is card 0.
 
 More parameters can be found in the command-line parameters section later.
 
@@ -58,7 +58,7 @@ A temporary .sock file will be generated in the execution directory. The path ne
 
 ```bash
 export XPU_ENABLE_PROFILER_TRACING=1
-export XPU_TRACING_OUTPUT_NAME=<xprofiler 执行目录>/xprofiler.sock
+export XPU_TRACING_OUTPUT_NAME=<xprofiler execution directory>/xprofiler.sock
 # Start your own program
 python xxx.py
 ```
@@ -99,7 +99,7 @@ xprofiler.sock
 ```python
 export XPU_ENABLE_PROFILER_TRACING=1
 # Here, the path to the .sock file from step 2 is used for assignment.
-export XPU_TRACING_OUTPUT_NAME=<xprofiler 执行目录>/xprofiler.sock
+export XPU_TRACING_OUTPUT_NAME=<xprofiler execution directory>/xprofiler.sock
 # Start your own program
 python xxx.py
 ```
@@ -108,21 +108,21 @@ Note: If you want to specify a particular card to run on, you must import the XP
 
 ##### More parameters
 
-| parameters                | Example                     | default value | describe                |
-| -------------------------- | --------------------------------------- | ------ | ------------------------------------------------------------ |
-| -b or --buffer-size        | -b=512                                  | 256    | Specifies the size of the trace buffer in MB. This is generally not required. However, if there are many trace signals, the buffer size can be increased appropriately to avoid OOS (Out of Size). |
-| -x or --xpu                | -x=0--xpu=0                             | 0      | Set the card number to be tracked; multiple cards or all cards can be set.                       |
-| -t or --time               | -t=10                                   | off    | Enable time mode, in seconds, to capture information over a specified period.                   |
-| -d or --deamonize          | -r500                                   | 0      | Enable daemon mode to retrieve events in the background.                               |
-| -r or --export-profile     | -e ./trace_output-e ./output/trace.json | ./     | Record the trace results to a document or folder. If this parameter is not specified, a default xprofiler.trace.json file will be generated in the execution directory. |
-| -S or --settings           | -S xprofiler.trace.json                 | off    | xprofiler reads a JSON file containing the events that need to be traced. If this parameter is not configured, xprofiler enables `--profile-api-trace` and `--sse-trace` by default. |
-| -A or --profiler-api-trace | -A                                      | on     | Get driver events.                                              |
-| -s or --sse-trace          | -s                                      | on     | Get all SSE events.                                           |
-| -C or --cluster-trace      | -C                                      | off    | Retrieve all cluster events.                                        |
-| -n or --sdnn-trace         | -n                                      | off    | Get all SDNN events.                                           |
-| -c or --sdnn-cluster-trace | -c                                      | off    | Retrieve all SDNN cluster events.                                  |
-| -E or --cache-trace        | -E                                      | off    | Get bandwidth statistics events.                                           |
-| -u or --debug              | -u44:open log，debug level-u0:close log    | 33     | Debug the interface and enable driver event/device event logging.。                    |
+| parameters                 | Example                                 | default value | describe                                                                                                                                                                                           |
+| -------------------------- | --------------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| -b or --buffer-size        | -b=512                                  | 256           | Specifies the size of the trace buffer in MB. This is generally not required. However, if there are many trace signals, the buffer size can be increased appropriately to avoid OOS (Out of Size). |
+| -x or --xpu                | -x=0--xpu=0                             | 0             | Set the card number to be tracked; multiple cards or all cards can be set.                                                                                                                         |
+| -t or --time               | -t=10                                   | off           | Enable time mode, in seconds, to capture information over a specified period.                                                                                                                      |
+| -d or --deamonize          | -r500                                   | 0             | Enable daemon mode to retrieve events in the background.                                                                                                                                           |
+| -r or --export-profile     | -e ./trace_output-e ./output/trace.json | ./            | Record the trace results to a document or folder. If this parameter is not specified, a default xprofiler.trace.json file will be generated in the execution directory.                            |
+| -S or --settings           | -S xprofiler.trace.json                 | off           | xprofiler reads a JSON file containing the events that need to be traced. If this parameter is not configured, xprofiler enables `--profile-api-trace` and `--sse-trace` by default.               |
+| -A or --profiler-api-trace | -A                                      | on            | Get driver events.                                                                                                                                                                                 |
+| -s or --sse-trace          | -s                                      | on            | Get all SSE events.                                                                                                                                                                                |
+| -C or --cluster-trace      | -C                                      | off           | Retrieve all cluster events.                                                                                                                                                                       |
+| -n or --sdnn-trace         | -n                                      | off           | Get all SDNN events.                                                                                                                                                                               |
+| -c or --sdnn-cluster-trace | -c                                      | off           | Retrieve all SDNN cluster events.                                                                                                                                                                  |
+| -E or --cache-trace        | -E                                      | off           | Get bandwidth statistics events.                                                                                                                                                                   |
+| -u or --debug              | -u44:open log，debug level-u0:close log | 33            | Debug the interface and enable driver event/device event logging.。                                                                                                                                |
 
 #### 3.View Results
 

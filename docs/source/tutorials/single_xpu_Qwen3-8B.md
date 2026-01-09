@@ -16,7 +16,7 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 
-export build_image="xxxxxxxxxxxxxxxxx" 
+export build_image="xxxxxxxxxxxxxxxxx"
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
@@ -58,7 +58,7 @@ def main():
             "content": [
                 {
                     "type": "text",
-                    "text": "说个笑话"
+                    "text": "tell a joke"
                 }
             ]
         }
@@ -76,8 +76,8 @@ def main():
 
     response = outputs[0].outputs[0].text
     print("=" * 50)
-    print("输入内容:", messages)
-    print("模型回复:\n", response)
+    print("Input content:", messages)
+    print("Model response:\n", response)
     print("=" * 50)
 
 if __name__ == "__main__":
@@ -91,16 +91,18 @@ If you run this script successfully, you can see the info shown below:
 
 ```bash
 ==================================================
-输入内容: [{'role': 'user', 'content': [{'type': 'text', 'text': '说个笑话'}]}]
-模型回复:
+Input content: [{'role': 'user', 'content': [{'type': 'text', 'text': 'tell a joke'}]}]
+Model response:
  <think>
-好的，用户让我讲个笑话。首先，我需要考虑用户的需求。他们可能只是想轻松一下，或者需要一些娱乐。接下来，我要选择一个适合的笑话，不要太复杂，容易理解，同时也要有趣味性。
 
-用户可能希望笑话是中文的，所以我要确保笑话符合中文的语言习惯和文化背景。我需要避免涉及敏感话题，比如政治、宗教或者可能引起误解的内容。然后，我得考虑笑话的结构，通常是一个设置和一个出人意料的结尾，这样能带来笑点。
+Okay, the user asked me to tell a joke. First, I need to consider the user's needs. They might just want to relax or need some entertainment. Next, I need to choose a suitable joke that is not too complicated, easy to understand, and also interesting.
 
-例如，可以讲一个关于日常生活的小幽默，比如动物或者常见的场景。比如，一只乌龟和兔子赛跑的故事，但加入一些反转。不过要确保笑话的长度适中，不要太长，以免用户失去兴趣。另外，要注意用词口语化，避免生硬或复杂的句子结构。
 
-可能还要检查一下这个笑话是否常见，避免重复。如果用户之前听过类似的，可能需要
+The user might expect the joke to be in Chinese, so I need to ensure that the joke conforms to the language habits and cultural background of Chinese. I need to avoid sensitive topics, such as politics, religion, or anything that might cause misunderstanding. Then, I have to consider the structure of the joke, which usually involves a setup and an unexpected ending to create humor.
+
+For example, I could tell a light-hearted story about everyday life, such as animals or common scenarios. For instance, the story of a turtle and a rabbit racing, but with a twist. However, I need to ensure that the joke is of moderate length and not too long, so the user doesn't lose interest. Additionally, I should pay attention to using colloquial language and avoid stiff or complex sentence structures.
+
+I might also need to check if this joke is common to avoid repetition. If the user has heard something similar before, I may need to come up with a different angle.
 ==================================================
 ```
 
@@ -130,6 +132,7 @@ python -m vllm.entrypoints.openai.api_server \
             "vllm.unified_attention", "vllm.unified_attention_with_output",
             "vllm.mamba_mixer2"]}' \
 ```
+
 If your service start successfully, you can see the info shown below:
 
 ```bash

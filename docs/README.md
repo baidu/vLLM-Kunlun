@@ -5,52 +5,53 @@
 uv venv myenv --python 3.12 --seed
 source myenv/bin/activate
 
-# 步骤1：进入docs目录
+
+ # Step 1: Enter the docs directory
 cd docs
 
-# 步骤2：安装依赖（使用uv）
+# Step 2: Install dependencies (using uv)
 uv pip install -r requirements-docs.txt
 
-# 安装 sphinx-autobuild（如果没在 requirements 文件里）
+# Install sphinx-autobuild (if not in requirements file)
 uv pip install sphinx-autobuild
 
-# 从 docs 目录运行：
+# Run from the docs directory:
 sphinx-autobuild ./source ./_build/html --port 8000
 
-# 步骤1：清理旧文件
+# Step 1: Clean up old files
 make clean
 
-# 步骤2：构建HTML
+# Step 2: Build HTML
 make html
 
-# 步骤3：本地预览
+# Step 3: Local preview
 python -m http.server -d _build/html/
 
-浏览器访问：http://localhost:8000
+Browser access: http://localhost:8000
 
 🌍 Internationalization
-国际化翻译流程（以中文为例）
+Internationalization translation process (taking Chinese as an example)
 
-# 步骤1：提取可翻译文本（生成 .pot）
+# Step 1: Extract translatable text (generate .pot)
 sphinx-build -b gettext source _build/gettext
 
-# 步骤2：生成/更新中文 .po 文件
+# Step 2: Generate/update Chinese .po file
 sphinx-intl update -p _build/gettext -l zh_CN
 
-# 步骤3：人工翻译 .po 文件
-# 用文本编辑器打开 source/locale/zh_CN/LC_MESSAGES/*.po
-# 在 msgstr "" 里填入中文翻译
+# Step 3: Manually translate .po file
+# Use a text editor to open source/locale/zh_CN/LC_MESSAGES/*.po
+# Fill in the Chinese translation in msgstr ""
 
-# 步骤4：编译并构建中文文档
+# Step 4: Compile and build Chinese documentation
 make intl
 
-# 步骤5：查看效果
+# Step 5: View the effect
 python -m http.server -d _build/html
 
 
-浏览器访问：
+Browser access:
 
-英文版： http://localhost:8000
-中文版： http://localhost:8000/zh-cn
+English version: http://localhost:8000
+Chinese version: http://localhost:8000/zh-cn
 
 ```

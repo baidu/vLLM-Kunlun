@@ -47,18 +47,15 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # The C compiler used for compiling the package. If not set, the default
     # value is None, which means the system default C compiler will be used.
     "C_COMPILER": lambda: os.getenv("C_COMPILER", None),
-    # The version of the Kunlun chip. If not set, the default value is
-    # KUNLUN910B1(Available for A2 and A3 series). It's used for package building.
-    # Please make sure that the version is correct.
-    "SOC_VERSION": lambda: os.getenv("SOC_VERSION", "KUNLUN910B1"),
+
+    "SOC_VERSION": lambda: os.getenv("SOC_VERSION", "KUNLUNP800"),
     # If set, vllm-kunlun will print verbose logs during compilation
     "VERBOSE": lambda: bool(int(os.getenv("VERBOSE", "0"))),
-    # The home path for CANN toolkit. If not set, the default value is
     # /usr/local/Kunlun/kunlun-toolkit/latest
     "KUNLUN_HOME_PATH": lambda: os.getenv("KUNLUN_HOME_PATH", None),
-    # The path for HCCL library, it's used by pyhccl communicator backend. If
-    # not set, the default value is libhccl.so。
-    "HCCL_SO_PATH": lambda: os.environ.get("HCCL_SO_PATH", None),
+    # The path for XCCL library, it's used by pyxccl communicator backend. If
+    # not set, the default value is libxccl.so。
+    "XCCL_SO_PATH": lambda: os.environ.get("XCCL_SO_PATH", None),
     # The version of vllm is installed. This value is used for developers who
     # installed vllm from source locally. In this case, the version of vllm is
     # usually changed. For example, if the version of vllm is "0.9.0", but when
@@ -119,7 +116,6 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # and the mla_pa will be the default path of deepseek decode path.
     "VLLM_KUNLUN_MLA_PA": lambda: int(os.getenv("VLLM_KUNLUN_MLA_PA", 0)),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
-    # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_KUNLUN_ENABLE_MATMUL_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_KUNLUN_ENABLE_MATMUL_ALLREDUCE", "0"))
     ),
