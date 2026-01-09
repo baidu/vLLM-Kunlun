@@ -65,6 +65,5 @@ If you find any problem when contributing, you can join our slack group to talk 
 :::{toctree}
 :caption: Index
 :maxdepth: 1
-testing
-multi_node_test
+contributing
 :::
