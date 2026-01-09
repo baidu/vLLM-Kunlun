@@ -74,10 +74,3 @@ If the PR spans more than one category, please include all relevant prefixes.
 ## Others
 
 If you find any problem when contributing, you can join our slack group to talk with us and then feel free to submit a PR to improve the doc to help other developers. 
-
-:::{toctree}
-:caption: Index
-:maxdepth: 1
-testing
-multi_node_test
-:::
