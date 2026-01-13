@@ -220,7 +220,6 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               infer_global_hyperparameters,
                                               split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
-import xtorch_ops
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -1194,7 +1193,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         tp_q_head_num=128
         softmax_lse = torch.zeros(tp_q_head_num, q.size(0), dtype=torch.float32, device=q.device)
         softmax_lse.fill_(float('-inf'))
-        xtorch_ops.attention(
+        kunlun_ops.attention(
             q=q,
             k_cache=k,
             v_cache=maybe_padded_v,
@@ -1777,7 +1776,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
-            xtorch_ops.concat_and_cache_mla(
+            kunlun_ops.concat_and_cache_mla(
                 k_c_normed,
                 k_pe.squeeze(1),
                 attn_metadata.slot_mapping.flatten(),

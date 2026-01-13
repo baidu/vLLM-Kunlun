@@ -223,6 +223,8 @@ class LayerNormFn(torch.autograd.Function):
         weight = weight.contiguous()
         if bias is not None:
             bias = bias.contiguous()
+        y, mean, rstd = torch.ops.xspeedgate_ops.rms_norm_gated_fwd(x, weight, bias, eps, z, group_size, norm_before_gate, is_rms_norm)
+        '''
         y, mean, rstd = layer_norm_fwd(
             x,
             weight,
@@ -233,6 +235,7 @@ class LayerNormFn(torch.autograd.Function):
             norm_before_gate=norm_before_gate,
             is_rms_norm=is_rms_norm,
         )
+        '''
         ctx.save_for_backward(x, weight, bias, mean, rstd, z)
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps

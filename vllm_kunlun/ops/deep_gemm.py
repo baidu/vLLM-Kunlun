@@ -1,5 +1,5 @@
 import torch
-import xtorch_ops
+import kunlun_ops
 
 def int8_mqa_logits(
     q: torch.Tensor,
@@ -29,7 +29,7 @@ def int8_mqa_logits(
     context_q_lens_xpu = torch.tensor([0, q.shape[0]], dtype=torch.int32, device=cu_seqlen_ks.device)
     context_k_lens_xpu = torch.tensor([0, kv[0].shape[0]], dtype=torch.int32, device=cu_seqlen_ks.device)
 
-    xtorch_ops.I8_mqa_logits(
+    kunlun_ops.I8_mqa_logits(
             q=q,
             fused_kv_cache=kv,
             weights=weights,
@@ -99,7 +99,7 @@ def int8_paged_mqa_logits(
             
     logits = torch.empty((batch_size, next_n, max_model_len), dtype=torch.float32, device=q_fp8.device)
 
-    xtorch_ops.I8_paged_mqa_logits(
+    kunlun_ops.I8_paged_mqa_logits(
                 q=q_fp8,
                 fused_kv_cache=kv_cache,
                 weights=weights,

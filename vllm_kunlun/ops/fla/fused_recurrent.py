@@ -11,7 +11,7 @@ from typing import Optional
 
 import torch
 
-import xtorch_ops
+import kunlun_ops
 
 
 class FusedRecurrentFunction(torch.autograd.Function):
@@ -30,8 +30,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
                 ssm_state_indices: Optional[torch.Tensor] = None,
                 num_accepted_tokens: Optional[torch.Tensor] = None,
                 use_qk_l2norm_in_kernel: bool = False):
-        
-        o, final_state = xtorch_ops.fused_recurrent_gated_delta_rule_fwdv2(
+        o, final_state = kunlun_ops.fused_recurrent_gated_delta_rule_fwdv2(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),

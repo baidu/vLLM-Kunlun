@@ -201,6 +201,10 @@ def recompute_w_u_fwd(
 
     chunk_indices = prepare_chunk_indices(
         cu_seqlens, BT) if cu_seqlens is not None else None
+    import cocopod
+    w, u = torch.ops.xspeedgate_ops.recompute_w_u_fwd(k, v, beta, g_cumsum, A, cu_seqlens, chunk_indices, chunk_size = BT)
+    return w, u
+
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64

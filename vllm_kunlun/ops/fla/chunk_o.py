@@ -155,6 +155,9 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v)
 
+    o = torch.ops.xspeedgate_ops.chunk_fwd_o(q, k, v, h, g, scale, cu_seqlens, chunk_indices, chunk_size)
+    return o
+
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), NT, B * H)
 

@@ -13,9 +13,6 @@ from typing import Optional
 import torch
 from vllm.triton_utils import tl, triton
 
-import xtorch_ops
-
-
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
@@ -87,9 +84,14 @@ def l2norm_fwd_kernel2(X, Y, eps, M, N: tl.constexpr, MBLOCK: tl.constexpr):
     tl.store(Y + (rindex + N * row_idx), xs * rsqrt, xmask)
 
 
-def l2norm_fwd_triton(x: torch.Tensor,
+def l2norm_fwd(x: torch.Tensor,
                eps: float = 1e-6,
                output_dtype: Optional[torch.dtype] = None):
+    import kunlun_ops
+    out = torch.empty_like(x)
+    kunlun_ops.l2norm(x, out, eps)
+    return out
+
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
     # allocate output
@@ -143,11 +145,3 @@ def l2norm_fwd_triton(x: torch.Tensor,
             )
 
     return y.view(x_shape_og)
-
-
-def l2norm_fwd(x: torch.Tensor,
-               eps: float = 1e-6,
-               output_dtype: Optional[torch.dtype] = None):
-    out = torch.empty_like(x)
-    xtorch_ops.l2norm(x, out, eps)                                                                                                                                                                                                                              
-    return out

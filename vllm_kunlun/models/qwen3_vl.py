@@ -85,7 +85,7 @@ from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM, Qwen3Model
 from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     maybe_prefix, merge_multimodal_embeddings)
 from vllm.model_executor.models.vision import get_vit_attn_backend, run_dp_sharded_mrope_vision_model
-import xtorch_ops
+
 from einops import repeat
 
 logger = init_logger(__name__)
