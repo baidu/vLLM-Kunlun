@@ -681,37 +681,45 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 tmp_block_tables = prefill_meta.block_tables * 2 
                 
             # Prefix cache
-            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=key_cache, # Key Cache [block_num, head, block_size, dim]
-                    v=value_cache,
-                    out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    is_prefix_cache=True, 
-                    block_table=tmp_block_tables, 
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None
-                )
-            else:
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=prefill_key,
-                    v=prefill_value,
-                    out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None, 
-                    swa_left = self.sliding_window if self.sliding_window is not None else -1,
-                    swa_right = 0 if self.sliding_window is not None else -1,
-                    sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
-                )
+            # if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
+            #     kunlun_ops.prefill_attention(
+            #         q=prefill_query,
+            #         k=key_cache, # Key Cache [block_num, head, block_size, dim]
+            #         v=value_cache,
+            #         out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
+            #         is_causal=True,
+            #         is_prefix_cache=True, 
+            #         block_table=tmp_block_tables, 
+            #         context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+            #         context_qlen_lod_xpu=prefill_meta.query_start_loc,
+            #         context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+            #         context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+            #         alibi_slopes=self.alibi_slopes,
+            #         softmax_lse=None
+            #     )
+            # else:
+            #     kunlun_ops.prefill_attention(
+            #         q=prefill_query,
+            #         k=prefill_key,
+            #         v=prefill_value,
+            #         out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
+            #         is_causal=True,
+            #         context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+            #         context_qlen_lod_xpu=prefill_meta.query_start_loc,
+            #         alibi_slopes=self.alibi_slopes,
+            #         softmax_lse=None, 
+            #         swa_left = self.sliding_window if self.sliding_window is not None else -1,
+            #         swa_right = 0 if self.sliding_window is not None else -1,
+            #         sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
+            #     )
+
+            prefill_query = query[num_decode_tokens:attn_metadata.num_actual_tokens]
+            prefill_key = key[num_decode_tokens:attn_metadata.num_actual_tokens]
+            prefill_value = value[num_decode_tokens:attn_metadata.num_actual_tokens]
+            assert prefill_query.shape[0] == num_prefill_tokens
+            output[num_decode_tokens:attn_metadata.num_actual_tokens] = KunlunOps.multi_query_kv_attention(
+                            prefill_meta.query_start_loc,prefill_meta.query_start_loc_host, prefill_query, prefill_key, prefill_value,
+                            alibi_slopes=self.alibi_slopes).view_as(prefill_query)
 
 
         if decode_meta := attn_metadata.decode_metadata:    

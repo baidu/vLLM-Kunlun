@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 from vllm_kunlun.ops.fla import (fused_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule, chunk_gated_delta_rule)
 from vllm.model_executor.layers.fla.ops import (
     RMSNormGated)
-from vllm_kunlun.ops.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import FusedMoE
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.layers.layernorm import (
@@ -227,8 +227,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         kunlun_linear_weights = self.gate.get_weights()
         final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits,
-                                           linear_weights=kunlun_linear_weights)
+                                           router_logits=router_logits)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -479,7 +478,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-        conv_state = self_kv_cache[0].transpose(-1, -2)
+        # conv_state = self_kv_cache[0].transpose(-1, -2)
+        conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
