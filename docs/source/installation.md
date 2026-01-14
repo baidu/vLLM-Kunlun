@@ -80,6 +80,10 @@ bash xpytorch-cp310-torch251-ubuntu2004-x64.run
 ```
 wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1231/xpytorch-cp310-torch251-ubuntu2004-x64.run
 ```
+## Install the KL3-customized build of PyTorch(Only DeepSeek)
+```
+wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/ds3_2/0107/xpytorch-cp310-torch251-ubuntu2004-x64.run
+```
 
 ## Install custom ops
 ```
@@ -88,6 +92,13 @@ pip install "https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/113
 ## Install custom ops(Only MIMO V2)
 ```
 pip install "https://vllm-ai-models.bj.bcebos.com/v1/vLLM-Kunlun/ops/swa/xtorch_ops-0.1.2109%252B523cb26d-cp310-cp310-linux_x86_64.whl"
+```
+
+## Install custom ops(Only DeepSeek)
+```
+pip install "https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1215/xtorch_ops-0.1.2263%2Bc030eebd-cp310-cp310-linux_x86_64.whl"
+```
+wget -O xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64.whl https://aihc-private-hcd.bj.bcebos.com/xspeedgate_release/deepseek_v3_2/xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64_2601062006.whl?authorization=bce-auth-v1%2FALTAKvz6x4eqcmSsKjQxq3vZdB%2F2026-01-06T12%3A12%3A24Z%2F2592000%2Fhost%2Fa5344c32358a010bb15e42e93d8e536a1e25024ee1f8263fed815418fffdef7f
 ```
 
 ## Install the KLX3 custom Triton build
