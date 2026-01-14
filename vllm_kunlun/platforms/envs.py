@@ -68,6 +68,11 @@ xvllm_environment_variables: dict[str, Callable[[], Any]] = {
     "ENABLE_VLLM_FUSED_QKV_SPLIT_NORM_ROPE":
     lambda: (os.environ.get("ENABLE_VLLM_FUSED_QKV_SPLIT_NORM_ROPE", "False").lower() in 
              ("true", "1")),
+
+    # use int8 bmm
+    "VLLM_KUNLUN_ENABLE_INT8_BMM":
+    lambda: (os.environ.get("VLLM_KUNLUN_ENABLE_INT8_BMM", "False").lower() in 
+             ("true", "1")),
 }
 
 # end-env-vars-definition

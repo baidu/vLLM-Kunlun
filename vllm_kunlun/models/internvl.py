@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Any, Literal, Optional, TypeVar, Union
 
 import numpy.typing as npt
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -297,6 +298,8 @@ def video_to_pixel_values_internvl(
     transform = build_transform(input_size=input_size)
     frames_list = list[Image.Image]()
     for frame in video:
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
         pil_frame = dynamic_preprocess_internvl(
             Image.fromarray(frame, mode="RGB"),
             target_ratios=target_ratios,
