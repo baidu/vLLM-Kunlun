@@ -1,5 +1,4 @@
 import torch
-import xtorch_ops
 
 def int8_mqa_logits(
     q: torch.Tensor,

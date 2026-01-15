@@ -1924,6 +1924,9 @@ def apply_repetition_penalties_(
     scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
     logits *= scaling
     
+##################################################
+# --------------- I8_mqa_logits -----------------
+##################################################
 @custom_op("_C::I8_mqa_logits", mutates_args=())
 def I8_mqa_logits(
     q: torch.Tensor,
@@ -1999,6 +2002,9 @@ def _fake_I8_mqa_logits(
 
 I8_mqa_logits.register_fake(_fake_I8_mqa_logits)
 
+##################################################
+# ------------- I8_paged_mqa_logits --------------
+##################################################
 @custom_op("_C::I8_paged_mqa_logits", mutates_args=())
 def I8_paged_mqa_logits(
     q: torch.Tensor,
@@ -2059,6 +2065,9 @@ def _fake_I8_paged_mqa_logits(
 
 I8_paged_mqa_logits.register_fake(_fake_I8_paged_mqa_logits)
 
+##################################################
+# ----------- sparse_prefill_fwd_opt -------------
+##################################################
 @custom_op("_C::sparse_prefill_fwd_opt", mutates_args=())
 def sparse_prefill_fwd_opt(
         q: torch.Tensor,
@@ -2144,6 +2153,9 @@ def _fake_sparse_prefill_fwd_opt(
 
 sparse_prefill_fwd_opt.register_fake(_fake_sparse_prefill_fwd_opt)
 
+##################################################
+# ------------------ fwd_kvcache_mla -------------
+##################################################
 @custom_op("_C::fwd_kvcache_mla", mutates_args=())
 def fwd_kvcache_mla(
         q_c: torch.Tensor,
