@@ -17,7 +17,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
             "vllm.model_executor.layers.sampler": "vllm_kunlun.ops.sample.sampler",
             "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
-            "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler"
+            "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
+            "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states"
         }
 
         if module_name in module_mappings:
