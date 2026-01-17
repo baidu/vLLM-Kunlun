@@ -978,6 +978,7 @@ def causal_conv1d_fn(
 
     tmp_conv_states = conv_states[cache_indices].transpose(-1, -2).contiguous()
     tmp_cache_indices = torch.arange(batch_size, dtype=torch.int32, device=cache_indices.device)
+    num_cache_lines = tmp_conv_states.shape[0]
 
     import kunlun_ops
     kunlun_ops.causal_conv1d_fn(x, out, dim, cu_seqlen, weight, width, tmp_conv_states, num_cache_lines,
@@ -1559,6 +1560,7 @@ def causal_conv1d_update(
         x = x.squeeze(-1).unsqueeze(1)
         out = torch.empty_like(x)
         import kunlun_ops
+        stride = conv_state.stride()[0]
         kunlun_ops.causal_conv1d_update(
                     x,
                     weight,
@@ -1569,6 +1571,7 @@ def causal_conv1d_update(
                     conv_state_indices_cpu=conv_state_indices_cpu,
                     conv_state_indices_xpu=conv_state_indices,
                     act=None,
+                    state_seq_stride=stride,
                     is_ncw=False
         )
         out = F.silu(out)

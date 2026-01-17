@@ -330,9 +330,24 @@ def chunk_gated_delta_rule(q: torch.Tensor,
             )
     if scale is None:
         scale = k.shape[-1]**-0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
-        q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
-        use_qk_l2norm_in_kernel)
+
+    if True:
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+        initial_state = initial_state.contiguous()
+
+        o = torch.empty_like(v)
+        final_state = torch.empty_like(initial_state)
+        import kunlun_ops
+        kunlun_ops.gated_delta_rule(q, k, v, initial_state, g, beta, final_state, o, scale, cu_seqlens.cpu(),
+                            cu_seqlens, cu_seqlens.cpu(), cu_seqlens, use_qk_l2norm_in_kernel=True)
+    else:
+        o, final_state = ChunkGatedDeltaRuleFunction.apply(
+            q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens,
+            use_qk_l2norm_in_kernel)
     if head_first:
         o = rearrange(o, 'b t h ... -> b h t ...')
     return o, final_state
