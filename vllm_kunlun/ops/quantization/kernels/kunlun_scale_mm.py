@@ -21,7 +21,6 @@ from typing import Optional
 import torch
 import xspeedgate_ops
 from vllm.platforms import current_platform, PlatformEnum
-from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
@@ -100,9 +99,12 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
             # )
 
 
+# monkey patch
 _POSSIBLE_KERNELS[PlatformEnum.CUDA] = [KunlunScaledMMLinearKernel]
+from vllm.model_executor.layers.quantization.kernels.scaled_mm import cutlass
 
-
+cutlass.CutlassScaledMMLinearKernel = KunlunScaledMMLinearKernel
 print(
-    f"[vllm_kunlun] ScaledMM kernels: {[k.__name__ for k in _POSSIBLE_KERNELS[PlatformEnum.CUDA]]}"
+    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.kernels.scaled_mm.cutlass.CutlassScaledMMLinearKernel \
+      --> vllm_kunlun.ops.quantization.kernels.kunlun_scale_mm.KunlunScaledMMLinearKernel"
 )

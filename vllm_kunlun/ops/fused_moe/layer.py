@@ -1,17 +1,35 @@
-"""layer.py"""
+#
+# Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
+#
+# This file is a part of the vllm-kunlun project.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from contextlib import nullcontext
-from typing import Callable, Optional, Union, get_args
+from typing import Callable, Optional
 
 import torch
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.layer import (
+    UnquantizedFusedMoEMethod,
+    FusedMoE,
+)
 
-def apply(
+
+class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+    def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -37,43 +55,47 @@ def apply(
         """apply"""
         if enable_eplb:
             raise NotImplementedError(
-                "EPLB not supported for `UnquantizedFusedMoEMethod` yet.")
-        
+                "EPLB not supported for `UnquantizedFusedMoEMethod` yet."
+            )
+
         """forward_kunlun"""
         from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+
         if self.moe.use_ep:
-            return ops.fused_moe_ep(x,
-                             layer.w13_weight,
-                             layer.w2_weight,
-                             router_logits,
-                             self.moe.ep_rank,
-                             top_k,
-                             renormalize=renormalize,
-                             inplace=True,
-                             use_grouped_topk=use_grouped_topk,
-                             num_expert_group=num_expert_group,
-                             topk_group=topk_group)
+            return ops.fused_moe_ep(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                router_logits,
+                self.moe.ep_rank,
+                top_k,
+                renormalize=renormalize,
+                inplace=True,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
         else:
-            return ops.fused_moe(x,
-                             layer.w13_weight,
-                             layer.w2_weight,
-                             router_logits,
-                             self.moe.ep_rank,
-                             top_k,
-                             renormalize=renormalize,
-                             inplace=True,
-                             use_grouped_topk=use_grouped_topk,
-                             num_expert_group=num_expert_group,
-                             topk_group=topk_group,
-                             scoring_func=scoring_func,
-                             e_score_correction_bias=e_score_correction_bias,
-                             w1_bias=getattr(layer, 'w13_bias', None),
-                             w2_bias=getattr(layer, 'w2_bias', None),
-                             )
+            return ops.fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                router_logits,
+                self.moe.ep_rank,
+                top_k,
+                renormalize=renormalize,
+                inplace=True,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+            )
 
-UnquantizedFusedMoEMethod.apply = apply
 
-class VllmFusedMoE(FusedMoE):
+class KunlunFusedMoE(FusedMoE):
     def __init__(
         self,
         num_experts: int,  # Global number of experts
@@ -131,7 +153,8 @@ class VllmFusedMoE(FusedMoE):
             has_bias=has_bias,
             is_sequence_parallel=is_sequence_parallel,
             zero_expert_num=zero_expert_num,
-            zero_expert_type=zero_expert_type)
+            zero_expert_type=zero_expert_type,
+        )
         self.has_bias = has_bias
         self.register_parameter("w13_bias", None)
         self.register_parameter("w2_bias", None)
@@ -143,7 +166,7 @@ class VllmFusedMoE(FusedMoE):
                 fused_mapping=self.quant_config.packed_modules_mapping,
             )
         ):
-            self.quant_method = UnquantizedFusedMoEMethod(self.moe_config)
+            self.quant_method = KunlunUnquantizedFusedMoEMethod(self.moe_config)
             moe_quant_params = {
                 "num_experts": self.local_num_experts,
                 "hidden_size": hidden_size,
@@ -154,4 +177,17 @@ class VllmFusedMoE(FusedMoE):
             self.quant_method.create_weights(layer=self, **moe_quant_params)
 
 
-FusedMoE = VllmFusedMoE
+# monkey patch
+from vllm.model_executor.layers.fused_moe import layer
+
+layer.UnquantizedFusedMoEMethod = KunlunUnquantizedFusedMoEMethod
+layer.FusedMoE = KunlunFusedMoE
+
+print(
+    "[Monkey Patch Applied] >>> from vllm.model_executor.layers.fused_moe.layer.UnquantizedFusedMoEMethod \
+      --> vllm_kunlun.ops.fused_moe.layer.KunlunUnquantizedFusedMoEMethod"
+)
+print(
+    "[Monkey Patch Applied] >>> from vllm.model_executor.layers.fused_moe.layer.FusedMoE \
+      --> vllm_kunlun.ops.fused_moe.layer.KunlunFusedMoE"
+)
