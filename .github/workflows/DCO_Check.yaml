@@ -13,7 +13,7 @@ jobs:
       
       # 2. 调用 DCO Action
       - name: Check DCO
-        run: print("ok")
+        run: print("ok dco ok ！！！")
         # uses: timedoor/dco-check-action@v3.0.0
         # with:
         #   # 必须提供 Token，否则无法读取 PR 的提交信息
