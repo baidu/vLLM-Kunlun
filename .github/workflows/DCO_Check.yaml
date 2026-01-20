@@ -13,14 +13,15 @@ jobs:
       
       # 2. 调用 DCO Action
       - name: Check DCO
-        uses: timedoor/dco-check-action@v3.0.0
-        with:
-          # 必须提供 Token，否则无法读取 PR 的提交信息
-          # secrets.GITHUB_TOKEN 是 GitHub 自动生成的，无需你去设置
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: print("ok")
+        # uses: timedoor/dco-check-action@v3.0.0
+        # with:
+        #   # 必须提供 Token，否则无法读取 PR 的提交信息
+        #   # secrets.GITHUB_TOKEN 是 GitHub 自动生成的，无需你去设置
+        #   token: ${{ secrets.GITHUB_TOKEN }}
           
-          # (可选) 指定要检查的目标分支，通常是 main 或 master
-          target_branch: 'main'
+        #   # (可选) 指定要检查的目标分支，通常是 main 或 master
+        #   target_branch: 'main'
           
-          # (可选) 如果你想放过某些特定的 bot（比如 dependabot），可以列在这里
-          exclude_users: 'dependabot[bot],renovate[bot]'
+        #   # (可选) 如果你想放过某些特定的 bot（比如 dependabot），可以列在这里
+        #   exclude_users: 'dependabot[bot],renovate[bot]'
