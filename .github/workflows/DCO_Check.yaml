@@ -1,0 +1,26 @@
+name: DCO Check Workflow
+
+on:
+  pull_request:
+    branches: [ "main" ]  # DCO 主要是在 PR 阶段检查最有意义
+
+jobs:
+  dco-check:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. DCO 检查通常不需要 checkout 代码，因为它调用的是 GitHub API
+      # 但如果你有其他测试步骤，通常会先 checkout
+      
+      # 2. 调用 DCO Action
+      - name: Check DCO
+        uses: timedoor/dco-check-action@v3.0.0
+        with:
+          # 必须提供 Token，否则无法读取 PR 的提交信息
+          # secrets.GITHUB_TOKEN 是 GitHub 自动生成的，无需你去设置
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # (可选) 指定要检查的目标分支，通常是 main 或 master
+          target_branch: 'main'
+          
+          # (可选) 如果你想放过某些特定的 bot（比如 dependabot），可以列在这里
+          exclude_users: 'dependabot[bot],renovate[bot]'
