@@ -92,10 +92,6 @@ def register_model():
     ModelRegistry.register_model(
         "DeepSeekMTPModel",
         "vllm_kunlun.models.deepseek_mtp:DeepSeekMTP")
-    
-    ModelRegistry.register_model(
-        "Glm4MoeForCausalLM",
-        "vllm_kunlun.models.glm4_moe:Glm4MoeForCausalLM")
 
 def register_quant_method():
     """to do"""
