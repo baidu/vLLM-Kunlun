@@ -42,25 +42,6 @@ jobs:
           # 加上 fetch-depth: 0 避免浅克隆带来的 git 报错
           fetch-depth: 0
       
-      - name: Dump Environment Info
-        run: |
-          echo "===== ENV ====="
-          env | sort
-          echo "===== PYTHON ====="
-          which python
-          python --version
-          echo "===== TORCH ====="
-          python - << 'EOF'
-          import torch, os
-          print("torch:", torch.__version__)
-          print("cuda:", torch.version.cuda)
-          print("is_cuda_available:", torch.cuda.is_available())
-          print("device_count:", torch.cuda.device_count())
-          print("VLLM_TARGET_DEVICE:", os.getenv("VLLM_TARGET_DEVICE"))
-          print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
-          EOF
-
-      # --- 第四步：运行测试 (终极修复版) ---
       - name: Run Unit Test
         run: |
           # 5. 运行测试
