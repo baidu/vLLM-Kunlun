@@ -76,7 +76,7 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
                 out_dtype=x.dtype,
                 azp_adj=azp_adj,
                 azp=azp,
-                bias=bias.to(torch.float32).contiguous() if bias else None,
+                bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             )
         else:  # symmetric
             return torch.ops._C.matmul(
@@ -85,7 +85,7 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
                 out_dtype=x.dtype,
                 x_pc_max=x_s * 127.0 if static else x_s,
                 w_pc_max=w_s,
-                bias=bias.to(torch.float32).contiguous() if bias else None,
+                bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             )
 
             # backup option: lower performance
@@ -95,7 +95,7 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
             #     scale_a=x_s / 127.0 if not static else x_s,
             #     scale_b=(w_s / 127.0).transpose(0, 1),
             #     out_dtype=x.dtype,
-            #     bias=bias.to(torch.float32).contiguous() if bias else None,
+            #     bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             # )
 
 

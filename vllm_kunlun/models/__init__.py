@@ -36,10 +36,6 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3NextForCausalLM",
         "vllm_kunlun.models.qwen3_next:Qwen3NextForCausalLM")
-    
-    ModelRegistry.register_model(
-        "GlmForCausalLM",
-        "vllm_kunlun.models.glm:GlmForCausalLM")  
 
     ModelRegistry.register_model(
         "GptOssForCausalLM",
