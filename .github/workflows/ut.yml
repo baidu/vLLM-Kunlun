@@ -4,7 +4,7 @@ on: [push, pull_request]
 
 jobs:
   test-kunlun:
-    runs-on: [self-hosted, test-1]
+    runs-on: [self-hosted, test-0]
 
     env:
       http_proxy: http://10.63.229.53:8891
