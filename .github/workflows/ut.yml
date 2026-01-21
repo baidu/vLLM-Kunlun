@@ -10,8 +10,6 @@ jobs:
       http_proxy: http://10.63.229.53:8891
       https_proxy: https://10.63.229.53:8891
       no_proxy: localhost,127.0.0.1,0.0.0.0,.baidu.com,.baidu-int.com
-      # 保持这个变量，以防万一
-      # VLLM_TARGET_DEVICE: empty 
 
     steps:
       # --- 第一步：环境配置 ---
@@ -47,11 +45,6 @@ jobs:
           # 5. 运行测试
           echo "Running full suite..."
           export XPU_VISIBLE_DEVICES=1
-          pytest \
-            -v \
-            -p no:warnings \
-            --cov=vllm \
-            --cov-report=term \
-            tests/ut
+          pytest -v -s tests/ut -p no:warnings tests/ut
 
 
