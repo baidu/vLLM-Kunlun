@@ -67,8 +67,9 @@ jobs:
           echo "Running full suite..."
           export XPU_VISIBLE_DEVICES=1
           pytest \
-            -v -s \
+            -q \
             -p no:warnings \
             --cov=vllm \
-            --cov-report=term-missing \
+            --cov-report=term \
             tests/ut
+
