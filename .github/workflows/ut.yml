@@ -1,0 +1,68 @@
+name: Kunlun Unit Test
+
+on: [push, pull_request]
+
+jobs:
+  test-kunlun:
+    runs-on: [self-hosted, test-1]
+
+    env:
+      http_proxy: http://10.63.229.53:8891
+      https_proxy: https://10.63.229.53:8891
+      no_proxy: localhost,127.0.0.1,0.0.0.0,.baidu.com,.baidu-int.com
+      # 保持这个变量，以防万一
+      # VLLM_TARGET_DEVICE: empty 
+
+    steps:
+      # --- 第一步：环境配置 ---
+      - name: Configure Environment
+        run: |
+          CONDA_BIN="/root/miniconda/envs/python310_torch25_cuda/bin"
+          echo "$CONDA_BIN" >> $GITHUB_PATH
+          echo "PY=$CONDA_BIN/python" >> $GITHUB_ENV
+      # --- 【关键修复】必须放在 checkout 之前！ ---
+      - name: Fix Git Proxy & SSL
+        run: |
+          # 1. 强制 Git 走代理
+          git config --global http.proxy http://10.63.229.53:8891
+          git config --global https.proxy http://10.63.229.53:8891
+          
+          # 2. 【核心】关闭 SSL 验证，解决 gnutls_handshake 报错
+          git config --global http.sslVerify false
+          
+          # 3. 增加缓存防止大文件中断
+          git config --global http.postBuffer 524288000
+          
+          # 4. 强制使用 HTTP 协议替代 HTTPS (有时候能绕过 GnuTLS 的 bug)
+          git config --global url."http://github.com/".insteadOf "https://github.com/"
+      # --- 第二步：拉取 vLLM-Kunlun 代码 ---
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # 加上 fetch-depth: 0 避免浅克隆带来的 git 报错
+          fetch-depth: 0
+      
+      - name: Dump Environment Info
+        run: |
+          echo "===== ENV ====="
+          env | sort
+          echo "===== PYTHON ====="
+          which python
+          python --version
+          echo "===== TORCH ====="
+          python - << 'EOF'
+          import torch, os
+          print("torch:", torch.__version__)
+          print("cuda:", torch.version.cuda)
+          print("is_cuda_available:", torch.cuda.is_available())
+          print("device_count:", torch.cuda.device_count())
+          print("VLLM_TARGET_DEVICE:", os.getenv("VLLM_TARGET_DEVICE"))
+          print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
+          EOF
+
+      # --- 第四步：运行测试 (终极修复版) ---
+      - name: Run Unit Test
+        run: |
+          # 5. 运行测试
+          echo "Running full suite..."
+          pytest -v -s --cov tests/ut -p no:warnings tests/ut
