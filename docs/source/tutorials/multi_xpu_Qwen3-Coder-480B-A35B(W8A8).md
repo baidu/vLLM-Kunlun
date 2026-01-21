@@ -16,7 +16,8 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 
-export build_image="xxxxxxxxxxxxxxxxx" 
+export build_image="iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32"
+
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
@@ -32,14 +33,12 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 
 ### Preparation Weight
 
-* Pull Qwen3-Coder-480B-A35B-Instruct bf16 weights
-* Modify the weights configuration.json file and add the fields quantization_config and compression_config.
+- Pull Qwen3-Coder-480B-A35B-Instruct bf16 weights
+- Modify the weights configuration.json file and add the fields quantization_config and compression_config.
 
 ```json
 {
-  "architectures": [
-    "Qwen3MoeForCausalLM"
-  ],
+  "architectures": ["Qwen3MoeForCausalLM"],
   "attention_dropout": 0.0,
   "decoder_sparse_step": 1,
   "eos_token_id": 151645,
@@ -61,7 +60,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
   "num_key_value_heads": 8,
   "output_router_logits": false,
   "qkv_bias": false,
-  "rms_norm_eps": 1e-06,
+  "rms_norm_eps": 1e-6,
   "rope_scaling": null,
   "rope_theta": 10000000,
   "router_aux_loss_coef": 0.0,
@@ -104,7 +103,6 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
     "sparsity_config": null
   }
 }
-
 ```
 
 ### Online Serving on Multi XPU
@@ -128,5 +126,15 @@ python3 -m vllm.entrypoints.openai.api_server \
  --enable-chunked-prefill=False \
  --no-enable-prefix-caching \
  --disable-log-requests \
- --gpu-memory-utilization 0.85
+ --gpu-memory-utilization 0.9 \
+ --compilation-config '{"splitting_ops": ["vllm.unified_attention",
+                                                "vllm.unified_attention_with_output",
+                                                "vllm.unified_attention_with_output_kunlun",
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
+                                                "vllm.sparse_attn_indexer"]}' 2>&1 | tee output_p800.log
 ```
