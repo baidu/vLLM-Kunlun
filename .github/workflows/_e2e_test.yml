@@ -2,24 +2,16 @@ name: 'e2e-test'
 
 on:
   workflow_call:
-    inputs:
-      vllm-e2e:
-        required: False
-        type: string
-      runner-e2e:
-        required: False
-        type: string
-      image-e2e:
-        required: False
-        type: string
-      type-e2e:
-        required: False
-        type: string
-      vllm-kunlun-e2e:
-        required: False
-        type: string
-
-
+  pull_request:            
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+  push:                    
+    branches:
+      - main
+concurrency:
+  group: e2e-singlecard
+  cancel-in-progress: false
 jobs:
   e2e:
     name: e2e-test-singlecard
@@ -38,7 +30,7 @@ jobs:
       
       - name: Verify PR workspace
         run: |
-          echo "===== WORKSPACE ====="
+          echo "===== 1WORKSPACE ====="
           pwd
           ls -l
 
@@ -63,7 +55,7 @@ jobs:
               local IMAGE=$(get_imagename)
               local NAME=$(get_dockername)
           
-              # 步骤1: 确认宿主机CUDA库路径
+              # Step 1: Detect host CUDA library path
               local HOST_CUDA_LIB_PATH=""
               for path in "/usr/local/cuda/lib64" "/usr/local/cuda-*/lib64"; do
                   if [ -d "$(echo $path)" ]; then
@@ -73,59 +65,59 @@ jobs:
               done
               
               if [ -z "$HOST_CUDA_LIB_PATH" ]; then
-                  echo "⚠️ 宿主机CUDA库路径未找到，将使用容器内置CUDA"
+                  echo "⚠️ Host CUDA library path not found, will use container built-in CUDA"
               else
-                  echo "✓ 检测到宿主机CUDA库路径: $HOST_CUDA_LIB_PATH"
+                  echo "✓ Detected host CUDA library path: $HOST_CUDA_LIB_PATH"
               fi
           
-              # 步骤2: 精确匹配NVIDIA设备 (避免nvidia-caps等特殊文件)
+              # Step 2: Precisely match NVIDIA devices (avoid special files like nvidia-caps)
               DEVICE_ARGS=""
               if [ -e "/dev/nvidia0" ]; then
-                  # 步骤2.1: 获取NVIDIA控制设备
+                 # Step 2.1: Add NVIDIA control device # 步骤2.1: 获取NVIDIA控制设备
                   DEVICE_ARGS="--device /dev/nvidia0:/dev/nvidia0"
                   
-                  # 步骤2.2: 获取其他GPU设备 (限定只匹配数字后缀设备)
+                  # Step 2.2: Add other GPU devices (only match numeric suffix devices)
                   for i in $(seq 1 16); do
                       if [ -e "/dev/nvidia$i" ]; then
                           DEVICE_ARGS="$DEVICE_ARGS --device /dev/nvidia$i:/dev/nvidia$i"
                       fi
                   done
                   
-                  # 步骤2.3: 添加必要的nvidia-uvm设备
+                  # Step 2.3: Add required nvidia-uvm device
                   if [ -e "/dev/nvidia-uvm" ]; then
                       DEVICE_ARGS="$DEVICE_ARGS --device /dev/nvidia-uvm:/dev/nvidia-uvm"
                   fi
                   
-                  # 步骤2.4: 添加必要的nvidia-modeset设备
+                  # Step 2.4: Add required nvidia-modeset device
                   if [ -e "/dev/nvidia-modeset" ]; then
                       DEVICE_ARGS="$DEVICE_ARGS --device /dev/nvidia-modeset:/dev/nvidia-modeset"
                   fi
               fi
           
-              # 新增: 挂载nvidia-smi二进制文件
+              # New: Mount nvidia-smi binary
               NVIDIA_BIN=""
               if [ -f "/usr/bin/nvidia-smi" ]; then
                   NVIDIA_BIN="-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi"
-                  echo "✓ 添加nvidia-smi挂载"
+                  echo "✓ Added nvidia-smi mount"
               else
-                  echo "⚠️ 未找到nvidia-smi，请检查NVIDIA驱动安装"
+                  echo "⚠️ nvidia-smi not found, please check NVIDIA driver installation"
               fi
           
-              # 新增: 挂载必要的NVIDIA库文件
+              # New: Mount required NVIDIA library files
               NVIDIA_LIBS=""
               if [ -d "/usr/lib64" ]; then
-                  echo "✓ 挂载关键NVIDIA库文件"
+                  echo "✓ Mounting critical NVIDIA library files"
                   for lib in libnvidia-ml.so libnvidia-ml.so.1; do
                       if [ -f "/usr/lib64/$lib" ]; then
                           NVIDIA_LIBS="$NVIDIA_LIBS -v /usr/lib64/$lib:/usr/lib64/$lib"
                       fi
                   done
               fi
-              # 步骤1: 在Docker启动前，确保宿主机有正确的软链接
+              # Step 1: Ensure correct symbolic links on host before starting Docker
               sudo ln -sf /usr/lib64/libcuda.so.1 /usr/lib64/libcuda.so
                           
-              # 步骤3: 创建容器 - A800优化版本
-              echo "启动容器，设备映射参数: $DEVICE_ARGS"
+              # Step 3: Create container - P800 optimized version
+              echo "Starting container with device mapping parameters: $DEVICE_ARGS"
               docker run \
                   -h `hostname` \
                   --privileged \
@@ -151,18 +143,17 @@ jobs:
                   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
                   -itd $IMAGE
           
-              # 步骤4: 配置容器内环境
+              # Step 4: Configure environment inside the container
               sleep 2
               if [ "$(docker ps -q -f name=$NAME)" ]; then
-                  echo "✓ 容器创建成功! 正在配置环境..."
-                  # 注入CUDA库路径配置脚本
+                  echo "✓ Container created successfully! Configuring environment..."
+                  # Inject CUDA library path configuration script
                   # docker exec $NAME bash -c 'ln -sf /usr/lib64/libcuda.so.1 /usr/lib64/libcuda.so'
                   # docker exec $NAME bash -c 'echo "export LD_LIBRARY_PATH=/usr/lib64:/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> ~/.bashrc'
-                  # # A800特定优化
                   # docker exec $NAME bash -c 'echo "export VLLM_USE_CUDA_GRAPH=1" >> ~/.bashrc'
                   # docker exec $NAME bash -c 'echo "export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION" >> ~/.bashrc'
                   # docker exec $NAME bash -c 'echo "export CUDA_DEVICE_MAX_CONNECTIONS=1" >> ~/.bashrc'
-                  echo "✓ 环境配置完成！"
+                  echo "✓ Environment configuration completed!"
               fi
           }
           
@@ -200,7 +191,7 @@ jobs:
           function config() {
               if [ ! -f ${CONFIG} ] ;then
                   read -p "Please input your name: " name
-                  DOCKER_NAME=${ME_PREFIX}-${name}  # 修改这里，使用ME_PREFIX代替NAME_PREFIX
+                  DOCKER_NAME=${ME_PREFIX}-${name}
                   echo "DOCKER_NAME=${DOCKER_NAME}, you can rename it by modify ${CONFIG}"
           
                   # initial .config file
@@ -208,7 +199,6 @@ jobs:
                   echo "IMAGE_NAME=${IMAGE}" >> ${CONFIG}
               fi
           
-              # 删除孤立的local语句
           }
           
           function get_value() {
@@ -330,17 +320,6 @@ jobs:
               pip install evalscope
               pip install 'evalscope[perf]'
             '
-      - name: Module import & version check
-        run: |
-          sudo docker exec aiak-e2e-singlecard bash -lc '
-            conda activate python310_torch25_cuda
-            echo "=== vLLM Version ==="
-            python -c "import vllm; print(vllm.__version__)"
-            echo "=== vLLM-Kunlun Version ==="
-            python -c "import importlib.metadata as m; print(m.version('vllm_kunlun'))"
-            echo "=== evalscope ==="
-            pip show evalscope
-          '
       - name: start server
         run: |
           sudo docker exec -d aiak-e2e-singlecard bash -lc '
@@ -387,9 +366,6 @@ jobs:
                 exit 1
               fi
           '
-      - name: Follow logs in CI
-        run: |
-          sudo docker logs --tail 500 aiak-e2e-singlecard
       - name: Accuracy testing
         run: |
           sudo docker exec aiak-e2e-singlecard bash -lc '

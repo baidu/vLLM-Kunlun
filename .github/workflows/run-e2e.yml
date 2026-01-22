@@ -6,9 +6,3 @@ on:
 jobs:
   call-e2e:
     uses: ./.github/workflows/_e2e_test.yml
-    with:
-      vllm-e2e: v0.11.0
-      vllm-kunlun-e2e: v0.11.0
-      runner-e2e: gajl-bbc-onlinec-com-1498363
-      image-e2e: iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32
-      type-e2e: singlecard
