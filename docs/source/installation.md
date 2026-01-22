@@ -32,6 +32,9 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 export build_image="wjie520/vllm_kunlun:v0.0.1"
+# or export build_image="iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32"
+
+
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -49,6 +52,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ### Install vLLM 0.11.0
 ```
 conda activate vllm_kunlun_0.10.1.1
+# or conda activate python310_torch25_cuda
 
 pip install vllm==0.11.0 --no-build-isolation --no-deps
 ```
@@ -79,6 +83,7 @@ bash xpytorch-cp310-torch251-ubuntu2004-x64.run
 ## Install the KL3-customized build of PyTorch(Only MIMO V2)
 ```
 wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1231/xpytorch-cp310-torch251-ubuntu2004-x64.run
+bash xpytorch-cp310-torch251-ubuntu2004-x64.run
 ```
 
 ## Install custom ops
