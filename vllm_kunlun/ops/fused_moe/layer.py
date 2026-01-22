@@ -162,7 +162,7 @@ class KunlunFusedMoE(FusedMoE):
         if (self.quant_config is None) or (
             should_ignore_layer(
                 prefix,
-                ignore=self.quant_config.ignore,
+                ignore=getattr(self.quant_config, "ignore", tuple()),
                 fused_mapping=self.quant_config.packed_modules_mapping,
             )
         ):
