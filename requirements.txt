@@ -1,5 +1,3 @@
---index-url https://pip.baidu-int.com/simple/
---trusted-host pip.baidu.com
 
 setuptools==80.9.0
 opencv-python-headless==4.12.0.88
