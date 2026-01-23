@@ -30,33 +30,40 @@ RUN apt-get update && \
     gcc g++ cmake libnuma-dev \
     wget tmux curl \
     software-properties-common && \
+    apt remove -y python3.8 python3.8-minimal python3.8-dev && \
+    apt purge -y python3.8 python3.8-minimal python3.8-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN conda init && conda create --name vllm_kunlun_0.10.1.1 python=3.10.15 -y && \
-    conda run -n vllm_kunlun_0.10.1.1 && source activate vllm_kunlun_0.10.1.1 && \
-    conda clean -afy
+RUN sed -i '/# >>> conda initialize >>>/,/# <<< conda initialize <<</d' ~/.bashrc && \
+    rm -rf /root/miniconda3 
 
-RUN source activate vllm_kunlun_0.10.1.1 && \
-    pip install torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118 && \
-    pip cache purge && rm -rf /root/.cache/pip
+ENV PATH=/root/.local/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-RUN source activate vllm_kunlun_0.10.1.1 && \
-    pip install setuptools==80.9.0 cuda_mock==1.1.1 hyperparameter==0.5.6 black==23.3.0 lark==1.2.2 \
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    source $HOME/.local/bin/env
+
+RUN uv venv --python 3.10 /opt/vllm_kunlun
+ENV PATH=/opt/vllm_kunlun/bin:${PATH} 
+
+RUN source /opt/vllm_kunlun/bin/activate && \
+    uv pip install torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118 && \
+    rm -rf /root/.cache/pip && uv cache clean
+
+RUN uv pip install setuptools==80.9.0 cuda_mock==1.1.1 hyperparameter==0.5.6 black==23.3.0 lark==1.2.2 \
     networkx wheel PyYAML==6.0.2 ipython h5py regex==2024.9.11 colorama==0.4.6 pynvml==11.5.3 \
-    nvidia-cuda-runtime-cu11 tabulate==0.9.0 openpyxl==3.1.5 pandas prettytable \
+    nvidia-cuda-runtime-cu11 tabulate==0.9.0 openpyxl==3.1.5 pandas prettytable setproctitle\
     pytest==8.1.0 pytest-repeat==0.9.3 pytest-timeout==2.3.1 py==1.11.0 datasets==2.16.0 \
     pydantic==2.9.2 psutil==6.1.0 einops==0.8.0 \
-    pytest-html==4.1.1 py-cpuinfo pytest-timeout==2.3.1 termcolor jsonlines==4.0.0 tiktoken \
+    pytest-html==4.1.1 pytest-timeout==2.3.1 termcolor jsonlines==4.0.0 tiktoken \
     qwen_vl_utils filetype fastapi==0.112.1 fire py-cpuinfo transformers==4.57.1 \
     gradio==4.0.0 sse-starlette trl==0.8.6 uvicorn accelerate==0.30.1 --index-url https://pip.baidu-int.com/simple/ && \
-    pip cache purge && rm -rf /root/.cache/pip
+    rm -rf /root/.cache/pip && uv cache clean
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
-    TERM=xterm-256color \
-    PATH=/root/miniconda/envs/vllm_kunlun_0.10.1.1/bin/:$PATH
+    TERM=xterm-256color
 
 WORKDIR /workspace
 RUN wget https://su.bcebos.com/v1/klx-sdk-release-public/xccl/resource/MLNX_OFED_LINUX-24.01-0.3.3.1-ubuntu20.04-x86_64.tgz && tar -xf MLNX_OFED_LINUX-24.01-0.3.3.1-ubuntu20.04-x86_64.tgz
@@ -68,16 +75,11 @@ RUN apt-get install -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-COPY vllm-kunlun/ /workspace/vllm-kunlun/ 
-RUN cd /workspace/vllm-kunlun && \
-    bash dockerfile/install.sh && \
-    rm -rf /workspace/vllm-kunlun/build/ && rm -rf /workspace/vllm-kunlun/vllm_kunlun.egg-info/
-
-# xpu-smi tools
-WORKDIR /workspace
 COPY xre-Linux-x86_64-5.2.0.0/  /workspace/xre-Linux-x86_64-5.2.0.0/
 RUN mv /workspace/xre-Linux-x86_64-5.2.0.0/bin/* /usr/local/bin/ && mv /workspace/xre-Linux-x86_64-5.2.0.0/so/*  /lib/x86_64-linux-gnu/ && \
     rm -rf /workspace/xre-Linux-x86_64-5.2.0.0/
+
+    ENV LD_LIBRARY_PATH=/opt/vllm_kunlun/lib:/opt/vllm_kunlun/lib64:/lib/x86_64-linux-gnu/:/opt/vllm_kunlun/xcudart/lib/
 
 RUN rm -rf \
     /root/.cache \
