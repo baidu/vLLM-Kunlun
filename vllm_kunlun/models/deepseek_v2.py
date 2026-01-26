@@ -589,8 +589,6 @@ def sparse_attn_indexer_vllm_kunlun(
         logits = logits.masked_fill(~mask, float('-inf'))
 
         del positions, mask
-        # 扩展 seq_lens 以匹配实际的 batch 大小（batch_size * next_n）
-        # 每个原始请求被重复 next_n 次
         expanded_seq_lens = decode_metadata.seq_lens[row_indices]
         topk_indices = torch.ops._C.fast_topkv2(logits, expanded_seq_lens, topk_tokens)
         need_mask = decode_metadata.seq_lens_cpu.min() < topk_tokens
