@@ -24,3 +24,4 @@ import vllm_kunlun.ops.linear
 import vllm_kunlun.ops.fused_moe.layer
 import vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors_moe
 import vllm_kunlun.ops.quantization.kernels.kunlun_scale_mm
+import vllm_kunlun.v1.sample.spec_decode.eagle
