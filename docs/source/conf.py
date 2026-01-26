@@ -32,7 +32,7 @@ import os
 # -- Project information -----------------------------------------------------
 
 project = "vllm-kunlun"
-copyright = "2025, vllm-kunlun team"
+copyright = "2026, vllm-kunlun team"
 author = "the vllm-kunlun team"
 
 # The full version, including alpha/beta/rc tags
