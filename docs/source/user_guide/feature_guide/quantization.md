@@ -31,7 +31,7 @@ Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, 
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
-      <td style="padding: 10px; border: 1px solid #000;">WIP</td>
+      <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">WIP</td>
     </tr>

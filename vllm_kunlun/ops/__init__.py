@@ -19,6 +19,7 @@ import vllm_kunlun.ops.rotary_embedding
 import vllm_kunlun.ops.layernorm
 import vllm_kunlun.ops.quantization.awq
 import vllm_kunlun.ops.quantization.gptq
+import vllm_kunlun.ops.quantization.moe_wna16
 import vllm_kunlun.ops.vocab_parallel_embedding
 import vllm_kunlun.ops.linear
 import vllm_kunlun.ops.fused_moe.layer
