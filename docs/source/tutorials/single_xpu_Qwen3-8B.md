@@ -124,7 +124,6 @@ python -m vllm.entrypoints.openai.api_server \
       --max_num_seqs 128 \
       --max_num_batched_tokens 32768 \
       --block-size 128 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B \

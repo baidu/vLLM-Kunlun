@@ -18,7 +18,6 @@ python -m vllm.entrypoints.openai.api_server \
       --model /your_modified_models\
       --trust-remote-code \
       --tensor-parallel-size 1 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name your_modified_models \

@@ -1,7 +1,9 @@
 # Quickstart
 
 ## Prerequisites
+
 ### Supported Devices
+
 - Kunlun3 P800
 
 ## Setup environment using container
@@ -32,10 +34,12 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
     -w /workspace \
     "$build_image" /bin/bash
 ```
+
 ::::
 :::::
 
 Start docker:
+
 ```bash
 #start
 bash ./rundocker.sh <container_name>
@@ -44,15 +48,17 @@ docker exec -it <container_name> bash
 ```
 
 The default working directory is `/workspace`. With the fully provisioned environment image we provide, you can quickly start developing and running tasks within this directory.
+
 ## Set up system environment
+
 ```
-#Set environment 
+#Set environment
 chmod +x /workspace/vllm-kunlun/setup_env.sh && source /workspace/vllm-kunlun/setup_env.sh
 ```
+
 ## Usage
 
 You can start the service quickly using the script below.
-
 
 :::::{tab-set}
 ::::{tab-item} Offline Batched Inference
@@ -152,20 +158,19 @@ python -m vllm.entrypoints.openai.api_server \
       --max_num_seqs 128 \
       --max_num_batched_tokens 32768 \
       --block-size 128 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-VL-30B-A3B-Instruct \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention", 
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
                                                 "vllm.unified_attention_with_output",
                                                 "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2", 
-                                                "vllm.mamba_mixer", 
-                                                "vllm.short_conv", 
-                                                "vllm.linear_attention", 
-                                                "vllm.plamo2_mamba_mixer", 
-                                                "vllm.gdn_attention", 
-                                                "vllm.sparse_attn_indexer"]}' \  
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
+                                                "vllm.sparse_attn_indexer"]}' \
 ```
 
 If you see a log as below:
