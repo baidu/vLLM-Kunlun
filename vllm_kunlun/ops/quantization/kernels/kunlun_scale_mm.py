@@ -99,12 +99,5 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
             # )
 
 
-# monkey patch
+# replace CutlassScaledMMLinearKernel with KunlunScaledMMLinearKernel
 _POSSIBLE_KERNELS[PlatformEnum.CUDA] = [KunlunScaledMMLinearKernel]
-from vllm.model_executor.layers.quantization.kernels.scaled_mm import cutlass
-
-cutlass.CutlassScaledMMLinearKernel = KunlunScaledMMLinearKernel
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.kernels.scaled_mm.cutlass.CutlassScaledMMLinearKernel \
-      --> vllm_kunlun.ops.quantization.kernels.kunlun_scale_mm.KunlunScaledMMLinearKernel"
-)

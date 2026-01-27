@@ -149,6 +149,14 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
       <td class="status-support">✅</td>
       <td></td>
     </tr>
+    <tr>
+      <td class="model-name">Kimi-K2</td>
+      <td class="status-support">✅</td>
+      <td class="status-support">✅</td>
+      <td></td>
+      <td class="status-support">✅</td>
+      <td></td>
+    </tr>
   </tbody>
 </table>
 

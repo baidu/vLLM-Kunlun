@@ -2275,7 +2275,7 @@ fwd_kvcache_mla.register_fake(_fake_fwd_kvcache_mla)
 
 
 ##################################################
-# --------------- dequant_int4 -----------------
+# --------------- dequant_int4 -------------------
 ##################################################
 @custom_op("_C::dequant_int4", mutates_args=())
 def dequant_int4(

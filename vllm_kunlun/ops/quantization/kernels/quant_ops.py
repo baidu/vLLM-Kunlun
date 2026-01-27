@@ -1,7 +1,7 @@
 #
-# Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-# Author: Tang Shiwen
-# Email: tangshiwen@baidu.com
+# Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
+# Author: Tang Shiwen, Li Wei
+# Email: tangshiwen@baidu.com, liwei157@baidu.com
 # This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -66,3 +66,21 @@ def dequant_int4(
     )
 
     return fpweight.transpose(1, 2).contiguous()
+
+
+def dequant_int4_native(weight_packed_uint8: torch.Tensor, scale: torch.Tensor):
+    """Unpack uint4 weight from packed uint8 weight and dequant it to float16."""
+    weight_upacked_fp16 = (
+        torch.stack(
+            (weight_packed_uint8 & 0xF, (weight_packed_uint8 >> 4) & 0xF),
+            dim=-1,
+        )
+        .reshape(*weight_packed_uint8.shape[:-1], -1)
+        .contiguous()
+        .to(torch.float16)
+        - 8.0
+    )
+    weight_upacked_fp16 *= scale.repeat(
+        1, 1, weight_upacked_fp16.shape[-1] // scale.shape[-1]
+    )
+    return weight_upacked_fp16
