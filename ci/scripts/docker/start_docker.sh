@@ -6,13 +6,11 @@ source ci/scripts/common/log.sh
 
 log "Starting docker container: ${DOCKER_NAME}"
 
-
-if sudo docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
+if docker ps -a --format '{{.Names}}' | grep -q "^${DOCKER_NAME}$"; then
   log "Container exists, removing first..."
-  sudo docker stop "${DOCKER_NAME}" >/dev/null 2>&1 || true
-  sudo docker rm "${DOCKER_NAME}" >/dev/null 2>&1 || true
+  docker stop "${DOCKER_NAME}" >/dev/null 2>&1 || true
+  docker rm "${DOCKER_NAME}" >/dev/null 2>&1 || true
 fi
-
 
 HOST_CUDA_LIB_PATH=""
 for path in "/usr/local/cuda/lib64" /usr/local/cuda-*/lib64; do
@@ -67,10 +65,10 @@ if [ -d "/usr/lib64" ]; then
 fi
 
 # Ensure libcuda symlink
-sudo ln -sf /usr/lib64/libcuda.so.1 /usr/lib64/libcuda.so || true
+ln -sf /usr/lib64/libcuda.so.1 /usr/lib64/libcuda.so || true
 
 log "docker run ${IMAGE_NAME}"
-sudo docker run \
+docker run \
   -h "$(hostname)" \
   --privileged \
   --net=host \
@@ -86,6 +84,7 @@ sudo docker run \
   -v /usr/lib64/libcuda.so:/usr/lib64/libcuda.so \
   -v /usr/lib64/libnvidia-ml.so.1:/usr/lib64/libnvidia-ml.so.1 \
   -v /usr/lib64/libnvidia-ptxjitcompiler.so.1:/usr/lib64/libnvidia-ptxjitcompiler.so.1 2>/dev/null \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -w /workspace \
   ${DEVICE_ARGS} \
   ${NVIDIA_BIN} \
@@ -96,7 +95,7 @@ sudo docker run \
   -itd "${IMAGE_NAME}"
 
 log "Container started. Inject conda activate into bashrc"
-sudo docker exec "${DOCKER_NAME}" bash -lc "
+docker exec "${DOCKER_NAME}" bash -lc "
   echo 'conda activate ${CONDA_ENV}' >> ~/.bashrc
   conda env list || true
 "

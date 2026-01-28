@@ -6,7 +6,7 @@ source ci/scripts/common/log.sh
 
 log "Waiting for vLLM to be ready: ${VLLM_API_BASE}/v1/models"
 
-sudo docker exec "${DOCKER_NAME}" bash -lc "
+docker exec "${DOCKER_NAME}" bash -lc "
   set -e
 
   for i in {1..90}; do

@@ -6,7 +6,7 @@ source ci/scripts/common/log.sh
 
 log "Starting vLLM server in container ${DOCKER_NAME}"
 
-sudo docker exec -d "${DOCKER_NAME}" bash -lc "
+docker exec -d "${DOCKER_NAME}" bash -lc "
   set -e
 
   chmod +x \"${GITHUB_WORKSPACE}/vLLM-Kunlun/setup_env.sh\"

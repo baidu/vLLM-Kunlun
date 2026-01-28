@@ -6,7 +6,7 @@ source ci/scripts/common/log.sh
 
 log "Running accuracy test via evalscope"
 
-sudo docker exec "${DOCKER_NAME}" bash -lc "
+docker exec "${DOCKER_NAME}" bash -lc "
   set -e
   rm -f ${ACC_LOG}
 
