@@ -1,0 +1,57 @@
+name: Unit Test
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-kunlun:
+    runs-on: 
+      labels:
+        - self-hosted
+        - Linux
+        - X64
+        - test-1 # Actions Runner Label
+        
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install vLLM-Kunlun Dependencies
+        run: |
+          pip install -r requirements.txt
+          
+          python setup.py build
+          python setup.py develop
+
+          # Install the KL3-customized build of PyTorch
+          wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-02T05%3A01%3A27Z%2F-1%2Fhost%2Ff3cf499234f82303891aed2bcb0628918e379a21e841a3fac6bd94afef491ff7
+          bash xpytorch-cp310-torch251-ubuntu2004-x64.run
+
+          # Install custom ops
+          pip install "https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xtorch_ops-0.1.2209%2B6752ad20-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-05T06%3A18%3A00Z%2F-1%2Fhost%2F14936c2b7e7c557c1400e4c467c79f7a9217374a7aa4a046711ac4d948f460cd"
+
+          # Install the KLX3 custom Triton build
+          pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl"
+
+          # Install the AIAK custom ops library
+          pip install "https://cce-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20251219_152418/xspeedgate_ops-0.0.0-cp310-cp310-linux_x86_64.whl"
+
+      - name: Install vLLM
+        run: |
+          pip install vllm==0.11.0 --no-build-isolation --no-deps --no-deps --index-url https://pip.baidu-int.com/simple/
+      
+      - name: Install Test Dependencies
+        run: |
+          pip install pytest
+
+      - name: Run Unit Test
+        run: |
+          echo "Running full suite..."
+          export XPU_VISIBLE_DEVICES=1
+          pytest \
+          -vs \
+          --cov=vllm_kunlun \
+          --cov-report=term-missing \
+          -p no:warnings tests/ut
