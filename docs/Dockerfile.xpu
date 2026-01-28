@@ -79,7 +79,7 @@ COPY xre-Linux-x86_64-5.2.0.0/  /workspace/xre-Linux-x86_64-5.2.0.0/
 RUN mv /workspace/xre-Linux-x86_64-5.2.0.0/bin/* /usr/local/bin/ && mv /workspace/xre-Linux-x86_64-5.2.0.0/so/*  /lib/x86_64-linux-gnu/ && \
     rm -rf /workspace/xre-Linux-x86_64-5.2.0.0/
 
-    ENV LD_LIBRARY_PATH=/opt/vllm_kunlun/lib:/opt/vllm_kunlun/lib64:/lib/x86_64-linux-gnu/:/opt/vllm_kunlun/xcudart/lib/
+ENV LD_LIBRARY_PATH=/opt/vllm_kunlun/lib:/opt/vllm_kunlun/lib64:/lib/x86_64-linux-gnu/:/opt/vllm_kunlun/xcudart/lib/
 
 RUN rm -rf \
     /root/.cache \

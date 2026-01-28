@@ -1,112 +1,106 @@
-default_install_hook_types:
-  - pre-commit
-  - commit-msg
-default_stages:
-  - pre-commit # Run locally
-  - manual # Run in CI
-exclude: 'examples/.*' # Exclude examples from all hooks by default
+# Global configuration
+default_install_hook_types:  # Default hook types to install
+  - pre-commit   # Pre-commit checks
+  - commit-msg   # Commit message checks
+default_stages:  # Default run stages
+  - pre-commit   # Run on local commits
+  - manual       # Run manually in CI only
+exclude: 'examples/.*'  # Path patterns to exclude from checks
 repos:
-# - repo: https://github.com/codespell-project/codespell
-#   rev: v2.4.1
-#   hooks:
-#     - id: codespell
-#       args: [
-#         --toml, pyproject.toml,
-#         '--skip', 'vllm_kunlun/csrc/**,tests/**,.github/**,',
-#         '-L', ''
-#       ]
-#       additional_dependencies:
-#         - tomli
-- repo: https://github.com/google/yapf
-  rev: v0.43.0
-  hooks:
-  - id: yapf
-    args: [--in-place, --verbose]
-    # Keep the same list from yapfignore here to avoid yapf failing without any inputs
-    exclude: '(.github|benchmarks|examples|docs)/.*'
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.11.7
-  hooks:
-  - id: ruff
-    args: [--output-format, github, --fix]
-  - id: ruff-format
-    files: ^(benchmarks|examples)/.*
-- repo: https://github.com/crate-ci/typos
-  rev: v1.32.0
-  hooks:
-  - id: typos
-    args: [
-      "--force-exclude",
-      "--exclude", "vllm_kunlun/csrc/**"
-    ]
-- repo: https://github.com/PyCQA/isort
-  rev: 6.0.1
-  hooks:
-  - id: isort
-- repo: https://github.com/jackdewinter/pymarkdown
-  rev: v0.9.29
-  hooks:
-  - id: pymarkdown
-    args: [fix]
-- repo: https://github.com/rhysd/actionlint
-  rev: v1.7.7
-  hooks:
-  - id: actionlint
-- repo: local
-  hooks:
-  # - id: mypy-3.10 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
-  #   name: Run mypy for Python 3.10
-  #   entry: tools/mypy.sh 1 "3.10"
-  #   # Use system python because vllm installation is required
-  #   language: system
-  #   types: [python]
-  #   stages: [manual] # Only run in CI
-  # - id: mypy-3.11 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
-  #   name: Run mypy for Python 3.11
-  #   entry: tools/mypy.sh 1 "3.11"
-  #   # Use system python because vllm installation is required
-  #   language: system
-  #   types: [python]
-  #   stages: [manual] # Only run in CI
-  # - id: mypy-3.12 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
-  #   name: Run mypy for Python 3.12
-  #   entry: tools/mypy.sh 1 "3.12"
-  #   # Use system python because vllm installation is required
-  #   language: system
-  #   types: [python]
-  #   stages: [manual] # Only run in CI
-  - id: signoff-commit
-    name: Sign-off Commit
-    entry: bash
-    args:
-      - -c
-      - |
-        if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
-          printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
-        fi
-    language: system
-    verbose: true
-    stages: [commit-msg]
-  - id: check-filenames
-    name: Check for spaces in all filenames
-    entry: bash
-    args:
-      - -c
-      - 'git ls-files | grep " " && echo "Filenames should not contain spaces!" && exit 1 || exit 0'
-    language: system
-    always_run: true
-    pass_filenames: false
-  # - id: python-init
-  #   name: Enforce __init__.py in Python packages
-  #   entry: python tools/check_python_src_init.py
-  #   language: python
-  #   types: [python]
-  #   pass_filenames: false
-  # Keep `suggestion` last
-  - id: suggestion
-    name: Suggestion
-    entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'
-    language: system
-    verbose: true
-    pass_filenames: false
-  # Insert new entries above the `suggestion` entry
+  # -----------------------
+  # Basic file format checks
+  # -----------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0  # Use fixed version for stability
+    hooks:
+      - id: end-of-file-fixer  # Ensure files end with newline
+      - id: trailing-whitespace  # Remove trailing whitespace
+      - id: check-yaml  # Check YAML syntax
+      - id: check-toml  # Check TOML syntax
+      - id: check-added-large-files  # Prevent accidental addition of large files
+        args: ["--maxkb=10240"]  # Maximum allowed file size (10MB)
+
+  # -----------------------
+  # Python import sorting (compatible with black)
+  # -----------------------
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2  # Version lock
+    hooks:
+      - id: isort
+        args: ["--profile=black"]  # Use black-compatible configuration
+        # Auto-fix import sorting:
+        # 1. Standard library imports
+        # 2. Third-party library imports  
+        # 3. Local application/library specific imports
+        # Separated by blank lines between groups
+
+  # -----------------------
+  # Python code formatting (Black)
+  # -----------------------
+  - repo: https://github.com/psf/black
+    rev: 26.1.0  # Black version
+    hooks:
+      - id: black
+        language_version: python3  # Specify Python version
+        # Black characteristics:
+        # - Strict code formatting
+        # - Unconfigurable (very few exceptions)
+        # - Fast execution
+        # - Produces uniform code style
+
+  # -----------------------
+  # Python Linting (Ruff)
+  # Characteristics: Fast, suitable for CI, replaces flake8/isort/etc.
+  # -----------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.14  # Ruff version
+    hooks:
+      - id: ruff-check  # Main linting checks
+        types_or: [ python, pyi ]  # Check .py and .pyi files
+        args: [ --fix ]  # Auto-fix fixable issues
+        # Checks include:
+        # - Unused imports/variables
+        # - Syntax errors
+        # - Code style issues
+        # - Potential bugs
+  - repo: https://github.com/jackdewinter/pymarkdown
+    rev: v0.9.29
+    hooks:
+    - id: pymarkdown
+      args: [fix]
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+    - id: actionlint
+
+  - repo: local
+    hooks:
+      - id: signoff-commit
+        name: Sign-off Commit
+        entry: bash
+        args:
+          - -c
+          - |
+            if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+              printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+            fi
+        language: system
+        verbose: true
+        stages: [commit-msg]
+
+      - id: check-filenames
+        name: Check for spaces in all filenames
+        entry: bash
+        args:
+          - -c
+          - 'git ls-files | grep " " && echo "Filenames should not contain spaces!" && exit 1 || exit 0'
+        language: system
+        always_run: true
+        pass_filenames: false
+
+      - id: suggestion
+        name: Suggestion
+        entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'
+        language: system
+        verbose: true
+        pass_filenames: false
