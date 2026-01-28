@@ -20,19 +20,18 @@ python -m vllm.entrypoints.openai.api_server \
       --max-model-len 32768 \
       --tensor-parallel-size 1 \
       --dtype float16 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name modelname \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention", 
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
                                                 "vllm.unified_attention_with_output",
                                                 "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2", 
-                                                "vllm.mamba_mixer", 
-                                                "vllm.short_conv", 
-                                                "vllm.linear_attention", 
-                                                "vllm.plamo2_mamba_mixer", 
-                                                "vllm.gdn_attention", 
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
                                                 "vllm.sparse_attn_indexer"]}' \
 
 ```
@@ -87,18 +86,18 @@ P99 ITL (ms):                                 46.14
 
 Key Parameter Explanation:
 
-| index                        | meaning                 | Optimization Objective   |
-| --------------------------- | ------------------------------------| ---------- |
-| ***\*Output Throughput\**** | Output token generation rate                   | ↑ The higher the better |
-| ***\*Mean TTFT\****         | First Token Delay (Time To First Token)         | ↓ The lower the better |
-| ***\*P99 TTFT\****          | 99% of requests have delayed first token.       | ↓ The lower the better |
-| ***\*Mean TPOT\****         | Average generation time per output token | ↓ The lower the better |
-| ***\*P99 TPOT\****          | 99% of requests' time per token generation    | ↓ The lower the better |
-| ***\*ITL\****               | Delay between adjacent output tokens            | ↓ The lower the better |
+| index                         | meaning                                    | Optimization Objective  |
+| ----------------------------- | ------------------------------------------ | ----------------------- |
+| **\*\*Output Throughput\*\*** | Output token generation rate               | ↑ The higher the better |
+| **\*\*Mean TTFT\*\***         | First Token Delay (Time To First Token)    | ↓ The lower the better  |
+| **\*\*P99 TTFT\*\***          | 99% of requests have delayed first token.  | ↓ The lower the better  |
+| **\*\*Mean TPOT\*\***         | Average generation time per output token   | ↓ The lower the better  |
+| **\*\*P99 TPOT\*\***          | 99% of requests' time per token generation | ↓ The lower the better  |
+| **\*\*ITL\*\***               | Delay between adjacent output tokens       | ↓ The lower the better  |
 
 ### 2.Offline testing
 
-Comming soon...
+Coming soon...
 
 ## EvalScope
 
@@ -137,19 +136,18 @@ python -m vllm.entrypoints.openai.api_server \
       --max-model-len 32768 \
       --tensor-parallel-size 1 \
       --dtype float16 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B-Instruct \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention", 
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
                                                 "vllm.unified_attention_with_output",
                                                 "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2", 
-                                                "vllm.mamba_mixer", 
-                                                "vllm.short_conv", 
-                                                "vllm.linear_attention", 
-                                                "vllm.plamo2_mamba_mixer", 
-                                                "vllm.gdn_attention", 
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
                                                 "vllm.sparse_attn_indexer"]}' \
 
 ```

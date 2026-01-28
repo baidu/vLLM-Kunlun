@@ -121,7 +121,6 @@ python3 -m vllm.entrypoints.openai.api_server \
  --max-model-len 40960 \
  --max-num-seqs 512 \
  --max-num-batched-tokens 40960 \
- --max-seq-len-to-capture 40960 \
  --distributed-executor-backend mp \
  --enable-chunked-prefill=False \
  --no-enable-prefix-caching \
