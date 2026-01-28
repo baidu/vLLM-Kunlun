@@ -589,7 +589,8 @@ def sparse_attn_indexer_vllm_kunlun(
         logits = logits.masked_fill(~mask, float('-inf'))
 
         del positions, mask
-        topk_indices = torch.ops._C.fast_topkv2(logits, decode_metadata.seq_lens, topk_tokens) # [B * N, K]
+        expanded_seq_lens = decode_metadata.seq_lens[row_indices]
+        topk_indices = torch.ops._C.fast_topkv2(logits, expanded_seq_lens, topk_tokens)
         need_mask = decode_metadata.seq_lens_cpu.min() < topk_tokens
         if need_mask:
             positions_topk = torch.arange(topk_tokens,

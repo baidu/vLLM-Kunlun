@@ -189,3 +189,7 @@ def kunlun_build(self,
 
 DeepseekV32IndexerMetadataBuilder.build_one_prefill_chunk= kunlun_build_one_prefill_chunk
 DeepseekV32IndexerMetadataBuilder.build = kunlun_build
+
+# Monkey patch: Upgrade cudagraph_support to UNIFORM_BATCH for spec-decode compatibility
+from vllm.v1.attention.backends.utils import AttentionCGSupport
+DeepseekV32IndexerMetadataBuilder.cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
