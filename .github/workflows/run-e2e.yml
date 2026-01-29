@@ -1,141 +1,161 @@
-# name: e2e-test
+name: e2e-test
 
-# on:
-#   workflow_call:
-#   pull_request:
-#     branches: [main]
-#     types: [opened, synchronize, reopened]
-#   push:
-#     branches: [main]
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
 
-# concurrency:
-#   group: e2e-singlecard
-#   cancel-in-progress: false
+concurrency:
+  group: e2e-singlecard
+  cancel-in-progress: false
 
-# jobs:
-#   e2e:
-#     name: e2e-test-singlecard
-#     runs-on:
-#       - self-hosted
-#       - Linux
-#       - X64
+jobs:
+  e2e:
+    name: e2e-test-singlecard
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
 
-#     steps:
-#       - name: Checkout PR code
-#         uses: actions/checkout@v4
-#         with:
-#           fetch-depth: 0
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-#       - name: Verify PR workspace
-#         run: |
-#           echo "===== WORKSPACE ====="
-#           pwd
-#           ls -l
-#           echo "===== GIT INFO ====="
-#           git rev-parse HEAD
-#           git log -1 --oneline
-#           git status --porcelain
+      - name: Verify PR workspace
+        run: |
+          echo "===== WORKSPACE ====="
+          pwd
+          ls -l
+          echo "===== GIT INFO ====="
+          git rev-parse HEAD
+          git log -1 --oneline
+          git status --porcelain
 
-#       - name: Start docker
-#         run: |
-#           bash ci/scripts/docker/start_docker.sh
+      - name: Start docker
+        run: |
+          bash ci/scripts/docker/start_docker.sh
 
-#       - name: Install enviroments
-#         run: |
-#           bash ci/scripts/env/install_env.sh
+      - name: Install enviroments
+        env: 
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          NO_PROXY_LIST: ${{ secrets.NO_PROXY_LIST }}
+        run: |
+          bash ci/scripts/env/install_env.sh
 
-#       - name: Start vLLM server
-#         run: |
-#           bash ci/scripts/server/start_vllm.sh
+      - name: Start vLLM server
+        run: |
+          bash ci/scripts/server/start_vllm.sh
 
-#       - name: Wait for vLLM ready
-#         run: |
-#           bash ci/scripts/server/wait_vllm.sh
+      - name: Wait for vLLM ready
+        run: |
+          bash ci/scripts/server/wait_vllm.sh
 
-#       - name: Accuracy testing
-#         run: |
-#           bash ci/scripts/tests/run_accuracy.sh
+      - name: API Test
+        run: |
+          docker exec aiak-e2e-singlecard bash -lc '
+            curl http://localhost:8356/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d @- << "EOF"
+          {
+            "model": "Qwen3-8B",
+            "messages": [
+              { "role": "user", "content": "Who are you?" }
+            ],
+            "max_tokens": 200,
+            "temperature": 0
+          }
+          EOF
+          '
 
-#       - name: Performance testing
-#         run: |
-#           docker exec aiak-e2e-singlecard bash -lc '
-#             source ci/scripts/common/env.sh
-#             source ci/scripts/common/log.sh
-#             #!/bin/bash
-#             # ==========================================
-#             # 1. Define test dimensions
-#             #    (can be easily extended, e.g., add "2048x2048")
-#             # ==========================================
-#             DIMENSIONS=("1024x1024")
+      # - name: Accuracy testing
+      #   run: |
+      #     bash ci/scripts/tests/run_accuracy.sh
 
-#             # ==========================================
-#             # 2. Define concurrency generation logic (densification strategy)
-#             # ============x==============================
-#             # Use array concatenation to combine different density ranges
-#             # Syntax: seq [start] [step] [end]
-#             CONCURRENCIES=(1)
+      # - name: Performance testing
+      #   run: |
+      #     docker exec aiak-e2e-singlecard bash -lc '
+      #       source ci/scripts/common/env.sh
+      #       source ci/scripts/common/log.sh
+      #       #!/bin/bash
+      #       # ==========================================
+      #       # 1. Define test dimensions
+      #       #    (can be easily extended, e.g., add "2048x2048")
+      #       # ==========================================
+      #       DIMENSIONS=("1024x1024")
 
-#             # ==========================================
-#             # 3. Automatically assemble test cases
-#             # ==========================================
-#             TEST_COMBINATIONS=() # Initialize empty array
+      #       # ==========================================
+      #       # 2. Define concurrency generation logic (densification strategy)
+      #       # ============x==============================
+      #       # Use array concatenation to combine different density ranges
+      #       # Syntax: seq [start] [step] [end]
+      #       CONCURRENCIES=(1)
 
-#             # 🔄 Modified: outer loop over batch size (concurrency), inner loop over dimensions
-#             for bs in "${CONCURRENCIES[@]}"; do    # ← outer loop: concurrency
-#                 for dim in "${DIMENSIONS[@]}"; do  # ← inner loop: dimensions
-#                     case_str="${bs}x${dim}"
-#                     TEST_COMBINATIONS+=("$case_str")
-#                 done
-#             done
+      #       # ==========================================
+      #       # 3. Automatically assemble test cases
+      #       # ==========================================
+      #       TEST_COMBINATIONS=() # Initialize empty array
 
-#             # ==========================================
-#             # 4. (Optional) Print generated cases for sanity check
-#             # ==========================================
-#             echo "Generated ${#TEST_COMBINATIONS[@]} test cases in total:"
-#             echo "${TEST_COMBINATIONS[@]}" # Uncomment if you want to print all cases
+      #       # 🔄 Modified: outer loop over batch size (concurrency), inner loop over dimensions
+      #       for bs in "${CONCURRENCIES[@]}"; do    # ← outer loop: concurrency
+      #           for dim in "${DIMENSIONS[@]}"; do  # ← inner loop: dimensions
+      #               case_str="${bs}x${dim}"
+      #               TEST_COMBINATIONS+=("$case_str")
+      #           done
+      #       done
 
-#             # Progress counters
-#             TOTAL_TESTS=${#TEST_COMBINATIONS[@]}
-#             CURRENT_TEST=0
+      #       # ==========================================
+      #       # 4. (Optional) Print generated cases for sanity check
+      #       # ==========================================
+      #       echo "Generated ${#TEST_COMBINATIONS[@]} test cases in total:"
+      #       echo "${TEST_COMBINATIONS[@]}" # Uncomment if you want to print all cases
 
-#             # Iterate over all test combinations
-#             for COMBINATION in "${TEST_COMBINATIONS[@]}"; do
-#                 # Parse parameters from combination string
-#                 NUM_PROMPTS=$(echo $COMBINATION | cut -d'x' -f1)
-#                 INPUT_LEN=$(echo $COMBINATION | cut -d'x' -f2)
-#                 OUTPUT_LEN=$(echo $COMBINATION | cut -d'x' -f3)
+      #       # Progress counters
+      #       TOTAL_TESTS=${#TEST_COMBINATIONS[@]}
+      #       CURRENT_TEST=0
 
-#                 # Update progress
-#                 CURRENT_TEST=$((CURRENT_TEST + 1))
+      #       # Iterate over all test combinations
+      #       for COMBINATION in "${TEST_COMBINATIONS[@]}"; do
+      #           # Parse parameters from combination string
+      #           NUM_PROMPTS=$(echo $COMBINATION | cut -d'x' -f1)
+      #           INPUT_LEN=$(echo $COMBINATION | cut -d'x' -f2)
+      #           OUTPUT_LEN=$(echo $COMBINATION | cut -d'x' -f3)
 
-#                 echo "=========================================================="
-#                 echo "Test progress: $CURRENT_TEST / $TOTAL_TESTS"
-#                 echo "Current configuration: concurrency=$NUM_PROMPTS, input_len=$INPUT_LEN, output_len=$OUTPUT_LEN"
-#                 echo "=========================================================="
+      #           # Update progress
+      #           CURRENT_TEST=$((CURRENT_TEST + 1))
 
-#                 #OUTPUT_FILE="$RESULT_DIR/p800_${NUM_PROMPTS}_${INPUT_LEN}_${OUTPUT_LEN}.log"
+      #           echo "=========================================================="
+      #           echo "Test progress: $CURRENT_TEST / $TOTAL_TESTS"
+      #           echo "Current configuration: concurrency=$NUM_PROMPTS, input_len=$INPUT_LEN, output_len=$OUTPUT_LEN"
+      #           echo "=========================================================="
 
-#                 # Run benchmark
-#                 python3 -m vllm.entrypoints.cli.main bench serve \
-#                     --host 127.0.0.1 \
-#                     --port ${VLLM_PORT:-8356}\
-#                     --backend vllm \
-#                     --model ${SERVED_MODEL_NAME:-Qwen3-8B} \
-#                     --dataset-name random \
-#                     --num-prompts $NUM_PROMPTS \
-#                     --random-input-len $INPUT_LEN \
-#                     --random-output-len $OUTPUT_LEN \
-#                     --tokenizer ${MODEL_PATH:-/ssd3/models/Qwen3-8B} \
-#                     --ignore-eos
-#             done
-#           '
+      #           #OUTPUT_FILE="$RESULT_DIR/p800_${NUM_PROMPTS}_${INPUT_LEN}_${OUTPUT_LEN}.log"
+
+      #           # Run benchmark
+      #           python3 -m vllm.entrypoints.cli.main bench serve \
+      #               --host 127.0.0.1 \
+      #               --port ${VLLM_PORT:-8356}\
+      #               --backend vllm \
+      #               --model ${SERVED_MODEL_NAME:-Qwen3-8B} \
+      #               --dataset-name random \
+      #               --num-prompts $NUM_PROMPTS \
+      #               --random-input-len $INPUT_LEN \
+      #               --random-output-len $OUTPUT_LEN \
+      #               --tokenizer ${MODEL_PATH:-/ssd3/models/Qwen3-8B} \
+      #               --ignore-eos
+      #       done
+      #     '
       
-#       - name: Set permissions
-#         if: always()
-#         run: |
-#           bash ci/scripts/docker/set_permissions.sh
+      - name: Set permissions
+        if: always()
+        run: |
+          bash ci/scripts/docker/set_permissions.sh
 
-#       - name: Cleanup docker
-#         if: always()
-#         run: |
-#           bash ci/scripts/docker/stop_docker.sh
+      - name: Cleanup docker
+        if: always()
+        run: |
+          bash ci/scripts/docker/stop_docker.sh

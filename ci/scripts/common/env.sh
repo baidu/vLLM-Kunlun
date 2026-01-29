@@ -14,11 +14,7 @@ export VLLM_API_BASE="http://127.0.0.1:${VLLM_PORT}"
 export MODEL_PATH="${MODEL_PATH:-/ssd3/models/Qwen3-8B}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3-8B}"
 
-export XPU_VISIBLE_DEVICES="${XPU_VISIBLE_DEVICES:-5}"
-
-# Proxy Configuration
-export PROXY_URL="${PROXY_URL:-http://agent.baidu.com:8891}"
-export NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,::1}"
+export XPU_VISIBLE_DEVICES="${XPU_VISIBLE_DEVICES:-4}"
 
 export WORKSPACE_MOUNT="${WORKSPACE_MOUNT:-/home/E2E/workspace:/workspace}"
 
