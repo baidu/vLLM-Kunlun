@@ -109,7 +109,6 @@ python -m vllm.entrypoints.openai.api_server \
       --max_num_batched_tokens 4096 \
       --max-seq-len-to-capture 4096 \
       --block-size 128 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name GLM-4.5 \

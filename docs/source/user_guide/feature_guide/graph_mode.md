@@ -10,7 +10,6 @@ There is a graph mode supported by vLLM Kunlun:
 
 - **KunlunGraph**: This is the default graph mode supported by vLLM Kunlun. In vLLM-KunLun-0.10.1.1, Qwen, GLM and InternVL series models are well tested.
 
-
 ## Using KunlunGraph
 
 KunlunGraph is enabled by default. Take Qwen series models as an example, just set to use V1 Engine(default) is enough.
@@ -34,7 +33,7 @@ vllm serve Qwen3-8B-Instruct
 
 ## Using KunlunGraph
 
-Enabling Kunlun Graph on the Kunlun platform requires the use of splitting ops. 
+Enabling Kunlun Graph on the Kunlun platform requires the use of splitting ops.
 
 Online example:
 
@@ -48,23 +47,21 @@ python -m vllm.entrypoints.openai.api_server \
       --max-model-len 32768 \
       --tensor-parallel-size 1 \
       --dtype float16 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B-Instruct \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention", 
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
                                                 "vllm.unified_attention_with_output",
                                                 "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2", 
-                                                "vllm.mamba_mixer", 
-                                                "vllm.short_conv", 
-                                                "vllm.linear_attention", 
-                                                "vllm.plamo2_mamba_mixer", 
-                                                "vllm.gdn_attention", 
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
                                                 "vllm.sparse_attn_indexer"]}' \
 
 ```
-
 
 ## Fallback to the Eager Mode
 
@@ -82,7 +79,6 @@ python -m vllm.entrypoints.openai.api_server \
       --max-model-len 32768 \
       --tensor-parallel-size 1 \
       --dtype float16 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B-Instruct \
