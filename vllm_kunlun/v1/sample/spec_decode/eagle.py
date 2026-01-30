@@ -50,6 +50,8 @@ def propose(
         target_hidden_states = self.model.combine_hidden_states(
             target_hidden_states)
         assert target_hidden_states.shape[-1] == self.hidden_size
+    elif self.method == "deepseek_mtp":
+        target_hidden_states = target_hidden_states
 
     # Shift the input ids by one token.
     # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
