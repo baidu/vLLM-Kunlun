@@ -29,8 +29,10 @@ uvloop==0.21.0
 prometheus-fastapi-instrumentator==7.1.0
 transformers==4.57.0
 
-# 基础构建依赖
+# basic 
 hatchling>=1.25
 build>=1.0.3
 pytest
+pytest-cov
 mock
+pre-commit
