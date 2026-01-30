@@ -15,20 +15,22 @@
 # This file is a part of the vllm-ascend project.
 #
 
-# embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
-
-# quantization
-import vllm_kunlun.ops.quantization.awq
-import vllm_kunlun.ops.quantization.gptq
-import vllm_kunlun.ops.quantization.moe_wna16
-import vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors
-import vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors_moe
-import vllm_kunlun.ops.quantization.kernels.kunlun_scale_mm
-import vllm_kunlun.ops.quantization.kernels.kunlun_exllama_linear
+import vllm_kunlun.ops.fused_moe.layer
 
 # base layers
 import vllm_kunlun.ops.layernorm
 import vllm_kunlun.ops.linear
-import vllm_kunlun.ops.fused_moe.layer
+
+# quantization
+import vllm_kunlun.ops.quantization.awq
+import vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors
+import vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors_moe
+import vllm_kunlun.ops.quantization.gptq
+import vllm_kunlun.ops.quantization.kernels.kunlun_exllama_linear
+import vllm_kunlun.ops.quantization.kernels.kunlun_scale_mm
+import vllm_kunlun.ops.quantization.moe_wna16
+
+# embedding
+import vllm_kunlun.ops.rotary_embedding
+import vllm_kunlun.ops.vocab_parallel_embedding
+import vllm_kunlun.v1.sample.spec_decode.eagle
