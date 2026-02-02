@@ -18,7 +18,6 @@ python -m vllm.entrypoints.openai.api_server \
       --model /your_modified_models\
       --trust-remote-code \
       --tensor-parallel-size 1 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name your_modified_models \
@@ -35,6 +34,18 @@ python -m vllm.entrypoints.openai.api_server \
 ```
 
 Please save a screenshot of your service running successfully, and attach an accuracy report.
+
+### Linting
+
+vLLM Kunlun uses pre-commit to lint and format the codebase. See https://pre-commit.com/#usage if pre-commit is new to you. Setting up pre-commit is as easy as:
+
+```bash
+
+uv pip install pre-commit
+pre-commit install
+```
+
+vLLM Kunlun's pre-commit hooks will now run automatically every time you commit.
 
 ### Submit the commit
 

@@ -16,7 +16,8 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 
-export build_image="xxxxxxxxxxxxxxxxx"
+export build_image="iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32"
+
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
@@ -122,9 +123,7 @@ python -m vllm.entrypoints.openai.api_server \
       --dtype float16 \
       --max_num_seqs 128 \
       --max_num_batched_tokens 32768 \
-      --max-seq-len-to-capture 32768 \
       --block-size 128 \
-      --no-enable-prefix-caching \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B \
