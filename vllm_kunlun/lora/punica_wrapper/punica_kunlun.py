@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Optional, Union, final
 
 import torch
 # Disable torchdynamo for all functions in this file
-torch._dynamo.config.disable = True
 
 
 # SPDX-License-Identifier: Apache-2.0

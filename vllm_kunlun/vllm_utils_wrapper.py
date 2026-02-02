@@ -2372,3 +2372,441 @@ def _fake_fast_topkv2(
     return topk_indices
 
 fast_topkv2.register_fake(_fake_fast_topkv2)
+
+##################################################
+# ----------------- LoRA ops --------------------
+##################################################
+
+##################################################
+# -------------- sgmv_shrink_lora ----------------
+##################################################
+@custom_op("_C::sgmv_shrink_lora", mutates_args=())
+def sgmv_shrink_lora(
+    inputs: torch.Tensor,  
+    lora_a_weights: torch.Tensor,  
+    output_tensor: torch.Tensor, 
+    block_statistic: torch.Tensor, 
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor, 
+    seq_len_tensor: torch.Tensor,  
+    lora_indices_tensor: torch.Tensor,  
+    batches: int,  
+    max_seq_length: int,  
+    token_nums: int,  
+    scaling: float,  
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(
+        inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+@impl("_C::sgmv_shrink_lora", "CUDA")
+def sgmv_shrink_lora_cuda(
+    inputs: torch.Tensor,  
+    lora_a_weights: torch.Tensor,  
+    output_tensor: torch.Tensor, 
+    block_statistic: torch.Tensor, 
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor, 
+    seq_len_tensor: torch.Tensor,  
+    lora_indices_tensor: torch.Tensor,  
+    batches: int,  
+    max_seq_length: int,  
+    token_nums: int,  
+    scaling: float,  
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(
+        inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+def _fake_sgmv_shrink_lora(
+    inputs: torch.Tensor,  
+    lora_a_weights: torch.Tensor,  
+    output_tensor: torch.Tensor, 
+    block_statistic: torch.Tensor, 
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor, 
+    seq_len_tensor: torch.Tensor,  
+    lora_indices_tensor: torch.Tensor,  
+    batches: int,  
+    max_seq_length: int,  
+    token_nums: int,  
+    scaling: float,  
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_shrink_lora.register_fake(_fake_sgmv_shrink_lora)
+
+
+##################################################
+# -------------- sgmv_expand_lora ----------------
+##################################################
+@custom_op("_C::sgmv_expand_lora", mutates_args=())
+def sgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    )
+
+
+@impl("_C::sgmv_expand_lora", "CUDA")
+def sgmv_expand_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    )
+
+
+def _fake_sgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_expand_lora.register_fake(_fake_sgmv_expand_lora)
+
+
+##################################################
+# ----------- sgmv_expand_slice_lora -------------
+##################################################
+@custom_op("_C::sgmv_expand_slice_lora", mutates_args=())
+def sgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor, 
+    moe_index: torch.Tensor, 
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,  
+    max_seq_length: int, 
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+@impl("_C::sgmv_expand_slice_lora", "CUDA")
+def sgmv_expand_slice_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor, 
+    moe_index: torch.Tensor, 
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,  
+    max_seq_length: int, 
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+def _fake_sgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor, 
+    moe_index: torch.Tensor, 
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,  
+    max_seq_length: int, 
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_expand_slice_lora.register_fake(_fake_sgmv_expand_slice_lora)
+
+
+##################################################
+# -------------- bgmv_shrink_lora ----------------
+##################################################
+@custom_op("_C::bgmv_shrink_lora", mutates_args=())
+def bgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
+        inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+@impl("_C::bgmv_shrink_lora", "CUDA")
+def bgmv_shrink_lora_cuda(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
+        inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+def _fake_bgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_shrink_lora.register_fake(_fake_bgmv_shrink_lora)
+
+
+##################################################
+# -------------- bgmv_expand_lora ----------------
+##################################################
+@custom_op("_C::bgmv_expand_lora", mutates_args=())
+def bgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0
+    )
+
+
+@impl("_C::bgmv_expand_lora", "CUDA")
+def bgmv_expand_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0
+    )
+
+
+def _fake_bgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_expand_lora.register_fake(_fake_bgmv_expand_lora)
+
+
+##################################################
+# ----------- bgmv_expand_slice_lora -------------
+##################################################
+@custom_op("_C::bgmv_expand_slice_lora", mutates_args=())
+def bgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+@impl("_C::bgmv_expand_slice_lora", "CUDA")
+def bgmv_expand_slice_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+def _fake_bgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_expand_slice_lora.register_fake(_fake_bgmv_expand_slice_lora)
+
+
+##################################################
+# ----------- lora_matmul_inplace ----------------
+##################################################
+@custom_op("_C::lora_matmul_inplace", mutates_args=())
+def lora_matmul_inplace(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0
+) -> None:
+    xtorch_ops.matmul(
+        x=x.contiguous(),
+        w=w.contiguous(),
+        out=output_tensor,
+        x_trans=x_trans,
+        w_trans=w_trans,
+        alpha=alpha,
+        beta=beta,
+    )
+
+
+@impl("_C::lora_matmul_inplace", "CUDA")
+def lora_matmul_inplace_cuda(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0
+) -> None:
+    xtorch_ops.matmul(
+        x=x.contiguous(),
+        w=w.contiguous(),
+        out=output_tensor,
+        x_trans=x_trans,
+        w_trans=w_trans,
+        alpha=alpha,
+        beta=beta,
+    )
+
+
+def _fake_lora_matmul_inplace(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0
+) -> None:
+    return None
+
+
+lora_matmul_inplace.register_fake(_fake_lora_matmul_inplace)

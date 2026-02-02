@@ -1,11 +1,6 @@
 """kunlun_ops for lora"""
  
 import torch
-import xspeedgate_ops
-import time
-from torch._C import dtype
-import os
-from torch._dynamo import disable
 
 
 def sgmv_shrink(
@@ -27,10 +22,25 @@ def sgmv_shrink(
     """
     sgmv_shrink
     """
- 
-
-    return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling)
- 
+    if seq_len_tensor.size(0) == 1:
+                lora_a_2d = lora_a_weights.squeeze(0)
+                torch.ops._C.lora_matmul_inplace(
+                    inputs,
+                    lora_a_2d,
+                    output_tensor,
+                    x_trans=False,
+                    w_trans=True,
+                    alpha=1.0,
+                    beta=1.0
+                )
+    else:
+        torch.ops._C.sgmv_shrink_lora(
+            inputs, lora_a_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, expert_m, b_seq_start_loc,
+            seq_len_tensor, lora_indices_tensor, batches, max_seq_length,
+            token_nums, scaling
+        )
+    return output_tensor
 
 
 def sgmv_expand(inputs: torch.Tensor,
@@ -49,9 +59,24 @@ def sgmv_expand(inputs: torch.Tensor,
     """
     sgmv_expand
     """
- 
-    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0)
- 
+    if seq_len_tensor.size(0) == 1:
+        lora_b_2d = lora_b_weights.squeeze(0)
+        torch.ops._C.lora_matmul_inplace(
+            inputs,
+            lora_b_2d,
+            output_tensor,
+            x_trans=False,
+            w_trans=True,
+            alpha=1.0,
+            beta=1.0
+        )
+    else:
+        torch.ops._C.sgmv_expand_lora(
+            inputs, lora_b_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, b_seq_start_loc, seq_len_tensor,
+            lora_indices_tensor, batches, max_seq_length, token_nums, add_inputs
+        )
+    return output_tensor
 
 
 def sgmv_expand_slice(inputs: torch.Tensor,
@@ -70,17 +95,22 @@ def sgmv_expand_slice(inputs: torch.Tensor,
                       slice_offset: int,
                       slice_size: int,
                       add_inputs: bool = False):
-    
     """
     sgmv_expand_slice
     """
- 
-
-    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, slice_offset)
- 
- 
- 
- 
+    if seq_len_tensor.size(0) == 1:
+        lora_b_2d = lora_b_weights.squeeze(0)
+        output_slice = output_tensor.narrow(1, slice_offset, slice_size)
+        beta = 1.0 if add_inputs else 0.0
+        output_slice.addmm_(inputs, lora_b_2d.t(), beta=beta, alpha=1.0)
+    else:
+        torch.ops._C.sgmv_expand_slice_lora(
+            inputs, lora_b_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, normed_scale, b_seq_start_loc,
+            seq_len_tensor, lora_indices_tensor, batches, max_seq_length,
+            token_nums, slice_offset, slice_size, add_inputs
+        )
+    return output_tensor
 
 
 def bgmv_shrink(
@@ -97,7 +127,24 @@ def bgmv_shrink(
     """
     bgmv_shrink
     """
-    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling)
+    if inputs.size(0) == 1:
+        lora_idx = lora_indices_tensor[0].item()
+        lora_a_2d = lora_a_weights[lora_idx].squeeze(0)
+        torch.ops._C.lora_matmul_inplace(
+            inputs,
+            lora_a_2d,
+            output_tensor,
+            x_trans=False,
+            w_trans=True,
+            alpha=scaling,
+            beta=1.0
+        )
+    else:
+        torch.ops._C.bgmv_shrink_lora(
+            inputs, lora_a_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, expert_m, lora_indices_tensor, scaling
+        )
+    return output_tensor
 
 
 def bgmv_expand(inputs: torch.Tensor,
@@ -108,11 +155,29 @@ def bgmv_expand(inputs: torch.Tensor,
                 moe_index: torch.Tensor,
                 lora_indices_tensor: torch.Tensor,
                 add_inputs: bool = True):
-    """"
-        bgmv_expand
     """
-    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0)
-# @my_wrapper
+    bgmv_expand
+    """
+    if inputs.size(0) == 1:
+        lora_idx = lora_indices_tensor[0].item()
+        lora_b_2d = lora_b_weights[lora_idx].squeeze(0)
+        beta = 1.0 if add_inputs else 0.0
+        torch.ops._C.lora_matmul_inplace(
+            inputs,
+            lora_b_2d,
+            output_tensor,
+            x_trans=False,
+            w_trans=True,
+            alpha=1.0,
+            beta=beta
+        )
+    else:
+        torch.ops._C.bgmv_expand_lora(
+            inputs, lora_b_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, lora_indices_tensor, add_inputs
+        )
+    return output_tensor
+
 
 def bgmv_expand_slice(
     inputs: torch.Tensor,
@@ -128,6 +193,18 @@ def bgmv_expand_slice(
     add_inputs: bool = True
 ):
     """
-        bgmv_expand_slice
+    bgmv_expand_slice
     """
-    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset)
+    if inputs.size(0) == 1:
+        lora_idx = lora_indices_tensor[0].item()
+        lora_b_2d = lora_b_weights[lora_idx].squeeze(0)
+        output_slice = output_tensor.narrow(1, slice_offset, slice_size)
+        beta = 1.0 if add_inputs else 0.0
+        output_slice.addmm_(inputs, lora_b_2d.t(), beta=beta, alpha=1.0)
+    else:
+        torch.ops._C.bgmv_expand_slice_lora(
+            inputs, lora_b_weights, output_tensor, block_statistic,
+            sorted_tokens_num_lod, moe_index, normed_scale, lora_indices_tensor,
+            slice_offset, slice_size, add_inputs
+        )
+    return output_tensor
