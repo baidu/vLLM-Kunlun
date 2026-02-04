@@ -10,7 +10,7 @@ from packaging import version
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-import xtorch_ops
+import kunlun_ops
 import os
 
 logger = init_logger(__name__)
@@ -200,16 +200,16 @@ def flashinfer_sample(
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     if k is None:
         # Top-p only.
-        next_token_ids = xtorch_ops.top_p_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_p_sampling_from_probs(
             probs,top_p=p, deterministic=True)
     elif p is None:
         # Top-k only.
-        next_token_ids = xtorch_ops.top_k_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_k_sampling_from_probs(
             probs, top_k=k, deterministic=True)
     else:
         # Both top-k and top-p.
         k = k.to(torch.int32)
-        next_token_ids = xtorch_ops.top_k_top_p_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_k_top_p_sampling_from_probs(
             probs, top_k=k, top_p=p, deterministic=True)
 
     return next_token_ids.view(-1)
