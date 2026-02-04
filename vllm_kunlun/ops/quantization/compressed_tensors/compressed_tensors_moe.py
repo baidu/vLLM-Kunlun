@@ -113,7 +113,7 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # NOTE: xtorch_ops use max as scale
+        # NOTE: kunlun_ops use max as scale
         with torch.no_grad():
             layer.w13_weight_scale.mul_(127.0)
             layer.w2_weight_scale.mul_(127.0)

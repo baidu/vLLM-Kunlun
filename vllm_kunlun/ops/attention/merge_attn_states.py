@@ -3,7 +3,7 @@
 from typing import Optional
 
 import torch
-import xtorch_ops
+import kunlun_ops
 from vllm.platforms import current_platform
 
 
@@ -16,7 +16,7 @@ def merge_attn_states(
     output_lse: Optional[torch.Tensor] = None,
 ) -> None:
 
-    return xtorch_ops.attention_merge_stage(
+    return kunlun_ops.attention_merge_stage(
         prefix_output,
         prefix_lse,
         suffix_output,
