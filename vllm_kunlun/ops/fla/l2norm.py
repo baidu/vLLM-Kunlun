@@ -13,7 +13,7 @@ from typing import Optional
 import torch
 from vllm.triton_utils import tl, triton
 
-import xtorch_ops
+import kunlun_ops
 
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -149,5 +149,5 @@ def l2norm_fwd(x: torch.Tensor,
                eps: float = 1e-6,
                output_dtype: Optional[torch.dtype] = None):
     out = torch.empty_like(x)
-    xtorch_ops.l2norm(x, out, eps)                                                                                                                                                                                                                              
+    kunlun_ops.l2norm(x, out, eps)                                                                                                                                                                                                                              
     return out

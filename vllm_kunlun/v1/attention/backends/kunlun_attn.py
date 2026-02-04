@@ -15,7 +15,7 @@
 # This file is a part of the vllm-kunlun project.
 #
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-import xtorch_ops
+import kunlun_ops
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, ClassVar, Tuple, Type, TYPE_CHECKING
 
@@ -643,7 +643,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
                 if key_cache.is_contiguous():
-                    xtorch_ops.reshape_and_cache(
+                    kunlun_ops.reshape_and_cache(
                         key,
                         value,
                         key_cache,
@@ -652,7 +652,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 else:
                     cast_key_cache = key_cache.squeeze(1).unsqueeze(-2)
                     cast_value_cache = value_cache.squeeze(1).unsqueeze(-2)
-                    xtorch_ops.reshape_and_cache_flash(
+                    kunlun_ops.reshape_and_cache_flash(
                         key,
                         value,
                         cast_key_cache,
@@ -681,7 +681,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 
             # Prefix cache
             if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
-                xtorch_ops.prefill_attention(
+                kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=key_cache, # Key Cache [block_num, head, block_size, dim]
                     v=value_cache,
@@ -697,7 +697,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     softmax_lse=None
                 )
             else:
-                xtorch_ops.prefill_attention(
+                kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=prefill_key,
                     v=prefill_value,
@@ -724,9 +724,9 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             else:
                 tmp_block_tables = decode_meta.block_tables * 2 # only test in Qwen3-Next
             
-            sig = inspect.signature(xtorch_ops.speculative_attention)
+            sig = inspect.signature(kunlun_ops.speculative_attention)
             if "max_window_size" in sig.parameters:
-                xtorch_ops.speculative_attention(
+                kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],
                     # Only MLA support q len > 1 right now         
                     q=decode_query.unsqueeze(0),                
@@ -750,7 +750,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     sink = self.sinks.to(torch.float32) if self.sinks is not None else None          
                 )
             else:
-                xtorch_ops.paged_attention(
+                kunlun_ops.paged_attention(
                     x=decode_query,
                     k_cache=key_cache,
                     v_cache=value_cache,
