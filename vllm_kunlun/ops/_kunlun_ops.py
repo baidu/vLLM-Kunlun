@@ -492,21 +492,27 @@ class KunlunOps:
             ouput = (out.view(M, moe_top_k, N) * normed_score.unsqueeze(2)).sum(dim=1).to(hidden_states.dtype)
             return ouput
         else:
-            moe_expand = torch.empty((M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device) # [M*top_k, N], float
-            expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)             # [E]
-            sorted_tokens_num_lod = torch.zeros(global_num_experts + 1, dtype=torch.int32, device=hidden_states.device)  # [E+1]
-            sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=hidden_states.device)
             
-            torch.ops._C.gen_block_statistic(topk_ids,block_statistic)
+            if M * moe_top_k > 768:
+                moe_expand = torch.empty((M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device) # [M*top_k, N], float
+                expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)             # [E]
+                sorted_tokens_num_lod = torch.zeros(global_num_experts + 1, dtype=torch.int32, device=hidden_states.device)  # [E+1]
+                sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=hidden_states.device)
 
-            torch.ops._C.moe_pre_sorted(
-                x=hidden_states,
-                topk_index=topk_ids,
-                block_statistic=block_statistic,
-                moe_expand=moe_expand,
-                moe_index=sorted_tokens_idx,
-                expert_m=expert_m,
-                sorted_tokens_num_lod=sorted_tokens_num_lod)
+                torch.ops._C.gen_block_statistic(topk_ids,block_statistic)
+
+                torch.ops._C.moe_pre_sorted(
+                    x=hidden_states,
+                    topk_index=topk_ids,
+                    block_statistic=block_statistic,
+                    moe_expand=moe_expand,
+                    moe_index=sorted_tokens_idx,
+                    expert_m=expert_m,
+                    sorted_tokens_num_lod=sorted_tokens_num_lod)
+            else:
+                sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = torch.ops.xspeedgate_ops.moe_pre_small(
+                    topk_ids, global_num_experts, index_have_neg=False, sort_mode=True, x=hidden_states
+                )
 
             y = torch.empty(M,moe_top_k,
                     w1.shape[1],
