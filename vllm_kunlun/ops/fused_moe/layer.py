@@ -132,5 +132,4 @@ class VllmFusedMoE(FusedMoE):
         self.has_bias=has_bias
         self.register_parameter("w13_bias", None)
         self.register_parameter("w2_bias", None)
-
 FusedMoE=VllmFusedMoE

@@ -10,6 +10,7 @@
 import warnings
 from typing import Optional
 import torch.nn.functional as F
+import cocopod
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,9 @@ from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
 from vllm.distributed import get_tensor_model_parallel_rank
+from .index import prepare_chunk_indices, prepare_chunk_offsets
+import xspeedgate_ops
+import cocopod
 
 
 def torch_solve_tril(A: torch.Tensor, cu_seqlens: Optional[torch.LongTensor] = None, output_dtype: torch.dtype = torch.float,):
@@ -33,7 +37,9 @@ def torch_solve_tril(A: torch.Tensor, cu_seqlens: Optional[torch.LongTensor] = N
     pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     A = F.pad(A, (0, 0, 0, pad_size))
     A = A.reshape(A.shape[0], A.shape[1], -1, chunk_size, A.shape[-1])
+    # mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=A.device), diagonal=0)
 
+    # A = A.masked_fill(mask, 0)
     for i in range(1, chunk_size):
         row = A[..., i, :i].clone()
         sub = A[..., :i, :i].clone()
@@ -113,19 +119,38 @@ def chunk_gated_delta_rule_fwd(q: torch.Tensor,
                                initial_state: torch.Tensor,
                                output_final_state: bool,
                                cu_seqlens: Optional[torch.LongTensor] = None):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    A = chunk_scaled_dot_kkt_fwd(k=k,
-                                 beta=beta,
-                                 g_cumsum=g,
-                                 cu_seqlens=cu_seqlens,
-                                 output_dtype=q.dtype)
+    chunk_size = 64
+    chunk_indices = prepare_chunk_indices(
+        cu_seqlens, 64) if cu_seqlens is not None else None
+    chunk_offsets = prepare_chunk_offsets(cu_seqlens, chunk_size) if cu_seqlens is not None else None
+
+    # !
+    # g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+    g = torch.ops.xspeedgate_ops.chunk_local_cumsum(g, chunk_size=64, reverse=False, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, head_first=False)
+
+    # !
+    # A = chunk_scaled_dot_kkt_fwd(k=k,
+    #                              beta=beta,
+    #                              g_cumsum=g,
+    #                              cu_seqlens=cu_seqlens,
+    #                              output_dtype=q.dtype)
+    A = torch.ops.xspeedgate_ops.chunk_scaled_dot_kkt_fwd(k, beta, g, cu_seqlens, chunk_indices, chunk_size)
+
 
     #torch版
     # if get_tensor_model_parallel_rank() == 0:
     #     torch.save(A, "A_in")
     #     torch.save(cu_seqlens, "cu_seqlens")
-    tmp_cu_seqlens = split_by_value(cu_seqlens)
-    torch.ops.xspeedgate_ops.solve_tril_fwd(A, tmp_cu_seqlens)
+    # A2 = A.clone()
+    torch.ops.xspeedgate_ops.solve_tril_ns(A, cu_seqlens, chunk_indices, chunk_size)
+
+    # !
+    # torch.ops.xspeedgate_ops.solve_tril_fwd(A, cu_seqlens)
+    # if get_tensor_model_parallel_rank() == 0:
+    #     err = torch.max(torch.abs(A - A2))
+    #     print("err", err)
+    #     if err > 1e-3:
+    #         raise
     # A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     # for i in range(len(cu_seqlens)-1):
     #     A_i = A[:, cu_seqlens[i]:cu_seqlens[i+1], :, :]
@@ -153,6 +178,17 @@ def chunk_gated_delta_rule_fwd(q: torch.Tensor,
         w[:, cu_seqlens[i]:cu_seqlens[i+1], :, :] = w_i
         u[:, cu_seqlens[i]:cu_seqlens[i+1], :, :] = u_i
     '''
+    w, u = torch.ops.xspeedgate_ops.recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        g_cumsum=g,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=64
+    )
+    '''
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -161,15 +197,55 @@ def chunk_gated_delta_rule_fwd(q: torch.Tensor,
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
     )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    '''
+
+    # i
+    # import os
+    # if not os.path.exists("/qwen-next/in"):
+    #     os.makedirs("/qwen-next/in")
+    #     torch.save(k, "/qwen-next/in/k.pt")
+    #     torch.save(u, "/qwen-next/in/u.pt")
+    #     torch.save(w, "/qwen-next/in/w.pt")
+    #     torch.save(g, "/qwen-next/in/g.pt")
+    #     torch.save(initial_state, "/qwen-next/in/initial_state.pt")
+    #     torch.save(cu_seqlens, "/qwen-next/in/cu_seqlens.pt")
+    #     torch.save(chunk_indices, "/qwen-next/in/chunk_indices.pt")
+    #     torch.save(chunk_offsets.to(torch.int32), "/qwen-next/in/chunk_offsets.pt")
+    #     torch.save(chunk_size, "/qwen-next/in/chunk_size.pt")
+    #     torch.save(output_final_state, "/qwen-next/in/output_final_state.pt")
+
+    h, v_new, final_state = torch.ops.xspeedgate_ops.chunk_gated_delta_rule_fwd_h(
+                            k, u, w, g, initial_state, cu_seqlens, chunk_indices,
+                            chunk_offsets.to(torch.int32), chunk_size, output_final_state, True)
+
+    # h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+    #     k=k,
+    #     w=w,
+    #     u=u,
+    #     g=g,
+    #     initial_state=initial_state,
+    #     output_final_state=output_final_state,
+    #     cu_seqlens=cu_seqlens,
+    # )
+    # if not os.path.exists("/qwen-next/out"):
+    #     os.makedirs("/qwen-next/out")
+    #     torch.save(h, "/qwen-next/out/h.pt")
+    #     torch.save(v_new, "/qwen-next/out/v_new.pt")
+    #     torch.save(final_state, "/qwen-next/out/final_state.pt")
+
+
+    o = torch.ops.xspeedgate_ops.chunk_fwd_o(
+        q=q,
         k=k,
-        w=w,
-        u=u,
+        v=v_new,
+        h=h,
         g=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
+        scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=64
     )
+    '''
     o = chunk_fwd_o(
         q=q,
         k=k,
@@ -179,6 +255,7 @@ def chunk_gated_delta_rule_fwd(q: torch.Tensor,
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+    '''
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:
@@ -331,7 +408,7 @@ def chunk_gated_delta_rule(q: torch.Tensor,
     if scale is None:
         scale = k.shape[-1]**-0.5
 
-    if True:
+    if False:
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()

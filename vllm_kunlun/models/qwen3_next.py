@@ -484,8 +484,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor_cpu = attn_metadata.non_spec_state_indices_tensor_cpu
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-        # conv_state = self_kv_cache[0].transpose(-1, -2)
         conv_state = self_kv_cache[0]
+        # if attn_metadata.num_prefills > 0:
+        #     conv_state = self_kv_cache[0].transpose(-1, -2)
+        # else:
+        #     conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
@@ -537,12 +540,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: process the remaining part
         if attn_metadata.num_prefills > 0:
-            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            # mixed_qkv_non_spec = mixed_qkv_non_spec_T.transpose(0, 1)
             mixed_qkv_non_spec = causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
+                mixed_qkv_non_spec,
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -551,7 +552,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
-            ).transpose(0, 1)
+            )
         elif attn_metadata.num_decodes > 0:
             # mixed_qkv_non_spec = mixed_qkv_non_spec
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -840,6 +841,9 @@ class Qwen3NextAttention(nn.Module):
             partial_rotary_factor=config.partial_rotary_factor,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
+        self.rotary_dim = self.head_dim
+        if config.partial_rotary_factor < 1.0:
+            self.rotary_dim = int(self.rotary_dim * config.partial_rotary_factor)
 
         self.attn = Attention(
             self.num_heads,
@@ -867,6 +871,24 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
+        # if self.attn_output_gate:
+        #     q_gate, k, v = qkv.split(
+        #         [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        #     orig_shape = q_gate.shape[:-1]
+        #     q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+        #     q, gate = torch.chunk(q_gate, 2, dim=-1)
+        #     q = q.reshape(*orig_shape, -1)
+        #     gate = gate.reshape(*orig_shape, -1)
+        # else:
+        #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+        #                         dim=-1)
+
+        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+        #     -1, self.num_heads * self.head_dim)
+        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+        #     -1, self.num_kv_heads * self.head_dim)
+
+        # q, k = self.rotary_emb(positions, q, k)
         q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
             qkv=qkv,
             q_weights=self.q_norm.weight,

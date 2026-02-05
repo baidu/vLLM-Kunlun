@@ -645,22 +645,27 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
-                if key_cache.is_contiguous():
-                    kunlun_ops.reshape_and_cache(
-                        key,
-                        value,
-                        key_cache,
-                        value_cache,
-                        updated_slot_mapping)
-                else:
-                    cast_key_cache = key_cache.squeeze(1).unsqueeze(-2)
-                    cast_value_cache = value_cache.squeeze(1).unsqueeze(-2)
-                    kunlun_ops.reshape_and_cache_flash(
-                        key,
-                        value,
-                        cast_key_cache,
-                        cast_value_cache,
-                        updated_slot_mapping)
+                # if key_cache.is_contiguous():
+                kunlun_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    updated_slot_mapping,
+                    BLHD_LAYOUT=False)
+                # else:
+                #     cast_key_cache = key_cache.squeeze(1).unsqueeze(-2)
+                #     cast_value_cache = value_cache.squeeze(1).unsqueeze(-2)
+                #     # print("key", key.shape)
+                #     # print("value", value.shape)
+                #     # print("cast_key_cache", cast_key_cache.shape)
+                #     # print("cast_value_cache", key_cache.shape)
+                #     kunlun_ops.reshape_and_cache_flash(
+                #         key,
+                #         value,
+                #         cast_key_cache,
+                #         cast_value_cache,
+                #         updated_slot_mapping)
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
@@ -684,52 +689,27 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             if key_cache.is_contiguous():
                 tmp_block_tables = prefill_meta.block_tables
             else:
-                # For hybrid Attention (Qwen3-Next)
-                tmp_block_tables = prefill_meta.block_tables * 2 
-                
-            # Prefix cache
-            # if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
-            #     kunlun_ops.prefill_attention(
-            #         q=prefill_query,
-            #         k=key_cache, # Key Cache [block_num, head, block_size, dim]
-            #         v=value_cache,
-            #         out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
-            #         is_causal=True,
-            #         is_prefix_cache=True, 
-            #         block_table=tmp_block_tables, 
-            #         context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-            #         context_qlen_lod_xpu=prefill_meta.query_start_loc,
-            #         context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-            #         context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-            #         alibi_slopes=self.alibi_slopes,
-            #         softmax_lse=None
-            #     )
-            # else:
-            #     kunlun_ops.prefill_attention(
-            #         q=prefill_query,
-            #         k=prefill_key,
-            #         v=prefill_value,
-            #         out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
-            #         is_causal=True,
-            #         context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-            #         context_qlen_lod_xpu=prefill_meta.query_start_loc,
-            #         alibi_slopes=self.alibi_slopes,
-            #         softmax_lse=None, 
-            #         swa_left = self.sliding_window if self.sliding_window is not None else -1,
-            #         swa_right = 0 if self.sliding_window is not None else -1,
-            #         sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
-            #     )
+                tmp_block_tables = prefill_meta.block_tables * 2 # only test in Qwen3-Next
 
-            prefill_query = query[num_decode_tokens:attn_metadata.num_actual_tokens]
-            prefill_key = key[num_decode_tokens:attn_metadata.num_actual_tokens]
-            prefill_value = value[num_decode_tokens:attn_metadata.num_actual_tokens]
-            assert prefill_query.shape[0] == num_prefill_tokens
-            output[num_decode_tokens:attn_metadata.num_actual_tokens] = KunlunOps.multi_query_kv_attention(
-                            prefill_meta.query_start_loc,prefill_meta.query_start_loc_host, prefill_query, prefill_key, prefill_value,
-                            alibi_slopes=self.alibi_slopes).view_as(prefill_query)
+            kunlun_ops.prefill_attention(
+                q=prefill_query,
+                k=key_cache, # Key Cache (block_num, head, block_size, dim)
+                v=value_cache,
+                out=output[num_decode_tokens:attn_metadata.num_actual_tokens],
+                is_causal=True,
+                is_prefix_cache=True,
+                block_table=tmp_block_tables,
+                context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                alibi_slopes=self.alibi_slopes,
+                softmax_lse=None,
+                sink=self.sinks
+            )
+            '''
 
-
-        if decode_meta := attn_metadata.decode_metadata:    
+        if decode_meta := attn_metadata.decode_metadata:
             assert attn_type != AttentionType.ENCODER_ONLY, (
                 "Encoder-only models should not have decode metadata.")
             decode_query = query[:num_decode_tokens]

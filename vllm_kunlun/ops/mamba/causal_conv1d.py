@@ -969,34 +969,21 @@ def causal_conv1d_fn(
     x = x.contiguous()
     out = torch.empty_like(x)
     has_initial_state = has_initial_state.to(torch.int32)
-    dim = x.shape[-2]
-    cu_seqlen = x.shape[-1]
+    dim = x.shape[-1]
+    cu_seqlen = x.shape[-2]
     width = weight.shape[-1]
     num_cache_lines = conv_states.shape[0]
     state_width = conv_states.shape[-2]
     batch_size = query_start_loc.shape[0] - 1
-
-    tmp_conv_states = conv_states[cache_indices].transpose(-1, -2).contiguous()
-    tmp_cache_indices = torch.arange(batch_size, dtype=torch.int32, device=cache_indices.device)
-    num_cache_lines = tmp_conv_states.shape[0]
+    stride = conv_states.stride()[0]
 
     import kunlun_ops
-    kunlun_ops.causal_conv1d_fn(x, out, dim, cu_seqlen, weight, width, tmp_conv_states, num_cache_lines,
+    kunlun_ops.causal_conv1d_fn(x, out, dim, cu_seqlen, weight, width, conv_states, num_cache_lines,
                                 state_width, query_start_loc.cpu(), query_start_loc, batch_size, bias,
-                                cache_indices_cpu=tmp_cache_indices.cpu(), cache_indices_xpu=tmp_cache_indices,
+                                cache_indices_cpu=cache_indices.cpu(), cache_indices_xpu=cache_indices,
                                 has_initial_state_cpu=has_initial_state.cpu(), has_initial_state_xpu=has_initial_state,
-                                act=None)
-    tmp_conv_states = tmp_conv_states.transpose(-1, -2).contiguous().view(tmp_conv_states.shape[0], conv_states.shape[1] * 1024, conv_states.shape[2] // 1024)
-    cast_conv_states = conv_states.view(conv_states.shape[0], 1, conv_states.shape[1] * 1024, conv_states.shape[2] // 1024)
-    kunlun_ops.reshape_and_cache_flash(
-                        tmp_conv_states,
-                        tmp_conv_states,
-                        cast_conv_states,
-                        cast_conv_states,
-                        cache_indices)
-    # conv_states[cache_indices] = tmp_conv_states.transpose(-1, -2).contiguous()
-    out = torch.nn.functional.silu(out)
-
+                                act="SWISH", state_seq_stride=stride)
+    # out = torch.nn.functional.silu(out)
     return out
 
 def torch_causal_conv1d_update(
@@ -1570,11 +1557,11 @@ def causal_conv1d_update(
                     bias,
                     conv_state_indices_cpu=conv_state_indices_cpu,
                     conv_state_indices_xpu=conv_state_indices,
-                    act=None,
+                    act="SWISH",
                     state_seq_stride=stride,
                     is_ncw=False
         )
-        out = F.silu(out)
+        # out = F.silu(out)
         out = out.squeeze(1)
         return out
         return torch_causal_conv1d_update(
