@@ -17,7 +17,7 @@
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 import xtorch_ops
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, ClassVar, Tuple, Type, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, TypeVar, ClassVar, Tuple, Type, TYPE_CHECKING
 
 import torch
 import numpy as np
@@ -208,6 +208,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_decodes: int = 0
+    is_speculative: Optional[bool] = False
+    max_model_len: int = 0
 
     def __post_init__(self):
         """__post_init__"""
@@ -314,7 +316,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables,
             enable_kv_scales_calculation=False,
-            use_cascade=self.use_cascade)
+            use_cascade=self.use_cascade,
+            is_speculative=self.is_speculative)
         return self._cached_prefill_metadata
 
     @property
@@ -338,7 +341,6 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
                            self.seq_lens_tensor[:-self.num_prefills])
             seq_lens_tensor_cpu = (None if self.seq_lens_tensor_cpu is None else
                            self.seq_lens_tensor_cpu[:-self.num_prefills])
-
             block_tables = (None if self.block_tables is None else
                         self.block_tables[:-self.num_prefills])
         else:
@@ -347,11 +349,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
                         self.slot_mapping)
             seq_lens_tensor = (None if self.seq_lens_tensor is None else
                            self.seq_lens_tensor)
-
             seq_lens_tensor_cpu = (None if self.seq_lens_tensor_cpu is None else
                            self.seq_lens_tensor_cpu)
-
-
             block_tables = (None if self.block_tables is None else
                         self.block_tables)
 
@@ -378,10 +377,11 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables,
             enable_kv_scales_calculation=False,
-            use_cascade=self.use_cascade)
+            use_cascade=self.use_cascade,
+            is_speculative=self.is_speculative)
         return self._cached_decode_metadata
 
-
+M = TypeVar("M")
 
 class KunlunAttentionMetadataBuilder:
     """KunlunAttentionMetadataBuilder"""
@@ -406,6 +406,33 @@ class KunlunAttentionMetadataBuilder:
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+
+    def _init_reorder_batch_threshold(
+        self,
+        reorder_batch_threshold: int | None = 1,
+        supports_spec_as_decode: bool = False,
+        supports_dcp_with_varlen: bool = False,
+    ) -> None:
+        self.reorder_batch_threshold = reorder_batch_threshold
+        if self.reorder_batch_threshold is not None and supports_spec_as_decode:
+            # If the backend supports spec-as-decode kernels, then we can set
+            # the reorder_batch_threshold based on the number of speculative
+            # tokens from the config.
+            speculative_config = self.vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.num_speculative_tokens is not None
+            ):
+                self.reorder_batch_threshold = max(
+                    self.reorder_batch_threshold,
+                    1 + speculative_config.num_speculative_tokens,
+                )
+
+        if (
+            self.vllm_config.parallel_config.decode_context_parallel_size > 1
+            and not supports_dcp_with_varlen
+        ):
+            self.reorder_batch_threshold = 1
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -453,6 +480,27 @@ class KunlunAttentionMetadataBuilder:
         # slow, so here we set it to 1.
         attn_metadata.seq_lens_tensor.fill_(1)
         return attn_metadata
+    
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> M:
+        """
+        Build attention metadata for draft model. Uses build by default.
+
+        Args:
+            common_attn_metadata: The common attention metadata.
+            draft_index: The index of the current draft operation.
+                When speculating a chain of tokens, this index refers to the
+                draft attempt for the i-th token.
+                For tree-based attention, this index instead refers to the
+                draft attempt for the i-th level in the tree of tokens.
+        """
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
 
     def build(self, common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata):
@@ -483,9 +531,18 @@ class KunlunAttentionMetadataBuilder:
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)
+
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold or 1,
+                require_uniform=True,
+            )
+        )
         
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
-            split_decodes_and_prefills(common_attn_metadata)
+        # num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
+        #     split_decodes_and_prefills(common_attn_metadata)
 
         num_scheduled_tokens = np.diff(common_attn_metadata.query_start_loc_cpu[:num_reqs + 1])
         tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
@@ -507,6 +564,7 @@ class KunlunAttentionMetadataBuilder:
         attn_metadata = KunlunMetadata(
             num_actual_tokens=num_actual_tokens,
             num_prefills=num_prefills,
+            num_decodes=num_decodes,
             slot_mapping=slot_mapping,
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=True,
@@ -525,6 +583,9 @@ class KunlunAttentionMetadataBuilder:
             block_tables=block_table_tensor,
             use_cuda_graph=False,
             use_cascade=use_cascade,
+            is_speculative=self.reorder_batch_threshold > 1,
+            # max_model_len=self.vllm_config.model_config.max_model_len,
+            max_model_len=max_seq_len,
         )
         return attn_metadata
 
@@ -642,10 +703,21 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
+                # from vllm.distributed import get_tensor_model_parallel_rank
+                # import os
+                # if get_tensor_model_parallel_rank() == 0 and not os.path.exists("/workspace/reshape.pt") and key.shape[0]!=updated_slot_mapping.shape[0]:
+                #     torch.save({'key':key,
+                #         'value':value,
+                #         'key_cache':key_cache,
+                #         'value_cache':value_cache,
+                #         'updated_slot_mapping':updated_slot_mapping}, "/workspace/reshape.pt")
+                        
+                # if get_tensor_model_parallel_rank() == 0:
+                #     print(f"key={key.shape},value={value.shape},key_cache={key_cache.shape},value_cache={value_cache.shape},slot_mapping={updated_slot_mapping.shape},{key_cache.is_contiguous()}",flush=True)
                 if key_cache.is_contiguous():
                     xtorch_ops.reshape_and_cache(
-                        key,
-                        value,
+                        key[:attn_metadata.num_actual_tokens],
+                        value[:attn_metadata.num_actual_tokens],
                         key_cache,
                         value_cache,
                         updated_slot_mapping)
@@ -678,7 +750,12 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             else:
                 # For hybrid Attention (Qwen3-Next)
                 tmp_block_tables = prefill_meta.block_tables * 2 
-                
+            
+            # from vllm.distributed import get_tensor_model_parallel_rank
+            # if get_tensor_model_parallel_rank() == 0:
+            #     print(f"prefill_attention: x={prefill_query.shape}, k={key_cache.shape}, v={value_cache.shape}, "
+            #     f"block_tables={tmp_block_tables.shape}, context_qlen_lod_cpu={prefill_meta.query_start_loc_host.shape}, context_kvlen_lod_cpu={prefill_meta.kv_lod_cpu.shape}", flush=True)
+
             # Prefix cache
             if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
                 xtorch_ops.prefill_attention(
@@ -697,6 +774,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     softmax_lse=None
                 )
             else:
+                # from vllm.distributed import get_tensor_model_parallel_rank
+                # if get_tensor_model_parallel_rank() == 0:
+                #     print(f"prefill_attention: [q={prefill_query.shape},{prefill_query.min().item()},{prefill_query.max().item()},{prefill_query.mean().item()}], "
+                #     f"[k={key_cache.shape},{key_cache.min().item()},{key_cache.max().item()},{key_cache.mean().item()}], "
+                #     f"[v={value_cache.shape},{value_cache.min().item()},{value_cache.max().item()},{value_cache.mean().item()}], "
+                #     f"[block_tables={tmp_block_tables.shape},{tmp_block_tables.min().item()},{tmp_block_tables.max().item()}, ], "
+                #     f"[context_qlen_lod_cpu={prefill_meta.query_start_loc_host.shape},context_qlen_lod_xpu={prefill_meta.query_start_loc.shape}], context_kvlen_lod_cpu={prefill_meta.kv_lod_cpu.shape}, context_kvlen_lod_xpu={prefill_meta.kv_lod_xpu}, "
+                #     f"[alibi_slopes={self.alibi_slopes}], [output={output.shape}]", flush=True)
                 xtorch_ops.prefill_attention(
                     q=prefill_query,
                     k=prefill_key,
@@ -711,7 +796,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     swa_right = 0 if self.sliding_window is not None else -1,
                     sink = self.sinks.to(torch.float32) if self.sinks is not None else None   
                 )
-
 
         if decode_meta := attn_metadata.decode_metadata:    
             assert attn_type != AttentionType.ENCODER_ONLY, (
@@ -749,7 +833,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     block_tables=tmp_block_tables,          
                     sink = self.sinks.to(torch.float32) if self.sinks is not None else None          
                 )
-            else:
+            elif not attn_metadata.is_speculative:
+                # from vllm.distributed import get_tensor_model_parallel_rank
+                # if get_tensor_model_parallel_rank() == 0:
+                #     print(f"paged_attention: [x={decode_query.shape}, {decode_query.min().item()},{decode_query.max().item()},{decode_query.mean().item()}], "
+                #     f"[k_cache={key_cache.shape},{key_cache.min().item()},{key_cache.max().item()},{key_cache.mean().item()}], "
+                #     f"[v_cache={value_cache.shape},{value_cache.min().item()},{value_cache.max().item()},{value_cache.mean().item()}], "
+                #     f"[block_tables={tmp_block_tables.shape},{tmp_block_tables.min().item()},{tmp_block_tables.max().item()}, ], "
+                #     f"context_lens_cpu={decode_meta.seq_lens_tensor_cpu.shape}, context_lens_xpu={decode_meta.seq_lens_tensor}", flush=True)
                 xtorch_ops.paged_attention(
                     x=decode_query,
                     k_cache=key_cache,
@@ -761,7 +852,68 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     is_causal=True,
                     out=output[:num_decode_tokens],
                     vo_head_dim=self.head_size
-                )      
+                )  
+            else:
+                batch_size = attn_metadata.num_decodes
+                query_seq_len, head_num, head_dim = decode_query.shape
+                assert query_seq_len % batch_size == 0
+                qlen = query_seq_len // batch_size 
+                out = output[:num_decode_tokens]
+                assert out.is_contiguous()
+
+                # from vllm.distributed import get_tensor_model_parallel_rank
+                # if get_tensor_model_parallel_rank() == 0 and decode_meta.seq_lens_tensor_cpu.shape[0] > 1:
+                #    print(f"out={out.shape}-{out.dtype}, decode_query={decode_query.shape}-{decode_query.dtype}, "
+                #    f"key_cache={key_cache.shape}-{key_cache.dtype}, value_cache={value_cache.shape}-{value_cache.dtype}, "
+                #    f"block_tables={tmp_block_tables.shape}-{tmp_block_tables.dtype}, "
+                #    f"seq_lens_tensor_cpu={decode_meta.seq_lens_tensor_cpu.shape}-{decode_meta.seq_lens_tensor_cpu.dtype}, seq_lens_tensor={decode_meta.seq_lens_tensor}")
+                xtorch_ops.speculative_attention(
+                    out=out.view(batch_size, qlen, head_num, self.head_size),       
+                    q=decode_query.view(batch_size, qlen, head_num, head_dim),                
+                    k_cache=key_cache,                  
+                    v_cache=value_cache,                        
+                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu, 
+                    context_lens_xpu=decode_meta.seq_lens_tensor,  
+                    batch_num=batch_size,                   
+                    qlen=qlen,                             
+                    max_context_len=attn_metadata.max_model_len,                  
+                    head_num=self.num_heads,                      
+                    head_dim=self.head_size,                   
+                    scale=0.0,                                 
+                    kv_head_num=self.num_kv_heads,                   
+                    block_size=key_cache.shape[2],                            
+                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1], 
+                    block_tables=tmp_block_tables,                
+                )
+                # xtorch_ops.speculative_attention(
+                #     out=out,       
+                #     q=decode_query,                
+                #     k_cache=key_cache,                  
+                #     v_cache=value_cache,                        
+                #     context_lens_cpu=decode_meta.seq_lens_tensor_cpu, 
+                #     context_lens_xpu=decode_meta.seq_lens_tensor,  
+                #     batch_num=batch_size,                   
+                #     qlen=qlen,                             
+                #     max_context_len=attn_metadata.max_model_len,                  
+                #     head_num=self.num_heads,                      
+                #     head_dim=self.head_size,                   
+                #     scale=0.0,                                 
+                #     kv_head_num=self.num_kv_heads,                   
+                #     block_size=key_cache.shape[2],                            
+                #     max_num_blocks_per_seq=decode_meta.block_tables.shape[1], 
+                #     block_tables=tmp_block_tables,                
+                # )    
+                
+
+                # naive_speculative_attention_pa(
+                #     out=out.view(batch_size, qlen, head_num, self.head_size),       
+                #     q=decode_query.view(batch_size, qlen, head_num, head_dim),                
+                #     k_cache=key_cache,                  
+                #     v_cache=value_cache, 
+                #     head_dim=self.head_size,                      
+                #     context_lens=attn_metadata.seq_lens_tensor_cpu[:attn_metadata.num_decodes], 
+                #     block_tables=attn_metadata.block_tables[:attn_metadata.num_decodes],  
+                # ) 
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 def use_cascade_attention(
