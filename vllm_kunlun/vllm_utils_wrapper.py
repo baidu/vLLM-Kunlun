@@ -12,6 +12,14 @@ import vllm.envs as envs
 import vllm.utils as _orig
 from torch.library import Library, register_fake
 
+try:
+    import vllm_kunlun._kunlun  # noqa: F401
+except ImportError as e:
+    try:
+        from . import _kunlun  # noqa: F401, F403
+    except ImportError:
+        print(f"Warning: Failed to load vllm_kunlun native extension: {e}")
+
 
 def patch_annotations_for_schema(func):
     """patch_annotations_for_schema"""
