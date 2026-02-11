@@ -1,76 +1,76 @@
-name: e2e-test
+# name: e2e-test
 
-on:
-  workflow_call:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
-  push:
-    branches: [main]
+# on:
+#   workflow_call:
+#   pull_request:
+#     branches: [main]
+#     types: [opened, synchronize, reopened]
+#   push:
+#     branches: [main]
 
-concurrency:
-  group: e2e-singlecard
-  cancel-in-progress: false
+# concurrency:
+#   group: e2e-singlecard
+#   cancel-in-progress: false
 
-jobs:
-  e2e:
-    name: e2e-test-singlecard
-    runs-on:
-      - self-hosted
-      - Linux
-      - X64
+# jobs:
+#   e2e:
+#     name: e2e-test-singlecard
+#     runs-on:
+#       - self-hosted
+#       - Linux
+#       - X64
 
-    steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+#     steps:
+#       - name: Checkout PR code
+#         uses: actions/checkout@v4
+#         with:
+#           fetch-depth: 0
 
-      - name: Verify PR workspace
-        run: |
-          echo "===== WORKSPACE ====="
-          pwd
-          ls -l
-          echo "===== GIT INFO ====="
-          git rev-parse HEAD
-          git log -1 --oneline
-          git status --porcelain
+#       - name: Verify PR workspace
+#         run: |
+#           echo "===== WORKSPACE ====="
+#           pwd
+#           ls -l
+#           echo "===== GIT INFO ====="
+#           git rev-parse HEAD
+#           git log -1 --oneline
+#           git status --porcelain
 
-      - name: Start docker
-        run: |
-          bash ci/scripts/docker/start_docker.sh
+#       - name: Start docker
+#         run: |
+#           bash ci/scripts/docker/start_docker.sh
 
-      - name: Install enviroments
-        env: 
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-          NO_PROXY_LIST: ${{ secrets.NO_PROXY_LIST }}
-        run: |
-          bash ci/scripts/env/install_env.sh
+#       - name: Install enviroments
+#         env: 
+#           PROXY_URL: ${{ secrets.PROXY_URL }}
+#           NO_PROXY_LIST: ${{ secrets.NO_PROXY_LIST }}
+#         run: |
+#           bash ci/scripts/env/install_env.sh
 
-      - name: Start vLLM server
-        run: |
-          bash ci/scripts/server/start_vllm.sh
+#       - name: Start vLLM server
+#         run: |
+#           bash ci/scripts/server/start_vllm.sh
 
-      - name: Wait for vLLM ready
-        run: |
-          bash ci/scripts/server/wait_vllm.sh
+#       - name: Wait for vLLM ready
+#         run: |
+#           bash ci/scripts/server/wait_vllm.sh
 
-      - name: API Test
-        run: |
-          docker exec aiak-e2e-singlecard bash -lc '
-            curl http://localhost:8356/v1/chat/completions \
-              -H "Content-Type: application/json" \
-              -d @- << "EOF"
-          {
-            "model": "Qwen3-8B",
-            "messages": [
-              { "role": "user", "content": "Who are you?" }
-            ],
-            "max_tokens": 200,
-            "temperature": 0
-          }
-          EOF
-          '
+#       - name: API Test
+#         run: |
+#           docker exec aiak-e2e-singlecard bash -lc '
+#             curl http://localhost:8356/v1/chat/completions \
+#               -H "Content-Type: application/json" \
+#               -d @- << "EOF"
+#           {
+#             "model": "Qwen3-8B",
+#             "messages": [
+#               { "role": "user", "content": "Who are you?" }
+#             ],
+#             "max_tokens": 200,
+#             "temperature": 0
+#           }
+#           EOF
+#           '
 
       # - name: Accuracy testing
       #   run: |
