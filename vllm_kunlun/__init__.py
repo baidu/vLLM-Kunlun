@@ -47,6 +47,16 @@ def register():
     """Register the Kunlun platform"""
     from .utils import redirect_output
     from .vllm_utils_wrapper import direct_register_custom_op, patch_annotations_for_schema
+    
+    # Change for GLM5
+    if "vllm.transformers_utils.config" in sys.modules:
+        from .transformer_utils.config import _XPU_CONFIG_REGISTRY
+        sys.modules["vllm.transformers_utils.config"]._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
+    
+    import vllm.config.model as model_module
+    from .config.model import is_deepseek_mla
+    model_module.ModelConfig.is_deepseek_mla = property(is_deepseek_mla)
+    
     import_hook()
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
 
