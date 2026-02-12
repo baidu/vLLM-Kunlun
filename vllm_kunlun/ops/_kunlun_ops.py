@@ -195,10 +195,6 @@ class KunlunOps:
         query_x = query.contiguous()
         key_x = key.contiguous()
 
-        num_tokens = query_x.shape[0]
-        num_heads = query_x.shape[1] // head_size
-        num_kv_heads = key_x.shape[1] // head_size
-
         torch.ops._C.rotary_embedding(
             positions,
             query_x,
@@ -206,9 +202,6 @@ class KunlunOps:
             head_size,
             cos_sin_cache,
             is_neox_style)
-
-        query_x = query_x.view(num_tokens, num_heads * head_size)
-        key_x = key_x.view(num_tokens, num_kv_heads * head_size)
 
         return query_x, key_x
 
