@@ -500,6 +500,14 @@ class KunlunOps:
             #     attn_metadata = attn_metadata[prefix]
             
             # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
+            if M * moe_top_k < 400:
+                sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = torch.ops.xspeedgate_ops.moe_pre_small(
+                    topk_ids, global_num_experts, False, False, hidden_states)
+                experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(topk_ids, global_num_experts, False)
+                out = torch.ops.xspeedgate_ops.fused_moe(hidden_states, w1, w2, normed_score.to(hidden_states.dtype),
+                    sorted_tokens_num_lod, sorted_tokens_idx, experts_num_lod)
+                return out.sum(1)
+            
             if M * moe_top_k > 768:
                 moe_expand = torch.empty((M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device) # [M*top_k, N], float
                 expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)             # [E]
