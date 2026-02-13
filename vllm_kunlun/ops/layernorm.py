@@ -21,7 +21,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as OriGemmaRMSNorm
 from vllm.model_executor.layers import layernorm
 from typing import Optional, Union
-import xtorch_ops
+import kunlun_ops
 
 def vllm_kunlun_forward_cuda(
         self,

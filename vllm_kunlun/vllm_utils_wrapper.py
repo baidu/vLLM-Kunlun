@@ -1,16 +1,24 @@
 """vllm_utils_wrapper.py"""
 
-import vllm.distributed.parallel_state as parallel_state
-import vllm.utils as _orig
-from typing import Any, Callable, Optional, Union, get_origin, get_args, List, Tuple
-from types import SimpleNamespace
-import torch
-from torch.library import Library
 import inspect
+import socket
 import typing
-from torch.library import register_fake
-import vllm_kunlun._kunlun
+from types import SimpleNamespace
+from typing import Any, Callable, List, Optional, Tuple, Union, get_args, get_origin
+
+import torch
+import vllm.distributed.parallel_state as parallel_state
 import vllm.envs as envs
+import vllm.utils as _orig
+from torch.library import Library, register_fake
+
+try:
+    import vllm_kunlun._kunlun  # noqa: F401
+except ImportError as e:
+    try:
+        from . import _kunlun  # noqa: F401, F403
+    except ImportError:
+        print(f"Warning: Failed to load vllm_kunlun native extension: {e}")
 
 
 def patch_annotations_for_schema(func):
@@ -87,7 +95,7 @@ def direct_register_custom_op(
     import torch.library
 
     if hasattr(torch.library, "infer_schema"):
-        patched_func = patch_annotations_for_schema(op_func)
+        patch_annotations_for_schema(op_func)
         schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
     else:
         # for pytorch 2.4
@@ -153,7 +161,7 @@ _wrapped.weak_ref_tensor = vllm_kunlun_weak_ref_tensor
 _wrapped.weak_ref_tensors = vllm_kunlun_weak_ref_tensors
 _wrapped._get_open_port = _get_open_port
 
-import sys
+import sys  # noqa: E402
 
 sys.modules["vllm.utils"] = _wrapped
 
@@ -204,11 +212,10 @@ parallel_state.GroupCoordinator.all_reduce = vllm_kunlun_all_reduce
 parallel_state.GroupCoordinator.all_gather = vllm_kunlun_all_gather
 
 
-from torch.library import custom_op, impl
-import torch
-from vllm import _custom_ops as ops
-from typing import Optional, List
-import os
+from typing import Optional  # noqa: E402
+
+import torch  # noqa: E402
+from torch.library import custom_op, impl  # noqa: E402
 
 
 @custom_op("_C::rms_norm", mutates_args=())
@@ -379,9 +386,9 @@ def silu_and_mul_quant_xpu(
     pass
 
 
-import torch
-import xtorch_ops
-from torch.library import custom_op, impl
+import kunlun_ops  # noqa: E402
+import torch  # noqa: E402
+from torch.library import custom_op, impl  # noqa: E402
 
 
 @custom_op("_C::add_rmsnorm", mutates_args=())
@@ -398,7 +405,7 @@ def add_rmsnorm(
     residual_output: torch.Tensor = None,
     output_max: torch.Tensor = None,
 ) -> None:
-    xtorch_ops.add_rmsnorm(
+    kunlun_ops.add_rmsnorm(
         x,
         y,  # 原来写 residual，这里其实是 y
         residual_output=residual_output,
@@ -422,7 +429,7 @@ def add_rmsnorm_cuda(
     residual_output: torch.Tensor = None,
     output_max: torch.Tensor = None,
 ) -> None:
-    xtorch_ops.add_rmsnorm(
+    kunlun_ops.add_rmsnorm(
         x,
         y,
         residual_output=residual_output,
@@ -444,7 +451,7 @@ def rmsnorm(
     residual_output: torch.Tensor = None,
     output_max: torch.Tensor = None,
 ) -> None:
-    xtorch_ops.rmsnorm(
+    kunlun_ops.rmsnorm(
         x,
         weight,
         output,
@@ -464,7 +471,7 @@ def rmsnorm_cuda(
     residual_output: torch.Tensor = None,
     output_max: torch.Tensor = None,
 ) -> None:
-    xtorch_ops.rmsnorm(
+    kunlun_ops.rmsnorm(
         x,
         weight,
         output,
@@ -472,7 +479,7 @@ def rmsnorm_cuda(
     )
 
 
-import torch
+import torch  # noqa: E402
 
 
 def _fake_rmsnorm(
@@ -534,7 +541,7 @@ def split_norm_rope_neox(
     rotary_dim: int,
     emb_batch_size: int = 1,
 ) -> None:
-    xtorch_ops.split_norm_rope_neox(
+    kunlun_ops.split_norm_rope_neox(
         q_emb,
         k_emb,
         v_out,
@@ -570,7 +577,7 @@ def split_norm_rope_neox_cuda(
     rotary_dim: int,
     emb_batch_size: int = 1,
 ) -> None:
-    xtorch_ops.split_norm_rope_neox(
+    kunlun_ops.split_norm_rope_neox(
         q_emb,
         k_emb,
         v_out,
@@ -618,7 +625,6 @@ split_norm_rope_neox.register_fake(_fake_split_norm_rope_neox)
 
 # register fake op impl here
 # for torch.dynamo
-from torch.library import register_fake
 
 if hasattr(torch.ops.custom_ops, "fc_fusion"):
 
@@ -643,7 +649,7 @@ if hasattr(torch.ops.custom_ops, "fc_fusion"):
 def silu_and_mul(
     out: torch.Tensor, x: torch.Tensor, axis: int = -1, turn: bool = True
 ) -> None:
-    xtorch_ops.swiglu(
+    kunlun_ops.swiglu(
         x=x,
         y=out,
     )
@@ -653,7 +659,7 @@ def silu_and_mul(
 def silu_and_mul_cuda(
     out: torch.Tensor, x: torch.Tensor, axis: int = -1, turn: bool = True
 ) -> None:
-    xtorch_ops.swiglu(
+    kunlun_ops.swiglu(
         x=x,
         y=out,
     )
@@ -730,7 +736,7 @@ def moe_softmax_topk(
     axis: int = -1,
     turn: bool = True,
 ) -> None:
-    xtorch_ops.moe_softmax_topk(x, normed_score, topk_index, block_statistic)
+    kunlun_ops.moe_softmax_topk(x, normed_score, topk_index, block_statistic)
 
 
 @impl("_C::moe_softmax_topk", "CUDA")
@@ -742,7 +748,7 @@ def moe_softmax_topk_cuda(
     axis: int = -1,
     turn: bool = True,
 ) -> None:
-    xtorch_ops.moe_softmax_topk(x, normed_score, topk_index, block_statistic)
+    kunlun_ops.moe_softmax_topk(x, normed_score, topk_index, block_statistic)
 
 
 def _fake_moe_softmax_topk(
@@ -775,7 +781,7 @@ def moe_ffn_block(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> None:
-    xtorch_ops.moe_ffn_block(
+    kunlun_ops.moe_ffn_block(
         x=x,
         gate_w=gate_w,
         inter_w=inter_w,
@@ -806,7 +812,7 @@ def moe_ffn_block_cuda(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
 ) -> None:
-    xtorch_ops.moe_ffn_block(
+    kunlun_ops.moe_ffn_block(
         x=x,
         gate_w=gate_w,
         inter_w=inter_w,
@@ -857,7 +863,7 @@ def moe_ffn_per_token_block(
     ep_size: int = 1,
     ep_rank: int = 0,
 ) -> None:
-    xtorch_ops.moe_ffn_per_token_block(
+    kunlun_ops.moe_ffn_per_token_block(
         x=x,
         inter_weight=inter_weight,
         inter_scale=inter_scale,
@@ -891,7 +897,7 @@ def moe_ffn_per_token_block_cuda(
     ep_size: int = 1,
     ep_rank: int = 0,
 ) -> None:
-    xtorch_ops.moe_ffn_per_token_block(
+    kunlun_ops.moe_ffn_per_token_block(
         x=x,
         inter_weight=inter_weight,
         inter_scale=inter_scale,
@@ -942,7 +948,7 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    xtorch_ops.rotary_embedding(
+    kunlun_ops.rotary_embedding(
         positions=positions,
         query=query,
         key=key,
@@ -961,7 +967,7 @@ def rotary_embedding_cuda(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    xtorch_ops.rotary_embedding(
+    kunlun_ops.rotary_embedding(
         positions=positions,
         query=query,
         key=key,
@@ -993,7 +999,7 @@ def gemm_I8_I8_bf16_nt(
     weight_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    xtorch_ops.gemm_I8_I8_bf16_nt(
+    kunlun_ops.gemm_I8_I8_bf16_nt(
         lhs=(x_q, x_scale), rhs=(weight, weight_scale), out=out
     )
 
@@ -1006,7 +1012,7 @@ def gemm_I8_I8_bf16_nt_cuda(
     weight_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    xtorch_ops.gemm_I8_I8_bf16_nt(
+    kunlun_ops.gemm_I8_I8_bf16_nt(
         lhs=(x_q, x_scale), rhs=(weight, weight_scale), out=out
     )
 
@@ -1032,7 +1038,7 @@ def moe_softmax_topk_norm(
     block_statistic: torch.Tensor,
     stable: bool = True,
 ) -> None:
-    xtorch_ops.moe_softmax_topk_norm(
+    kunlun_ops.moe_softmax_topk_norm(
         x, normed_score, topk_index, block_statistic, stable
     )
 
@@ -1045,7 +1051,7 @@ def moe_softmax_topk_norm_cuda(
     block_statistic: torch.Tensor,
     stable: bool = True,
 ) -> None:
-    xtorch_ops.moe_softmax_topk_norm(
+    kunlun_ops.moe_softmax_topk_norm(
         x, normed_score, topk_index, block_statistic, stable
     )
 
@@ -1065,14 +1071,14 @@ moe_softmax_topk_norm.register_fake(_fake_moe_softmax_topk_norm)
 
 @custom_op("_C::gen_block_statistic", mutates_args=())
 def gen_block_statistic(topk_ids: torch.Tensor, block_statistic: torch.Tensor) -> None:
-    xtorch_ops.gen_block_statistic(topk_ids, block_statistic)
+    kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
 
 
 @impl("_C::gen_block_statistic", "CUDA")
 def gen_block_statistic_cuda(
     topk_ids: torch.Tensor, block_statistic: torch.Tensor
 ) -> None:
-    xtorch_ops.gen_block_statistic(topk_ids, block_statistic)
+    kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
 
 
 def fake_gen_block_statistic(
@@ -1095,7 +1101,7 @@ def moe_pre_sorted(
     sorted_tokens_num_lod: torch.Tensor,
     index_have_neg: bool = False,
 ) -> None:
-    xtorch_ops.moe_pre_sorted(
+    kunlun_ops.moe_pre_sorted(
         x,
         topk_index,
         block_statistic,
@@ -1117,7 +1123,7 @@ def moe_pre_sorted_cuda(
     sorted_tokens_num_lod: torch.Tensor,
     index_have_neg: bool = False,
 ) -> None:
-    xtorch_ops.moe_pre_sorted(
+    kunlun_ops.moe_pre_sorted(
         x,
         topk_index,
         block_statistic,
@@ -1165,7 +1171,7 @@ def moe_fc(
     use_pack_int4: Optional[bool] = False,
     sort_mode: Optional[bool] = True,
 ) -> None:
-    xtorch_ops.moe_fc(
+    kunlun_ops.moe_fc(
         x=x,
         weight=weight,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
@@ -1208,7 +1214,7 @@ def moe_fc_cuda(
     use_pack_int4: Optional[bool] = False,
     sort_mode: Optional[bool] = True,
 ) -> None:
-    xtorch_ops.moe_fc(
+    kunlun_ops.moe_fc(
         x=x,
         weight=weight,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
@@ -1264,7 +1270,7 @@ def moe_post(
     dequant_scale: torch.Tensor,
     y: torch.Tensor,
 ) -> None:
-    xtorch_ops.moe_post(x, moe_index, normed_scale, dequant_scale, y)
+    kunlun_ops.moe_post(x, moe_index, normed_scale, dequant_scale, y)
 
 
 @impl("_C::moe_post", "CUDA")
@@ -1275,7 +1281,7 @@ def moe_post_cuda(
     dequant_scale: torch.Tensor,
     y: torch.Tensor,
 ) -> None:
-    xtorch_ops.moe_post(x, moe_index, normed_scale, dequant_scale, y)
+    kunlun_ops.moe_post(x, moe_index, normed_scale, dequant_scale, y)
 
 
 def fake_moe_post(
@@ -1302,7 +1308,7 @@ def moe_sigmoid_group_topk_norm(
     n_group: int,
     topk_group: int,
 ) -> None:
-    xtorch_ops.moe_sigmoid_group_topk_norm(
+    kunlun_ops.moe_sigmoid_group_topk_norm(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
@@ -1325,7 +1331,7 @@ def moe_sigmoid_group_topk_norm_cuda(
     n_group: int,
     topk_group: int,
 ) -> None:
-    xtorch_ops.moe_sigmoid_group_topk_norm(
+    kunlun_ops.moe_sigmoid_group_topk_norm(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
@@ -1370,7 +1376,7 @@ def awq_dequantize(
         device=qweight.device,
     )
     group_m = int(qweight.shape[0] / scales.shape[0])
-    xtorch_ops.awq_dequantize(
+    kunlun_ops.awq_dequantize(
         qweight=qweight,
         scales=scales,
         zeros=zeros,
@@ -1396,7 +1402,7 @@ def awq_dequantize_cuda(
         device=qweight.device,
     )
     group_m = int(qweight.shape[0] / scales.shape[0])
-    out = xtorch_ops.awq_dequantize(
+    kunlun_ops.awq_dequantize(
         qweight=qweight,
         scales=scales,
         zeros=zeros,
@@ -1441,7 +1447,7 @@ def awq_gemm(
         (x.shape[0], qweight.shape[1] * 8), dtype=torch.float16, device=x.device
     )
     group_size = int(qweight.shape[0] / scale.shape[0])
-    xtorch_ops.awq_gemm(
+    kunlun_ops.awq_gemm(
         x=x,
         w=qweight,
         scale=scale,
@@ -1465,7 +1471,7 @@ def awq_gemm_cuda(
         (x.shape[0], qweight.shape[1] * 8), dtype=torch.float16, device=x.device
     )
     group_size = int(qweight.shape[0] / scale.shape[0])
-    xtorch_ops.awq_gemm(
+    kunlun_ops.awq_gemm(
         x=x,
         w=qweight,
         scale=scale,
@@ -1502,7 +1508,7 @@ def gptq_shuffle(
     q_perm: torch.Tensor,
     bit: int,
 ) -> None:
-    xtorch_ops.gptq_shuffle(weight=q_weight, perm=q_perm, bit=bit)
+    kunlun_ops.gptq_shuffle(weight=q_weight, perm=q_perm, bit=bit)
 
 
 @impl("_C::gptq_shuffle", "CUDA")
@@ -1511,7 +1517,7 @@ def gptq_shuffle_cuda(
     q_perm: torch.Tensor,
     bit: int,
 ) -> None:
-    xtorch_ops.gptq_shuffle(weight=q_weight, perm=q_perm, bit=bit)
+    kunlun_ops.gptq_shuffle(weight=q_weight, perm=q_perm, bit=bit)
 
 
 def _fake_gptq_shuffle(
@@ -1535,7 +1541,7 @@ def concat_and_cache_mla(
     kv_cache: torch.Tensor,  # [num_blocks, block_size, (kv_lora_rank + pe_dim)]
     slot_mapping: torch.Tensor,  # [num_tokens] or [num_actual_tokens]
 ) -> None:
-    xtorch_ops.concat_and_cache_mla(
+    kunlun_ops.concat_and_cache_mla(
         kv_c=kv_c,
         k_pe=k_pe,
         slot_mapping=slot_mapping,
@@ -1550,7 +1556,7 @@ def concat_and_cache_mla_cuda(
     kv_cache: torch.Tensor,  # [num_blocks, block_size, (kv_lora_rank + pe_dim)]
     slot_mapping: torch.Tensor,  # [num_tokens] or [num_actual_tokens]
 ) -> None:
-    xtorch_ops.concat_and_cache_mla(
+    kunlun_ops.concat_and_cache_mla(
         kv_c=kv_c,
         k_pe=k_pe,
         slot_mapping=slot_mapping,
@@ -1592,7 +1598,7 @@ def scaled_int8_quant(
         azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
         if symmetric:
             # NOTE: For quant2d ops, scale represents max.
-            xtorch_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
         else:
             torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
                 x_q, x.contiguous(), scale, azp
@@ -1619,7 +1625,7 @@ def scaled_int8_quant_cuda(
         azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
         if symmetric:
             # NOTE: For quant2d ops, scale represents max.
-            xtorch_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
         else:
             torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
                 x_q, x.contiguous(), scale, azp
@@ -1771,7 +1777,7 @@ def matmul(
         dtype=out_dtype,
         device=x.device,
     )
-    xtorch_ops.matmul(
+    kunlun_ops.matmul(
         x=x.contiguous(),
         w=w.contiguous(),
         out=out,
@@ -1808,7 +1814,7 @@ def matmul_cuda(
         dtype=out_dtype,
         device=x.device,
     )
-    xtorch_ops.matmul(
+    kunlun_ops.matmul(
         x=x.contiguous(),
         w=w.contiguous(),
         out=out,
@@ -1859,7 +1865,7 @@ def quant2d(
     max: torch.Tensor,
     force_sdnn: bool = False,
 ) -> None:
-    xtorch_ops.quant2d(
+    kunlun_ops.quant2d(
         x=x,
         y=x_q,
         max=max,
@@ -1874,7 +1880,7 @@ def quant2d_cuda(
     max: torch.Tensor,
     force_sdnn: bool = False,
 ) -> None:
-    xtorch_ops.quant2d(
+    kunlun_ops.quant2d(
         x=x,
         y=x_q,
         max=max,
@@ -1915,7 +1921,7 @@ def apply_repetition_penalties_(
 
 
 @impl("_C::apply_repetition_penalties_", "CUDA")
-def apply_repetition_penalties_(
+def apply_repetition_penalties_cuda(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,
     output_mask: torch.Tensor,
@@ -1948,7 +1954,7 @@ def I8_mqa_logits(
     is_causal: Optional[bool] = False,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.I8_mqa_logits(
+    kunlun_ops.I8_mqa_logits(
         q=q,
         fused_kv_cache=fused_kv_cache,
         weights=weights,
@@ -1978,7 +1984,7 @@ def I8_mqa_logits_cuda(
     is_causal: Optional[bool] = False,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.I8_mqa_logits(
+    kunlun_ops.I8_mqa_logits(
         q=q,
         fused_kv_cache=fused_kv_cache,
         weights=weights,
@@ -2028,7 +2034,7 @@ def I8_paged_mqa_logits(
     out: torch.Tensor,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.I8_paged_mqa_logits(
+    kunlun_ops.I8_paged_mqa_logits(
         q=q,
         fused_kv_cache=fused_kv_cache,
         weights=weights,
@@ -2054,7 +2060,7 @@ def I8_paged_mqa_logits_cuda(
     out: torch.Tensor,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.I8_paged_mqa_logits(
+    kunlun_ops.I8_paged_mqa_logits(
         q=q,
         fused_kv_cache=fused_kv_cache,
         weights=weights,
@@ -2105,7 +2111,7 @@ def sparse_prefill_fwd_opt(
     is_causal: Optional[bool] = True,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.sparse_prefill_fwd_opt(
+    kunlun_ops.sparse_prefill_fwd_opt(
         q=q,
         kv=kv,
         indices=indices,
@@ -2141,7 +2147,7 @@ def sparse_prefill_fwd_opt_cuda(
     is_causal: Optional[bool] = True,
     use_xfa_boost: Optional[bool] = False,
 ) -> None:
-    xtorch_ops.sparse_prefill_fwd_opt(
+    kunlun_ops.sparse_prefill_fwd_opt(
         q=q,
         kv=kv,
         indices=indices,
@@ -2201,7 +2207,7 @@ def fwd_kvcache_mla(
     use_xfa_boost: Optional[bool] = False,
     kv_lod_xpu: Optional[torch.Tensor] = None,
 ) -> None:
-    xtorch_ops.fwd_kvcache_mla(
+    kunlun_ops.fwd_kvcache_mla(
         q_c=q_c,
         kv_cache=kv_cache,
         indices=indices,
@@ -2235,7 +2241,7 @@ def fwd_kvcache_mla_cuda(
     use_xfa_boost: Optional[bool] = False,
     kv_lod_xpu: Optional[torch.Tensor] = None,
 ) -> None:
-    xtorch_ops.fwd_kvcache_mla(
+    kunlun_ops.fwd_kvcache_mla(
         q_c=q_c,
         kv_cache=kv_cache,
         indices=indices,
@@ -2287,7 +2293,7 @@ def dequant_int4(
     int4_signed: bool = True,
     use_mode_fast: bool = False,
 ) -> None:
-    xtorch_ops.dequant_int4(
+    kunlun_ops.dequant_int4(
         x=x,
         scale=scale,
         zero=zero,
@@ -2309,7 +2315,7 @@ def dequant_int4_cuda(
     int4_signed: bool = True,
     use_mode_fast: bool = False,
 ) -> None:
-    xtorch_ops.dequant_int4(
+    kunlun_ops.dequant_int4(
         x=x,
         scale=scale,
         zero=zero,
@@ -2341,34 +2347,499 @@ dequant_int4.register_fake(_fake_dequant_int4)
 ##################################################
 @custom_op("_C::fast_topkv2", mutates_args=())
 def fast_topkv2(
-        score: torch.Tensor, 
-        lengths: torch.Tensor, 
-        topk: Optional[int] = 2048) -> torch.Tensor:
+    score: torch.Tensor, lengths: torch.Tensor, topk: Optional[int] = 2048
+) -> torch.Tensor:
     assert topk == 2048, "fast_topkv2 only supports topk = 2048 by now"
-    topk_indices = xtorch_ops.fast_topkv2(
-        score=score,
-        lengths=lengths,
-        topk=topk)
+    topk_indices = kunlun_ops.fast_topkv2(score=score, lengths=lengths, topk=topk)
     return topk_indices
+
 
 @impl("_C::fast_topkv2", "CUDA")
 def fast_topkv2_cuda(
-        score: torch.Tensor, 
-        lengths: torch.Tensor, 
-        topk: Optional[int] = 2048) -> torch.Tensor:
+    score: torch.Tensor, lengths: torch.Tensor, topk: Optional[int] = 2048
+) -> torch.Tensor:
     assert topk == 2048, "fast_topkv2 only supports topk = 2048 by now"
-    topk_indices = xtorch_ops.fast_topkv2(
-        score=score,
-        lengths=lengths,
-        topk=topk)
+    topk_indices = kunlun_ops.fast_topkv2(score=score, lengths=lengths, topk=topk)
     return topk_indices
 
+
 def _fake_fast_topkv2(
-        score: torch.Tensor, 
-        lengths: torch.Tensor, 
-        topk: Optional[int] = 2048) -> torch.Tensor:
+    score: torch.Tensor, lengths: torch.Tensor, topk: Optional[int] = 2048
+) -> torch.Tensor:
     assert topk == 2048, "fast_topkv2 only supports topk = 2048 by now"
     topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
     return topk_indices
 
+
 fast_topkv2.register_fake(_fake_fast_topkv2)
+
+##################################################
+# ----------------- LoRA ops --------------------
+##################################################
+
+
+##################################################
+# -------------- sgmv_shrink_lora ----------------
+##################################################
+@custom_op("_C::sgmv_shrink_lora", mutates_args=())
+def sgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    scaling: float,
+) -> torch.Tensor:
+    # return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(
+    #     inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling
+    # )
+    return torch.ops.xspeedgate_ops.sgmv_shrink_sdnn(
+        inputs,
+        lora_a_weights,
+        seq_len_tensor,
+        lora_indices_tensor,
+        output_tensor,
+        scaling,
+    )
+
+
+@impl("_C::sgmv_shrink_lora", "CUDA")
+def sgmv_shrink_lora_cuda(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    scaling: float,
+) -> torch.Tensor:
+    # return torch.ops.xspeedgate_ops.sgmv_shrink_cluster(
+    #     inputs, lora_a_weights, seq_len_tensor, lora_indices_tensor, output_tensor, scaling
+    # )
+    return torch.ops.xspeedgate_ops.sgmv_shrink_sdnn(
+        inputs,
+        lora_a_weights,
+        seq_len_tensor,
+        lora_indices_tensor,
+        output_tensor,
+        scaling,
+    )
+
+
+def _fake_sgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    scaling: float,
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_shrink_lora.register_fake(_fake_sgmv_shrink_lora)
+
+
+##################################################
+# -------------- sgmv_expand_lora ----------------
+##################################################
+@custom_op("_C::sgmv_expand_lora", mutates_args=())
+def sgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    # return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+    #     inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    # )
+    return torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    )
+
+
+@impl("_C::sgmv_expand_lora", "CUDA")
+def sgmv_expand_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    # return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+    #     inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    # )
+    return torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
+        inputs, lora_b_weights, seq_len_tensor, lora_indices_tensor, output_tensor, 0
+    )
+
+
+def _fake_sgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_expand_lora.register_fake(_fake_sgmv_expand_lora)
+
+
+##################################################
+# ----------- sgmv_expand_slice_lora -------------
+##################################################
+@custom_op("_C::sgmv_expand_slice_lora", mutates_args=())
+def sgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs,
+        lora_b_weights,
+        seq_len_tensor,
+        lora_indices_tensor,
+        output_tensor,
+        slice_offset,
+    )
+
+
+@impl("_C::sgmv_expand_slice_lora", "CUDA")
+def sgmv_expand_slice_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.sgmv_expand_cluster(
+        inputs,
+        lora_b_weights,
+        seq_len_tensor,
+        lora_indices_tensor,
+        output_tensor,
+        slice_offset,
+    )
+
+
+def _fake_sgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    b_seq_start_loc: torch.Tensor,
+    seq_len_tensor: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    batches: int,
+    max_seq_length: int,
+    token_nums: int,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = False,
+) -> torch.Tensor:
+    return output_tensor
+
+
+sgmv_expand_slice_lora.register_fake(_fake_sgmv_expand_slice_lora)
+
+
+##################################################
+# -------------- bgmv_shrink_lora ----------------
+##################################################
+@custom_op("_C::bgmv_shrink_lora", mutates_args=())
+def bgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
+        inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+@impl("_C::bgmv_shrink_lora", "CUDA")
+def bgmv_shrink_lora_cuda(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
+        inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling
+    )
+
+
+def _fake_bgmv_shrink_lora(
+    inputs: torch.Tensor,
+    lora_a_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    expert_m: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    scaling: float = 1.0,
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_shrink_lora.register_fake(_fake_bgmv_shrink_lora)
+
+
+##################################################
+# -------------- bgmv_expand_lora ----------------
+##################################################
+@custom_op("_C::bgmv_expand_lora", mutates_args=())
+def bgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0
+    )
+
+
+@impl("_C::bgmv_expand_lora", "CUDA")
+def bgmv_expand_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0
+    )
+
+
+def _fake_bgmv_expand_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_expand_lora.register_fake(_fake_bgmv_expand_lora)
+
+
+##################################################
+# ----------- bgmv_expand_slice_lora -------------
+##################################################
+@custom_op("_C::bgmv_expand_slice_lora", mutates_args=())
+def bgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+@impl("_C::bgmv_expand_slice_lora", "CUDA")
+def bgmv_expand_slice_lora_cuda(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset
+    )
+
+
+def _fake_bgmv_expand_slice_lora(
+    inputs: torch.Tensor,
+    lora_b_weights: torch.Tensor,
+    output_tensor: torch.Tensor,
+    block_statistic: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    moe_index: torch.Tensor,
+    normed_scale: torch.Tensor,
+    lora_indices_tensor: torch.Tensor,
+    slice_offset: int,
+    slice_size: int,
+    add_inputs: bool = True,
+) -> torch.Tensor:
+    return output_tensor
+
+
+bgmv_expand_slice_lora.register_fake(_fake_bgmv_expand_slice_lora)
+
+
+##################################################
+# ----------- lora_matmul_inplace ----------------
+##################################################
+@custom_op("_C::lora_matmul_inplace", mutates_args=())
+def lora_matmul_inplace(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    kunlun_ops.matmul(
+        x=x.contiguous(),
+        w=w.contiguous(),
+        out=output_tensor,
+        x_trans=x_trans,
+        w_trans=w_trans,
+        alpha=alpha,
+        beta=beta,
+    )
+
+
+@impl("_C::lora_matmul_inplace", "CUDA")
+def lora_matmul_inplace_cuda(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    kunlun_ops.matmul(
+        x=x.contiguous(),
+        w=w.contiguous(),
+        out=output_tensor,
+        x_trans=x_trans,
+        w_trans=w_trans,
+        alpha=alpha,
+        beta=beta,
+    )
+
+
+def _fake_lora_matmul_inplace(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    output_tensor: torch.Tensor,
+    x_trans: bool = False,
+    w_trans: bool = True,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+) -> None:
+    return None
+
+
+lora_matmul_inplace.register_fake(_fake_lora_matmul_inplace)

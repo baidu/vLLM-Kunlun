@@ -22,16 +22,11 @@ Punica: Multi-Tenant LoRA Serving.
 https://arxiv.org/abs/2310.18547
 """
 
-from typing import TYPE_CHECKING, Optional, Union, final
-
-import torch
-# Disable torchdynamo for all functions in this file
-torch._dynamo.config.disable = True
-
-
 # SPDX-License-Identifier: Apache-2.0
 from typing import Callable, Optional, Tuple, Union
 
+import torch
+from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
 
 from vllm_kunlun.lora.ops.kunlun_ops import (
     bgmv_expand,
@@ -42,7 +37,7 @@ from vllm_kunlun.lora.ops.kunlun_ops import (
     sgmv_shrink,
 )
 
-from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
+# Disable torchdynamo for all functions in this file
 
 
 # The platforms that are compatible with the PyTorch-native implementation can

@@ -1339,6 +1339,10 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
 
+class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    pass
+
+
 # Compatibility with
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-Base/blob/main/configuration_deepseek.py
 def get_spec_layer_idx_from_weight_name(config: Union[DeepseekV2Config,
