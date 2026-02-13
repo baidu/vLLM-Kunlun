@@ -31,23 +31,18 @@ from typing import (
 import kunlun_ops
 import numpy as np
 import torch
-from vllm.attention.backends.abstract import (
+from vllm.config import VllmConfig
+from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionMetadata,
     AttentionType,
-)
-from vllm.config import VllmConfig
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.utils import (
-    AttentionCGSupport,
     CommonAttentionMetadata,
-    split_decodes_and_prefills,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
-# from vllm.attention.backends.utils import CommonAttentionState
-# from vllm.attention.backends.utils import is_block_tables_empty, compute_slot_mapping_start_idx, compute_slot_mapping
 from vllm_kunlun.ops.paged_attn import PagedAttention, PagedAttentionMetadata
 
 if TYPE_CHECKING:
@@ -56,6 +51,7 @@ if TYPE_CHECKING:
 
 import inspect
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 
@@ -67,8 +63,19 @@ class KunlunAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        """get_name"""
-        return "Kunlun_v1"
+        """get_name attention backend name
+        attention backend in "FLASH_ATTN,
+        FLASH_ATTN_DIFFKV, TRITON_ATTN,
+        ROCM_ATTN, ROCM_AITER_MLA,
+        ROCM_AITER_TRITON_MLA, ROCM_AITER_FA,
+        ROCM_AITER_MLA_SPARSE, TORCH_SDPA,
+        FLASHINFER, FLASHINFER_MLA, TRITON_MLA,
+        CUTLASS_MLA, FLASHMLA, FLASHMLA_SPARSE,
+        FLASH_ATTN_MLA, IPEX, NO_ATTENTION, FLEX_ATTENTION,
+        TREE_ATTN, ROCM_AITER_UNIFIED_ATTN, CPU_ATTN,
+        CUSTOM"
+        """
+        return "CUSTOM"
 
     @staticmethod
     def get_impl_cls() -> Type["KunlunAttentionImpl"]:
@@ -84,11 +91,6 @@ class KunlunAttentionBackend(AttentionBackend):
     def get_builder_cls() -> Type["KunlunAttentionMetadataBuilder"]:
         """get_builder_cls"""
         return KunlunAttentionMetadataBuilder
-
-    # @staticmethod
-    # def get_state_cls() -> Type["CommonAttentionState"]:
-    #     """get_state_cls"""
-    #     return CommonAttentionState
 
     @staticmethod
     def get_kv_cache_shape(

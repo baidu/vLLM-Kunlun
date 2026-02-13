@@ -1,29 +1,42 @@
 """kunlun"""
+
+from typing import TYPE_CHECKING, Optional
+
 import psutil
 import torch
-
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum, _Backend
-from typing import Optional, Union
 import vllm.envs as envs
+from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+else:
+    VllmConfig = None
 
 
 logger = init_logger(__name__)
 
+
 class KunlunPlatform(Platform):
     """KunlunPlatform"""
-    _enum = PlatformEnum.CUDA 
-    dist_backend:str = "nccl"
+
+    _enum = PlatformEnum.CUDA
+    dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
     device_name: str = "xpu"
 
     @property
     def device_type(self):
         """
-        返回设备类型，固定为'cuda'。
+        Return the device type.
+
+        The device type is always ``"cuda"``.
         """
         return "cuda"
-    
+
     def is_kunlun(self) -> bool:
         """is_kunlun"""
         return self._enum == PlatformEnum.CUDA
@@ -71,13 +84,17 @@ class KunlunPlatform(Platform):
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         """
-            获取设备名称，默认返回 "kunlun"。
-        
+        Return the device name.
+
+        The device name is always reported as ``"kunlun"``.
+
         Args:
-            device_id (int, optional): 设备ID，默认为0. Ignored in this method. Defaults to 0.
-        
+            device_id (int, optional):
+                The device index. This argument is ignored. Defaults to ``0``.
+
         Returns:
-            str: 设备名称，固定返回 "kunlun".
+            str:
+                Always ``"kunlun"``.
         """
         return "kunlun"
 
@@ -92,25 +109,33 @@ class KunlunPlatform(Platform):
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """
-            获取设备总内存大小，单位为字节（B）。默认返回第一个设备的总内存大小。
-        如果传入参数`device_id`不是整数或者超出了可用设备范围，将会引发ValueError异常。
-        
+        Return the total memory capacity of a device in bytes.
+
+        By default, the memory size of device ``0`` is returned. A ``ValueError``
+        is raised if ``device_id`` is not an integer or falls outside the range
+        of available devices.
+
         Args:
-            device_id (int, optional): 设备ID，默认为0. Defaults to 0.
-        
+            device_id (int, optional):
+                The device index. Defaults to ``0``.
+
         Raises:
-            ValueError: 当传入的`device_id`不是整数或者超出了可用设备范围时引发此异常。
-        
+            ValueError:
+                If ``device_id`` is not an integer or is out of range.
+
         Returns:
-            int: 设备总内存大小，单位为字节（B）。
+            int:
+                Total device memory in bytes.
         """
         return psutil.virtual_memory().total
 
     @classmethod
     def inference_mode(cls):
         """
-            进入推理模式，禁止计算梯度。
-        返回：torch.no_grad()，一个上下文管理器，用于禁止计算梯度。
+        Enter inference mode by disabling gradient computation.
+
+        Returns:
+            torch.no_grad: A context manager that disables gradient computation.
         """
         return torch.no_grad()
 
@@ -119,54 +144,51 @@ class KunlunPlatform(Platform):
         """get_device_capability"""
         major, minor = torch.cuda.get_device_capability()
         return DeviceCapability(major=major, minor=minor)
-    
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """
-            根据配置更新各个部分的默认值。
-        如果未指定，则根据某些条件自动选择worker类。
-        如果缓存配置中没有设置块大小，则将其设置为16。
-        如果使用MLA，并且`VLLM_ATTENTION_BACKEND`未设置或设置为"FLASHMLA"，
-        则将缓存块大小设置为64。
-        如果在DeepEP高吞吐量后端、数据并行大于1和CUDA图形模式下运行，则强制
-        强制执行即时模式，因为DP + DeepEP高吞吐量内核不是CUDA图形兼容的，而且
-        使用DeepEP低延迟内核可以解决这个问题。
-        
+        TODO Update here for v0.15.1
+
+        Update default values across different config sections.
+
+        If certain fields are not specified, this function will automatically
+        choose appropriate defaults based on runtime conditions.
+
+        - If the cache block size is not set, it defaults to 16.
+        - If MLA is enabled and `VLLM_ATTENTION_BACKEND` is not set or is set
+        to "FLASHMLA", the cache block size will be updated to 64.
+        - When running with the DeepEP high-throughput backend, data parallelism
+        greater than 1, and CUDA graph mode, eager execution will be enforced.
+        This is because DP + DeepEP high-throughput kernels are not compatible
+        with CUDA graphs. The DeepEP low-latency kernels should be used instead.
+
         Args:
-            vllm_config (VllmConfig): VLLM配置对象。
-        
+            vllm_config (VllmConfig): The vLLM configuration object.
+
         Raises:
-            NotImplementedError: 如果在vLLM V1上使用多步调度，则会引发NotImplementedError。
-            请从命令行中删除--num-scheduler-steps参数。
-            NotImplementedError: 如果在vLLM V1上使用MLA，则会引发NotImplementedError。
-            请确保在使用MLA之前设置了`VLLM_ATTENTION_BACKEND`环境变量。
-        
+            NotImplementedError:
+                If multi-step scheduling is used in vLLM V1.
+                Please remove the `--num-scheduler-steps` argument.
+            NotImplementedError:
+                If MLA is used in vLLM V1 without setting the
+                `VLLM_ATTENTION_BACKEND` environment variable.
+
         Returns:
-            None: 无返回值。
+            None.
         """
-        parallel_config = vllm_config.parallel_config
-        scheduler_config = vllm_config.scheduler_config
+        parallel_config = vllm_config.parallel_config  # Not use scheduler_config
+        # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
+            # v0.15.1 do not support v0.15.1, remove the if condition
             if vllm_config.speculative_config:
-                if envs.VLLM_USE_V1:
-                    parallel_config.worker_cls = \
-                            "vllm.v1.worker.gpu_worker.Worker"
-                else:
-                    parallel_config.worker_cls = \
-                        "vllm.spec_decode.spec_decode_worker.create_spec_worker"
-                    parallel_config.sd_worker_cls = \
-                        "vllm.worker.worker.Worker"
+                # if envs.VLLM_USE_V1:
+                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
             else:
-                print(f"envs.VLLM_USE_V1 = {envs.VLLM_USE_V1}")
-                if envs.VLLM_USE_V1:
-                    parallel_config.worker_cls = \
-                            "vllm.v1.worker.gpu_worker.Worker"
-                else:
-                    parallel_config.worker_cls = "vllm.worker.worker.Worker"
-        
+                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = 16
@@ -177,48 +199,58 @@ class KunlunPlatform(Platform):
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
-            use_sparse = hasattr(vllm_config.model_config.hf_config,
-                                 "index_topk")
-            use_flashmla = (envs.VLLM_ATTENTION_BACKEND is None \
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA")
+            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+            use_flashmla = (
+                envs.VLLM_ATTENTION_BACKEND is None
+                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+            )
             from vllm.attention.ops.flashmla import is_flashmla_supported
-            if use_flashmla and is_flashmla_supported()[0] \
-                and cache_config.block_size != 64:
+
+            if (
+                use_flashmla
+                and is_flashmla_supported()[0]
+                and cache_config.block_size != 64
+            ):
                 cache_config.block_size = 64
-                logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLA backend.")
+                logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
             if use_sparse and cache_config.block_size != 64:
                 cache_config.block_size = 64
                 logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLASparse "
-                    "backend.")
+                    "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
+                )
 
-        if (envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
-                and parallel_config.data_parallel_size > 1
-                and vllm_config.compilation_config.use_cudagraph):
+        if (
+            envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
+            and parallel_config.data_parallel_size > 1
+            and vllm_config.compilation_config.use_cudagraph
+        ):
             logger.info(
                 "Data Parallel: Forcing enforce eager to be True since DP "
                 "with DeepEP high-throughput kernels are not CUDA Graph "
                 "compatible. The DeepEP low-latency kernels are CUDA Graph "
                 "compatible. Set the all_to_all backend to deepep_low_latency "
-                "to use those kernels instead.")
+                "to use those kernels instead."
+            )
             vllm_config.compilation_config.use_cudagraph = False
             vllm_config.model_config.enforce_eager = True
             # TODO (varun): Turning this ON gives incorrect results for the
             # Deepseek-V2-lite model.
             vllm_config.compilation_config.use_inductor = False
-        if vllm_config.compilation_config.use_cudagraph and envs.VLLM_USE_V1:
-            vllm_config.compilation_config.custom_ops = ["all"]
-            vllm_config.compilation_config.pass_config.enable_fusion = False
-            vllm_config.compilation_config.use_inductor = False
-
+        # v0.15.1 do not support v0.15.1, remove the if condition
+        # if vllm_config.compilation_config.use_cudagraph:
+        #     vllm_config.compilation_config.custom_ops = ["all"]
+        #     vllm_config.compilation_config.pass_config.enable_fusion = False
+        #     vllm_config.compilation_config.use_inductor = False
 
     @classmethod
-    def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
-                             kv_cache_dtype, block_size, use_v1, use_mla,use_sink, use_sparse=False):
+    def get_attn_backend_cls(
+        cls,
+        selected_backend: "AttentionBackendEnum",
+        attn_selector_config: "AttentionSelectorConfig",
+    ) -> str:
         """
             Returns the class of attention backend based on the selected backend and other parameters.
-        
+
         Args:
             selected_backend (str): Selected backend name. Currently supported backends are 'kunlun' and 'default'.
             head_size (int): Size of the attention heads.
@@ -227,41 +259,47 @@ class KunlunPlatform(Platform):
             block_size (int): Block size used in the attention computation.
             use_v1 (bool, optional): Whether to use v1 version of the backend. Defaults to False.
             use_mla (bool, optional): Whether to use MLA version of the backend. Defaults to False.
-        
+
         Returns:
             str: Class name of the attention backend.
         """
-        if use_mla:
-            if use_sparse:
+        if attn_selector_config.use_mla:
+            if attn_selector_config.use_sparse:
                 logger.info_once("Using Sparse MLA backend on V1 engine.")
-                # return ("vllm.v1.attention.backends.mla.flashmla_sparse."
-                #         "FlashMLASparseBackend")
-                return ("vllm_kunlun.v1.attention.backends.mla.flashmla_sparse."
-                        "FlashMLASparseBackend")
+                return (
+                    "vllm_kunlun.v1.attention.backends.mla.flashmla_sparse."
+                    "FlashMLASparseBackend"
+                )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
-        if use_v1:
-            return "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
-        elif not use_mla:                     
-            return "vllm_kunlun.ops.attention.backends.kunlun_attn.KunlunAttentionBackend"
+        elif not attn_selector_config.use_mla:
+            return (
+                "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
+            )
         else:
-            return "vllm_kunlun.attention.backends.kunlun_mla.KunlunMLAAttentionBackend"
+            return (
+                "vllm_kunlun.v1.attention.backends.kunlun_mla.KunlunMLAAttentionBackend"
+            )
 
     @classmethod
-    def get_current_memory_usage(cls,
-                                 device: Optional[torch.types.Device] = None
-                                 ) -> float:
+    def get_current_memory_usage(
+        cls, device: Optional[torch.types.Device] = None
+    ) -> float:
         """
-        获取当前设备的内存使用情况，包括已分配和最大分配。
-            如果未指定设备，则默认为当前上下文中的设备。
-        
-            Args:
-                device (Optional[torch.types.Device], optional): 可选的设备对象，默认为None。默认为当前上下文中的设备。
-        
-            Returns:
-                float: 返回一个浮点数，表示当前设备的内存使用情况，单位是字节（bytes）。
-        
-            Raises:
-                None.
+        Get the memory usage statistics of the target device, including
+        the currently allocated memory and the peak allocation.
+
+        If no device is specified, the device in the current context is used.
+
+        Args:
+            device (Optional[torch.types.Device], optional):
+                The device to query. Defaults to the current active device.
+
+        Returns:
+            float:
+                The memory usage of the device in bytes.
+
+        Raises:
+            None.
         """
         torch.cuda.reset_peak_memory_stats(device)
         return torch.cuda.max_memory_allocated(device)
@@ -269,27 +307,30 @@ class KunlunPlatform(Platform):
     @classmethod
     def is_async_output_supported(cls, enforce_eager: Optional[bool]) -> bool:
         """
-            判断是否支持异步输出。
-        默认情况下，Kunlun 不支持异步输出。
-        
+        Return whether asynchronous output is supported.
+
+        By default, Kunlun does not support async output.
+
         Args:
-            enforce_eager (Optional[bool], optional): 是否强制使用 eager execution. Defaults to None.
-                None 表示不强制使用 eager execution，而是根据当前环境自动选择。
-        
+            enforce_eager (Optional[bool], optional):
+                Whether to force eager execution. If set to ``None``, the runtime
+                will decide automatically based on the current environment.
+
         Returns:
-            bool: True 表示支持异步输出，False 表示不支持异步输出。
+            bool:
+                ``True`` if async output is supported, otherwise ``False``.
         """
-        # 假设 Kunlun 不支持异步输出
+        # Assume Kunlun does not support async output.
         return False
 
     @classmethod
     def supports_v1(cls, model_config: "ModelConfig") -> bool:
         """
             Check if the model config is supported by this class in v1.
-        
+
         Args:
             model_config (ModelConfig): Model configuration to be checked.
-        
+
         Returns:
             bool: Whether the model config is supported in v1. Always returns True for this class.
         """
@@ -304,23 +345,23 @@ class KunlunPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-       '''
-       communicator
-       '''
-       return "vllm_kunlun.distributed.kunlun_communicator.KunlunCommunicator"
+        """
+        communicator
+        """
+        return "vllm_kunlun.distributed.kunlun_communicator.KunlunCommunicator"
 
     @classmethod
     def get_punica_wrapper(cls):
-        ''' 
+        """
         kunlun wrapper
-        '''
+        """
         return "vllm_kunlun.lora.punica_wrapper.punica_kunlun.PunicaWrapperKunlun"
-    
+
     @classmethod
     def check_if_supports_dtype(cls, torch_dtype: torch.dtype):
-        '''
-        Kunlun3平台支持的数据类型
-        '''
+        """
+        Data Types Supported on the Kunlun3 Platform
+        """
         supported_dtypes = {
             torch.float32,
             torch.float16,
@@ -332,13 +373,13 @@ class KunlunPlatform(Platform):
                 f"Kunlun platform does not support dtype {torch_dtype}. "
                 "Supported dtypes are: fp32, fp16, bf16, int8."
             )
-       
+
     def opaque_attention_op(cls) -> bool:
-        '''
-        确保V1 Graph在Kunlun3平台使用vllm.unified_attention_with_output_kunlun作为split ops 
-        '''
+        """
+        Ensure that V1 Graph uses `vllm.unified_attention_with_output_kunlun` as the split op on the Kunlun3 platform.
+        """
         return True
-    
+
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True

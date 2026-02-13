@@ -1,6 +1,7 @@
 import inspect
+import types
 import typing
-from typing import Callable, List, Optional, get_args, get_origin
+from typing import Any, Callable, List, Optional, get_args, get_origin
 
 import torch
 import vllm.utils.torch_utils as torch_utils_orig
@@ -69,27 +70,45 @@ def direct_register_custom_op(
         my_lib._register_fake(op_name, fake_impl)
 
 
+def _normalize_ann(ann):
+    """Convert PEP604 `T | None` to typing.Union[T, None] for torch infer_schema."""
+    if isinstance(ann, types.UnionType):  # Python 3.10: int | None
+        args = get_args(ann)
+        return typing.Union[args]  # type: ignore[misc]
+    return ann
+
+
 def patch_annotations_for_schema(func):
     """patch_annotations_for_schema"""
     sig = inspect.signature(func)
+
+    # patch return annotation too
+    ret = _normalize_ann(sig.return_annotation)
+    sig = sig.replace(return_annotation=ret)
+
     new_params = []
-
     for name, param in sig.parameters.items():
-        ann = param.annotation
+        ann = _normalize_ann(param.annotation)
 
-        if get_origin(ann) is typing.Union and type(None) in get_args(ann):
-            inner_type = [a for a in get_args(ann) if a is not type(None)][0]
-            if get_origin(inner_type) is list:  # Optional[list[int]]
-                inner_args = get_args(inner_type)
-                new_ann = Optional[List[inner_args[0] if inner_args else typing.Any]]
-                param = param.replace(annotation=new_ann)
+        origin = get_origin(ann)
+        args = get_args(ann)
 
-        elif get_origin(ann) is list:
-            args = get_args(ann)
-            new_ann = List[args[0] if args else typing.Any]
-            param = param.replace(annotation=new_ann)
+        # Optional[T] (typing.Union[T, NoneType])
+        if origin is typing.Union and type(None) in args:
+            inner = [a for a in args if a is not type(None)][0]
+            inner_origin = get_origin(inner)
+            inner_args = get_args(inner)
 
-        new_params.append(param)
+            # Optional[list[T]]
+            if inner_origin is list:
+                new_ann = Optional[List[inner_args[0] if inner_args else Any]]
+                ann = new_ann
+
+        # list[T] -> typing.List[T]
+        elif origin is list:
+            ann = List[args[0] if args else Any]
+
+        new_params.append(param.replace(annotation=ann))
 
     func.__signature__ = sig.replace(parameters=new_params)
     return func
