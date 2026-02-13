@@ -1,16 +1,14 @@
 """vllm_utils_wrapper.py"""
 
-import inspect
 import socket
-import typing
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional, Tuple, Union, get_args, get_origin
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import vllm.distributed.parallel_state as parallel_state
 import vllm.envs as envs
 import vllm.utils as _orig
-from torch.library import Library, register_fake
+from torch.library import register_fake
 
 try:
     import vllm_kunlun._kunlun  # noqa: F401
@@ -19,94 +17,6 @@ except ImportError as e:
         from . import _kunlun  # noqa: F401, F403
     except ImportError:
         print(f"Warning: Failed to load vllm_kunlun native extension: {e}")
-
-
-def patch_annotations_for_schema(func):
-    """patch_annotations_for_schema"""
-    sig = inspect.signature(func)
-    new_params = []
-
-    for name, param in sig.parameters.items():
-        ann = param.annotation
-
-        if get_origin(ann) is typing.Union and type(None) in get_args(ann):
-            inner_type = [a for a in get_args(ann) if a is not type(None)][0]
-            if get_origin(inner_type) is list:  # Optional[list[int]]
-                inner_args = get_args(inner_type)
-                new_ann = Optional[List[inner_args[0] if inner_args else typing.Any]]
-                param = param.replace(annotation=new_ann)
-
-        elif get_origin(ann) is list:
-            args = get_args(ann)
-            new_ann = List[args[0] if args else typing.Any]
-            param = param.replace(annotation=new_ann)
-
-        new_params.append(param)
-
-    func.__signature__ = sig.replace(parameters=new_params)
-    return func
-
-
-def supports_custom_op() -> bool:
-    """supports_custom_op"""
-    return hasattr(torch.library, "custom_op")
-
-
-vllm_lib = Library("vllm", "FRAGMENT")  # noqa
-
-
-def direct_register_custom_op(
-    op_name: str,
-    op_func: Callable,
-    mutates_args: Optional[list[str]] = None,
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
-    dispatch_key: str = "CUDA",
-    tags: tuple[torch.Tag, ...] = (),
-):
-    """
-    `torch.library.custom_op` can have significant overhead because it
-    needs to consider complicated dispatching logic. This function
-    directly registers a custom op and dispatches it to the CUDA backend.
-    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
-    for more details.
-
-    By default, the custom op is registered to the vLLM library. If you
-    want to register it to a different library, you can pass the library
-    object to the `target_lib` argument.
-
-    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
-    library object. If you want to bind the operator to a different library,
-    make sure the library object is alive when the operator is used.
-    """
-    if not supports_custom_op():
-        from vllm.platforms import current_platform
-
-        assert not current_platform.is_cuda_alike(), (
-            "cuda platform needs torch>=2.4 to support custom op, "
-            "chances are you are using an old version of pytorch "
-            "or a custom build of pytorch. It is recommended to "
-            "use vLLM in a fresh new environment and let it install "
-            "the required dependencies."
-        )
-        return
-    if mutates_args is None:
-        mutates_args = []
-    import torch.library
-
-    if hasattr(torch.library, "infer_schema"):
-        patch_annotations_for_schema(op_func)
-        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
-    else:
-        # for pytorch 2.4
-        import torch._custom_op.impl
-
-        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
-    my_lib = target_lib or vllm_lib
-    my_lib.define(op_name + schema_str, tags=tags)
-    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
 
 
 def vllm_kunlun_weak_ref_tensor(tensor: Any) -> Any:
@@ -156,7 +66,6 @@ def _get_open_port() -> int:
 
 
 _wrapped = SimpleNamespace(**_orig.__dict__)
-_wrapped.direct_register_custom_op = direct_register_custom_op
 _wrapped.weak_ref_tensor = vllm_kunlun_weak_ref_tensor
 _wrapped.weak_ref_tensors = vllm_kunlun_weak_ref_tensors
 _wrapped._get_open_port = _get_open_port
@@ -211,8 +120,6 @@ def vllm_kunlun_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.T
 parallel_state.GroupCoordinator.all_reduce = vllm_kunlun_all_reduce
 parallel_state.GroupCoordinator.all_gather = vllm_kunlun_all_gather
 
-
-from typing import Optional  # noqa: E402
 
 import torch  # noqa: E402
 from torch.library import custom_op, impl  # noqa: E402
