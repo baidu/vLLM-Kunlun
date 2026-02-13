@@ -29,7 +29,7 @@ class MLAModules:
     indexer_rotary_emb: Optional[torch.nn.Module]
 
 
-@CustomOp.register("multi_head_latent_attention")
+@CustomOp.register("multi_head_latent_attention_kunlun")
 class MultiHeadLatentAttention(CustomOp):
     """MLA layer registered as CustomOp.
     Note that currently MLA ignores the enable/disable mechanism of CustomOp
