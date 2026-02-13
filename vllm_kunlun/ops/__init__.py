@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import vllm_kunlun.ops._custom_ops
 import vllm_kunlun.ops.fused_moe.layer
 
 # base layers

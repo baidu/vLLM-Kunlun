@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 import inspect
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 
@@ -446,8 +447,14 @@ M = TypeVar("M")
 class KunlunAttentionMetadataBuilder:
     """KunlunAttentionMetadataBuilder"""
 
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold: ClassVar[Optional[int]] = 1
+    _cudagraph_support = (
+        AttentionCGSupport.ALWAYS
+        if get_flash_attn_version() == 3
+        else AttentionCGSupport.UNIFORM_BATCH
+    )
+    supports_update_block_table: bool = True
 
     def __init__(
         self,
@@ -537,6 +544,14 @@ class KunlunAttentionMetadataBuilder:
         self._num_decode_tokens = num_decode_tokens
         self._num_prefill_tokens = num_prefill_tokens
         return modified_batch
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "AttentionSpec",
+    ) -> AttentionCGSupport:
+        return cls._cudagraph_support
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -941,6 +956,7 @@ def use_cascade_attention(
     use_alibi: bool,
     use_sliding_window: bool,
     num_sms: int,
+    dcp_world_size: int,
     use_local_attention: bool = False,
 ) -> bool:
     """Decide whether to use cascade attention.
