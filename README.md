@@ -40,7 +40,7 @@ This plugin provides a hardware-pluggable interface that decouples the integrati
 
 - **Seamless Plugin Integration** — Works as a standard vLLM platform plugin via Python entry points, no need to modify vLLM source code
 - **Broad Model Support** — Supports 15+ mainstream LLMs including Qwen, Llama, DeepSeek, Kimi-K2, and multimodal models
-- **Quantization Support** — FP8 and other quantization methods for MoE and dense models
+- **Quantization Support** — INT8 and other quantization methods for MoE and dense models
 - **LoRA Fine-Tuning** — LoRA adapter support for Qwen series models
 - **Piecewise Kunlun Graph** — Hardware-accelerated graph optimization for high-performance inference
 - **FlashMLA Attention** — Optimized multi-head latent attention for DeepSeek MLA architectures
