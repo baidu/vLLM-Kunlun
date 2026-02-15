@@ -20,6 +20,7 @@ import vllm_kunlun.ops.fused_moe.layer
 # base layers
 import vllm_kunlun.ops.layernorm
 import vllm_kunlun.ops.linear
+import vllm_kunlun.ops.mla
 
 # quantization
 import vllm_kunlun.ops.quantization.awq
@@ -33,4 +34,4 @@ import vllm_kunlun.ops.quantization.moe_wna16
 # embedding
 import vllm_kunlun.ops.rotary_embedding
 import vllm_kunlun.ops.vocab_parallel_embedding
-import vllm_kunlun.v1.sample.spec_decode.eagle
+import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401, F403
