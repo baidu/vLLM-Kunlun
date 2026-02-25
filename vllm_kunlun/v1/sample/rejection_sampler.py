@@ -11,6 +11,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+import kunlun_ops
+
 logger = init_logger(__name__)
 
 PLACEHOLDER_TOKEN_ID = -1
@@ -132,7 +134,6 @@ class RejectionSampler(nn.Module):
         ]
         return outputs
 
-
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -179,25 +180,15 @@ def rejection_sample(
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
-        if min(num_draft_tokens) == 1 and max(
-                num_draft_tokens) == 1 and sampling_metadata.all_greedy:
-            rejection_greedy_sample_spec_len_1_pytorch(
-                output_token_ids,
-                draft_token_ids,
-                target_argmax,
-                bonus_token_ids,
-            )
-        else:
-            rejection_greedy_sample_pytorch(
-                output_token_ids,
-                cu_num_draft_tokens,
-                draft_token_ids,
-                target_argmax,
-                bonus_token_ids,
-                num_draft_tokens,
-                max_spec_len,
-                is_greedy,
-            )
+        kunlun_ops.rejection_greedy_sample(
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            is_greedy,
+            max_spec_len,
+        )
         if sampling_metadata.all_greedy:
             return output_token_ids
 
@@ -222,8 +213,9 @@ def rejection_sample(
         sampling_metadata,
         device,
     )
+    bonus_token_ids = bonus_token_ids.squeeze(1)
 
-    rejection_random_sample_pytorch(
+    kunlun_ops.rejection_random_sample(
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -235,8 +227,7 @@ def rejection_sample(
         is_greedy,
         max_spec_len,
         vocab_size,
-        IS_NGRAM=draft_probs is None,
-        # num_warps=1,
+        no_draft_probs=draft_probs is None,
     )
     return output_token_ids
 
@@ -422,7 +413,7 @@ def sample_recovered_tokens(
             q[i].exponential_(generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    sample_recovered_tokens_pytorch(
+    kunlun_ops.sample_recovered_tokens(
         recovered_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -430,7 +421,7 @@ def sample_recovered_tokens(
         target_probs,
         q,
         vocab_size,
-        IS_NGRAM=draft_probs is None,
+        no_draft_probs=draft_probs is None,
     )
     return recovered_token_ids
 
@@ -642,4 +633,3 @@ def sample_recovered_tokens_pytorch(
 
             if IS_NGRAM:
                 target_probs[token_idx, draft_token_id] = orig_prob
-
