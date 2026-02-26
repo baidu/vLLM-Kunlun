@@ -93,7 +93,7 @@ class SiluAndMul(CustomOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         """forward_cuda"""
-        import xtorch_ops
+        import kunlun_ops
         
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
@@ -103,7 +103,7 @@ class SiluAndMul(CustomOp):
 
     def forward_kunlun(self, x: torch.Tensor) -> torch.Tensor:
         """forward_kunlun"""
-        import xtorch_ops
+        import kunlun_ops
         
         d = x.shape[-1] // 2
         output_shape = (x.shape[:-1] + (d, ))
@@ -251,14 +251,14 @@ class GeluAndMul(CustomOp):
             无。
         """
         # from vllm import _custom_ops as ops
-        import xtorch_ops
+        import kunlun_ops
         # d = x.shape[-1] // 2
         # output_shape = (x.shape[:-1] + (d, ))
         out = torch.empty(x, dtype=x.dtype, device=x.device)
         if self.approximate == "none":
             # ops.gelu_and_mul(out, x)
             print(x,x.shape)
-            xtorch_ops.gelu(x, out)
+            kunlun_ops.gelu(x, out)
         elif self.approximate == "tanh":
             ops.gelu_tanh_and_mul(out, x)
         return out

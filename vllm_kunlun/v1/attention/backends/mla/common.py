@@ -207,7 +207,6 @@ from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
-from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase,
@@ -221,7 +220,7 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               infer_global_hyperparameters,
                                               split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
-import xtorch_ops
+import kunlun_ops
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -322,6 +321,7 @@ class MLACommonPrefillMetadata:
         # New for MLA (compared to FlashAttention)
         # For handling chunked prefill
         cu_seq_lens: torch.Tensor
+        cu_seq_lens_cpu: torch.Tensor
         starts: torch.Tensor
         seq_tot: list[int]
         max_seq_lens: list[int]
@@ -795,6 +795,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu \
                             .to(device, non_blocking=True),
+                        cu_seq_lens_cpu=cu_seq_lens_cpu,
                         starts=cp_chunk_starts.to(device, non_blocking=True),
                         seq_tot=cp_chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
@@ -812,6 +813,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu \
                             .to(device, non_blocking=True),
+                        cu_seq_lens_cpu=cu_seq_lens_cpu,
                         starts=chunk_starts.to(device, non_blocking=True),
                         seq_tot=chunk_seq_lens.sum(dim=1).tolist(),
                         max_seq_lens=chunk_seq_lens.max(dim=1).values.tolist(),
@@ -1104,7 +1106,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 ) * q_len
                 sorted_tokens_idx = torch.arange(
                     self.num_heads * q_len, dtype=torch.int, device="cuda")
-                xtorch_ops.mla_bmm_I8(
+                kunlun_ops.mla_bmm_I8(
                     x.contiguous(),  # [1, 16, 512] torch.float16
                     self.W_UV, # [16, 128, 512] torch.int8
                     self.W_UV_SCALE, # [2048, 1] torch.float32
@@ -1215,10 +1217,10 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         # )
         attn_out = torch.empty_like(q)
         ds_alpha = 1.8738542070926265
-        tp_q_head_num=128
+        tp_q_head_num=q.size(1)
         softmax_lse = torch.zeros(tp_q_head_num, q.size(0), dtype=torch.float32, device=q.device)
         softmax_lse.fill_(float('-inf'))
-        xtorch_ops.attention(
+        kunlun_ops.attention(
             q=q,
             k_cache=k,
             v_cache=maybe_padded_v,
@@ -1247,7 +1249,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         # Remain consistent with old `flash_attn_varlen_func` where there
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:
-            return attn_out, lse
+            return attn_out, softmax_lse
         return attn_out
 
     def _run_prefill_new_tokens_fa(self, prefill: MLACommonPrefillMetadata, q,
@@ -1310,7 +1312,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             k=k,
             v=v,
             context_seq_lod_xpu=prefill.query_start_loc,
-            context_seq_lod_cpu=prefill.chunked_context.cu_seq_lens[chunk_idx],
+            context_seq_lod_cpu=prefill.chunked_context.cu_seq_lens_cpu[chunk_idx],
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
@@ -1404,7 +1406,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             self.W_UK_T = W_UK.transpose(1, 2).contiguous()
             self.W_UK_SCALE = torch.empty([W_UK.shape[0] * W_UK.shape[2], 1],
                             dtype=torch.float, device=kv_b_proj_weight.device)
-            xtorch_ops.quant2d(w_uk_dq_trans, self.W_UK_T, self.W_UK_SCALE)
+            kunlun_ops.quant2d(w_uk_dq_trans, self.W_UK_T, self.W_UK_SCALE)
             self.W_UV = W_UV.contiguous()
             self.W_UV_SCALE = W_UV_SCALE.contiguous().reshape(-1, 1)
         else:
@@ -1548,7 +1550,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            self.gather_and_maybe_dequant_cache_py_optimized(
+            torch.ops.xspeedgate_ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
@@ -1743,12 +1745,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
+            output_lse = torch.empty_like(output)
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
                 prefix_lse=context_lse,
                 suffix_output=suffix_output,
                 suffix_lse=suffix_lse,
+                output_lse=output_lse,
             )
 
         # unpad if necessary
@@ -1832,7 +1836,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
-            xtorch_ops.concat_and_cache_mla(
+            kunlun_ops.concat_and_cache_mla(
                 k_c_normed,
                 k_pe.squeeze(1),
                 attn_metadata.slot_mapping.flatten(),
@@ -1881,7 +1885,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     sorted_tokens_idx = torch.arange(
                         self.num_heads * q_len, dtype=torch.int, device="cuda")
                     extra_params = {"trans": False}
-                    xtorch_ops.mla_bmm_I8(
+                    kunlun_ops.mla_bmm_I8(
                         decode_q_nope.contiguous(),
                         self.W_UK_T,
                         self.W_UK_SCALE,

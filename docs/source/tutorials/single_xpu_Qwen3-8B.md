@@ -128,9 +128,16 @@ python -m vllm.entrypoints.openai.api_server \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention_with_output_kunlun",
-            "vllm.unified_attention", "vllm.unified_attention_with_output",
-            "vllm.mamba_mixer2"]}' \
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
+                                                "vllm.unified_attention_with_output",
+                                                "vllm.unified_attention_with_output_kunlun",
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
+                                                "vllm.sparse_attn_indexer"]}' \
 ```
 
 If your service start successfully, you can see the info shown below:

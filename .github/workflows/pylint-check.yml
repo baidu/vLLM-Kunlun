@@ -1,0 +1,54 @@
+name: Code Style Check
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+jobs:
+  pylint-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install tools
+        run: |
+          pip install black isort ruff
+
+      - name: Get changed python files
+        id: changed
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only --diff-filter=ACMRT origin/${{ github.base_ref }}...HEAD)
+          else
+            files=$(git diff --name-only --diff-filter=ACMRT HEAD~1...HEAD)
+          fi
+
+          files=$(echo "$files" | grep '\.py$' || true)
+
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$files" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run ruff
+        if: steps.changed.outputs.files != ''
+        run: |
+          echo "${{ steps.changed.outputs.files }}" | xargs ruff check --fix
+        continue-on-error: true
+
+      - name: Run black
+        if: steps.changed.outputs.files != ''
+        run: |
+          echo "${{ steps.changed.outputs.files }}" | xargs black --check
+
+      - name: Run isort
+        if: steps.changed.outputs.files != ''
+        run: |
+          echo "${{ steps.changed.outputs.files }}" | xargs isort --check-only --profile black

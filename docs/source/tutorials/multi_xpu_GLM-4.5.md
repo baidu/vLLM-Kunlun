@@ -113,7 +113,16 @@ python -m vllm.entrypoints.openai.api_server \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name GLM-4.5 \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention_with_output_kunlun", "vllm.unified_attention", "vllm.unified_attention_with_output", "vllm.mamba_mixer2"]}'  > log_glm_plugin.txt 2>&1 &
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
+                                                "vllm.unified_attention_with_output",
+                                                "vllm.unified_attention_with_output_kunlun",
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
+                                                "vllm.sparse_attn_indexer"]}'  > log_glm_plugin.txt 2>&1 &
 ```
 
 If your service start successfully, you can see the info shown below:

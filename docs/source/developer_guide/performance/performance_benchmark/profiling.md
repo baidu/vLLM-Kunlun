@@ -1,18 +1,23 @@
 # Profiling
 
-
-
 ## 🔧 Action Plan（Three Phases）
+
 ### Phase 1️⃣: Multi-Device Log Redirection Configuration
+
 #### Background
+
 By default, kernel logs from all 8 XPU devices are interleaved and emitted to [stdout], resulting in:
+
 - It becomes impossible to distinguish which log originates from which device.
 - Timestamps become interleaved, making it difficult to analyze the temporal relationships.
 - Single-device bottlenecks are masked by global aggregation.
 
 #### Solution
+
 During model initialization, create separate log files for each device.
+
 #### Code Explanation (embedded in qwen2.py)
+
 ```python
 import os  # ← Ensure this is imported at the top of the file
 from vllm.distributed import get_tensor_model_parallel_rank  # ← Import function to get the tensor model parallel rank
@@ -30,38 +35,42 @@ class Qwen2Model(nn.Module):
         try:
             # Step 1: Get the current XPU device's rank (0~7)
             rank = get_tensor_model_parallel_rank()
-            
+
             # Step 2: Create log directory (works with your get_kernel_time_ex.py)
             log_dir = "./xpu_logs"
             os.makedirs(log_dir, exist_ok=True)
-            
+
             # Step 3: Generate a separate log file for each device
             log_file = os.path.join(log_dir, f"rank_{rank}.log")
-            
+
             # Step 4: Core operation – redirect file descriptors
             # os.O_TRUNC: Clear previous logs on each run to avoid mixing outputs
             fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o664)
             os.dup2(fd, 1)  # Redirect stdout → rank_X.log
             os.dup2(fd, 2)  # Redirect stderr → rank_X.log
             os.close(fd)     # Close original file descriptor; redirection persists
-            
+
             # Optional: print a confirmation message (will go into rank_X.log)
             print(f"[Qwen2Model Init] Rank {rank} log redirected to {log_file}")
-            
+
         except Exception as e:
             # Fallback mechanism: failure to redirect logs does not affect model loading
             print(f"[WARNING] Failed to redirect log for rank: {e}", flush=True)
         # ========== End of log redirection code ==========
 
 ```
+
 #### ⚠️ Common Issues
+
 **Q1**:Why not use Python's `logging` module?
 **A**:The XPU runtime kernel logs are emitted from the C++ layer and cannot be captured by Python’s `logging` module. Redirection via low-level file descriptors is required.
 **Q1**:Will logs be lost if the model fails to load??
 **A**:The `try-except` block ensures that if log redirection fails, it falls back to the default behavior without affecting model startup.
 
 ### Phase 2️⃣: Profiling Environment Activation
+
 #### 🚀 vLLM Launch
+
 ```bash
 unset XPU_DUMMY_EVENT
 export XPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -96,14 +105,21 @@ USE_ORI_ROPE=1 VLLM_USE_V1=1 python -m vllm.entrypoints.openai.api_server \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen2.5-72B-Instruct \
-      --compilation-config '{"splitting_ops": ["vllm.unified_attention_with_output_kunlun",
-            "vllm.unified_attention", "vllm.unified_attention_with_output",
-            "vllm.mamba_mixer2"]}' 2>&1 | tee output_p800.log
+      --compilation-config '{"splitting_ops": ["vllm.unified_attention",
+                                                "vllm.unified_attention_with_output",
+                                                "vllm.unified_attention_with_output_kunlun",
+                                                "vllm.mamba_mixer2",
+                                                "vllm.mamba_mixer",
+                                                "vllm.short_conv",
+                                                "vllm.linear_attention",
+                                                "vllm.plamo2_mamba_mixer",
+                                                "vllm.gdn_attention",
+                                                "vllm.sparse_attn_indexer"]}' 2>&1 | tee output_p800.log
 
 ```
 
-
 #### 🚀 Client Load Testing
+
 ```bash
 #!/bin/bash
 
@@ -177,6 +193,7 @@ echo "=========================================================="
 ```
 
 ### Phase 3️⃣: Log Analysis and Bottleneck Identification
+
 ```text
 xpu_logs/
 ├─ rank_0.log
@@ -189,16 +206,19 @@ xpu_logs/
 └─ rank_7.log
 
 ```
+
 #### 🔍 Script Workflow (op_log.py)
+
 **Input**:Raw Kernel Logs (Sample Format)
+
 ```
 [XPURT_PROF] void xblas_xpu3::fc_cdnn_infer<float16,...> 123456 ns
 [XPURT_PROF] void kl3_all_reduce<float16> 987654 ns
 ```
+
 **Processing logic**
 :::::{tab-set}
-::::{tab-item} op_log.py 
-
+::::{tab-item} op_log.py
 
 ```python
 """
@@ -382,8 +402,6 @@ if __name__ == '__main__':
 
 ::::{tab-item} op_log.sh
 
-
-
 ```bash
 
 for i in {0..7}; do
@@ -397,9 +415,12 @@ for i in {0..7}; do
     head -n 6 analysis_rank${i}.log | tail -n 5
 done
 ```
+
 ::::
 :::::
+
 #### 📈 Output Example (analysis_rank0.log)
+
 ```
 Filename: xpu_logs/rank_0.log
 -xpu option: 2
@@ -410,9 +431,11 @@ void xblas_xpu3::fc_cdnn_infer<float16, float16, float16, float16, float, 
 void kl3_all_reduce<float16>                                                                                                                          176134    14782.525712413793       27.506              
 void kl3_all_reduce_butterfly<float16>                                                                                                                164864    4197.28395862069         7.81           
 ```
+
 #### 🚨 Troubleshooting Guide
-|Symptom|Cause|Solution|
-|-|-|-|
-|`xpu_logs` directory is empty|XPUAPI_DEBUG not enabled|Verify that the environment variable is correctly set|
-All 8 log files have identical content|Multi-process backend not activated|Ensure `--distributed-executor-backend` mp is specified|
-|Throughput drops >15%|Profiling overhead too high|Enable profiling only during analysis; disable in production|
+
+| Symptom                                | Cause                               | Solution                                                     |
+| -------------------------------------- | ----------------------------------- | ------------------------------------------------------------ |
+| `xpu_logs` directory is empty          | XPUAPI_DEBUG not enabled            | Verify that the environment variable is correctly set        |
+| All 8 log files have identical content | Multi-process backend not activated | Ensure `--distributed-executor-backend` mp is specified      |
+| Throughput drops >15%                  | Profiling overhead too high         | Enable profiling only during analysis; disable in production |

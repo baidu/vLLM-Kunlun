@@ -10,7 +10,7 @@ from packaging import version
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-import xtorch_ops
+import kunlun_ops
 import os
 
 logger = init_logger(__name__)
@@ -37,7 +37,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
@@ -58,7 +58,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: Optional[torch.Tensor],
         p: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
         if (k is None and p is None) or generators:
             if generators:
@@ -158,14 +158,21 @@ def random_sample(
         if os.getenv('FAST_RANDOM_SAMPLE') == "1":
             q.uniform_()
             q = -torch.log(q)
-            q = q.clamp(min=1e-4)
+            q = q.clamp(min=1e-12)
         else:
             q.exponential_()
     if generators:
         # TODO(woosuk): This can be slow because we handle each request
         # one by one. Optimize this.
-        for i, generator in generators.items():
-            q[i].exponential_(generator=generator)
+        if os.getenv('FAST_RANDOM_SAMPLE') == "1":
+            for i, generator in generators.items():
+                q[i].uniform_(generator=generator)
+            q = -torch.log(q)
+            q = q.clamp(min=1e-12)
+        else:
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
@@ -193,16 +200,16 @@ def flashinfer_sample(
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     if k is None:
         # Top-p only.
-        next_token_ids = xtorch_ops.top_p_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_p_sampling_from_probs(
             probs,top_p=p, deterministic=True)
     elif p is None:
         # Top-k only.
-        next_token_ids = xtorch_ops.top_k_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_k_sampling_from_probs(
             probs, top_k=k, deterministic=True)
     else:
         # Both top-k and top-p.
         k = k.to(torch.int32)
-        next_token_ids = xtorch_ops.top_k_top_p_sampling_from_probs(
+        next_token_ids = kunlun_ops.top_k_top_p_sampling_from_probs(
             probs, top_k=k, top_p=p, deterministic=True)
 
     return next_token_ids.view(-1)

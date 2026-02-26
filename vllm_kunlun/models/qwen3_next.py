@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 from vllm_kunlun.ops.fla import (fused_recurrent_gated_delta_rule, torch_chunk_gated_delta_rule, chunk_gated_delta_rule)
 from vllm.model_executor.layers.fla.ops import (
     RMSNormGated)
-from vllm_kunlun.ops.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.layers.layernorm import (
@@ -70,7 +70,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer,
 from vllm_kunlun.ops.activation import SiluAndMul
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm.model_executor.layers.vocab_parallel_embedding import get_masked_input_and_mask
-import xtorch_ops
+import kunlun_ops
 
 
 @torch.compile(dynamic=True, backend="aot_eager")
@@ -640,7 +640,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             last_recurrent_state = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype).view(
                                     last_recurrent_state.shape[0], -1, last_recurrent_state.shape[-1])
             cast_ssm_state = ssm_state.view(ssm_state.shape[0], 1, -1, ssm_state.shape[-1])
-            xtorch_ops.reshape_and_cache_flash(
+            kunlun_ops.reshape_and_cache_flash(
                                 last_recurrent_state,
                                 last_recurrent_state,
                                 cast_ssm_state,

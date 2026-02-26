@@ -7,7 +7,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-import xtorch_ops
+import kunlun_ops
 
 logger = init_logger(__name__)
 
@@ -104,7 +104,7 @@ def flash_mla_with_kvcache(
     is_context = False
     vo_head_dim = -1
     
-    xtorch_ops.paged_attention(out,
+    kunlun_ops.paged_attention(out,
                                q,
                                k_cache, None,
                                block_table,
@@ -149,7 +149,7 @@ def kunlun_flash_mla_with_kvcache(
         p_sums:  (batch_size, seq_len_q, num_heads_q), torch.float32.
     """
     assert not is_fp8_kvcache, "By now, the kernel does not support uint8 kv cache."
-    assert q.shape[1] <= 2, "xtorch_ops.fwd_kvcache_mla only support seq_len_q <= 2 for now."
+    assert q.shape[1] <= 2, "kunlun_ops.fwd_kvcache_mla only support seq_len_q <= 2 for now."
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if indices is not None:
@@ -159,10 +159,8 @@ def kunlun_flash_mla_with_kvcache(
         assert not causal, \
             "causal must be `false` if sparse attention is enabled."
     
-    q_r, pe_cache = None, None # 当q_r和pe_cache为空时，为packed模式
     batch_size, seq_len_q, num_heads_q, head_dim = q.shape
     kv_lora_rank = head_dim_v
-    rope_head_dim = head_dim - kv_lora_rank
     
     out = torch.zeros([batch_size, seq_len_q, num_heads_q, kv_lora_rank],
                         dtype=q.dtype, device=q.device)
@@ -171,7 +169,7 @@ def kunlun_flash_mla_with_kvcache(
     p_sums = torch.zeros([batch_size, seq_len_q, num_heads_q],
                             dtype=torch.float32, device=q.device)
 
-    xtorch_ops.fwd_kvcache_mla(
+    torch.ops._C.fwd_kvcache_mla(
         q_c=q,
         kv_cache=k_cache,
         indices=indices,
@@ -224,7 +222,7 @@ def flash_mla_sparse_prefill(
     max_logits = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
     lse = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
 
-    xtorch_ops.sparse_prefill_fwd_opt(
+    torch.ops._C.sparse_prefill_fwd_opt(
         q=q,
         kv=kv,
         indices=indices,

@@ -8,22 +8,23 @@ Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, 
 <table border="1" style="border-collapse: collapse; width: auto; margin: 0 0 0 0; text-align: center;">
   <thead>
     <tr>
-      <td colspan="2" style="padding: 10px; font-weight: bold; border: 1px solid #000;">Compressed-Tensor (w8a8)</td>
+      <td colspan="2" style="padding: 10px; font-weight: bold; border: 1px solid #000;">Compressed-Tensors (w8a8-Int8)</td>
       <td colspan="4" style="padding: 10px; font-weight: bold; border: 1px solid #000;">Weight only (w4a16/w8a16)</td>
     </tr>
     <tr>
       <td style="padding: 10px; border: 1px solid #000;">Dynamic</td>
       <td style="padding: 10px; border: 1px solid #000;">Static</td>
-      <td colspan="2" style="padding: 10px; border: 1px solid #000;">AWQ (w4a16)</td>
+      <td colspan="1" style="padding: 10px; border: 1px solid #000;">AWQ (w4a16)</td>
       <td colspan="2" style="padding: 10px; border: 1px solid #000;">GPTQ (w4a16/w8a16)</td>
+       <td colspan="1" style="padding: 10px; border: 1px solid #000;">Compressed-Tensors (w4a16)</td>
     </tr>
     <tr>
       <td style="padding: 10px; border: 1px solid #000;">Dense/MoE</td>
       <td style="padding: 10px; border: 1px solid #000;">Dense/MoE</td>
+      <td style="padding: 10px; border: 1px solid #000;">Dense/MoE</td>
       <td style="padding: 10px; border: 1px solid #000;">Dense</td>
       <td style="padding: 10px; border: 1px solid #000;">MoE</td>
-      <td style="padding: 10px; border: 1px solid #000;">Dense</td>
-      <td style="padding: 10px; border: 1px solid #000;">MoE</td>
+      <td style="padding: 10px; border: 1px solid #000;">Dense/MoE</td>
     </tr>
   </thead>
   <tbody>
@@ -31,15 +32,17 @@ Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, 
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
-      <td style="padding: 10px; border: 1px solid #000;">WIP</td>
       <td style="padding: 10px; border: 1px solid #000;">✅</td>
       <td style="padding: 10px; border: 1px solid #000;">WIP</td>
+      <td style="padding: 10px; border: 1px solid #000;">✅</td>
     </tr>
   </tbody>
 </table>
 
-+ W8A8 dynamic and static quantization are now supported for all LLMs and VLMs.
-+ AWQ/GPTQ quantization is supported for all dense models.
++ Compressed-Tensors w8a8-Int8 dynamic and static quantization are supported for all LLMs and VLMs.
++ Compressed-Tensors w4a16 are supported for all LLMs and VLMs.
++ AWQ(w4a16) quantization is supported for all LLMs and VLMs.
++ GPTQ (w4a16/w8a16) quantization is supported for all dense models.
 
 ## Usages
 

@@ -52,6 +52,7 @@ user_guide/release_notes
 :::{toctree}
 :caption: Developer Guide
 :maxdepth: 1
+developer_guide/developer_guide
 developer_guide/contribution/index
 developer_guide/feature_guide/index
 developer_guide/evaluation/index

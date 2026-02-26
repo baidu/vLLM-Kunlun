@@ -311,7 +311,10 @@ class KunlunPlatform(Platform):
 
     @classmethod
     def get_punica_wrapper(cls):
-        return "vllm.lora.punica_wrapper.punica_cpu.PunicaWrapperCPU"
+        ''' 
+        kunlun wrapper
+        '''
+        return "vllm_kunlun.lora.punica_wrapper.punica_kunlun.PunicaWrapperKunlun"
     
     @classmethod
     def check_if_supports_dtype(cls, torch_dtype: torch.dtype):
