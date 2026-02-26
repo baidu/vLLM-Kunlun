@@ -10,14 +10,63 @@ from types import CodeType
 from typing import Any, Callable, Optional, ParamSpec, TypeVar
 
 import torch
+import torch._C._dynamo.guards
 import vllm.envs as envs
-from vllm.compilation import _compilation_context
 from vllm.config import CompilationMode, CUDAGraphMode, get_current_vllm_config
 from vllm.config.compilation import DynamicShapesType
 from vllm.logger import init_logger
 from vllm.utils.nvtx_pytorch_hooks import layerwise_nvtx_marker_context
 
 logger = init_logger(__name__)
+
+R = TypeVar("R")
+P = ParamSpec("P")
+
+
+def _noop_add_global_state_guard(
+    self: torch._C._dynamo.guards.GuardManager, *args: Any, **kwargs: Any
+) -> None:
+    """No-op to skip the GLOBAL_STATE guard entirely"""
+    pass
+
+
+def _noop_add_torch_function_mode_stack_guard(
+    self: torch._C._dynamo.guards.GuardManager, *args: Any, **kwargs: Any
+) -> None:
+    """No-op to skip the TORCH_FUNCTION_MODE_STACK guard entirely"""
+    pass
+
+
+@contextmanager
+def _compilation_context() -> Generator[None, None, None]:
+    """Context manager for compilation settings and patches."""
+    original_global_state_guard = (
+        torch._C._dynamo.guards.GuardManager.add_global_state_guard
+    )
+    original_torch_function_mode_stack_guard = (
+        torch._C._dynamo.guards.GuardManager.add_torch_function_mode_stack_guard
+    )
+    original_cache_size = torch._dynamo.config.cache_size_limit
+    original_accumulated_cache = torch._dynamo.config.accumulated_cache_size_limit
+    try:
+        torch._dynamo.config.cache_size_limit = 2048
+        torch._dynamo.config.accumulated_cache_size_limit = 8192
+        torch._C._dynamo.guards.GuardManager.add_global_state_guard = (
+            _noop_add_global_state_guard
+        )
+        torch._C._dynamo.guards.GuardManager.add_torch_function_mode_stack_guard = (
+            _noop_add_torch_function_mode_stack_guard
+        )
+        yield
+    finally:
+        torch._C._dynamo.guards.GuardManager.add_global_state_guard = (
+            original_global_state_guard
+        )
+        torch._C._dynamo.guards.GuardManager.add_torch_function_mode_stack_guard = (
+            original_torch_function_mode_stack_guard
+        )
+        torch._dynamo.config.cache_size_limit = original_cache_size
+        torch._dynamo.config.accumulated_cache_size_limit = original_accumulated_cache
 
 
 class TorchCompileWrapperWithCustomDispatcher:
