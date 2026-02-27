@@ -319,19 +319,6 @@ class KunlunPlatform(Platform):
         return False
 
     @classmethod
-    def supports_v1(cls, model_config: "ModelConfig") -> bool:
-        """
-            Check if the model config is supported by this class in v1.
-
-        Args:
-            model_config (ModelConfig): Model configuration to be checked.
-
-        Returns:
-            bool: Whether the model config is supported in v1. Always returns True for this class.
-        """
-        return True
-
-    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """
         Set the device for the current platform.
