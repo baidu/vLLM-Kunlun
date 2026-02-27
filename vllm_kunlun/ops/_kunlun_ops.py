@@ -516,12 +516,14 @@ class KunlunOps:
                 moe_topk=moe_top_k,
                 y=y,
             )
+            del moe_expand
 
             d = y.shape[-1] // 2
             output_shape = (y.shape[:-1] + (d, ))
             out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
             torch.ops._C.silu_and_mul(out1, y)
-            
+            del y
+
             out = torch.empty(M,moe_top_k,
                     w2.shape[1],
                     dtype=hidden_states.dtype,
@@ -537,7 +539,7 @@ class KunlunOps:
                 moe_topk=moe_top_k,
                 y=out,
             )
-
+            del out1
             dequant_scale = torch.ones([M, moe_top_k], dtype = torch.float32, device=out.device)
             output = torch.empty([M, N], dtype=hidden_states.dtype, device=hidden_states.device)
             sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
@@ -549,7 +551,7 @@ class KunlunOps:
                 dequant_scale=dequant_scale,
                 y=output
             )
-            
+            del out
             return output
 
     @staticmethod
