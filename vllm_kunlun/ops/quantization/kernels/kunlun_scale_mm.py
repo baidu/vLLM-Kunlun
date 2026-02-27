@@ -19,16 +19,12 @@
 from typing import Optional
 
 import torch
-import xspeedgate_ops
-from vllm.platforms import current_platform, PlatformEnum
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    convert_to_channelwise,
-)
 from vllm.model_executor.layers.quantization.kernels.scaled_mm import (
     _POSSIBLE_KERNELS,
-    ScaledMMLinearLayerConfig,
     CutlassScaledMMLinearKernel,
+    ScaledMMLinearLayerConfig,
 )
+from vllm.platforms import PlatformEnum, current_platform
 
 
 class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
@@ -60,7 +56,7 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
         # scaled_int8_quant supports both dynamic and static quant
         # Currently, static is per-tensor and dynamic is per-token
         x_q, x_s, x_zp, static = torch.ops._C.scaled_int8_quant(
-            x=x.contiguous(),
+            x=x,
             scale=x_s,
             azp=x_zp,
             symmetric=symmetric,
@@ -83,7 +79,7 @@ class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):
                 x=x_q,
                 w=w_q.transpose(0, 1),
                 out_dtype=x.dtype,
-                x_pc_max=x_s * 127.0 if static else x_s,
+                x_pc_max=x_s,
                 w_pc_max=w_s,
                 bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             )

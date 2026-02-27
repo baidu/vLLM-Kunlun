@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Optional
 
+import kunlun_ops
 import torch
 import torch.nn as nn
-from packaging import version
-
-from vllm import envs
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-import kunlun_ops
-import os
 
 logger = init_logger(__name__)
+
 
 class TopKTopPSampler(nn.Module):
     """
@@ -26,8 +23,7 @@ class TopKTopPSampler(nn.Module):
     def __init__(self, logprobs_mode):
         super().__init__()
         self.logprobs_mode = logprobs_mode
-        logger.info_once(
-            "Using FlashInfer for top-p & top-k sampling.")
+        logger.info_once("Using FlashInfer for top-p & top-k sampling.")
         self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
 
@@ -116,6 +112,7 @@ def apply_top_k_top_p(
     logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
     return logits
 
+
 def apply_top_k_only(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -140,6 +137,7 @@ def apply_top_k_only(
     logits.masked_fill_(logits < top_k_mask, -float("inf"))
     return logits
 
+
 def random_sample(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
@@ -155,23 +153,25 @@ def random_sample(
     # not have its own seed. Then, we overwrite the values for the requests
     # that have their own seeds.
     if len(generators) != probs.shape[0]:
-        if os.getenv('FAST_RANDOM_SAMPLE') == "1":
+        if os.getenv("FAST_RANDOM_SAMPLE") == "1":
             q.uniform_()
             q = -torch.log(q)
             q = q.clamp(min=1e-12)
         else:
-            q.exponential_()
+            # q.exponential_()
+            torch.ops.xspeedgate_ops.inplace_exponential(q)
     if generators:
         # TODO(woosuk): This can be slow because we handle each request
         # one by one. Optimize this.
-        if os.getenv('FAST_RANDOM_SAMPLE') == "1":
+        if os.getenv("FAST_RANDOM_SAMPLE") == "1":
             for i, generator in generators.items():
                 q[i].uniform_(generator=generator)
             q = -torch.log(q)
             q = q.clamp(min=1e-12)
         else:
             for i, generator in generators.items():
-                q[i].exponential_(generator=generator)
+                # q[i].exponential_(generator=generator)
+                torch.ops.xspeedgate_ops.inplace_exponential(q[i], generator=generator)
 
     return probs.div_(q).argmax(dim=-1).view(-1)
 
@@ -201,15 +201,18 @@ def flashinfer_sample(
     if k is None:
         # Top-p only.
         next_token_ids = kunlun_ops.top_p_sampling_from_probs(
-            probs,top_p=p, deterministic=True)
+            probs, top_p=p, deterministic=True
+        )
     elif p is None:
         # Top-k only.
         next_token_ids = kunlun_ops.top_k_sampling_from_probs(
-            probs, top_k=k, deterministic=True)
+            probs, top_k=k, deterministic=True
+        )
     else:
         # Both top-k and top-p.
         k = k.to(torch.int32)
         next_token_ids = kunlun_ops.top_k_top_p_sampling_from_probs(
-            probs, top_k=k, top_p=p, deterministic=True)
+            probs, top_k=k, top_p=p, deterministic=True
+        )
 
     return next_token_ids.view(-1)
