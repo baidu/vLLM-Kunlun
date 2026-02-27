@@ -1,4 +1,5 @@
 """kunlun"""
+
 from typing import TYPE_CHECKING, Optional
 
 import psutil
@@ -8,6 +9,11 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+else:
+    VllmConfig = None
 
 logger = init_logger(__name__)
 
@@ -212,6 +218,7 @@ class KunlunPlatform(Platform):
                 )
 
         from vllm.config import CUDAGraphMode
+
         if (
             envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
             and parallel_config.data_parallel_size > 1
@@ -230,11 +237,10 @@ class KunlunPlatform(Platform):
             # Deepseek-V2-lite model.
             # Note: use_inductor removed in v0.15.1, use backend="eager" instead
             vllm_config.compilation_config.backend = "eager"
-        # v0.15.1: 设置 backend="eager" 避免 inductor/Triton 调用
+        # v0.15.1: set backend="eager" to avoid inductor/Triton
         if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             vllm_config.compilation_config.custom_ops = ["all"]
             vllm_config.compilation_config.pass_config.enable_fusion = False
-            # 设置 backend 为 eager，避免 Triton 调用，让 wrapper 接管编译
             vllm_config.compilation_config.backend = "eager"
 
     @classmethod
