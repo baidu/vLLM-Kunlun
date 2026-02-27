@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 class KunlunPlatform(Platform):
     """KunlunPlatform"""
 
-    _enum = PlatformEnum.CUDA
+    _enum = PlatformEnum.OOT
     dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
     device_name: str = "xpu"
@@ -37,7 +37,7 @@ class KunlunPlatform(Platform):
 
     def is_kunlun(self) -> bool:
         """is_kunlun"""
-        return self._enum == PlatformEnum.CUDA
+        return self._enum == PlatformEnum.OOT
 
     def is_cuda(self) -> bool:
         """is_cuda"""

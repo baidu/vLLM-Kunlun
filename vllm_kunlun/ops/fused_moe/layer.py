@@ -3,8 +3,6 @@ Kunlun optimized FusedMoE - replaces UnquantizedFusedMoEMethod
 Uses monolithic mode to receive router_logits directly and call KunlunOps.fused_moe
 """
 
-from typing import Callable
-
 import torch
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
@@ -81,17 +79,3 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
             )
-
-    # On KunlunPlatform (_enum=PlatformEnum.CUDA), dispatch_forward selects
-    # forward_cuda. In monolithic mode, apply_monolithic is called directly
-    # by FusedMoE.forward_impl, but we still override forward_cuda and
-    # forward_native as a fallback in case they are invoked.
-    def forward_cuda(
-        self,
-        layer,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.apply_monolithic(layer, x, router_logits)
-
-    forward_native: Callable = forward_cuda
