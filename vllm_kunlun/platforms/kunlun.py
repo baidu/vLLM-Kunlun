@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
-
 logger = init_logger(__name__)
 
 
@@ -218,10 +217,12 @@ class KunlunPlatform(Platform):
                     "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
                 )
 
+        from vllm.config import CUDAGraphMode
+
         if (
             envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
             and parallel_config.data_parallel_size > 1
-            and vllm_config.compilation_config.use_cudagraph
+            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             logger.info(
                 "Data Parallel: Forcing enforce eager to be True since DP "
@@ -230,16 +231,17 @@ class KunlunPlatform(Platform):
                 "compatible. Set the all_to_all backend to deepep_low_latency "
                 "to use those kernels instead."
             )
-            vllm_config.compilation_config.use_cudagraph = False
+            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             vllm_config.model_config.enforce_eager = True
             # TODO (varun): Turning this ON gives incorrect results for the
             # Deepseek-V2-lite model.
-            vllm_config.compilation_config.use_inductor = False
-        # v0.15.1 do not support v0.15.1, remove the if condition
-        # if vllm_config.compilation_config.use_cudagraph:
-        #     vllm_config.compilation_config.custom_ops = ["all"]
-        #     vllm_config.compilation_config.pass_config.enable_fusion = False
-        #     vllm_config.compilation_config.use_inductor = False
+            # Note: use_inductor removed in v0.15.1, use backend="eager" instead
+            vllm_config.compilation_config.backend = "eager"
+        # v0.15.1: set backend="eager" to avoid inductor/Triton
+        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            vllm_config.compilation_config.custom_ops = ["all"]
+            vllm_config.compilation_config.pass_config.enable_fusion = False
+            vllm_config.compilation_config.backend = "eager"
 
     @classmethod
     def get_attn_backend_cls(

@@ -47,6 +47,13 @@ def register():
     logger = logging.getLogger("vllm_kunlun")
     logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
 
+    # --- load native extension to register torch.ops._C.weak_ref_tensor ---
+    try:
+        from . import _kunlun  # noqa: F401
+        logger.info("[KunlunPlugin] _kunlun native extension loaded")
+    except ImportError as e:
+        logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", e)
+
     # --- import wrapper & patch utils ---
     try:
         from .schema import direct_register_custom_op  # noqa: F401
