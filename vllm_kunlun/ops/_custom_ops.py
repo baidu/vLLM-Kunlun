@@ -111,6 +111,68 @@ def rms_norm_static_fp8_quant_xpu(
     pass
 
 
+@custom_op("_C::rms_norm_per_block_quant", mutates_args=())
+def rms_norm_per_block_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+    group_size: List[int],
+    scale_ub: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    is_scale_transposed: bool = False,
+) -> None:
+    pass
+
+
+@impl("_C::rms_norm_per_block_quant", "CUDA")
+def rms_norm_per_block_quant_xpu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+    group_size: List[int],
+    scale_ub: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    is_scale_transposed: bool = False,
+) -> None:
+    pass
+
+
+@custom_op("_C::fused_qk_norm_rope", mutates_args=())
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+) -> None:
+    pass
+
+
+@impl("_C::fused_qk_norm_rope", "CUDA")
+def fused_qk_norm_rope_xpu(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+) -> None:
+    pass
+
+
 @custom_op("_C::fused_add_rms_norm_static_fp8_quant", mutates_args=())
 def fused_add_rms_norm_static_fp8_quant(
     result: torch.Tensor,
