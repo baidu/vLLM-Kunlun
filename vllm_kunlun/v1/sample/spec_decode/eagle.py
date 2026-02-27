@@ -163,7 +163,7 @@ def propose(
         torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone().to(torch.int32)
     )
 
-    attn_metadata_builder = self.runner.attn_groups[0][0].metadata_builder
+    attn_metadata_builder = self.runner.attn_groups[0][0].metadata_builders[ubatch_id]
     for token_index in range(self.num_speculative_tokens - 1):
         # Update the inputs.
         # cast to int32 is crucial when eagle model is compiled.

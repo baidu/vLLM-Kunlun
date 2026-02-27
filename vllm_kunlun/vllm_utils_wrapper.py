@@ -1591,6 +1591,8 @@ def scaled_int8_quant(
     if scale is not None:  # static
         static = True
         torch.ops.xspeedgate_ops.static_scaled_int8_quant(x_q, x, scale, azp)
+        # NOTE: For static, scale represents max.
+        scale *= 127.0
     else:  # dynamic
         scale = torch.empty(
             (x.numel() // x.shape[-1], 1), device=x.device, dtype=torch.float32
@@ -1617,7 +1619,11 @@ def scaled_int8_quant_cuda(
     x_q = torch.empty_like(x, dtype=torch.int8, device=x.device)
     if scale is not None:  # static
         static = True
-        torch.ops.xspeedgate_ops.static_scaled_int8_quant(x_q, x, scale, azp)
+        torch.ops.xspeedgate_ops.static_scaled_int8_quant(
+            x_q, x.contiguous(), scale, azp
+        )
+        # NOTE: For static, scale represents max.
+        scale *= 127.0
     else:  # dynamic
         scale = torch.empty(
             (x.numel() // x.shape[-1], 1), device=x.device, dtype=torch.float32

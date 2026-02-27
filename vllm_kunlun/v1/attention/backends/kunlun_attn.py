@@ -15,7 +15,6 @@
 # This file is a part of the vllm-kunlun project.
 #
 from dataclasses import dataclass
-from itertools import accumulate
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -219,12 +218,12 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
 
     seq_lens_tensor_cpu: Optional[torch.Tensor] = None
 
-    num_prefill_tokens: int = 0
-    num_decode_tokens: int = 0
-    num_prefills: int = 0
-    num_decodes: int = 0
+    num_prefill_tokens: Optional[int] = 0
+    num_decode_tokens: Optional[int] = 0
+    num_prefills: Optional[int] = 0
+    num_decodes: Optional[int] = 0
     is_speculative: Optional[bool] = False
-    max_model_len: int = 0
+    max_model_len: Optional[int] = 0
 
     def __post_init__(self):
         """__post_init__"""
@@ -578,20 +577,11 @@ class KunlunAttentionMetadataBuilder:
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
-        )
+        query_start_loc_host = common_attn_metadata.query_start_loc_cpu
+        query_start_loc = common_attn_metadata.query_start_loc
 
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-
-        seq_start_loc = list(accumulate(seq_lens, initial=0))
-
-        seq_start_loc_tensor = torch.empty(
-            len(seq_start_loc), dtype=torch.int32, device=self.device
-        )
-        seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
 
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
@@ -694,7 +684,10 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
-        self.sliding_window = sliding_window
+        if sliding_window is None:
+            self.sliding_window = (-1, -1)
+        else:
+            self.sliding_window = (sliding_window, 0)
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -710,7 +703,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 f"Supported head sizes are: {suppored_head_sizes}."
             )
 
-        self.sinks = sinks
+        self.sinks = sinks.to(torch.float32) if sinks is not None else None
         if sinks is not None:
             assert sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
@@ -718,6 +711,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 f"num_heads: {num_heads}."
             )
         self.multi_modal_placeholder_index_maps = multi_modal_placeholder_index_maps
+
+        self.has_max_window_size = False
+        sig = inspect.signature(kunlun_ops.speculative_attention)
+        if "max_window_size" in sig.parameters:
+            self.has_max_window_size = True
 
     def forward(
         self,
@@ -836,13 +834,9 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
                     softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
+                    swa_left=self.sliding_window[0],
+                    swa_right=self.sliding_window[1],
+                    sink=self.sinks,
                 )
 
         if decode_meta := attn_metadata.decode_metadata:
@@ -859,8 +853,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     decode_meta.block_tables * 2
                 )  # only test in Qwen3-Next
 
-            sig = inspect.signature(kunlun_ops.speculative_attention)
-            if "max_window_size" in sig.parameters:
+            if self.has_max_window_size:
                 kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],
                     # Only MLA support q len > 1 right now
@@ -880,13 +873,9 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     kv_head_num=self.num_kv_heads,
                     block_size=key_cache.shape[2],
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                    max_window_size=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
+                    max_window_size=self.sliding_window[0],
                     block_tables=tmp_block_tables,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
+                    sink=self.sinks,
                 )
             elif not attn_metadata.is_speculative:
                 kunlun_ops.paged_attention(
@@ -903,15 +892,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 )
             else:
                 batch_size = attn_metadata.num_decodes
-                query_seq_len, head_num, head_dim = decode_query.shape
-                assert query_seq_len % batch_size == 0
-                qlen = query_seq_len // batch_size
+                qlen = decode_query.shape[0] // batch_size
                 out = output[:num_decode_tokens]
-                assert out.is_contiguous()
 
                 kunlun_ops.speculative_attention(
-                    out=out.view(batch_size, qlen, head_num, self.head_size),
-                    q=decode_query.view(batch_size, qlen, head_num, head_dim),
+                    out=out,  # 3D: (num_decode_tokens, head_num, v_dim)
+                    q=decode_query,  # 3D: (num_decode_tokens, head_num, head_dim)
+                    # out=out.view(batch_size, qlen, head_num, self.head_size),
+                    # q=decode_query.view(batch_size, qlen, head_num, head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
