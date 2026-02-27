@@ -6,17 +6,23 @@ torch_xray is an operator precision analysis tool that can dump module-level inp
 
 ### 1.Download and install
 
-***\*python3.10:\****
+**\*python3.12:\***
 
-bos:/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/torch_xray-999.9.9-cp310-cp310-linux_x86_64.whl
+```
+pip install "https://klx-sdk-release-public.su.bcebos.com/torch_xray/release/2.0.3.0/torch_xray-2.0.3-cp312-cp312-linux_x86_64.whl"
+```
 
-﻿[https://su.bcebos.com/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/](https://su.bcebos.com/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/torch_xray-999.9.9-py3-none-any.whl)torch_xray-999.9.9-cp310-cp310-linux_x86_64.whl
+**\*python3.10:\***
 
-***\*python3.8:\****
+```
+pip install "https://klx-sdk-release-public.su.bcebos.com/torch_xray/release/2.0.3.0/torch_xray-2.0.3-cp310-cp310-linux_x86_64.whl"
+```
 
-bos:/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/torch_xray-999.9.9-cp38-cp38-linux_x86_64.whl
+**\*python3.8:\***
 
-﻿[https://su.bcebos.com/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/](https://su.bcebos.com/klx-sdk-release-public/xpytorch/dev_kl3/torch_xray/latest/torch_xray-999.9.9-py3-none-any.whl)torch_xray-999.9.9-cp38-cp38-linux_x86_64.whl
+```
+pip install "https://klx-sdk-release-public.su.bcebos.com/torch_xray/release/2.0.3.0/torch_xray-2.0.3-cp38-cp38-linux_x86_64.whl"
+```
 
 Note that the same installation package must be used when using it in different environments.
 
