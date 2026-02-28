@@ -24,7 +24,7 @@ class KunlunPlatform(Platform):
     _enum = PlatformEnum.OOT
     dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
-    device_name: str = "xpu"
+    device_name: str = "cuda"
 
     @property
     def device_type(self):
