@@ -337,5 +337,5 @@ def prepare_next_token_ids_padded(
     return next_token_ids, valid_sampled_tokens_count
 
 
-EagleProposer.propose = propose
+# EagleProposer.propose = propose
 EagleProposer.prepare_next_token_ids_padded = prepare_next_token_ids_padded

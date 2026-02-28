@@ -12,21 +12,21 @@
 from typing import Optional
 
 import torch
-
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .op import exp
 from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 # @triton.autotune(
 #     configs=[
 #         triton.Config({
@@ -40,7 +40,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 #     ],
 #     key=['H', 'K', 'V', 'BT'],
 # )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
     k,
@@ -67,10 +67,12 @@ def chunk_fwd_kernel_o(
 
     if IS_VARLEN:
         i_tg = i_t
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
-            tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
@@ -89,12 +91,15 @@ def chunk_fwd_kernel_o(
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK),
-                                (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT),
-                                (BK, BT), (0, 1))
-        p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV),
-                                (BK, BV), (1, 0))
+        p_q = tl.make_block_ptr(
+            q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+        )
+        p_k = tl.make_block_ptr(
+            k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
+        )
+        p_h = tl.make_block_ptr(
+            h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
+        )
         # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         # [BK, BT]
@@ -109,8 +114,8 @@ def chunk_fwd_kernel_o(
 
     if USE_G:
         g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T, ), (H, ), (i_t * BT, ), (BT, ), (0, ))
-        b_g = tl.load(p_g, boundary_check=(0, ))
+        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        b_g = tl.load(p_g, boundary_check=(0,))
         b_o = b_o * tl.exp(b_g)[:, None]
         b_A = b_A * tl.exp(b_g[:, None] - b_g[None, :])
 
@@ -120,10 +125,12 @@ def chunk_fwd_kernel_o(
     # b_A = tl.where(m_A, b_A, 0)
     b_A = tl.where(o_t[:, None] >= o_t[None, :], b_A, 0)
 
-    p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (i_t * BT, i_v * BV),
-                            (BT, BV), (1, 0))
-    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (i_t * BT, i_v * BV),
-                            (BT, BV), (1, 0))
+    p_v = tl.make_block_ptr(
+        v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+    )
+    p_o = tl.make_block_ptr(
+        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+    )
     b_v = tl.load(p_v, boundary_check=(0, 1))
 
     # to fix mma -> mma layout conversion
@@ -133,48 +140,29 @@ def chunk_fwd_kernel_o(
 
 
 def chunk_fwd_o(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        h: torch.Tensor,
-        g: Optional[torch.Tensor] = None,  # cumsum of log decay
-        scale: Optional[float] = None,
-        cu_seqlens: Optional[torch.LongTensor] = None,
-        chunk_size: int = 64) -> torch.Tensor:
-    B, T, Hg, K, V = *q.shape, v.shape[-1]
-    H = v.shape[-2]
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    h: torch.Tensor,
+    g: Optional[torch.Tensor] = None,  # cumsum of log decay
+    scale: Optional[float] = None,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    _, T, _, _, _ = *q.shape, v.shape[-1]
     if FLA_GDN_FIX_BT:
         BT = 64
     else:
         BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = prepare_chunk_indices(
-        cu_seqlens, BT) if cu_seqlens is not None else None
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    )
     if scale is None:
-        scale = k.shape[-1]**-0.5
+        scale = k.shape[-1] ** -0.5
 
     o = torch.empty_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta['BV']), NT, B * H)
-
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=64,
-        BV=32
+    o = torch.ops.xspeedgate_ops.chunk_fwd_o(
+        q, k, v, h, g, scale, cu_seqlens, chunk_indices, chunk_size
     )
     return o
