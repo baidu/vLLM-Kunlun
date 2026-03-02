@@ -1727,26 +1727,24 @@ def scaled_int8_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     static = False
     x_q = torch.empty_like(x, dtype=torch.int8, device=x.device)
+    x = x.contiguous()
+
     if scale is not None:  # static
         static = True
-        torch.ops.xspeedgate_ops.static_scaled_int8_quant(
-            x_q, x.contiguous(), scale, azp
-        )
+        torch.ops.xspeedgate_ops.static_scaled_int8_quant(x_q, x, scale, azp)
         # NOTE: For static, scale represents max.
-        scale *= 127.0
+        max_vals = scale * 127.0
     else:  # dynamic
-        scale = torch.empty(
+        max_vals = torch.empty(
             (x.numel() // x.shape[-1], 1), device=x.device, dtype=torch.float32
         )
-        azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
+        azp = None if symmetric else torch.empty_like(max_vals, dtype=torch.int32)
         if symmetric:
             # NOTE: For quant2d ops, scale represents max.
-            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            kunlun_ops.quant2d(x=x, y=x_q, max=max_vals, force_sdnn=True)
         else:
-            torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
-                x_q, x.contiguous(), scale, azp
-            )
-    return x_q, scale, azp, static
+            torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(x_q, x, max_vals, azp)
+    return x_q, max_vals, azp, static
 
 
 @impl("_C::scaled_int8_quant", "CUDA")
@@ -1758,26 +1756,23 @@ def scaled_int8_quant_cuda(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     static = False
     x_q = torch.empty_like(x, dtype=torch.int8, device=x.device)
+    x = x.contiguous()
     if scale is not None:  # static
         static = True
-        torch.ops.xspeedgate_ops.static_scaled_int8_quant(
-            x_q, x.contiguous(), scale, azp
-        )
+        torch.ops.xspeedgate_ops.static_scaled_int8_quant(x_q, x, scale, azp)
         # NOTE: For static, scale represents max.
-        scale *= 127.0
+        max_vals = scale * 127.0
     else:  # dynamic
-        scale = torch.empty(
+        max_vals = torch.empty(
             (x.numel() // x.shape[-1], 1), device=x.device, dtype=torch.float32
         )
-        azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
+        azp = None if symmetric else torch.empty_like(max_vals, dtype=torch.int32)
         if symmetric:
             # NOTE: For quant2d ops, scale represents max.
-            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            kunlun_ops.quant2d(x=x, y=x_q, max=max_vals, force_sdnn=True)
         else:
-            torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
-                x_q, x.contiguous(), scale, azp
-            )
-    return x_q, scale, azp, static
+            torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(x_q, x, max_vals, azp)
+    return x_q, max_vals, azp, static
 
 
 def _fake_scaled_int8_quant(

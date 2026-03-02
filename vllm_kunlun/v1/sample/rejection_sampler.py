@@ -332,14 +332,17 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
-    expand_pytorch(
-        expanded_x,
-        x,
-        cu_num_tokens,
-        replace_from,
-        replace_to,
-        MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
-    )
+    if x.dtype in (torch.int32, torch.float32):
+        kunlun_ops.expand_tokens(expanded_x, x, cu_num_tokens, replace_from, replace_to)
+    else:
+        expand_pytorch(
+            expanded_x,
+            x,
+            cu_num_tokens,
+            replace_from,
+            replace_to,
+            MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
+        )
     return expanded_x
 
 
