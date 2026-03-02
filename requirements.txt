@@ -28,6 +28,7 @@ tokenizers>=0.21.2
 uvloop==0.21.0
 prometheus-fastapi-instrumentator==7.1.0
 transformers==4.57.0
+typer >= 0.21.1
 
 # basic 
 hatchling>=1.25
