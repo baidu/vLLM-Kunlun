@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 try:
+    import cocopod  # noqa
     import kunlun_ops
 
     logger.info("Load custom ops library success!")
