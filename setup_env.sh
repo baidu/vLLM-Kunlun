@@ -1,5 +1,5 @@
 unset XPU_DUMMY_EVENT
-export XPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export XFT_USE_FAST_SWIGLU=1 #使用快速swiglu实现
 export XPU_USE_FAST_SWIGLU=1 #使用moe算子中快速swiglu实现
 export XMLIR_CUDNN_ENABLED=1
