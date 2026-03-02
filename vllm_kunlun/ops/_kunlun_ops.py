@@ -19,7 +19,9 @@
 
 from typing import Optional
 
+import cocopod  # noqa
 import torch
+import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
