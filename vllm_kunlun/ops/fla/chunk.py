@@ -13,6 +13,7 @@ from typing import Optional
 import cocopod  # noqa
 import torch
 import torch.nn.functional as F
+import xspeedgate_ops  # noqa
 from einops import rearrange
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
