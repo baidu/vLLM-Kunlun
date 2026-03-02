@@ -167,7 +167,7 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
 
         if not getattr(self, "_is_compiled", False):
             self.forward_static = torch.compile(
-                self.forward_static, backend="aot_eager"
+                self.forward_native, backend="aot_eager"
             )
             self._is_compiled = True
         return self.forward_native(x, residual)
