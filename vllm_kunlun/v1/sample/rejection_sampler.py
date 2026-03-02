@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+import xspeedgate_ops
 
 logger = init_logger(__name__)
 
@@ -175,15 +176,22 @@ def rejection_sample(
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+
+    # Ensure bonus_token_ids is 1-dimensional
+    bonus_token_ids_1d = (
+        bonus_token_ids.squeeze(1) if bonus_token_ids.ndim == 2 else bonus_token_ids
+    )
+    # Compute target argmax for both greedy and random sampling
+    target_argmax = target_probs.argmax(dim=-1)
+
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
-        target_argmax = target_probs.argmax(dim=-1)
         kunlun_ops.rejection_greedy_sample(
             output_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
             target_argmax,
-            bonus_token_ids,
+            bonus_token_ids_1d,
             is_greedy,
             max_spec_len,
         )
@@ -213,20 +221,24 @@ def rejection_sample(
     )
     bonus_token_ids = bonus_token_ids.squeeze(1)
 
+    # Rejection sampling for random sampling requests (V1)
     kunlun_ops.rejection_random_sample(
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
         target_probs,
-        bonus_token_ids,
+        bonus_token_ids_1d,
         recovered_token_ids,
         uniform_probs,
         is_greedy,
         max_spec_len,
         vocab_size,
         no_draft_probs=draft_probs is None,
+        threshold_single=1.0,
+        draft_prob_val=1.0,
     )
+
     return output_token_ids
 
 
@@ -320,14 +332,17 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
-    expand_pytorch(
-        expanded_x,
-        x,
-        cu_num_tokens,
-        replace_from,
-        replace_to,
-        MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
-    )
+    if x.dtype in (torch.int32, torch.float32):
+        kunlun_ops.expand_tokens(expanded_x, x, cu_num_tokens, replace_from, replace_to)
+    else:
+        expand_pytorch(
+            expanded_x,
+            x,
+            cu_num_tokens,
+            replace_from,
+            replace_to,
+            MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
+        )
     return expanded_x
 
 
@@ -403,16 +418,19 @@ def sample_recovered_tokens(
         dtype=torch.float32,
         device=device,
     )
-    q.exponential_()
+    # q.exponential_()
+    torch.ops.xspeedgate_ops.inplace_exponential(q)
     for i, generator in sampling_metadata.generators.items():
         # Do not generate random numbers for requests with no draft tokens.
         # This can be important for reproducibility.
         if num_draft_tokens[i] > 0:
-            q[i].exponential_(generator=generator)
+            # q[i].exponential_(generator=generator)
+            torch.ops.xspeedgate_ops.inplace_exponential(q[i], generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
+
     kunlun_ops.sample_recovered_tokens(
-        recovered_token_ids,
+        recovered_token_ids,  # output_token_ids
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
