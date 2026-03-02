@@ -16,7 +16,6 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             "vllm.v1.worker.utils": "vllm_kunlun.v1.worker.utils",
             "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
             "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
-            "vllm.model_executor.layers.sampler": "vllm_kunlun.ops.sample.sampler",
             "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
             "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
         }
@@ -50,6 +49,7 @@ def register():
     # --- load native extension to register torch.ops._C.weak_ref_tensor ---
     try:
         from . import _kunlun  # noqa: F401
+
         logger.info("[KunlunPlugin] _kunlun native extension loaded")
     except ImportError as e:
         logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", e)

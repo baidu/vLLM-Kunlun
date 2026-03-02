@@ -12,109 +12,12 @@ from typing import Optional
 
 import cocopod  # noqa
 import torch
-import torch.nn.functional as F
 import xspeedgate_ops  # noqa
 from einops import rearrange
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .l2norm import l2norm_fwd
 from .utils import SUPPRESS_LEVEL, input_guard
-
-
-def torch_solve_tril(
-    A: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    output_dtype: torch.dtype = torch.float,
-):
-    chunk_size = 64
-    A = -A.transpose(1, 2)
-    sequence_length = A.shape[-2]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    A = F.pad(A, (0, 0, 0, pad_size))
-    A = A.reshape(A.shape[0], A.shape[1], -1, chunk_size, A.shape[-1])
-    # mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=A.device), diagonal=0)
-
-    # A = A.masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = A[..., i, :i].clone()
-        sub = A[..., :i, :i].clone()
-        A[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    A = A + torch.eye(chunk_size, dtype=A.dtype, device=A.device)
-    return A.reshape(A.shape[0], A.shape[1], -1, A.shape[-1])[
-        :, :, :sequence_length, :
-    ].transpose(1, 2)
-
-
-def recompute_w_u_fwd_torch(
-    k: torch.Tensor,  # [B, T, H, K]
-    v: torch.Tensor,  # [B, T, H, V]
-    beta: torch.Tensor,  # [B, T, H]
-    g: torch.Tensor,  # [B, T, H]
-    A: torch.Tensor,  # [B, H, T, T]
-):
-    """
-    最简单版本：假设等长序列，key和value头数相同
-    """
-    chunk_size = 64
-    num_v_heads, num_k_heads = v.shape[2], k.shape[2]
-    k = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-    k, v, beta, g, A = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (k, v, beta, g, A)
-    ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = k.shape
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    k = F.pad(k, (0, 0, 0, pad_size))
-    v = F.pad(v, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    A = F.pad(A, (0, 0, 0, pad_size))
-    A = A.reshape(A.shape[0], A.shape[1], -1, chunk_size, A.shape[-1])
-
-    v_beta = v * beta.unsqueeze(-1)
-    k_beta = k * beta.unsqueeze(-1)
-
-    k, v, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (k, v, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-
-    u = A @ v_beta
-    w = A @ (k_beta * g.exp().unsqueeze(-1))
-    w = (
-        w.reshape(w.shape[0], w.shape[1], -1, w.shape[-1])[:, :, :sequence_length, :]
-        .transpose(1, 2)
-        .contiguous()
-    )
-    u = (
-        u.reshape(u.shape[0], u.shape[1], -1, u.shape[-1])[:, :, :sequence_length, :]
-        .transpose(1, 2)
-        .contiguous()
-    )
-
-    return w, u
-
-
-def split_by_value(tensor, chunk_size=64):
-    indices = tensor.tolist()
-    result = set(indices)  # 使用集合避免重复
-
-    for i in range(len(indices) - 1):
-        start = indices[i]
-        end = indices[i + 1]
-
-        # 计算第一个对齐边界
-        # 我们要找的是 start + n*chunk_size，其中n是使结果大于start的最小整数
-        first_boundary = start + chunk_size
-
-        # 在(start, end)范围内插入所有对齐边界
-        boundary = first_boundary
-        while boundary < end:
-            result.add(boundary)
-            boundary += chunk_size
-
-    return torch.tensor(sorted(result), dtype=tensor.dtype, device=tensor.device)
 
 
 def chunk_gated_delta_rule_fwd(
@@ -138,8 +41,6 @@ def chunk_gated_delta_rule_fwd(
         else None
     )
 
-    # !
-    # g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     g = torch.ops.xspeedgate_ops.chunk_local_cumsum(
         g,
         chunk_size=64,
@@ -149,34 +50,11 @@ def chunk_gated_delta_rule_fwd(
         head_first=False,
     )
 
-    # !
-    # A = chunk_scaled_dot_kkt_fwd(k=k,
-    #                              beta=beta,
-    #                              g_cumsum=g,
-    #                              cu_seqlens=cu_seqlens,
-    #                              output_dtype=q.dtype)
     A = torch.ops.xspeedgate_ops.chunk_scaled_dot_kkt_fwd(
         k, beta, g, cu_seqlens, chunk_indices, chunk_size
     )
 
-    # torch版
-    # if get_tensor_model_parallel_rank() == 0:
-    #     torch.save(A, "A_in")
-    #     torch.save(cu_seqlens, "cu_seqlens")
-    # A2 = A.clone()
     torch.ops.xspeedgate_ops.solve_tril_ns(A, cu_seqlens, chunk_indices, chunk_size)
-
-    # !
-    # torch.ops.xspeedgate_ops.solve_tril_fwd(A, cu_seqlens)
-    # if get_tensor_model_parallel_rank() == 0:
-    #     err = torch.max(torch.abs(A - A2))
-    #     print("err", err)
-    #     if err > 1e-3:
-    #         raise
-    # A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    # for i in range(len(cu_seqlens)-1):
-    #     A_i = A[:, cu_seqlens[i]:cu_seqlens[i+1], :, :]
-    #     A[:, cu_seqlens[i]:cu_seqlens[i+1], :, :] = torch_solve_tril(A=A_i, cu_seqlens=torch.tensor([0, cu_seqlens[i+1]-cu_seqlens[i]], device=q.device), output_dtype=k.dtype)
 
     """
     B, T, Hg, K, V = *k.shape, v.shape[-1]
@@ -220,22 +98,6 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
     """
-
-    # i
-    # import os
-    # if not os.path.exists("/qwen-next/in"):
-    #     os.makedirs("/qwen-next/in")
-    #     torch.save(k, "/qwen-next/in/k.pt")
-    #     torch.save(u, "/qwen-next/in/u.pt")
-    #     torch.save(w, "/qwen-next/in/w.pt")
-    #     torch.save(g, "/qwen-next/in/g.pt")
-    #     torch.save(initial_state, "/qwen-next/in/initial_state.pt")
-    #     torch.save(cu_seqlens, "/qwen-next/in/cu_seqlens.pt")
-    #     torch.save(chunk_indices, "/qwen-next/in/chunk_indices.pt")
-    #     torch.save(chunk_offsets.to(torch.int32), "/qwen-next/in/chunk_offsets.pt")
-    #     torch.save(chunk_size, "/qwen-next/in/chunk_size.pt")
-    #     torch.save(output_final_state, "/qwen-next/in/output_final_state.pt")
-
     h, v_new, final_state = torch.ops.xspeedgate_ops.chunk_gated_delta_rule_fwd_h(
         k,
         u,
@@ -249,21 +111,6 @@ def chunk_gated_delta_rule_fwd(
         output_final_state,
         True,
     )
-
-    # h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-    #     k=k,
-    #     w=w,
-    #     u=u,
-    #     g=g,
-    #     initial_state=initial_state,
-    #     output_final_state=output_final_state,
-    #     cu_seqlens=cu_seqlens,
-    # )
-    # if not os.path.exists("/qwen-next/out"):
-    #     os.makedirs("/qwen-next/out")
-    #     torch.save(h, "/qwen-next/out/h.pt")
-    #     torch.save(v_new, "/qwen-next/out/v_new.pt")
-    #     torch.save(final_state, "/qwen-next/out/final_state.pt")
 
     o = torch.ops.xspeedgate_ops.chunk_fwd_o(
         q=q,
