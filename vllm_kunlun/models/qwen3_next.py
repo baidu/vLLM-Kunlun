@@ -38,6 +38,7 @@ from vllm.model_executor.layers.fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3NextRMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -134,11 +135,15 @@ def get_masked_input_and_mask_kunlun(
 
 get_masked_input_and_mask = get_masked_input_and_mask_kunlun
 
+logger = init_logger(__name__)
+
+KVCache = tuple[torch.Tensor, torch.Tensor]
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
 
@@ -209,7 +214,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
@@ -324,24 +329,31 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
-        self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
-        self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_qkvz,
-            bias=False,
+        # self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        # self.projection_size_ba = self.num_v_heads * 2
+        # self.in_proj_qkvz = ColumnParallelLinear(
+        #     input_size=self.hidden_size,
+        #     output_size=self.projection_size_qkvz,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=f"{prefix}.in_proj_qkvz",
+        # )
+        self.in_proj_qkvz = self.create_qkvz_proj(
+            hidden_size=self.hidden_size,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_qkvz",
         )
         # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = ColumnParallelLinear(
+        self.in_proj_ba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.projection_size_ba,
+            output_sizes=[self.num_v_heads] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
         )
-
+        
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
@@ -400,10 +412,26 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[sum((key_dim, key_dim, value_dim, value_dim))],
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
     def fix_query_key_value_ordering(
         self,
-        mixed_qkvz,
-        mixed_ba,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
     ):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
@@ -1048,7 +1076,7 @@ class Qwen3NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config: Qwen3NextConfig = vllm_config.model_config.hf_config
+        config: Qwen3NextConfig = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
 
         eplb_config = parallel_config.eplb_config
@@ -1125,7 +1153,7 @@ class Qwen3NextModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=getattr(self.config, "num_experts", 0),
             num_redundant_experts=self.num_redundant_experts,
         )
 
@@ -1284,7 +1312,7 @@ class Qwen3NextForCausalLM(
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -1348,7 +1376,7 @@ class Qwen3NextForCausalLM(
         cls, vllm_config: "VllmConfig"
     ) -> tuple[tuple[int, int], tuple[int, int]]:
         parallel_config = vllm_config.parallel_config
-        hf_config = vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_text_config
         tp_size = parallel_config.tensor_parallel_size
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens

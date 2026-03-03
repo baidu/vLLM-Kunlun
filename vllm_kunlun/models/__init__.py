@@ -93,6 +93,10 @@ def register_model():
         "GlmMoeDsaForCausalLM", "vllm_kunlun.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
 
+    ModelRegistry.register_model(
+        "Qwen3_5MoeForConditionalGeneration",
+        "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForConditionalGeneration")
+
 
 def register_quant_method():
     """to do"""
