@@ -50,10 +50,10 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ::::
 :::::
 ## Install vLLM-kunlun
-### Install vLLM 0.11.0
+### Install vLLM 0.15.1
 
 ```
-uv pip install vllm==0.11.0 --no-build-isolation --no-deps
+uv pip install vllm==0.15.1 --no-build-isolation --no-deps
 ```
 
 ### Build and Install
@@ -135,10 +135,17 @@ uv pip install "https://vllm-ai-models.bj.bcebos.com/v1/vLLM-Kunlun/ops/swa/xtor
 uv pip install "https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1215/xtorch_ops-0.1.2263%2Bc030eebd-cp310-cp310-linux_x86_64.whl"
 ```
 
-## Install the KLX3 custom Triton build
+## Install Kunlun-related packages
 
 ```
-uv pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl"
+# Install kunlun_ops
+uv pip install "https://baidu-kunlun-customer.su.bcebos.com/aiak/mimo/20260227/kunlun_ops-0.1.58+ee39020a-cp310-cp310-linux_x86_64.whl"
+
+# Install xspeedgate_ops
+uv pip install "http://vllm-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20260228_173659/xspeedgate_ops-1.0.0+04b2a8c-cp310-cp310-linux_x86_64.whl"
+
+# Install cocopod
+uv pip install "https://vllm-ai-models.bj.bcebos.com/link/20260228_163304/cocopod-1.0.0-cp310-cp310-linux_x86_64.whl"
 ```
 
 ## Install the AIAK custom ops library
