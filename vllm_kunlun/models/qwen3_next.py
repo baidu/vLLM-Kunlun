@@ -5,7 +5,6 @@
 from collections.abc import Iterable
 from itertools import islice
 
-import kunlun_ops
 import torch
 from einops import rearrange
 from torch import nn
@@ -329,15 +328,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
         # projection of the input hidden states
-        # self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
-        # self.projection_size_ba = self.num_v_heads * 2
-        # self.in_proj_qkvz = ColumnParallelLinear(
-        #     input_size=self.hidden_size,
-        #     output_size=self.projection_size_qkvz,
-        #     bias=False,
-        #     quant_config=quant_config,
-        #     prefix=f"{prefix}.in_proj_qkvz",
-        # )
         self.in_proj_qkvz = self.create_qkvz_proj(
             hidden_size=self.hidden_size,
             key_dim=self.key_dim,
@@ -353,7 +343,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj_ba",
         )
-        
+
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
@@ -651,10 +641,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
+                    : attn_metadata.num_decodes
                 ],
                 conv_state_indices_cpu=non_spec_state_indices_tensor_cpu[
-                    : attn_metadata.num_actual_tokens
+                    : attn_metadata.num_decodes
                 ],
                 validate_data=True,
             )
@@ -710,38 +700,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            slot_mapping = torch.full(
-                (ssm_state.shape[0],), -1, dtype=torch.int32, device="cuda"
-            )
-            slot_mapping[non_spec_state_indices_tensor] = torch.arange(
-                len(non_spec_state_indices_tensor), dtype=torch.int32, device="cuda"
-            )
-
-            initial_state_shape = (
-                non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
-            )
-            initial_state = torch.empty(
-                initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
-            )
-            initial_state = initial_state.view(
-                initial_state.shape[0], 1, -1, initial_state.shape[-1]
-            )
-            cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
-
-            kunlun_ops.reshape_and_cache_flash(
-                cast_ssm_state,
-                cast_ssm_state,
-                initial_state,
-                initial_state,
-                slot_mapping,
-            )
-            initial_state = initial_state.view(initial_state_shape)
-
-            initial_state = initial_state * has_initial_state.view(
-                has_initial_state.shape[0], 1, 1, 1
-            )
+            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            initial_state[~has_initial_state, ...] = 0
             initial_state = initial_state.transpose(-1, -2).contiguous()
-
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -761,18 +722,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 last_recurrent_state.transpose(-1, -2)
                 .contiguous()
                 .to(ssm_state.dtype)
-                .view(last_recurrent_state.shape[0], -1, last_recurrent_state.shape[-1])
             )
-            cast_ssm_state = ssm_state.view(
-                ssm_state.shape[0], 1, -1, ssm_state.shape[-1]
-            )
-
-            kunlun_ops.reshape_and_cache_flash(
-                last_recurrent_state,
-                last_recurrent_state,
-                cast_ssm_state,
-                cast_ssm_state,
-                non_spec_state_indices_tensor,
+            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                ssm_state.dtype
             )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
