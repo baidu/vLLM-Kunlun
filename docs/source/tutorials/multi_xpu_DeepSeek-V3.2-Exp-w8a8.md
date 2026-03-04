@@ -7,6 +7,7 @@ Setup environment using container:
 Please follow the [installation.md](../installation.md) document to set up the environment first.
 
 Create a container
+
 ```bash
 # !/bin/bash
 # rundocker.sh
@@ -36,13 +37,16 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ### Preparation Weight
 
 - Pull DeepSeek-V3.2-Exp-w8a8-int8 weights
+
   ```
   wget -O DeepSeek-V3.2-Exp-w8a8-int8.tar.gz https://aihc-private-hcd.bj.bcebos.com/v1/LLM/DeepSeek/DeepSeek-V3.2-Exp-w8a8-int8.tar.gz?authorization=bce-auth-v1%2FALTAKvz6x4eqcmSsKjQxq3vZdB%2F2025-12-24T06%3A07%3A10Z%2F-1%2Fhost%2Fa324bf469176934a05f75d3acabc3c1fb891be150f43fb1976e65b7ec68733db
   ```
+
 - Ensure that the field "quantization_config" is included.If not, deployment will result in an OOM (Out of Memory) error.
 
 vim model/DeepSeek-V3.2-Exp-w8a8-int8/config.json
-```config.json
+
+```json
 "quantization_config": {
     "config_groups": {
       "group_0": {
@@ -108,7 +112,7 @@ export CUDA_GRAPH_OPTIMIZE_STREAM=1 && \
 export XMLIR_ENABLE_MOCK_TORCH_COMPILE=false && \
 export XPU_USE_MOE_SORTED_THRES=1 && \
 export USE_ORI_ROPE=1 && \
-export VLLM_USE_V1=1 
+export VLLM_USE_V1=1
 
 python -m vllm.entrypoints.openai.api_server  \
         --host 0.0.0.0 \
@@ -129,9 +133,9 @@ python -m vllm.entrypoints.openai.api_server  \
         --compilation-config '{"splitting_ops":["vllm.unified_attention",
             "vllm.unified_attention_with_output",
             "vllm.unified_attention_with_output_kunlun",
-            "vllm.mamba_mixer2", 
-            "vllm.mamba_mixer", 
-            "vllm.short_conv", 
+            "vllm.mamba_mixer2",
+            "vllm.mamba_mixer",
+            "vllm.short_conv",
             "vllm.linear_attention",
             "vllm.plamo2_mamba_mixer",
             "vllm.gdn_attention",
