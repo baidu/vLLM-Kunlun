@@ -117,17 +117,7 @@ python -m vllm.entrypoints.openai.api_server \
     --no-enable-prefix-caching \
     --no-enable-chunked-prefill \
     --distributed-executor-backend mp \
-    --served-model-name InternVL2_5-26B \
-    --compilation-config '{"splitting_ops": ["vllm.unified_attention",
-                                                "vllm.unified_attention_with_output",
-                                                "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2",
-                                                "vllm.mamba_mixer",
-                                                "vllm.short_conv",
-                                                "vllm.linear_attention",
-                                                "vllm.plamo2_mamba_mixer",
-                                                "vllm.gdn_attention",
-                                                "vllm.sparse_attn_indexer"]}'
+    --served-model-name InternVL2_5-26B
 ```
 
 If your service start successfully, you can see the info shown below:
