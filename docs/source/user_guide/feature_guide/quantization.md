@@ -1,7 +1,7 @@
 # Quantization Guide
 >Note: This feature is currently experimental. In future versions, there may be behavioral changes around configuration, coverage, performance improvement.
 
-Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, and GPTQ, enabling various precision configurations including W8A8, W4A16, and W8A16. These can help reduce memory consumption and accelerate inference while preserving model accuracy.
+Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, and GPTQ, enabling various precision configurations including W8A8, W4A16, and W8A16. These can help reduce memory consumption and accelerate inference while preserving model accuracy. Our quantized models are in [model_list.md](../support_matrix/model_list.md). 
 
 
 ## Support Matrix
