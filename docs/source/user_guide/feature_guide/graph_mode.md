@@ -31,7 +31,7 @@ Online example:
 vllm serve Qwen3-8B-Instruct
 ```
 
-## Using KunlunGraph
+## Advanced KunlunGraph Configuration
 
 Below is a more detailed online example with additional configuration options.
 
