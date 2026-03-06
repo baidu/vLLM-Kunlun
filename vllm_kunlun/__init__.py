@@ -90,6 +90,26 @@ def register():
         logger.exception("[KunlunPlugin] import_hook() failed")
         raise
 
+    # --- register reasoning parser override (lazy, to avoid circular import) ---
+    try:
+        from vllm.reasoning import ReasoningParserManager
+
+        # Override the lazy registration path with our custom parser.
+        # This happens before vllm's default lazy registration (which is
+        # triggered when vllm.reasoning module is imported), so our path
+        # takes precedence.
+
+        # Custom parser for Qwen3.5 support
+        ReasoningParserManager.register_lazy_module(
+            name="qwen3",
+            module_path="vllm_kunlun.reasoning.qwen3_reasoning_parser",
+            class_name="Qwen3ReasoningParser",
+        )
+        logger.info("[KunlunPlugin] registered Qwen3ReasoningParser override (lazy)")
+    except Exception:
+        logger.exception("[KunlunPlugin] Qwen3ReasoningParser registration failed")
+        # Non-fatal: continue without the override
+
     logger.info("[KunlunPlugin] register() done")
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
 
