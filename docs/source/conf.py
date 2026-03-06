@@ -116,6 +116,7 @@ html_logo = "logos/vllm-kunlun-logo-text-light.png"
 html_theme_options = {
     "path_to_docs": "docs/source",
     "repository_url": "https://github.com/baidu/vLLM-Kunlun",
+    "repository_branch": "v0.15.1-dev",
     "use_repository_button": True,
     "use_edit_page_button": True,
 }

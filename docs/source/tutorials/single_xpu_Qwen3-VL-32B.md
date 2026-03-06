@@ -101,7 +101,7 @@ Because they don’t have the guts! 🦴😄
 ### Online Serving on Single XPU
 Start the vLLM server on a single XPU:
 
-```text
+```bash
 python -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0 \
     --port 9988 \
@@ -127,8 +127,7 @@ python -m vllm.entrypoints.openai.api_server \
                                                 "vllm.linear_attention",
                                                 "vllm.plamo2_mamba_mixer",
                                                 "vllm.gdn_attention",
-                                                "vllm.sparse_attn_indexer"]}
-                                                #Version 0.11.0
+                                                "vllm.sparse_attn_indexer"]}'
 ```
 
 If your service start successfully, you can see the info shown below:

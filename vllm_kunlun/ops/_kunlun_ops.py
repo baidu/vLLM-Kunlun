@@ -19,7 +19,9 @@
 
 from typing import Optional
 
+import cocopod  # noqa
 import torch
+import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -772,9 +774,9 @@ class KunlunOps:
         cu_seqlens: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Qwen3-NEXT模型中 Gated DeltaNet的核心算子, 将做完sigmoid_gating和delta_rule_update融合在一起
-        1.  Sigmoid Gating: 对输入进行门控, 类似于 GLU (Gated Linear Unit)。
-        2.  Delta Rule Update: 执行一个并行的状态空间模型(SSM)的递归更新, 同时结合了一个局部的注意力机制。
+        Core operator for Gated DeltaNet in Qwen3-NEXT model, fusing sigmoid_gating and delta_rule_update together.
+        1.  Sigmoid Gating: Gates the input, similar to GLU (Gated Linear Unit).
+        2.  Delta Rule Update: Performs a parallel state space model (SSM) recurrent update, combined with a local attention mechanism.
         """
 
         o, final_state = kunlun_ops.fused_recurrent_gated_delta_rule_fwd(
