@@ -23,7 +23,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
 ## Prerequisites
 
 - **Hardware**: Kunlun3 P800
-- **OS**: Ubuntu 22.04
+- **OS**: Ubuntu 20.04
 - **Software**:
   - Python >=3.10
   - PyTorch ≥ 2.5.1

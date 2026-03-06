@@ -4,7 +4,7 @@ This document describes how to install vllm-kunlun manually.
 
 ## Requirements
 
-- **OS**: Ubuntu 22.04
+- **OS**: Ubuntu 20.04
 - **Software**:
   - Python >=3.10
   - PyTorch ≥ 2.5.1
@@ -75,7 +75,7 @@ python setup.py install
 Copy the eval_frame.py patch:
 
 ```
-cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/vllm_kunlun_0.10.1.1/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
+cp vllm_kunlun/patches/eval_frame.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
 ```
 
 ## Choose to download customized xpytorch
