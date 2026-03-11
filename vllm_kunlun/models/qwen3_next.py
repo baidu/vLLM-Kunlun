@@ -5,6 +5,7 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import kunlun_ops
 import torch
 from einops import rearrange
 from torch import nn
@@ -561,6 +562,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata is None:
             # V1 profile run
             return
+
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -568,6 +570,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
@@ -595,8 +598,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
             else:
-                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+                mixed_qkv_spec = mixed_qkv[spec_token_masks]
+                mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
@@ -668,10 +671,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 g_non_spec = None
                 beta_non_spec = None
             else:
-                g_spec = g.index_select(1, spec_token_indx)
-                beta_spec = beta.index_select(1, spec_token_indx)
-                g_non_spec = g.index_select(1, non_spec_token_indx)
-                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                g_spec = g[:, spec_token_masks]
+                beta_spec = beta[:, spec_token_masks]
+                g_non_spec = g[:, ~spec_token_masks]
+                beta_non_spec = beta[:, ~spec_token_masks]
         else:
             g_spec = None
             beta_spec = None
@@ -701,7 +704,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-            initial_state[~has_initial_state, ...] = 0
+            initial_state = initial_state * has_initial_state.view(
+                has_initial_state.shape[0], 1, 1, 1
+            )
             initial_state = initial_state.transpose(-1, -2).contiguous()
             (
                 core_attn_out_non_spec,
@@ -722,9 +727,18 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 last_recurrent_state.transpose(-1, -2)
                 .contiguous()
                 .to(ssm_state.dtype)
+                .view(last_recurrent_state.shape[0], -1, last_recurrent_state.shape[-1])
             )
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
+            cast_ssm_state = ssm_state.view(
+                ssm_state.shape[0], 1, -1, ssm_state.shape[-1]
+            )
+
+            kunlun_ops.reshape_and_cache_flash(
+                last_recurrent_state,
+                last_recurrent_state,
+                cast_ssm_state,
+                cast_ssm_state,
+                non_spec_state_indices_tensor,
             )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
@@ -849,26 +863,49 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+        # MRoPE (multimodal) passes positions as [3, num_tokens] (T/H/W dims).
+        # The fused XPU kernel xspeedgate_ops.split_norm_rope_neox only supports
+        # 1-D positions [num_tokens], so fall back to the non-fused path when
+        # a 2-D MRoPE position tensor is detected.
+        if positions.dim() == 2:
+            # --- Non-fused fallback path for MRoPE positions ---
+            # Split qkv (and gate if attn_output_gate is enabled)
+            if self.attn_output_gate:
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                orig_shape = q_gate.shape[:-1]
+                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+                q, gate = torch.chunk(q_gate, 2, dim=-1)
+                q = q.reshape(*orig_shape, -1)
+                gate = gate.reshape(*orig_shape, -1)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
+
+            q, k = self.rotary_emb(positions, q, k)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
-
-        q, k = self.rotary_emb(positions, q, k)
+            # --- Fused path for standard 1-D positions ---
+            q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
+                qkv=qkv,
+                q_weights=self.q_norm.weight,
+                k_weights=self.k_norm.weight,
+                positions=positions,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                rotary_dim=self.rotary_dim,
+                attn_output_gate=self.attn_output_gate,
+            )
 
         attn_output = self.attn(q, k, v)
 
