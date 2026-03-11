@@ -614,8 +614,7 @@ class KunlunOps:
         hidden_states: torch.Tensor,
         w13_weight: torch.Tensor,
         w2_weight: torch.Tensor,
-        gating_output: torch.Tensor,
-        linear_weights: torch.Tensor,
+        router_logits: torch.Tensor,
         ep_rank: int,
         top_k: int,
         renormalize: bool,
@@ -629,8 +628,6 @@ class KunlunOps:
         x = hidden_states
         batch, hidden_size = x.shape
         num_local_experts, up_gate_size, _ = w13_weight.shape
-
-        router_logits = x.to(linear_weights.dtype) @ linear_weights.T
 
         topk_weights = torch.empty(
             batch, top_k, dtype=router_logits.dtype, device=router_logits.device

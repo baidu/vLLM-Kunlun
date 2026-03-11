@@ -16,22 +16,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, Optional, Union
 
-import os
 import torch
-from vllm.logger import init_logger
 from compressed_tensors.quantization import ActivationOrdering, QuantizationStrategy
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     CompressedTensorsW4A4Mxfp4MoEMethod,
     CompressedTensorsW4A8Int8MoEMethod,
-    CompressedTensorsW8A8Int8MoEMethod,
-    CompressedTensorsW8A8Int8MoEMethod,
     CompressedTensorsW8A8Fp8MoEMethod,
-    CompressedTensorsWNA16MoEMethod
+    CompressedTensorsW8A8Int8MoEMethod,
+    CompressedTensorsWNA16MoEMethod,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.utils import find_matched_target
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    find_matched_target,
+)
+
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_kunlun
 
@@ -94,7 +96,7 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "WNA16MoE is not supported with actorder=group/dynamic."
                 )
             # MarlinMoE kernel is not supported on XPU.
-            logger.warning_once(f"Using KunlunCompressedTensorsWNA16MoEMethod")
+            logger.warning_once("Using KunlunCompressedTensorsWNA16MoEMethod")
             return KunlunCompressedTensorsWNA16MoEMethod(quant_config, layer.moe_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
             return CompressedTensorsW4A4Mxfp4MoEMethod(layer.moe_config)
@@ -331,7 +333,9 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
             w13_data = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
             w13_data = w13_data.view(torch.int8)
             w13_data.bitwise_xor_(0x88)  # in-place XOR
-            layer.w13_weight_packed.data = w13_data  # Direct assignment, no new Parameter
+            layer.w13_weight_packed.data = (
+                w13_data  # Direct assignment, no new Parameter
+            )
 
             # Process w2 weights: same as w13
             w2_data = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
@@ -444,7 +448,9 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         """Optimized implementation using preprocessed weights and fuse_moe_ct_w4a16."""
         # EP mode is not supported for int4 packed weights
         if self.moe.use_ep:
-            raise NotImplementedError("EP mode is not supported for int4 packed weights yet.")
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
+            )
 
         # Use preprocessed weights and scales (processed in process_weights_after_loading)
         # Weights are already int8 (XOR 0x88) and scales are already float32 (multiplied by 7.0)
@@ -473,9 +479,7 @@ if USE_MOE_FC:
     KunlunCompressedTensorsWNA16MoEMethod.apply = (
         KunlunCompressedTensorsWNA16MoEMethod.apply_moe_fc
     )
-    print(
-        "USE_MOE_FC=1: Using apply_moe_fc (original implementation with dequant)"
-    )
+    print("USE_MOE_FC=1: Using apply_moe_fc (original implementation with dequant)")
 else:
     KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading = (
         KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading_moe_fc_v3
@@ -483,9 +487,7 @@ else:
     KunlunCompressedTensorsWNA16MoEMethod.apply = (
         KunlunCompressedTensorsWNA16MoEMethod.apply_moe_fc_v3
     )
-    print(
-        "USE_MOE_FC=0 (default): Using apply_moe_fc_v3 (optimized implementation)"
-    )
+    print("USE_MOE_FC=0 (default): Using apply_moe_fc_v3 (optimized implementation)")
 
 
 # monkey patch

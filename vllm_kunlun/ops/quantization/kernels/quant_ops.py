@@ -17,7 +17,6 @@
 # limitations under the License.
 
 import torch
-import xspeedgate_ops
 
 
 def dequant_int4(
@@ -91,9 +90,7 @@ def dequant_int4_kunlun(weight_packed_uint8: torch.Tensor, scale: torch.Tensor):
     unpacked_shape = list(weight_packed_uint8.shape)
     unpacked_shape[-1] *= 2
     output = torch.empty(
-        unpacked_shape, 
-        dtype=torch.float16, 
-        device=weight_packed_uint8.device
+        unpacked_shape, dtype=torch.float16, device=weight_packed_uint8.device
     )
     torch.ops.xspeedgate_ops.dequant_int4(weight_packed_uint8, output, scale, None, 32)
     return output
