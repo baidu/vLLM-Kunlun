@@ -43,12 +43,13 @@ class GDNAttentionMetadata:
     num_actual_tokens: int
 
     has_initial_state: torch.Tensor | None = None
+    has_initial_state_cpu: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
-
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
@@ -56,6 +57,7 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor_cpu: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
+
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
 
     spec_token_masks: torch.Tensor | None = (
@@ -305,7 +307,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks]
 
         if num_prefills > 0:
-            has_initial_state = context_lens_tensor > 0
+            # has_initial_state = context_lens_tensor > 0
+            has_initial_state = (context_lens_tensor > 0).to(torch.int32)
             if spec_sequence_masks is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks]
                 assert non_spec_query_start_loc_cpu is not None
@@ -404,8 +407,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=has_initial_state,
+            has_initial_state_cpu=(
+                has_initial_state.cpu() if has_initial_state is not None else None
+            ),
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=(
+                non_spec_query_start_loc.cpu()
+                if non_spec_query_start_loc is not None
+                else None
+            ),
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_tensor_cpu=(

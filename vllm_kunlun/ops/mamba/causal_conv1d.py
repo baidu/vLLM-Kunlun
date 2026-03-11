@@ -17,25 +17,37 @@ def causal_conv1d_fn(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     query_start_loc: Optional[torch.Tensor] = None,
+    query_start_loc_cpu: Optional[torch.Tensor] = None,
     cache_indices: Optional[torch.Tensor] = None,
+    cache_indices_cpu: Optional[torch.Tensor] = None,
     has_initial_state: Optional[torch.Tensor] = None,
+    has_initial_state_cpu: Optional[torch.Tensor] = None,
     conv_states: Optional[torch.Tensor] = None,
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
 ):
+    if not x.is_contiguous():
+        x = x.contiguous()
 
-    x = x.contiguous()
     out = torch.empty_like(x)
-    has_initial_state = has_initial_state.to(torch.int32)
-    dim = x.shape[-1]
-    cu_seqlen = x.shape[-2]
+
+    x_shape = x.shape
+    dim = x_shape[-1]
+    cu_seqlen = x_shape[-2]
     width = weight.shape[-1]
+
+    assert (
+        conv_states is not None
+    ), "conv_states is required for kunlun causal_conv1d_fn"
     num_cache_lines = conv_states.shape[0]
     state_width = conv_states.shape[-2]
+    stride = conv_states.stride(0)
+    assert (
+        query_start_loc is not None
+    ), "query_start_loc is required for kunlun causal_conv1d_fn"
     batch_size = query_start_loc.shape[0] - 1
-    stride = conv_states.stride()[0]
 
     kunlun_ops.causal_conv1d_fn(
         x,
@@ -47,18 +59,18 @@ def causal_conv1d_fn(
         conv_states,
         num_cache_lines,
         state_width,
-        query_start_loc.cpu(),
+        query_start_loc_cpu,
         query_start_loc,
         batch_size,
         bias,
-        cache_indices_cpu=cache_indices.cpu(),
+        cache_indices_cpu=cache_indices_cpu,
         cache_indices_xpu=cache_indices,
-        has_initial_state_cpu=has_initial_state.cpu(),
+        has_initial_state_cpu=has_initial_state_cpu,
         has_initial_state_xpu=has_initial_state,
         act="SWISH",
         state_seq_stride=stride,
     )
-    # out = torch.nn.functional.silu(out)
+
     return out
 
 

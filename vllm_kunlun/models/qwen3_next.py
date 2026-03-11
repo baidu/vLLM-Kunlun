@@ -567,8 +567,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
         has_initial_state = attn_metadata.has_initial_state
+        has_initial_state_cpu = attn_metadata.has_initial_state_cpu
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
@@ -632,8 +634,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
+                has_initial_state_cpu=has_initial_state_cpu,
                 cache_indices=non_spec_state_indices_tensor,
+                cache_indices_cpu=non_spec_state_indices_tensor_cpu,
                 query_start_loc=non_spec_query_start_loc,
+                query_start_loc_cpu=non_spec_query_start_loc_cpu,
                 metadata=attn_metadata,
             )
         elif attn_metadata.num_decodes > 0:
