@@ -255,9 +255,7 @@ def set_functorch_config() -> None:
     # ----------------------------------------------------------
     {
         "file": "vllm/transformers_utils/config.py",
-        "desc": (
-            "support qwen3_5 in vllm0.15.1"
-        ),
+        "desc": ("support qwen3_5 in vllm0.15.1"),
         "lines": "101",
         "old": """\
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
@@ -329,14 +327,12 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
 )""",
     },
     # ----------------------------------------------------------
-    # Patch 9: vllm/transformers_utils/configs/__init__.py 
+    # Patch 9: vllm/transformers_utils/configs/__init__.py
     #                       add qwen3_5
     # ----------------------------------------------------------
     {
         "file": "vllm/transformers_utils/configs/__init__.py",
-        "desc": (
-            "support qwen3_5 in vllm0.15.1"
-        ),
+        "desc": ("support qwen3_5 in vllm0.15.1"),
         "lines": "55",
         "old": """\
 _CLASS_TO_MODULE: dict[str, str] = {
@@ -433,9 +429,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     },
     {
         "file": "vllm/transformers_utils/configs/__init__.py",
-        "desc": (
-            "support qwen3_5 in vllm0.15.1"
-        ),
+        "desc": ("support qwen3_5 in vllm0.15.1"),
         "lines": "97",
         "old": """\
 __all__ = [
@@ -521,6 +515,28 @@ __all__ = [
     "Qwen3_5MoeTextConfig",
     "Tarsier2Config",
 ]""",
+    },
+    # ----------------------------------------------------------
+    # Patch 10: utils.py — Add backend="torch_native" to
+    #           apply_token_bitmask_inplace call
+    # ----------------------------------------------------------
+    {
+        "file": "vllm/v1/structured_output/utils.py",
+        "desc": (
+            "Add backend='torch_native' parameter to "
+            "xgr.apply_token_bitmask_inplace call. Without this parameter, "
+            "the default backend may not be compatible with the Kunlun "
+            "platform on PyTorch 2.5.1."
+        ),
+        "lines": "119",
+        "old": (
+            "xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, "
+            "indices=index_tensor)"
+        ),
+        "new": (
+            "xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, "
+            'indices=index_tensor, backend="torch_native")'
+        ),
     },
 ]
 
