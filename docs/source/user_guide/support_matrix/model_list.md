@@ -35,7 +35,15 @@
       <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/DeepSeek-V3.1-Terminus-W8A8-INT8-Dynamic-NextN.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/DeepSeek-V3.1-Terminus-W8A8-INT8-Dynamic-NextN.tar</a></td>
     </tr>
     <tr>
-      <td rowspan="11">Qwen</td>
+      <td rowspan="13">Qwen</td>
+      <td>Qwen3.5-397B-A17B-W8A8-INT8-Dynamic</td>
+      <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3.5-397B-A17B-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3.5-397B-A17B-W8A8-INT8-Dynamic.tar</a></td>
+    </tr>
+     <tr>
+      <td>Qwen3.5-122B-A10B-W8A8-INT8-Dynamic</td>
+      <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3.5-122B-A10B-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3.5-122B-A10B-W8A8-INT8-Dynamic.tar</a></td>
+    </tr>
+    <tr>
       <td>Qwen3-Next-80B-A3B-Thinking-W8A8-INT8-Dynamic</td>
       <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3-Next-80B-A3B-Thinking-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/Qwen3-Next-80B-A3B-Thinking-W8A8-INT8-Dynamic.tar</a></td>
     </tr>
@@ -99,6 +107,15 @@
     <tr>
       <td>MiMo-V2-Flash-W8A8-INT8-Dynamic</td>
       <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiMo-V2-Flash-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiMo-V2-Flash-W8A8-INT8-Dynamic.tar</a></td>
+    </tr>
+    <tr>
+      <td rowspan="2">MinMax</td>
+      <td>MiniMax-M2.1-W8A8-INT8-Dynamic</td>
+      <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiniMax-M2.1-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiniMax-M2.1-W8A8-INT8-Dynamic.tar</a></td>
+    </tr>
+    <tr>
+      <td>MiniMax-M2.5-W8A8-INT8-Dynamic</td>
+      <td><a href="https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiniMax-M2.5-W8A8-INT8-Dynamic.tar">https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/release_packages/MiniMax-M2.5-W8A8-INT8-Dynamic.tar</a></td>
     </tr>
   </tbody>
 </table>
