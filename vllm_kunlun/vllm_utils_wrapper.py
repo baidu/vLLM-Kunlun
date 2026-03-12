@@ -197,8 +197,9 @@ def vllm_kunlun_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.T
         (world_size,) + input_size, dtype=input_.dtype, device=input_.device
     )
     # All-gather.
+    cast_output_tensor = output_tensor.view(-1, input_.shape[-1]) # for cudagraph
     torch.distributed.all_gather_into_tensor(
-        output_tensor, input_, group=self.device_group
+        cast_output_tensor, input_, group=self.device_group
     )
     # Reshape
     output_tensor = output_tensor.movedim(0, dim)
