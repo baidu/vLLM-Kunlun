@@ -404,7 +404,6 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
         x: torch.Tensor,
         lora_a_stacked: Tuple[torch.Tensor, ...],
         lora_b_stacked: Tuple[torch.Tensor, ...],
-        lora_bias_stacked: Optional[Tuple[torch.Tensor, ...]],
         scale: float,
         output_slices: Tuple[int, ...],
         *,
@@ -421,18 +420,21 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
                     @ lora_a_stacked[indices[i], layer_idx, :, :]
                     @ lora_b_stacked[indices[i], layer_idx, :, :]
                     * scale
-                    ).squeeze(0)+lora_bias_stacked[i]
+                    ).squeeze(0)
 
         Args:
             y (torch.Tensor): Output tensor. Will be changed in-place.
             x (torch.Tensor): Input tensor
             lora_a_stacked (Tuple[torch.Tensor, ...]): lora_a's weight.
             lora_b_stacked (Tuple[torch.Tensor, ...]): lora_b's weight.
-            lora_bias_stacked (Optional[Tuple[torch.Tensor, ...]]): lora's bias.
             scale (float): Scaling factor.
             output_slices (Tuple[int, ...]): Every slice's size.
             buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
         """
+        # 从 kwargs 中获取 lora_bias_stacked（如果有）
+        lora_bias_stacked: Optional[Tuple[torch.Tensor, ...]] = kwargs.get(
+            "lora_bias_stacked", None
+        )
 
         if self.no_lora:
             return

@@ -23,7 +23,7 @@ torch::Tensor weak_ref_tensor(torch::Tensor& tensor) {
     return new_tensor;
 }
 
-TORCH_LIBRARY(_kunlun, m) {
+TORCH_LIBRARY(_C, m) {
     m.def("weak_ref_tensor", &weak_ref_tensor);
 }
 

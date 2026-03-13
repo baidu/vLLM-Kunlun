@@ -16,16 +16,15 @@
 # limitations under the License.
 
 import json
-import tempfile
-import shutil
 import os
+import shutil
+import tempfile
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import huggingface_hub
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
-
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils import tokenizer
