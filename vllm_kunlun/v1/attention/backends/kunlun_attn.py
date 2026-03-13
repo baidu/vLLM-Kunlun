@@ -567,7 +567,7 @@ class KunlunAttentionMetadataBuilder:
         )
 
     def build(
-        self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata
+        self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
     ):
         """build"""
         num_reqs = common_attn_metadata.num_reqs
@@ -666,17 +666,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         alibi_slopes: Optional[List[float]],
         sliding_window: Optional[int],
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
-        kv_sharing_target_layer_name: Optional[str] = None,
         attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
         sinks: Optional[torch.Tensor] = None,
         multi_modal_placeholder_index_maps: Optional[torch.Tensor] = None,
     ) -> None:
         """__init__"""
-        if blocksparse_params is not None:
-            raise ValueError("kunlunAttention does not support block-sparse attention.")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -695,6 +692,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.use_irope = use_irope
+        self.attn_type = attn_type
 
         suppored_head_sizes = PagedAttention.get_supported_head_sizes()
         if head_size not in suppored_head_sizes:
@@ -725,9 +723,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         value: Optional[torch.Tensor],
         kv_cache: torch.Tensor,
         attn_metadata: Optional[KunlunMetadata],
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-        attn_type: AttentionType = AttentionType.DECODER,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
@@ -746,10 +741,38 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         else:
             assert value is None
 
+        attn_type = self.attn_type
+
+        if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+            # For encoder self-attention, there should be no KV cache.
+            if query is not None and not query.is_contiguous():
+                query = query.contiguous()
+            if key is not None and not key.is_contiguous():
+                key = key.contiguous()
+            if value is not None and not value.is_contiguous():
+                value = value.contiguous()
+            kunlun_ops.prefill_attention(
+                q=query[: attn_metadata.num_actual_tokens],
+                k=key[: attn_metadata.num_actual_tokens],
+                v=value[: attn_metadata.num_actual_tokens],
+                out=output[: attn_metadata.num_actual_tokens],
+                is_causal=False,
+                context_qlen_lod_cpu=attn_metadata.query_start_loc_host,
+                context_qlen_lod_xpu=attn_metadata.query_start_loc,
+                alibi_slopes=self.alibi_slopes,
+                softmax_lse=None,
+                swa_left=self.sliding_window[0],
+                swa_right=self.sliding_window[1],
+                sink=self.sinks,
+            )
+            return output.view(-1, self.num_heads * self.head_size)
+
         # Self-attention vs. cross-attention will impact
         # which KV cache memory-mapping & which
         # seqlen datastructures we utilize
-        if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
+        if (attn_type != AttentionType.ENCODER and 
+           attn_type != AttentionType.ENCODER_ONLY and 
+           kv_cache.numel() > 0):
             # KV-cache during decoder-self- or
             # encoder-decoder-cross-attention, but not
             # during encoder attention.
