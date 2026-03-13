@@ -110,6 +110,10 @@ def register_model():
         "GlmMoeDsaForCausalLM", "vllm_kunlun.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
 
+    ModelRegistry.register_model(
+        "MiniMaxM2ForCausalLM",
+        "vllm_kunlun.models.minimax_m2:MiniMaxM2ForCausalLM"
+    )
 
 def register_quant_method():
     """to do"""
