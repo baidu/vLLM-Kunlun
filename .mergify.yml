@@ -1,0 +1,78 @@
+pull_request_rules:
+
+  - name: feature branch
+    conditions:
+      - head~=^feature/
+    actions:
+      label:
+        add: [feature]
+
+  - name: fix branch
+    conditions:
+      - head~=^fix/
+    actions:
+      label:
+        add: [bug]
+
+  - name: commit contains refactor
+    conditions:
+      - commits~=Feature
+    actions:
+      label:
+        add: [feature]
+  - name: commit contains fix
+    conditions:
+      - commits~=fix
+    actions:
+      label:
+        add: [bug]
+  - name: commit contains CI/Build
+    conditions:
+      - commits~=CI/Build
+    actions:
+      label:
+        add: [ci]
+  - name: commit contains Doc
+    conditions:
+      - commits~=Doc
+    actions:
+      label:
+        add: [documentation]
+  - name: commit contains [Misc]
+    conditions:
+      - commits~=Misc
+    actions:
+      label:
+        add: [misc]
+  - name: commit contains Qwen
+    conditions:
+      - commits~=Qwen
+    actions:
+      label:
+        add: [qwen]
+  - name: commit contains Updata
+    conditions:
+      - commits~=Updata
+    actions:
+      label:
+        add: [updata]
+  - name: commit contains GLM
+    conditions:
+      - commits~=GLM
+    actions:
+      label:
+        add: [glm]
+  - name: commit contains deepseek
+    conditions:
+      - commits~=deepseek
+    actions:
+      label:
+        add: [deepseek]   
+
+  - name: docs change
+    conditions:
+      - files~=^docs/
+    actions:
+      label:
+        add: [documentation]
+  
