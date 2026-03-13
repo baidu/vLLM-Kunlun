@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm_kunlun.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_optimized as apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 import xspeedgate_ops
 
@@ -219,7 +219,6 @@ def rejection_sample(
         sampling_metadata,
         device,
     )
-    bonus_token_ids = bonus_token_ids.squeeze(1)
 
     # Rejection sampling for random sampling requests (V1)
     kunlun_ops.rejection_random_sample(
@@ -284,7 +283,7 @@ def compute_probs(
     top_k = None
     if sampling_metadata.top_k is not None:
         top_k = expand_batch_to_tokens(
-            sampling_metadata.top_k,
+            sampling_metadata.top_k.to(torch.int32),
             cu_num_draft_tokens,
             num_tokens,
         )

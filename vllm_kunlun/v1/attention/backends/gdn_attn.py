@@ -46,8 +46,11 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: Optional[torch.Tensor] = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    non_spec_query_start_loc_cpu: Optional[
+        torch.Tensor] = None  # shape: [batch - num_spec_decodes + 1,]
 
     spec_state_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch, num_spec]
+    spec_state_indices_tensor_cpu: Optional[torch.Tensor] = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: Optional[torch.Tensor] = (
         None  # shape: [batch - num_spec_decodes,]
     )
@@ -57,6 +60,7 @@ class GDNAttentionMetadata:
         None  # shape: [num_prefill_tokens + num_decode_tokens,]
     )
     num_accepted_tokens: Optional[torch.Tensor] = None  # shape: [batch,]
+    num_accepted_tokens_cpu: Optional[torch.Tensor] = None  # shape: [batch,]
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: Optional[dict] = None
@@ -243,13 +247,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks]
-            has_initial_state_cpu = has_initial_state.cpu()
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(non_spec_query_start_loc)
             )
         else:
             has_initial_state = None
-            has_initial_state_cpu = None
         num_actual_tokens = (
             num_prefill_tokens + num_decode_tokens + num_spec_decode_tokens
         )
@@ -340,10 +342,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=num_actual_tokens,
             has_initial_state=has_initial_state,
-            has_initial_state_cpu=has_initial_state_cpu,
+            has_initial_state_cpu=has_initial_state.to(torch.int32).cpu() if has_initial_state is not None else None,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc.cpu() if non_spec_query_start_loc is not None else None,
             spec_state_indices_tensor=spec_state_indices_tensor,
+            spec_state_indices_tensor_cpu=spec_state_indices_tensor.cpu() if spec_state_indices_tensor is not None else None,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_tensor_cpu=(
                 non_spec_state_indices_tensor.cpu()
@@ -353,6 +357,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks=spec_sequence_masks,
             spec_token_masks=spec_token_masks,
             num_accepted_tokens=num_accepted_tokens,
+            num_accepted_tokens_cpu=num_accepted_tokens.cpu() if num_accepted_tokens is not None else None,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -378,6 +383,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"and number of tokens ({m.num_actual_tokens}) <= "
             f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
         )
+
+        # adaptor for mtp. If query_start_loc is [3, 3, 3, 2], make it [3, 3, 3].
+        if m.query_start_loc.shape[0] > 2 and m.query_start_loc[-1] - m.query_start_loc[-2] < m.query_start_loc[-2] - m.query_start_loc[-3]:
+            m.query_start_loc = m.query_start_loc[:-1]
+            m.seq_lens_cpu = m.seq_lens_cpu[:-1]
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()

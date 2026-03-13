@@ -113,6 +113,70 @@ def apply_top_k_top_p(
     return logits
 
 
+def apply_top_k_top_p_optimized(
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+    fallback_k: int = 256,                                                                                                                                                                                                                                      
+) -> torch.Tensor:
+    """Optimized top-k + top-p: avoid full vocab sort by working on a
+    smaller top-k subset.
+
+    Strategy:
+      1. Determine select_k = max(k_i, fallback_k) across the batch so
+         that a single torch.topk(select_k) covers every row's top-k
+         requirement.
+      2. Sort only the select_k selected values (select_k << V) and
+         apply top-p (softmax -> cumsum) on this small window.
+      3. Scatter surviving logits back to original positions; everything
+         else is set to -inf.
+
+    Args:
+        logits:     [B, V] raw logits.
+        k:          [B] per-row top-k counts, or None.
+        p:          [B] per-row top-p thresholds, or None.
+        fallback_k: when k is None, use this as the top-k window size.
+                    Must be large enough so that the top-p mass is well
+                    approximated within the window.
+    """
+    if p is None:
+        if k is None:
+            return logits
+        return apply_top_k_only(logits, k)
+
+    B, V = logits.shape
+
+    # --- Step 1: determine select_k and do a single partial sort via topk ---
+    if k is not None:
+        select_k = int(k.max().item())
+    else:
+        select_k = fallback_k
+    select_k = min(select_k, V)  # safety clamp
+
+    # topk_vals: [B, select_k] descending; topk_idx: [B, select_k] original indices
+    topk_vals, topk_idx = logits.topk(select_k, dim=1, largest=True, sorted=True)
+
+    if k is not None:
+        # k is 1-based count; gather index is 0-based.
+        k_idx = (k.to(torch.long) - 1).unsqueeze(1)
+        k_thresh = topk_vals.gather(1, k_idx)  # [B, 1]
+        topk_vals.masked_fill_(topk_vals < k_thresh, -float("inf"))
+
+    # --- Step 3: apply top-p on the (already top-k-masked) subset ---
+    probs_sort = topk_vals.softmax(dim=-1)
+    probs_cumsum = probs_sort.cumsum(dim=-1)
+    # Descending top-p with exclusive cumsum: equivalent to "shifted > p"
+    # but avoids slice copy/clone.
+    top_p_mask = (probs_cumsum - probs_sort) >= p.unsqueeze(1)
+    top_p_mask[:, 0] = False
+    topk_vals.masked_fill_(top_p_mask, -float("inf"))
+
+    # --- Step 4: scatter back to full vocab; fill non-topk with -inf ---
+    out = logits.new_full((B, V), -float("inf"))
+    out.scatter_(1, topk_idx, topk_vals)
+    return out
+
+
 def apply_top_k_only(
     logits: torch.Tensor,
     k: torch.Tensor,

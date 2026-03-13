@@ -469,6 +469,8 @@ class KunlunAttentionMetadataBuilder:
         self.kv_cache_spec = kv_cache_spec
         self.device = device
 
+        self._init_reorder_batch_threshold(1, self.vllm_config.speculative_config is not None)
+
     def _init_reorder_batch_threshold(
         self,
         reorder_batch_threshold: int | None = 1,
@@ -583,11 +585,6 @@ class KunlunAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
-        kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
-        kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-        kv_lod_xpu = kv_lod_cpu.to(self.device)
-
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -596,22 +593,24 @@ class KunlunAttentionMetadataBuilder:
             )
         )
 
-        num_scheduled_tokens = np.diff(
-            common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        )
-        tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
+        num_scheduled_tokens = common_attn_metadata.query_start_loc[1:] - common_attn_metadata.query_start_loc[:-1]
 
         if num_decode_tokens == 0:
-            max_decode_seq_len = 0
+            max_decode_seq_len = 0 
         else:
-            max_decode_seq_len = np.max(tmp_decode_scheduled_tokens)
-
-        tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes:num_reqs]
+            tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
+            max_decode_seq_len = torch.max(tmp_decode_scheduled_tokens).item()
 
         if num_prefill_tokens == 0:
-            max_prefill_seq_len = 0
+            max_prefill_seq_len = 0 
+            kv_lod_cpu = None
+            kv_lod_xpu = None
         else:
-            max_prefill_seq_len = np.max(tmp_prefill_scheduled_tokens)
+            tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes: num_reqs]
+            max_prefill_seq_len = torch.max(tmp_prefill_scheduled_tokens).item()
+            kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
+            kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
+            kv_lod_xpu = kv_lod_cpu.to(self.device)
 
         use_cascade = False
 
@@ -906,28 +905,42 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             else:
                 batch_size = attn_metadata.num_decodes
                 qlen = decode_query.shape[0] // batch_size
-                out = output[:num_decode_tokens]
+                if qlen == 1:
+                    kunlun_ops.paged_attention(
+                        x=decode_query,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        block_tables=tmp_block_tables,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        is_context=False,
+                        is_causal=True,
+                        out=output[:num_decode_tokens],
+                        vo_head_dim=self.head_size,
+                    )
+                else:
+                    out = output[:num_decode_tokens]
 
-                kunlun_ops.speculative_attention(
-                    out=out,  # 3D: (num_decode_tokens, head_num, v_dim)
-                    q=decode_query,  # 3D: (num_decode_tokens, head_num, head_dim)
-                    # out=out.view(batch_size, qlen, head_num, self.head_size),
-                    # q=decode_query.view(batch_size, qlen, head_num, head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                    context_lens_xpu=decode_meta.seq_lens_tensor,
-                    batch_num=batch_size,
-                    qlen=qlen,
-                    max_context_len=decode_meta.max_model_len,
-                    head_num=self.num_heads,
-                    head_dim=self.head_size,
-                    scale=0.0,
-                    kv_head_num=self.num_kv_heads,
-                    block_size=key_cache.shape[2],
-                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                    block_tables=tmp_block_tables,
-                )
+                    kunlun_ops.speculative_attention(
+                        out=out,  # 3D: (num_decode_tokens, head_num, v_dim)
+                        q=decode_query,  # 3D: (num_decode_tokens, head_num, head_dim)
+                        # out=out.view(batch_size, qlen, head_num, self.head_size),
+                        # q=decode_query.view(batch_size, qlen, head_num, head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        batch_num=batch_size,
+                        qlen=qlen,
+                        max_context_len=decode_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=0.0,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                        block_tables=tmp_block_tables,
+                    )
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
