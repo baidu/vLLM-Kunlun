@@ -126,15 +126,5 @@ python3 -m vllm.entrypoints.openai.api_server \
  --enable-chunked-prefill=False \
  --no-enable-prefix-caching \
  --disable-log-requests \
- --gpu-memory-utilization 0.9 \
- --compilation-config '{"splitting_ops": ["vllm.unified_attention",
-                                                "vllm.unified_attention_with_output",
-                                                "vllm.unified_attention_with_output_kunlun",
-                                                "vllm.mamba_mixer2",
-                                                "vllm.mamba_mixer",
-                                                "vllm.short_conv",
-                                                "vllm.linear_attention",
-                                                "vllm.plamo2_mamba_mixer",
-                                                "vllm.gdn_attention",
-                                                "vllm.sparse_attn_indexer"]}' 2>&1 | tee output_p800.log
+ --gpu-memory-utilization 0.9 2>&1 | tee output_p800.log
 ```

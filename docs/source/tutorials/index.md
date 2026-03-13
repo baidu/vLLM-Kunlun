@@ -11,4 +11,6 @@ multi_xpu_GLM-4.5
 multi_xpu_GLM-5-W8A8-INT8
 multi_xpu_DeepSeek-V3.2-Exp-w8a8
 multi_xpu_Qwen3-Coder-480B-A35B(W8A8)
+multi_xpu_DeepSeek-V3.2-Exp-w8a8
+multi_xpu_GLM-5-W8A8-INT8
 :::

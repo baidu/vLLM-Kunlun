@@ -7,6 +7,7 @@ Setup environment using container:
 Please follow the [installation.md](../installation.md) document to set up the environment first.
 
 Create a container
+
 ```bash
 # !/bin/bash
 # rundocker.sh
@@ -36,6 +37,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ### Preparation Weight
 
 - Pull GLM-5-W8A8-INT8 weights
+
   ```
   wget -O GLM-5-W8A8-INT8-Dynamic.tar.gz https://aihc-private-hcd.bj.bcebos.com/LLM/AICapX-Quant-Models/GLM-5-W8A8-INT8-Dynamic.tar.gz
   ```
@@ -56,8 +58,8 @@ export CUDA_GRAPH_OPTIMIZE_STREAM=1 && \
 export XMLIR_ENABLE_MOCK_TORCH_COMPILE=false && \
 export XPU_USE_MOE_SORTED_THRES=1 && \
 export USE_ORI_ROPE=1 && \
-export VLLM_USE_V1=1 
-                              
+export VLLM_USE_V1=1
+
 python -m vllm.entrypoints.openai.api_server  \
         --host 0.0.0.0 \
         --port 8806   \
@@ -74,19 +76,5 @@ python -m vllm.entrypoints.openai.api_server  \
         --distributed-executor-backend mp \
         --disable-log-requests \
         --no-enable-prefix-caching \
-        --kv-cache-dtype bfloat16 \
-        --compilation-config '{
-            "splitting_ops":[
-                "vllm.unified_attention",
-                "vllm.unified_attention_with_output",
-                "vllm.unified_attention_with_output_kunlun",
-                "vllm.mamba_mixer2", 
-                "vllm.mamba_mixer", 
-                "vllm.short_conv", 
-                "vllm.linear_attention",
-                "vllm.plamo2_mamba_mixer",
-                "vllm.gdn_attention",
-                "vllm.sparse_attn_indexer",
-                "vllm.sparse_attn_indexer_vllm_kunlun"
-            ]}'
+        --kv-cache-dtype bfloat16
 ```
