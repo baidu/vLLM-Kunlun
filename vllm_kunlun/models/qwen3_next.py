@@ -840,6 +840,7 @@ class Qwen3NextAttention(nn.Module):
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
+        self.rotary_dim = self.rotary_emb.rotary_dim
 
         self.attn = Attention(
             self.num_heads,
