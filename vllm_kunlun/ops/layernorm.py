@@ -129,48 +129,50 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Static forward for compilation/cudagraph support."""
         if not x.is_contiguous():
+            # kunlun does not support uncontiguous input and they do not think it is a bug
+            # so we must make it contiguous() manually
             x = x.contiguous()
-
-        effective_weight = weight + 1
-
+        if x.dim() == 3:
+            x_shape = x.shape
+            x = x.view(-1, x.size(-1))
         if residual is not None:
-            torch.ops._C.add_rmsnorm(
+            out = torch.empty_like(x)
+            out_residual = torch.empty_like(residual)
+            torch.ops._C.gemma_add_rmsnorm(
                 x,
                 residual,
-                residual_output=residual,
-                weight=effective_weight,
+                residual_output=out_residual,
+                weight=weight,
                 eps=variance_epsilon,
-                output=x,
+                output=out,
             )
-            return x, residual
+        else:
+            out = torch.empty_like(x)
+            torch.ops._C.gemma_rmsnorm(
+                x,
+                weight,
+                out,
+                variance_epsilon,
+            )
 
-        out = torch.empty_like(x)
-        torch.ops._C.rmsnorm(
-            x,
-            effective_weight,
-            out,
-            variance_epsilon,
-        )
-        return out
+        if x.dim() == 3:
+            x = x.view(x_shape)
+            if out is not None:
+                out = out.view(x_shape)
+
+        if residual is not None:
+            return out, out_residual
+        else:
+            return out
 
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Kunlun-optimized forward_oot for Gemma models."""
-        if torch.compiler.is_compiling():
-            self.forward_static = self.forward_xpu
-            return self.forward_native(x, residual)
-
-        if not getattr(self, "_is_compiled", False):
-            self.forward_static = torch.compile(
-                self.forward_native, backend="aot_eager"
-            )
-            self._is_compiled = True
-        return self.forward_native(x, residual)
+        # """Kunlun-optimized forward_oot for Gemma models."""
+        return self.forward_xpu(self.weight.data, self.variance_epsilon, x, residual)
 
 
 # Log that OOT registration is complete
