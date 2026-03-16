@@ -6,7 +6,23 @@ import logging
 import os
 import sys
 
+from vllm.logger import init_logger as init_vllm_logger
+
 OLD_IMPORT_HOOK = builtins.__import__
+
+
+def _configure_kunlun_logger() -> logging.Logger:
+    """Reuse vLLM's handler for the vllm_kunlun logger tree."""
+    vllm_logger = init_vllm_logger("vllm")
+    kunlun_logger = logging.getLogger("vllm_kunlun")
+
+    if not kunlun_logger.handlers:
+        for handler in vllm_logger.handlers:
+            kunlun_logger.addHandler(handler)
+
+    kunlun_logger.setLevel(vllm_logger.getEffectiveLevel())
+    kunlun_logger.propagate = False
+    return kunlun_logger
 
 
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
@@ -44,6 +60,7 @@ def import_hook():
 def register():
     """Register the Kunlun platform"""
 
+    logger = _configure_kunlun_logger()
     logger = logging.getLogger("vllm_kunlun")
     logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
 
