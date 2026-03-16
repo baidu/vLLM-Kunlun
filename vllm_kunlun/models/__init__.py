@@ -111,7 +111,7 @@ def register_model():
     )
 
     ModelRegistry.register_model(
-        "MiniMaxM2ForCausalLM", "vllm_kunlun.models.minimax_m2:GlmMoeDsaForCausalLM"
+        "MiniMaxM2ForCausalLM", "vllm_kunlun.models.minimax_m2:MiniMaxM2ForCausalLM"
     )
 
 
