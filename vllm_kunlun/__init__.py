@@ -61,7 +61,6 @@ def register():
     """Register the Kunlun platform"""
 
     logger = _configure_kunlun_logger()
-    logger = logging.getLogger("vllm_kunlun")
     logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
 
     # --- load native extension to register torch.ops._C.weak_ref_tensor ---
