@@ -34,6 +34,11 @@ def allocate_temp_tensors(
     )
 
     for tensor, (_, _, init) in zip(tensors, specs):
+        if init not in ("empty", "zeros", "ones"):
+            raise ValueError(
+                f"Invalid init value {init!r}; expected one of "
+                '{"empty", "zeros", "ones"}.'
+            )
         if init == "zeros":
             tensor.zero_()
         elif init == "ones":
