@@ -658,7 +658,6 @@ class KunlunOps:
         batch, hidden_size = x.shape
         num_local_experts, up_gate_size, _ = w13_weight.shape
 
-
         topk_weights = torch.empty(
             batch, top_k, dtype=router_logits.dtype, device=router_logits.device
         )
