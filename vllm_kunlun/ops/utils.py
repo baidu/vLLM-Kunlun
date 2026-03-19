@@ -18,6 +18,7 @@
 """Common utilities for Kunlun ops."""
 
 from collections.abc import Sequence
+from math import prod
 
 import torch
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -39,3 +40,9 @@ def allocate_temp_tensors(
             tensor.fill_(1)
 
     return tensors
+
+
+def view_temp_tensor(buffer: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    """Create a shaped view from a flat workspace buffer."""
+
+    return buffer[: prod(shape)].view(shape)
