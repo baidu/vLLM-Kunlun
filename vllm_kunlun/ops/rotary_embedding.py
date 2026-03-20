@@ -165,6 +165,8 @@ def vllm_kunlun_mrope_forward_cuda(
 
 RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
 RotaryEmbedding.forward = vllm_kunlun_forward_cuda
+if os.getenv('USE_ORI_ROPE') == "0":
+    RotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
 DeepseekScalingRotaryEmbedding.forward = vllm_ds_rope_forward_cuda
 DeepseekScalingRotaryEmbedding.forward_cuda = vllm_ds_rope_forward_cuda
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
@@ -183,9 +185,11 @@ def Split_Norm_Rope(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
     rotary_dim=head_dim
-    q_emb_out = torch.empty((num_tokens, q_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
-    k_emb_out = torch.empty((num_tokens, kv_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
-    v_out = torch.empty((num_tokens, kv_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
+    qkv = qkv.view(num_tokens, -1, head_dim)
+
+    q_emb_out = torch.empty((num_tokens, q_head_num, head_dim), dtype=qkv.dtype, device=qkv.device)
+    k_emb_out = torch.empty((num_tokens, kv_head_num, head_dim), dtype=qkv.dtype, device=qkv.device)
+    v_out = torch.empty((num_tokens, kv_head_num, head_dim), dtype=qkv.dtype, device=qkv.device)
     torch.ops._C.split_norm_rope_neox(
                         q_emb_out,                    
                         k_emb_out,                     
@@ -202,4 +206,7 @@ def Split_Norm_Rope(
                         head_dim,                 
                         rotary_dim,            
                     )
+    q_emb_out = q_emb_out.view(num_tokens, -1)
+    k_emb_out = k_emb_out.view(num_tokens, -1)
+    v_out = v_out.view(num_tokens, -1)
     return  q_emb_out, k_emb_out, v_out
