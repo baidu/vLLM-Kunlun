@@ -469,7 +469,9 @@ class KunlunAttentionMetadataBuilder:
         self.kv_cache_spec = kv_cache_spec
         self.device = device
 
-        self._init_reorder_batch_threshold(1, self.vllm_config.speculative_config is not None)
+        self._init_reorder_batch_threshold(
+            1, self.vllm_config.speculative_config is not None
+        )
 
     def _init_reorder_batch_threshold(
         self,
@@ -569,7 +571,10 @@ class KunlunAttentionMetadataBuilder:
         )
 
     def build(
-        self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
     ):
         """build"""
         num_reqs = common_attn_metadata.num_reqs
@@ -593,20 +598,23 @@ class KunlunAttentionMetadataBuilder:
             )
         )
 
-        num_scheduled_tokens = common_attn_metadata.query_start_loc[1:] - common_attn_metadata.query_start_loc[:-1]
+        num_scheduled_tokens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
 
         if num_decode_tokens == 0:
-            max_decode_seq_len = 0 
+            max_decode_seq_len = 0
         else:
             tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
             max_decode_seq_len = torch.max(tmp_decode_scheduled_tokens).item()
 
         if num_prefill_tokens == 0:
-            max_prefill_seq_len = 0 
+            max_prefill_seq_len = 0
             kv_lod_cpu = None
             kv_lod_xpu = None
         else:
-            tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes: num_reqs]
+            tmp_prefill_scheduled_tokens = num_scheduled_tokens[num_decodes:num_reqs]
             max_prefill_seq_len = torch.max(tmp_prefill_scheduled_tokens).item()
             kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
             kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
@@ -769,9 +777,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         # Self-attention vs. cross-attention will impact
         # which KV cache memory-mapping & which
         # seqlen datastructures we utilize
-        if (attn_type != AttentionType.ENCODER and 
-           attn_type != AttentionType.ENCODER_ONLY and 
-           kv_cache.numel() > 0):
+        if (
+            attn_type != AttentionType.ENCODER
+            and attn_type != AttentionType.ENCODER_ONLY
+            and kv_cache.numel() > 0
+        ):
             # KV-cache during decoder-self- or
             # encoder-decoder-cross-attention, but not
             # during encoder attention.
@@ -790,14 +800,35 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
-                kunlun_ops.reshape_and_cache_flash(
-                    key[: attn_metadata.num_actual_tokens],
-                    value[: attn_metadata.num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    updated_slot_mapping,
-                    BLHD_LAYOUT=False,
-                )
+
+                # Ouput looping problems exist in serveral models
+                # kunlun_ops.reshape_and_cache_flash(
+                #     key[: attn_metadata.num_actual_tokens],
+                #     value[: attn_metadata.num_actual_tokens],
+                #     key_cache,
+                #     value_cache,
+                #     updated_slot_mapping,
+                #     BLHD_LAYOUT=False,
+                # )
+
+                if key_cache.is_contiguous():
+                    kunlun_ops.reshape_and_cache(
+                        key[: attn_metadata.num_actual_tokens],
+                        value[: attn_metadata.num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        updated_slot_mapping,
+                    )
+                else:
+                    cast_key_cache = key_cache.squeeze(1).unsqueeze(-2)
+                    cast_value_cache = value_cache.squeeze(1).unsqueeze(-2)
+                    kunlun_ops.reshape_and_cache_flash(
+                        key,
+                        value,
+                        cast_key_cache,
+                        cast_value_cache,
+                        updated_slot_mapping,
+                    )
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
@@ -865,7 +896,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     decode_meta.block_tables * 2
                 )  # only test in Qwen3-Next
 
-            if self.has_max_window_size:
+            if self.has_max_window_size and self.sliding_window[0] >= 0:
                 kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],
                     # Only MLA support q len > 1 right now
