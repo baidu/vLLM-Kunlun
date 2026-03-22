@@ -180,6 +180,18 @@ class MinimaxM2ToolParser(ToolParser):
 
         function_name = self._extract_name(name_match.group(1))
 
+        # Validate function name against available tools
+        if tools:
+            valid_names = {
+                tool.function.name for tool in tools if hasattr(tool, "function")
+            }
+            if function_name not in valid_names:
+                logger.warning(
+                    "Tool '%s' not found in available tools, skipping",
+                    function_name,
+                )
+                return None
+
         # Get parameter configuration
         param_config = {}
         if tools:
@@ -411,12 +423,30 @@ class MinimaxM2ToolParser(ToolParser):
                     # Found complete function name
                     function_name_raw = tool_text[func_start:func_end]
                     self.current_function_name = self._extract_name(function_name_raw)
+
+                    # Validate function name against available tools
+                    if request and request.tools:
+                        valid_names = {
+                            tool.function.name
+                            for tool in request.tools
+                            if hasattr(tool, "function")
+                        }
+                        if self.current_function_name not in valid_names:
+                            logger.warning(
+                                "Streaming: tool '%s' not found in "
+                                "available tools, skipping",
+                                self.current_function_name,
+                            )
+                            # Skip this invoke block entirely
+                            self.current_tool_index += 1
+                            self.current_function_name = None
+                            return None
+
                     self.current_tool_id = self._generate_tool_call_id()
                     self.header_sent = True
                     self.in_function = True
 
                     # Add to prev_tool_call_arr immediately when we detect a tool call
-                    # Each tool call should be recorded regardless of function name
                     # Ensure we don't add the same tool call index multiple times
                     if len(self.prev_tool_call_arr) <= self.current_tool_index:
                         self.prev_tool_call_arr.append(
