@@ -24,7 +24,7 @@ import torch
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 
-from vllm_kunlun.ops.utils import allocate_temp_tensors, view_temp_tensor
+from vllm_kunlun.ops.utils import allocate_temp_tensors
 
 logger = init_logger(__name__)
 
@@ -500,49 +500,53 @@ class KunlunOps:
             use_presorted_preprocess = token_rows > 768
             use_separate_activation_buffer = M < 1024
 
-            # We acquire workspace only once for the whole fused MoE.
-            # The same flat buffers are then reinterpreted as different tensor
-            # views whose lifetimes do not overlap:
-            # - `scratch_b` initially stores the W1 output `y`, and may be
-            #   reused for the W2 output `out` once activation is complete
-            # - for small-M, `scratch_a` stores activated output `out1`
-            # - for large-M, activation is fused into `y`, so `scratch_a`
-            #   can be reused for the W2 output `out`
-            moe_expand_numel = token_rows * N
-            y_numel = token_rows * w1.shape[1]
-            out1_numel = token_rows * (w1.shape[1] // 2)
-            out_numel = token_rows * w2.shape[1]
-            if use_separate_activation_buffer:
-                scratch_a_numel = out1_numel
-                scratch_b_numel = max(y_numel, out_numel)
-                w2_output_in_scratch_a = False
-            else:
-                scratch_a_numel = out_numel
-                scratch_b_numel = y_numel
-                w2_output_in_scratch_a = True
-
             if use_presorted_preprocess:
-                # `moe_expand` is produced before the W1 output exists, so it
-                # can share storage with the later scratch_a consumer.
-                scratch_a_numel = max(scratch_a_numel, moe_expand_numel)
-                (
-                    scratch_a,
-                    scratch_b,
-                    dequant_scale_buffer,
-                    expert_m,
-                    sorted_tokens_num_lod,
-                    sorted_tokens_idx,
-                ) = allocate_temp_tensors(
+                if use_separate_activation_buffer:
                     (
-                        ((scratch_a_numel,), hidden_states.dtype, "empty"),
-                        ((scratch_b_numel,), hidden_states.dtype, "empty"),
-                        ((token_rows,), torch.float32, "ones"),
-                        ((global_num_experts,), torch.int32, "zeros"),
-                        ((global_num_experts + 1,), torch.int32, "zeros"),
-                        ((token_rows,), torch.int32, "zeros"),
+                        moe_expand,
+                        expert_m,
+                        sorted_tokens_num_lod,
+                        sorted_tokens_idx,
+                        y,
+                        out1,
+                        out,
+                        dequant_scale,
+                    ) = allocate_temp_tensors(
+                        (
+                            ((token_rows, N), hidden_states.dtype, "empty"),
+                            ((global_num_experts,), torch.int32, "zeros"),
+                            ((global_num_experts + 1,), torch.int32, "zeros"),
+                            ((token_rows,), torch.int32, "zeros"),
+                            ((M, moe_top_k, w1.shape[1]), hidden_states.dtype, "empty"),
+                            (
+                                (M, moe_top_k, w1.shape[1] // 2),
+                                hidden_states.dtype,
+                                "empty",
+                            ),
+                            ((M, moe_top_k, w2.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k), torch.float32, "ones"),
+                        )
                     )
-                )
-                moe_expand = view_temp_tensor(scratch_a, (token_rows, N))
+                else:
+                    (
+                        moe_expand,
+                        expert_m,
+                        sorted_tokens_num_lod,
+                        sorted_tokens_idx,
+                        y,
+                        out,
+                        dequant_scale,
+                    ) = allocate_temp_tensors(
+                        (
+                            ((token_rows, N), hidden_states.dtype, "empty"),
+                            ((global_num_experts,), torch.int32, "zeros"),
+                            ((global_num_experts + 1,), torch.int32, "zeros"),
+                            ((token_rows,), torch.int32, "zeros"),
+                            ((M, moe_top_k, w1.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k, w2.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k), torch.float32, "ones"),
+                        )
+                    )
 
                 torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
@@ -565,18 +569,29 @@ class KunlunOps:
                         x=hidden_states,
                     )
                 )
-                scratch_a, scratch_b, dequant_scale_buffer = allocate_temp_tensors(
-                    (
-                        ((scratch_a_numel,), hidden_states.dtype, "empty"),
-                        ((scratch_b_numel,), hidden_states.dtype, "empty"),
-                        ((token_rows,), torch.float32, "ones"),
+                if use_separate_activation_buffer:
+                    y, out1, out, dequant_scale = allocate_temp_tensors(
+                        (
+                            ((M, moe_top_k, w1.shape[1]), hidden_states.dtype, "empty"),
+                            (
+                                (M, moe_top_k, w1.shape[1] // 2),
+                                hidden_states.dtype,
+                                "empty",
+                            ),
+                            ((M, moe_top_k, w2.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k), torch.float32, "ones"),
+                        )
                     )
-                )
+                else:
+                    y, out, dequant_scale = allocate_temp_tensors(
+                        (
+                            ((M, moe_top_k, w1.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k, w2.shape[1]), hidden_states.dtype, "empty"),
+                            ((M, moe_top_k), torch.float32, "ones"),
+                        )
+                    )
 
-            # scratch_b keeps the W1 output alive until activation is finished.
-            y = view_temp_tensor(scratch_b, (M, moe_top_k, w1.shape[1]))
-
-            moe_expand = moe_expand.view(token_rows, hidden_dim)
+            moe_expand = moe_expand.reshape(token_rows, hidden_dim)
 
             if use_separate_activation_buffer:
                 torch.ops._C.moe_fc(
@@ -587,13 +602,7 @@ class KunlunOps:
                     moe_topk=moe_top_k,
                     y=y,
                 )
-
-                # In the small-M branch, activation output cannot alias `y`
-                # because `silu_and_mul` still reads from the original W1
-                # output while writing the activated result.
-                out1 = view_temp_tensor(scratch_a, (M, moe_top_k, y.shape[-1] // 2))
                 torch.ops._C.silu_and_mul(out1, y)
-
                 out1 = out1.reshape(-1, out1.shape[-1])
             else:
                 torch.ops._C.moe_fc(
@@ -608,12 +617,6 @@ class KunlunOps:
 
                 y = y[..., : y.shape[-1] // 2]
                 out1 = y.reshape(-1, y.shape[-1])
-
-            if w2_output_in_scratch_a:
-                out = view_temp_tensor(scratch_a, (M, moe_top_k, w2.shape[1]))
-            else:
-                out = view_temp_tensor(scratch_b, (M, moe_top_k, w2.shape[1]))
-            dequant_scale = view_temp_tensor(dequant_scale_buffer, (M, moe_top_k))
 
             torch.ops._C.moe_fc(
                 x=out1,
