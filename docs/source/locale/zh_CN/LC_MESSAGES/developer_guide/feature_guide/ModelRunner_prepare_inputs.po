@@ -23,4 +23,3 @@ msgstr ""
 #: ../../source/developer_guide/feature_guide/ModelRunner_prepare_inputs.md:1
 msgid "Prepare inputs for model forwarding"
 msgstr ""
-

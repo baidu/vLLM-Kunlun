@@ -95,7 +95,8 @@ def register_model():
 
     ModelRegistry.register_model(
         "Qwen3_5MoeForConditionalGeneration",
-        "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForConditionalGeneration")
+        "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
+    )
 
 
 def register_quant_method():

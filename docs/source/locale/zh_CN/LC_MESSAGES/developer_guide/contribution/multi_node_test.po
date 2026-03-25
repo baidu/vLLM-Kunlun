@@ -130,4 +130,3 @@ msgid ""
 "your use case, and the latter defines the path to the configuration file "
 "you have completed in step 2."
 msgstr ""
-

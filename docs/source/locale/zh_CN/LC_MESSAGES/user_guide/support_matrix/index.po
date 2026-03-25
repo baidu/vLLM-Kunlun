@@ -30,4 +30,3 @@ msgstr "特性与模型"
 #, fuzzy
 msgid "This section provides a detailed matrix supported by vLLM Kunlun."
 msgstr "本节提供了 vLLM Kunlun 的详细支持矩阵。"
-

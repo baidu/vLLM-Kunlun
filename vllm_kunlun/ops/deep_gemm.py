@@ -1,5 +1,6 @@
 import torch
-import xspeedgate_ops
+import xspeedgate_ops  # noqa
+
 
 def int8_mqa_logits(
     q: torch.Tensor,
@@ -29,29 +30,30 @@ def int8_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    seq_len_q, seq_len_kv =q.shape[0], kv[0].shape[0]
+    seq_len_q, seq_len_kv = q.shape[0], kv[0].shape[0]
     logits = torch.empty((seq_len_q, seq_len_kv), dtype=torch.float32, device=q.device)
 
     torch.ops._C.I8_mqa_logits(
-            q=q,
-            fused_kv_cache=kv,
-            weights=weights,
-            context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
-            context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
-            logits=logits,
-            clean_logits=True,
-            use_xfa_boost=False,
-        ) 
+        q=q,
+        fused_kv_cache=kv,
+        weights=weights,
+        context_q_lens=(context_q_lens_cpu, context_q_lens_xpu),
+        context_k_lens=(context_k_lens_cpu, context_k_lens_xpu),
+        logits=logits,
+        clean_logits=True,
+        use_xfa_boost=False,
+    )
 
     # mask参考 https://github.com/vllm-project/vllm/blob/v0.11.0/tests/kernels/attention/test_deepgemm_attention.py 的_ref_fp8_mqa_logits函数的实现
     torch.ops.xspeedgate_ops.mask_for_I8_mqa_logits(
-            seq_len_kv=seq_len_kv,
-            cu_seqlen_ks=cu_seqlen_ks,
-            cu_seqlen_ke=cu_seqlen_ke,
-            logits=logits,
+        seq_len_kv=seq_len_kv,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+        logits=logits,
     )
 
     return logits
+
 
 def int8_paged_mqa_logits(
     q_fp8: torch.Tensor,
@@ -86,30 +88,34 @@ def int8_paged_mqa_logits(
     """
     batch_size, next_n, _, D = q_fp8.shape
     num_blocks, block_size, _, _ = kv_cache_fp8.shape
-    
+
     kv_cache_fp8 = kv_cache_fp8.view(num_blocks, -1)
-    k_val = kv_cache_fp8[:, :block_size * D].view(torch.int8)
+    k_val = kv_cache_fp8[:, : block_size * D].view(torch.int8)
     k_val = k_val.view(-1, block_size, 1, D)
-    
+
     block_indices = block_tables.flatten()
-    k_scale = kv_cache_fp8[block_indices, block_size * D:].view(-1, 4).view(torch.float32)
+    k_scale = (
+        kv_cache_fp8[block_indices, block_size * D :].view(-1, 4).view(torch.float32)
+    )
     k_scale = k_scale.view(-1, max_model_len)
     kv_cache = [k_val, k_scale]
 
-    weights = weights.view(batch_size,next_n,-1)
-            
-    logits = torch.empty((batch_size, next_n, max_model_len), dtype=torch.float32, device=q_fp8.device)
+    weights = weights.view(batch_size, next_n, -1)
+
+    logits = torch.empty(
+        (batch_size, next_n, max_model_len), dtype=torch.float32, device=q_fp8.device
+    )
 
     torch.ops._C.I8_paged_mqa_logits(
-                q=q_fp8,
-                fused_kv_cache=kv_cache,
-                weights=weights,
-                context_lens=[context_lens_cpu, context_lens],
-                block_table=block_tables,
-                max_context_len=max_model_len,
-                clean_logits=True,
-                out=logits,
-                use_xfa_boost=False
-            )
+        q=q_fp8,
+        fused_kv_cache=kv_cache,
+        weights=weights,
+        context_lens=[context_lens_cpu, context_lens],
+        block_table=block_tables,
+        max_context_len=max_model_len,
+        clean_logits=True,
+        out=logits,
+        use_xfa_boost=False,
+    )
     logits = logits.view(-1, max_model_len)
     return logits

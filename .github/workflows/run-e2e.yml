@@ -41,7 +41,7 @@
 #           bash ci/scripts/docker/start_docker.sh
 
 #       - name: Install enviroments
-#         env: 
+#         env:
 #           PROXY_URL: ${{ secrets.PROXY_URL }}
 #           NO_PROXY_LIST: ${{ secrets.NO_PROXY_LIST }}
 #         run: |
@@ -149,13 +149,13 @@
       #               --ignore-eos
       #       done
       #     '
-      
-      - name: Set permissions
-        if: always()
-        run: |
-          bash ci/scripts/docker/set_permissions.sh
 
-      - name: Cleanup docker
-        if: always()
-        run: |
-          bash ci/scripts/docker/stop_docker.sh
+      # - name: Set permissions
+      #   if: always()
+      #   run: |
+      #     bash ci/scripts/docker/set_permissions.sh
+
+      # - name: Cleanup docker
+      #   if: always()
+      #   run: |
+      #     bash ci/scripts/docker/stop_docker.sh

@@ -3,10 +3,10 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 void rms_norm_xpu(torch::Tensor &output,
-                  torch::Tensor &input, 
-                  torch::Tensor &weight, 
+                  torch::Tensor &input,
+                  torch::Tensor &weight,
                   double eps);
-// inplace             
+// inplace
 void fused_add_rms_norm_xpu(torch::Tensor& input,     // [..., hidden_size]
                         torch::Tensor& residual,  // [..., hidden_size]
                         torch::Tensor& weight,    // [hidden_size]
@@ -20,18 +20,18 @@ void quick_gelu_xpu(torch::Tensor &output,
                       torch::Tensor &input);
 
 // neox && gptj
-void rotary_embedding(torch::Tensor &positions, 
+void rotary_embedding(torch::Tensor &positions,
                       torch::Tensor& query,
-                      torch::Tensor& key, 
+                      torch::Tensor& key,
                       int64_t head_size,
-                      torch::Tensor& cos_sin_cache, 
+                      torch::Tensor& cos_sin_cache,
                       bool is_neox);
 
-void batched_rotary_embedding(torch::Tensor &positions, 
+void batched_rotary_embedding(torch::Tensor &positions,
                       torch::Tensor& query,
-                      torch::Tensor& key, 
+                      torch::Tensor& key,
                       int64_t head_size,
-                      torch::Tensor& cos_sin_cache, 
+                      torch::Tensor& cos_sin_cache,
                       bool is_neox,
                       int64_t rot_dim,
                       torch::Tensor& offsets);
@@ -47,11 +47,11 @@ void paged_attention_v1_xpu(
     torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
     torch::Tensor& seq_lens,      // [num_seqs]
     torch::Tensor& seq_lens_host, // [num_seqs]
-    int64_t block_size, 
+    int64_t block_size,
     int64_t max_seq_len,
     const c10::optional<torch::Tensor>& alibi_slopes, // [num_heads]
-    const std::string& kv_cache_dtype, 
-    double k_scale, 
+    const std::string& kv_cache_dtype,
+    double k_scale,
     double v_scale,
     int64_t tp_rank, int64_t blocksparse_local_blocks, // no used but to keep same with vllm-offficial
     int64_t blocksparse_vert_stride, int64_t blocksparse_block_size, // no used but to keep same with vllm-offficial
@@ -66,7 +66,7 @@ void reshape_and_cache(
     torch::Tensor&
         value_cache,  // [num_blocks, num_heads, head_size, block_size]
     torch::Tensor& slot_mapping,  // [num_tokens]
-    const std::string& kv_cache_dtype, 
+    const std::string& kv_cache_dtype,
     const double k_scale,
     const double v_scale);
 
@@ -150,9 +150,9 @@ void outplace_fused_experts_sorted_xpu(
 );
 
 
-void grouped_topk_xpu(torch::Tensor &router_logits, 
+void grouped_topk_xpu(torch::Tensor &router_logits,
     torch::Tensor& score_bias,
-    torch::Tensor& topk_weight, 
+    torch::Tensor& topk_weight,
     torch::Tensor& topk_ids,
     double scale,
     int64_t expert_group_num,
@@ -168,7 +168,7 @@ torch::Tensor weak_ref_tensor(torch::Tensor& tensor);
 
 void dynamic_scaled_int8_quant_xpu(torch::Tensor &out,
                   torch::Tensor &x,
-                  torch::Tensor &input_scale, 
+                  torch::Tensor &input_scale,
                   const c10::optional<torch::Tensor>& input_azp
 );
 void cutlass_scaled_mm_xpu(torch::Tensor& out, torch::Tensor const& a,

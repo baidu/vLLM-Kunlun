@@ -79,4 +79,3 @@ msgstr "运行 docker 容器"
 #~ "To enable quantization for kunlun, "
 #~ "quantization method must be \"kunlun\""
 #~ msgstr "要在kunlun上启用量化，量化方法必须为“kunlun”。"
-

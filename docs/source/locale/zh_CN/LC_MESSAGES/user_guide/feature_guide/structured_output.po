@@ -232,4 +232,3 @@ msgstr "什么是结构化输出？"
 #~ msgstr ""
 #~ "查看更多其他用法的示例 [在这里](https://github.com/vllm-"
 #~ "project/vllm/blob/main/examples/offline_inference/structured_outputs.py)。"
-

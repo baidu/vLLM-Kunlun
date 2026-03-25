@@ -103,4 +103,3 @@ msgstr "在单个XPU上进行离线推理"
 
 #~ msgid "Logs of the vllm server:"
 #~ msgstr "vllm 服务器的日志："
-

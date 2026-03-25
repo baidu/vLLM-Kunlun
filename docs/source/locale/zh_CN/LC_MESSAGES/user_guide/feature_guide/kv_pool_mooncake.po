@@ -27,4 +27,3 @@ msgstr ""
 #: ../../source/user_guide/feature_guide/kv_pool_mooncake.md:3
 msgid "Environmental Dependencies"
 msgstr ""
-

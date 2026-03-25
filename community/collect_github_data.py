@@ -9,12 +9,12 @@ It also generates a visualization chart and saves it as 'github_stats.png'.
 """
 
 import os
-import requests
 from datetime import datetime, timedelta
+
+import matplotlib.pyplot as plt
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import matplotlib.pyplot as plt
-
 
 """
 # Initialization & configuration
@@ -27,11 +27,7 @@ HEADERS = {"Authorization": f"token {GH_PAT}"}
 
 # Configure request retry strategy (to handle transient GitHub API instability)
 session = requests.Session()
-retry = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504]
-)
+retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("https://", adapter)
 
@@ -44,7 +40,9 @@ def validate_config():
         List[str]: Repositories list in format ["owner/repo1", "owner/repo2", ...]
     """
     if not GH_PAT:
-        raise ValueError("ERROR: GH_PAT is not set. Please add it in Secrets/environment variables.")
+        raise ValueError(
+            "ERROR: GH_PAT is not set. Please add it in Secrets/environment variables."
+        )
     if not TARGET_REPOS or TARGET_REPOS.strip() == "":
         raise ValueError(
             "ERROR: TARGET_REPOS is not set. Please provide a comma-separated repo list "
@@ -53,7 +51,9 @@ def validate_config():
 
     target_repos_list = TARGET_REPOS.split(",")
     if not all(repo.strip() for repo in target_repos_list):
-        raise ValueError("ERROR: Invalid TARGET_REPOS format. Repo list cannot contain empty items.")
+        raise ValueError(
+            "ERROR: Invalid TARGET_REPOS format. Repo list cannot contain empty items."
+        )
     return [repo.strip() for repo in target_repos_list]
 
 
@@ -77,12 +77,16 @@ def get_stat_period():
             datetime.strptime(end_str, "%Y-%m-%d")
             return f"{start_str}T00:00:00Z", f"{end_str}T23:59:59Z"
         except ValueError:
-            raise ValueError("ERROR: Invalid START_DATE/END_DATE format. Expected 'YYYY-MM-DD'.")
+            raise ValueError(
+                "ERROR: Invalid START_DATE/END_DATE format. Expected 'YYYY-MM-DD'."
+            )
 
     # Auto-calculate biweekly window: last 14 days to today
     end_date = datetime.now()
     start_date = end_date - timedelta(days=14)
-    return start_date.strftime("%Y-%m-%dT00:00:00Z"), end_date.strftime("%Y-%m-%dT23:59:59Z")
+    return start_date.strftime("%Y-%m-%dT00:00:00Z"), end_date.strftime(
+        "%Y-%m-%dT23:59:59Z"
+    )
 
 
 def get_github_contributor_stats(
@@ -176,28 +180,51 @@ def fetch_prs(repo, start_str, end_str, is_main_repo=False):
     """
     try:
         url = f"https://api.github.com/repos/{repo}/pulls"
-        params = {"state": "all", "since": start_str, "until": end_str, "per_page": 1000}
+        params = {
+            "state": "all",
+            "since": start_str,
+            "until": end_str,
+            "per_page": 1000,
+        }
         response = session.get(url, headers=HEADERS, params=params)
         response.raise_for_status()
         prs = response.json()
 
         open_prs = [pr for pr in prs if pr["state"] == "open"]
-        merged_prs = [pr for pr in prs if pr.get("merged_at") and start_str <= pr["merged_at"] <= end_str]
-        closed_prs = [pr for pr in prs if pr["state"] == "closed" and not pr.get("merged_at")]
+        merged_prs = [
+            pr
+            for pr in prs
+            if pr.get("merged_at") and start_str <= pr["merged_at"] <= end_str
+        ]
+        closed_prs = [
+            pr for pr in prs if pr["state"] == "closed" and not pr.get("merged_at")
+        ]
 
         if is_main_repo:
             target_repos = validate_config()
             prs_from_target = 0
             for pr in merged_prs:
                 # Determine whether PR head repo is from a target repo list
-                if pr.get("head") and pr["head"].get("repo") and pr["head"]["repo"].get("full_name") in target_repos:
+                if (
+                    pr.get("head")
+                    and pr["head"].get("repo")
+                    and pr["head"]["repo"].get("full_name") in target_repos
+                ):
                     prs_from_target += 1
-            return len(prs), len(merged_prs), len(closed_prs), len(open_prs), prs_from_target
+            return (
+                len(prs),
+                len(merged_prs),
+                len(closed_prs),
+                len(open_prs),
+                prs_from_target,
+            )
 
         return len(prs), len(merged_prs), len(closed_prs), len(open_prs), 0
 
     except requests.exceptions.HTTPError as e:
-        raise Exception(f"Failed to fetch PR data for {repo}: {e.response.status_code} - {e.response.text}")
+        raise Exception(
+            f"Failed to fetch PR data for {repo}: {e.response.status_code} - {e.response.text}"
+        )
     except Exception as e:
         raise Exception(f"Exception while fetching PR data for {repo}: {str(e)}")
 
@@ -212,7 +239,12 @@ def fetch_issues(repo, start_str, end_str):
     """
     try:
         url = f"https://api.github.com/repos/{repo}/issues"
-        params = {"state": "all", "since": start_str, "until": end_str, "per_page": 1000}
+        params = {
+            "state": "all",
+            "since": start_str,
+            "until": end_str,
+            "per_page": 1000,
+        }
         response = session.get(url, headers=HEADERS, params=params)
         response.raise_for_status()
         issues = response.json()
@@ -226,7 +258,9 @@ def fetch_issues(repo, start_str, end_str):
         return len(open_issues), len(close_issues)
 
     except requests.exceptions.HTTPError as e:
-        raise Exception(f"Failed to fetch Issue data for {repo}: {e.response.status_code} - {e.response.text}")
+        raise Exception(
+            f"Failed to fetch Issue data for {repo}: {e.response.status_code} - {e.response.text}"
+        )
     except Exception as e:
         raise Exception(f"Exception while fetching Issue data for {repo}: {str(e)}")
 
@@ -272,9 +306,13 @@ def fetch_stars_forks(repo, start_str):
         return new_stars, current_stars, new_forks, current_forks
 
     except requests.exceptions.HTTPError as e:
-        raise Exception(f"Failed to fetch Stars/Forks data for {repo}: {e.response.status_code} - {e.response.text}")
+        raise Exception(
+            f"Failed to fetch Stars/Forks data for {repo}: {e.response.status_code} - {e.response.text}"
+        )
     except Exception as e:
-        raise Exception(f"Exception while fetching Stars/Forks data for {repo}: {str(e)}")
+        raise Exception(
+            f"Exception while fetching Stars/Forks data for {repo}: {str(e)}"
+        )
 
 
 def plot_github_stats(stats: dict, start_time: str, end_time: str):
@@ -295,13 +333,13 @@ def plot_github_stats(stats: dict, start_time: str, end_time: str):
         stats["forks_total"],
     ]
 
-    colors = ['#4E79A7', '#F28E2B', '#E15759', '#76B7B2', '#59A14F']
+    colors = ["#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F"]
 
     def extract_date(date_str):
         # Support multiple time formats
-        for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S', '%Y/%m/%d'):
+        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d"):
             try:
-                return datetime.strptime(date_str.strip(), fmt).strftime('%Y-%m-%d')
+                return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")
             except ValueError:
                 continue
         return date_str[:10] if len(date_str) >= 10 else date_str
@@ -317,14 +355,18 @@ def plot_github_stats(stats: dict, start_time: str, end_time: str):
         plt.text(
             bar.get_x() + bar.get_width() / 2,
             height + max(values) * 0.01,
-            f'{int(height):,}',
-            ha='center',
-            va='bottom',
-            fontweight='bold',
-            fontsize=10
+            f"{int(height):,}",
+            ha="center",
+            va="bottom",
+            fontweight="bold",
+            fontsize=10,
         )
 
-    plt.title(f'GitHub Community Statistics\n({start_date} ~ {end_date})', fontsize=14, fontweight='bold')
+    plt.title(
+        f"GitHub Community Statistics\n({start_date} ~ {end_date})",
+        fontsize=14,
+        fontweight="bold",
+    )
     plt.ylabel("Count", fontsize=12)
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
@@ -365,12 +407,14 @@ def main():
             "forks_total": 0,
             "open_issues": 0,
             "close_issues": 0,
-            "issues_total": 0
+            "issues_total": 0,
         }
 
         # 4) Fetch data per repo
         for repo in target_repos_list:
-            total_contributors, period_contributors = get_github_contributor_stats(repo, start_str, end_str, GH_PAT)
+            total_contributors, period_contributors = get_github_contributor_stats(
+                repo, start_str, end_str, GH_PAT
+            )
             prs_t, prs_m, prs_c, prs_o, _ = fetch_prs(repo, start_str, end_str)
             open_issues, close_issues = fetch_issues(repo, start_str, end_str)
             stars_n, stars_t, forks_n, forks_t = fetch_stars_forks(repo, start_str)

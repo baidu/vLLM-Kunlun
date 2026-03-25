@@ -35,4 +35,3 @@ msgstr ""
 #: ../../source/tutorials/single_npu_qwen2_audio.md:7
 msgid "Run docker container:"
 msgstr ""
-

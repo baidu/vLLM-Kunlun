@@ -36,7 +36,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 RUN sed -i '/# >>> conda initialize >>>/,/# <<< conda initialize <<</d' ~/.bashrc && \
-    rm -rf /root/miniconda3 
+    rm -rf /root/miniconda3
 
 ENV PATH=/root/.local/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -44,7 +44,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     source $HOME/.local/bin/env
 
 RUN uv venv --python 3.10 /opt/vllm_kunlun
-ENV PATH=/opt/vllm_kunlun/bin:${PATH} 
+ENV PATH=/opt/vllm_kunlun/bin:${PATH}
 
 RUN source /opt/vllm_kunlun/bin/activate && \
     uv pip install torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118 && \

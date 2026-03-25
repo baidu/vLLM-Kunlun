@@ -7,7 +7,7 @@ Please provide a clear and concise description of this PR:
 - What is the overall approach?
 -->
 
-FIX #xxxx  
+FIX #xxxx
 <!-- Link the existing issue(s) this PR resolves, e.g.:
 FIX #1234
 -->
@@ -41,7 +41,7 @@ Please prefix the PR title with one or more of the following labels to help revi
 <details>
 <summary><b>Detailed Checklist (Click to Expand)</b></summary>
 
-<p>Thank you for contributing to <b>vLLM Kunlun</b>!  
+<p>Thank you for contributing to <b>vLLM Kunlun</b>!
 To help us maintain high code quality and streamline the review process, please ensure your PR meets the following requirements.</p>
 
 <h3>1. Code Quality</h3>

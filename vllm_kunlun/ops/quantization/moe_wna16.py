@@ -16,15 +16,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from typing import Optional, Callable, Union
+from typing import Callable, Optional, Union
 
+import torch
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4
 
 
 def convert_awq_tensor_for_kunlun(
@@ -254,7 +254,7 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
             int4_signed=False,
             use_mode_fast=layer.align_type,
         )
-        
+
         if self.moe.use_ep:
             return ops.fused_moe_ep(
                 x,
@@ -289,7 +289,7 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
             )
 
 
-from vllm.model_executor.layers.quantization import moe_wna16
+from vllm.model_executor.layers.quantization import moe_wna16  # noqa
 
 moe_wna16.MoeWNA16Method = KunlunMoeWNA16Method
 print(

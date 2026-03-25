@@ -24,6 +24,7 @@ import weakref
 from enum import Enum
 from os.path import dirname, join
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -32,13 +33,11 @@ from typing import (
     Optional,
     Set,
     Tuple,
-    TYPE_CHECKING,
     Union,
 )
 from unittest.mock import patch
 
 import sympy
-
 import torch
 import torch.fx
 import torch.utils._pytree as pytree
@@ -74,7 +73,6 @@ from .hooks import Hooks
 from .mutation_guard import install_generation_tagging_init
 from .utils import common_constant_types, compile_times
 
-
 if TYPE_CHECKING:
     from torch._subclasses import fake_tensor
 
@@ -97,11 +95,13 @@ cached_backends: Dict[int, CompilerFn] = {}
 
 unset = Unset.token
 
-from torch._C._dynamo.eval_frame import set_eval_frame
+from torch._C._dynamo.eval_frame import set_eval_frame  # noqa
+
+
 def _maybe_set_eval_frame(callback: DynamoCallback):
     # A wrapper on set_eval_frame that is guarded by a Justknob.
     # Users can disable torchDynamo by setting the JK to False.
-    #from torch._C._dynamo.eval_frame import set_eval_frame
+    # from torch._C._dynamo.eval_frame import set_eval_frame
 
     if not justknobs_check("pytorch/compiler:enable_compiler_set_eval_frame"):
         torch._dynamo.utils.warn_once(
@@ -128,7 +128,7 @@ DONT_WRAP_FILES = {
 
 
 def _debug_get_cache_entry_list(
-    code: Union[types.CodeType, Callable[..., Any]]
+    code: Union[types.CodeType, Callable[..., Any]],
 ) -> List[CacheEntry]:
     """
     Given a code object or a callable object, retrieve the cache entries
@@ -371,9 +371,9 @@ class _TorchDynamoContext:
         # add context containing GraphModule to any GraphModule forward functions
         if isinstance(fn, GraphModule):
             # add context containing GraphModule to any GraphModule forward functions
-            code_context.get_context(fn.forward.__code__)[
-                "orig_graphmodule"
-            ] = weakref.ref(fn)
+            code_context.get_context(fn.forward.__code__)["orig_graphmodule"] = (
+                weakref.ref(fn)
+            )
 
         # Optimize the forward method of torch.nn.Module object
         if isinstance(fn, torch.nn.Module):
@@ -489,9 +489,7 @@ class _TorchDynamoContext:
         # should prevent any type of skipping.
         if callback not in (None, False):
             if not hasattr(fn, "__code__"):
-                raise RuntimeError(
-                    textwrap.dedent(
-                        """
+                raise RuntimeError(textwrap.dedent("""
 
                         torch._dynamo.optimize is called on a non function object.
                         If this is a callable class, please wrap the relevant code into a function and optimize the
@@ -519,9 +517,7 @@ class _TorchDynamoContext:
                         and then optimize the wrapper_fn
 
                         >> opt_wrapper_fn = torch._dynamo.optimize(wrapper_fn)
-                        """
-                    )
-                )
+                        """))
             always_optimize_code_objects[fn.__code__] = True
 
         return _fn
@@ -787,9 +783,11 @@ def _optimize(
         hooks,
         backend_ctx_ctor,
         dynamic=dynamic,
-        compiler_config=backend.get_compiler_config()
-        if hasattr(backend, "get_compiler_config")
-        else None,
+        compiler_config=(
+            backend.get_compiler_config()
+            if hasattr(backend, "get_compiler_config")
+            else None
+        ),
         rebuild_ctx=rebuild_ctx,
     )
 
@@ -903,9 +901,11 @@ class FlattenInputOutputSignature(torch.fx.interpreter.Transformer):
                         flat_args[i],
                         symbolic_context=StatelessSymbolicContext(
                             dynamic_sizes=[
-                                DimDynamic.DYNAMIC
-                                if d in flat_args_dynamic_dims[i]
-                                else DimDynamic.STATIC
+                                (
+                                    DimDynamic.DYNAMIC
+                                    if d in flat_args_dynamic_dims[i]
+                                    else DimDynamic.STATIC
+                                )
                                 for d in range(len(flat_args[i].shape))
                             ],
                             constraint_sizes=[None] * len(flat_args[i].shape),
@@ -1680,7 +1680,7 @@ class TorchPatcher:
         for opt_mod in optimizer_modules:
             opt_name = opt_mod.__name__.split(".")[-1]
             fused_fn_name = f"_fused_{opt_name}"
-            single_tensor_fn_name = f"_single_tensor_{opt_name}"
+            # single_tensor_fn_name = f"_single_tensor_{opt_name}"
 
             if hasattr(opt_mod, fused_fn_name):
                 setattr(

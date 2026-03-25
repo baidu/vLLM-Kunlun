@@ -74,4 +74,3 @@ msgstr "使用 OpenCompass"
 #~ "你可以在 [OpenCompass "
 #~ "文档](https://opencompass.readthedocs.io/en/latest/index.html) "
 #~ "查看更多用法。"
-

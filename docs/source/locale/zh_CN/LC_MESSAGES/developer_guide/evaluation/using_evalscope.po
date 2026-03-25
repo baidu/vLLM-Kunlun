@@ -97,4 +97,3 @@ msgstr "使用 EvalScope"
 #~ "更多详情见：[EvalScope 文档 - "
 #~ "模型推理压力测试](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/quick_start.html"
 #~ "#basic-usage)。"
-

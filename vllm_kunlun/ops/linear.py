@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
-import torch.nn as nn
-from typing import Any
-
 from torch.nn.parameter import Parameter
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     WEIGHT_LOADER_V2_SUPPORTED,
-    ReplicatedLinear,
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     UnquantizedLinearMethod,
-    ColumnParallelLinear
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -22,15 +20,7 @@ from vllm.model_executor.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
 )
-from vllm.distributed import (
-    divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
-)
-from vllm.logger import init_logger
+from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
@@ -49,6 +39,7 @@ def get_weights_half(self):
     if hasattr(self, "kunlun_linear_weights_half"):
         return self.kunlun_linear_weights_half
     weights = torch.nn.Parameter(self.weight.to(torch.float16))
+    return weights
 
 
 ReplicatedLinear.get_weights = get_weights
@@ -142,127 +133,79 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
 
     return param[shard_id], loaded_weight
 
+
 def weight_loader(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: tuple[int, ...] | int | None = None,
-    ):
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if isinstance(loaded_shard_id, tuple) and (
-            is_gguf_weight or is_gguf_weight_type
-        ):
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported for GGUF."
-            )
-        if is_gguf_weight_type:
-            if loaded_shard_id is not None:
-                param.data[loaded_shard_id].copy_(loaded_weight)
-                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
-            else:
-                param.shard_weight_type = {
-                    i: loaded_weight.item() for i, _ in enumerate(self.output_sizes)
-                }
-            return
+    self,
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id: tuple[int, ...] | int | None = None,
+):
+    is_gguf_weight = getattr(param, "is_gguf_weight", False)
+    is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+    if isinstance(loaded_shard_id, tuple) and (is_gguf_weight or is_gguf_weight_type):
+        raise NotImplementedError(
+            "Shard id with multiple indices is not supported for GGUF."
+        )
+    if is_gguf_weight_type:
+        if loaded_shard_id is not None:
+            param.data[loaded_shard_id].copy_(loaded_weight)
+            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+        else:
+            param.shard_weight_type = {
+                i: loaded_weight.item() for i, _ in enumerate(self.output_sizes)
+            }
+        return
 
-        if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
-
-            if loaded_shard_id is not None:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-                param.shard_id.append(loaded_shard_id)
-                param.shard_id_map[loaded_shard_id] = len(param.data_container)
-                param.data_container.append(loaded_weight)
-                return
-
-        param_data = param.data
+    if is_gguf_weight:
         output_dim = getattr(param, "output_dim", None)
-        # Special case for per-tensor scale to load scalar into fused array.
-        needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
+        shard_size = loaded_weight.size(output_dim) // self.tp_size
+        start_idx = self.tp_rank * shard_size
 
-        if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
-            # Loaded weight is already fused on disk (mlp).
-            # (e.g., Phi-3's gate_up_proj).
-            if output_dim is None:
-                if needs_scalar_to_array:
-                    param_data, loaded_weight = adjust_scalar_to_fused_array(
-                        param_data, loaded_weight, 0
-                    )
-
-                assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
-                return
-            output_sizes = (
-                self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
-                if loaded_shard_id is not None
-                else self.output_sizes
-            )
-            current_shard_offset = 0
-            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-            if use_bitsandbytes_4bit and isinstance(loaded_shard_id, tuple):
-                raise NotImplementedError(
-                    "Shard id with multiple indices is not supported "
-                    "for BNB quantization yet."
-                )
-            shard_offsets: list[tuple[int, int, int]] = []
-            for i, output_size in enumerate(output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
-                current_shard_offset += output_size
-            packed_dim = getattr(param, "packed_dim", None)
-            for shard_id, shard_offset, shard_size in shard_offsets:
-                # Special case for Quantization.
-                # If quantized, we need to adjust the offset and size to account
-                # for the packing.
-                if packed_dim == output_dim:
-                    shard_size = shard_size // param.packed_factor
-                    shard_offset = shard_offset // param.packed_factor
-                    # Special case for Marlin.
-                    shard_size, shard_offset = adjust_marlin_shard(
-                        param, shard_size, shard_offset
-                    )
-
-                shard_size, shard_offset = adjust_bitblas_shard(
-                    param, shard_size, shard_offset
-                )
-
-                if use_bitsandbytes_4bit:
-                    index = list(itertools.accumulate([0] + self.output_sizes))
-                    orig_offsets = {
-                        str(i): (index[i], size)
-                        for i, size in enumerate(self.output_sizes)
-                    }
-                    orig_offsets["total"] = (self.output_size, 0)
-                    shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                        param, orig_offsets, str(shard_id)
-                    )
-
-                loaded_weight_shard = loaded_weight.narrow(
-                    output_dim, shard_offset, shard_size
-                )
-                self.weight_loader(param, loaded_weight_shard, shard_id)
+        if loaded_shard_id is not None:
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+            param.shard_id.append(loaded_shard_id)
+            param.shard_id_map[loaded_shard_id] = len(param.data_container)
+            param.data_container.append(loaded_weight)
             return
 
-        assert loaded_shard_id < len(self.output_sizes)
-        if output_dim is not None:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id])
-            shard_size = self.output_sizes[loaded_shard_id]
-            shard_offset //= self.tp_size
-            shard_size //= self.tp_size
+    param_data = param.data
+    output_dim = getattr(param, "output_dim", None)
+    # Special case for per-tensor scale to load scalar into fused array.
+    needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
-            if isinstance(param, BlockQuantScaleParameter):
-                weight_block_size = getattr(self, "weight_block_size", None)
-                shard_size, shard_offset = adjust_block_scale_shard(
-                    weight_block_size, shard_size, shard_offset
+    if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+        # Loaded weight is already fused on disk (mlp).
+        # (e.g., Phi-3's gate_up_proj).
+        if output_dim is None:
+            if needs_scalar_to_array:
+                param_data, loaded_weight = adjust_scalar_to_fused_array(
+                    param_data, loaded_weight, 0
                 )
 
-
-            # Special case for quantization.
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
+            return
+        output_sizes = (
+            self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
+            if loaded_shard_id is not None
+            else self.output_sizes
+        )
+        current_shard_offset = 0
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        if use_bitsandbytes_4bit and isinstance(loaded_shard_id, tuple):
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported "
+                "for BNB quantization yet."
+            )
+        shard_offsets: list[tuple[int, int, int]] = []
+        for i, output_size in enumerate(output_sizes):
+            shard_offsets.append((i, current_shard_offset, output_size))
+            current_shard_offset += output_size
+        packed_dim = getattr(param, "packed_dim", None)
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            # Special case for Quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
-            packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
                 shard_size = shard_size // param.packed_factor
                 shard_offset = shard_offset // param.packed_factor
@@ -270,44 +213,93 @@ def weight_loader(
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
+
             shard_size, shard_offset = adjust_bitblas_shard(
                 param, shard_size, shard_offset
             )
 
-            use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-            is_sharded_weight = getattr(param, "is_sharded_weight", False)
-            # bitsandbytes loads the weights of the specific portion
-            # no need to narrow
-            is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
-
             if use_bitsandbytes_4bit:
-                shard_size = loaded_weight.shape[output_dim]
-                shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+                import itertools
 
-            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            start_idx = self.tp_rank * shard_size
-            if not is_sharded_weight:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-        # Special case for per-tensor scales in fused case.
-        elif needs_scalar_to_array:
-            param_data, loaded_weight = adjust_scalar_to_fused_array(
-                param_data, loaded_weight, loaded_shard_id
-            )
-
-        else:
-            ignore_warning = getattr(param, "ignore_warning", False)
-            if not ignore_warning:
-                logger.warning(
-                    "Loading a weight without `output_dim` attribute in "
-                    "MergedColumnParallelLinear, assume the weight is "
-                    "the same for all partitions."
+                index = list(itertools.accumulate([0] + self.output_sizes))
+                orig_offsets = {
+                    str(i): (index[i], size) for i, size in enumerate(self.output_sizes)
+                }
+                orig_offsets["total"] = (self.output_size, 0)
+                shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                    param, orig_offsets, str(shard_id)
                 )
 
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+            loaded_weight_shard = loaded_weight.narrow(
+                output_dim, shard_offset, shard_size
+            )
+            self.weight_loader(param, loaded_weight_shard, shard_id)
+        return
+
+    assert loaded_shard_id < len(self.output_sizes)
+    if output_dim is not None:
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        shard_size = self.output_sizes[loaded_shard_id]
+        shard_offset //= self.tp_size
+        shard_size //= self.tp_size
+
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        # Special case for quantization.
+        # If quantized, we need to adjust the offset and size to account
+        # for the packing.
+        packed_dim = getattr(param, "packed_dim", None)
+        if packed_dim == output_dim:
+            shard_size = shard_size // param.packed_factor
+            shard_offset = shard_offset // param.packed_factor
+            # Special case for Marlin.
+            shard_size, shard_offset = adjust_marlin_shard(
+                param, shard_size, shard_offset
+            )
+        shard_size, shard_offset = adjust_bitblas_shard(param, shard_size, shard_offset)
+
+        use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        # bitsandbytes loads the weights of the specific portion
+        # no need to narrow
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+        if use_bitsandbytes_4bit:
+            shard_size = loaded_weight.shape[output_dim]
+            shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
+
+        param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+        start_idx = self.tp_rank * shard_size
+        if not is_sharded_weight:
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+    # Special case for per-tensor scales in fused case.
+    elif needs_scalar_to_array:
+        param_data, loaded_weight = adjust_scalar_to_fused_array(
+            param_data, loaded_weight, loaded_shard_id
+        )
+
+    else:
+        ignore_warning = getattr(param, "ignore_warning", False)
+        if not ignore_warning:
+            logger.warning(
+                "Loading a weight without `output_dim` attribute in "
+                "MergedColumnParallelLinear, assume the weight is "
+                "the same for all partitions."
+            )
+
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
 
 def _load_fused_module_from_checkpoint(
-    self, param: BasevLLMParameter, loaded_weight: torch.Tensor, output_sizes: list[int] | None = None,
+    self,
+    param: BasevLLMParameter,
+    loaded_weight: torch.Tensor,
+    output_sizes: list[int] | None = None,
 ):
     """
     Handle special case for models where MLP layers are already
@@ -343,6 +335,7 @@ def _load_fused_module_from_checkpoint(
         )
         self.weight_loader_v2(param, loaded_weight_shard, shard_id)
 
+
 def weight_loader_v2(
     self,
     param: BasevLLMParameter,
@@ -360,10 +353,10 @@ def weight_loader_v2(
         self._load_fused_module_from_checkpoint(param, loaded_weight)
         return
         output_sizes = (
-                [self.output_sizes[idx] for idx in loaded_shard_id]
-                if loaded_shard_id
-                else None
-            )
+            [self.output_sizes[idx] for idx in loaded_shard_id]
+            if loaded_shard_id
+            else None
+        )
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)
             output_sizes = [
@@ -371,8 +364,8 @@ def weight_loader_v2(
                 for size in (output_sizes or self.output_sizes)
             ]
         self._load_fused_module_from_checkpoint(
-                param, loaded_weight, output_sizes=output_sizes
-            )
+            param, loaded_weight, output_sizes=output_sizes
+        )
         return
 
     assert loaded_shard_id < len(self.output_sizes)
@@ -387,7 +380,6 @@ def weight_loader_v2(
             weight_block_size, shard_size, shard_offset
         )
 
-
     param.load_merged_column_weight(
         loaded_weight=loaded_weight,
         shard_id=loaded_shard_id,
@@ -396,15 +388,20 @@ def weight_loader_v2(
         tp_rank=self.tp_rank,
     )
 
+
 # rewrite MergedColumnParallelLinear to support qwen3.5
 MergedColumnParallelLinear.weight_loader = weight_loader
-MergedColumnParallelLinear._load_fused_module_from_checkpoint = _load_fused_module_from_checkpoint
+MergedColumnParallelLinear._load_fused_module_from_checkpoint = (
+    _load_fused_module_from_checkpoint
+)
 MergedColumnParallelLinear.weight_loader_v2 = weight_loader_v2
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """
     Base on v0.11.0 QKVParallelLinear, And add v_head size for swa (MIMO V2)
     """
+
     def __init__(
         self,
         hidden_size: int,
@@ -756,4 +753,3 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
-

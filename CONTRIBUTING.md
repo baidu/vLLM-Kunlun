@@ -1,7 +1,7 @@
 <!--
 #
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-# 
+#
 # This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,9 +44,9 @@ and keeps discussions focused.
 ### Reporting New Issues
 
 When opening a new issue, please provide as much information as possible, such as:
-- A clear and detailed problem description  
-- Relevant logs or error messages  
-- Code snippets, screenshots, or videos if applicable  
+- A clear and detailed problem description
+- Relevant logs or error messages
+- Code snippets, screenshots, or videos if applicable
 
 The more context you provide, the easier it will be for maintainers to diagnose and resolve the issue.
 

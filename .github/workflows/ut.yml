@@ -7,13 +7,13 @@
 
 # jobs:
 #   test-kunlun:
-#     runs-on: 
+#     runs-on:
 #       labels:
 #         - self-hosted
 #         - Linux
 #         - X64
 #         - test-1 # Actions Runner Label
-        
+
 #     steps:
 #       - name: Checkout Code
 #         uses: actions/checkout@v4
@@ -21,7 +21,7 @@
 #       - name: Install vLLM-Kunlun Dependencies
 #         run: |
 #           pip install -r requirements.txt
-          
+
 #           python setup.py build
 #           python setup.py develop
 
@@ -41,7 +41,7 @@
 #       - name: Install vLLM
 #         run: |
 #           pip install vllm==0.11.0 --no-build-isolation --no-deps --no-deps --index-url https://pip.baidu-int.com/simple/
-      
+
 #       - name: Run Unit Test
 #         run: |
 #           echo "Running full suite..."

@@ -5,20 +5,13 @@ from itertools import islice
 
 import torch
 from torch import nn
-
 from vllm.attention.backends.abstract import AttentionType
-from vllm_kunlun.ops.attention.layer import Attention
-from vllm.config import (
-    CacheConfig,
-    VllmConfig,
-    get_current_vllm_config,
-)
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
@@ -27,7 +20,6 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm_kunlun.ops.linear import QKVParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -39,9 +31,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.utils import sequence_parallel_chunk
-from vllm.sequence import IntermediateTensors
-
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -52,7 +41,12 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.sequence import IntermediateTensors
+
 from vllm_kunlun.ops.activation import SiluAndMul
+from vllm_kunlun.ops.attention.layer import Attention
+from vllm_kunlun.ops.linear import QKVParallelLinear
+
 logger = init_logger(__name__)
 
 
@@ -115,7 +109,6 @@ class MiMoV2MoE(nn.Module):
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.n_routed_experts
 
-
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -170,8 +163,12 @@ class MiMoV2MoE(nn.Module):
             topk_group=config.topk_group,
             scoring_func="sigmoid",
         )
-        self.register_buffer("kunlun_linear_weights", torch.zeros(
-            config.num_local_experts,config.hidden_size,dtype=torch.float))
+        self.register_buffer(
+            "kunlun_linear_weights",
+            torch.zeros(
+                config.num_local_experts, config.hidden_size, dtype=torch.float
+            ),
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, "MiMoV2MoE only supports 1D or 2D inputs"
@@ -185,7 +182,8 @@ class MiMoV2MoE(nn.Module):
             gate_input = hidden_states
         router_logits = self.gate(gate_input)
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits)
+            hidden_states=hidden_states, router_logits=router_logits
+        )
 
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
@@ -257,7 +255,7 @@ class MiMoV2Attention(nn.Module):
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             base=self.rope_theta,
-            partial_rotary_factor=partial_rotary_factor
+            partial_rotary_factor=partial_rotary_factor,
         )
 
         self.attention_sink_bias = (

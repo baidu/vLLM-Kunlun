@@ -27,4 +27,3 @@ msgstr ""
 #: ../../source/developer_guide/feature_guide/KV_Cache_Pool_Guide.md:3
 msgid "Why KV Cache Pool?"
 msgstr ""
-

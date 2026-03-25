@@ -3,7 +3,6 @@
 
 Like vLLM, we now support quantization methods such as compressed-tensors, AWQ, and GPTQ, enabling various precision configurations including W8A8, W4A16, and W8A16. These can help reduce memory consumption and accelerate inference while preserving model accuracy.
 
-
 ## Support Matrix
 <table border="1" style="border-collapse: collapse; width: auto; margin: 0 0 0 0; text-align: center;">
   <thead>
@@ -55,7 +54,6 @@ python -m vllm.entrypoints.openai.api_server \
     --quantization compressed-tensors
 ```
 
-
 ### AWQ
 
 To run an `AWQ` model with vLLM-Kunlun, you can use `Qwen/Qwen3-32B-AWQ` with the following command:
@@ -66,7 +64,6 @@ python -m vllm.entrypoints.openai.api_server \
     --quantization awq
 ```
 
-
 ### GPTQ
 
 To run a `GPTQ` model with vLLM-Kunlun, you can use `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4` with the following command:
@@ -76,4 +73,3 @@ python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
     --quantization gptq
 ```
-

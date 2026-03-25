@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Optional
 
-import torch
 import kunlun_ops
-from vllm.platforms import current_platform
+import torch
 
 
 def merge_attn_states(
@@ -17,10 +16,5 @@ def merge_attn_states(
 ) -> None:
 
     return kunlun_ops.attention_merge_stage(
-        prefix_output,
-        prefix_lse,
-        suffix_output,
-        suffix_lse,
-        output,
-        output_lse
+        prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
     )

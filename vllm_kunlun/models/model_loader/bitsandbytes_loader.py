@@ -1,4 +1,7 @@
-class BitsAndBytesModelLoader():
+from typing import Callable
+
+
+class BitsAndBytesModelLoader:
     """Model loader to load model weights with BitAndBytes quantization."""
 
     possible_config_file_names = ["adapter_config.json"]

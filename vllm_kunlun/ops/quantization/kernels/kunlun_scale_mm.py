@@ -19,16 +19,12 @@
 from typing import Optional
 
 import torch
-import xspeedgate_ops
-from vllm.platforms import current_platform, PlatformEnum
-from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    convert_to_channelwise,
-)
 from vllm.model_executor.layers.quantization.kernels.scaled_mm import (
     _POSSIBLE_KERNELS,
-    ScaledMMLinearLayerConfig,
     CutlassScaledMMLinearKernel,
+    ScaledMMLinearLayerConfig,
 )
+from vllm.platforms import PlatformEnum, current_platform
 
 
 class KunlunScaledMMLinearKernel(CutlassScaledMMLinearKernel):

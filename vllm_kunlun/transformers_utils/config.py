@@ -1,5 +1,5 @@
 from transformers import PretrainedConfig
-from vllm.transformers_utils.config import LazyConfigDict, _CONFIG_REGISTRY
+from vllm.transformers_utils.config import LazyConfigDict
 
 _XPU_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     chatglm="ChatGLMConfig",

@@ -47,7 +47,7 @@ pip install -U pip
 
 This tool fetches data through the GitHub API. To avoid API rate limits and ensure access to private repositories, it is recommended to configure a personal token.
 
-1. Open the token creation page:  
+1. Open the token creation page:
    https://github.com/settings/tokens
 2. Create a token (read-only permissions are sufficient)
 3. Export the token as an environment variable:

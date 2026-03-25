@@ -102,7 +102,6 @@ The `compare` command is used to process the H5 files generated on the GPU and X
 
 If you encounter a "no matched keys" problem, please refer to the instructions at the end of this article for a solution.
 
-
 #### Example of results
 
 ```bash
@@ -149,7 +148,7 @@ To be improved...
 
 ```bash
 X_DEBUG=0x102 # trace operator name、arguments shape、dtype、data_range
-X_DEDUP=True # Remove duplicates based on shape and dtype. 
+X_DEDUP=True # Remove duplicates based on shape and dtype.
 X_DUMP_NUM # The default value is 0, meaning no tensor data is saved. Setting it to n means that n parameters are randomly selected from each operator to save the actual parameters.
 ```
 
@@ -177,23 +176,25 @@ class Qwen3_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
-        # Start dump 
+        # Start dump
         # X_DEBUG=0x102 # trace operator name、arguments shape、dtype、data_range
         # X_DEDUP=True # Remove duplicates based on shape and dtype.
         # The default value is 0, meaning no tensor data is saved. Setting it to n means that n parameters are randomly selected from each operator to save the actual parameters.
         begin_dump(X_DEBUG=0x102, X_DEDUP=True, X_DUMP_NUM=5)
-        
+
         hidden_states = x.to(device=self.device, dtype=self.dtype)
         hidden_states = self.patch_embed(hidden_states)
         ...........
-        
+
         # End dump
         end_dump(clear_context=True)
         return hidden_states
 ```
+
 This is the file directory.
+
 ```bash
-├── xary_debug/                
+├── xary_debug/
 │   ├── proc_xxx/     # Process-based storage results
 │       ├── dump/     # The dumped tensor
 │       ├── dump.json # Information needed to generate unit tests, such as input/output size and dtype.

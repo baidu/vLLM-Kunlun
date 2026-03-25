@@ -2,28 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ast
-from functools import partial
-from importlib.resources import contents
 import json
 from collections.abc import Sequence
+from enum import Enum
 from typing import Any, Optional, Union
 
 import regex as re
-from enum import Enum
-from vllm.utils import random_uuid
-
-from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
-                                              ChatCompletionToolsParam,
-                                              DeltaFunctionCall, DeltaMessage,
-                                              DeltaToolCall,
-                                              ExtractedToolCallInformation,
-                                              FunctionCall, ToolCall)
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+)
 from vllm.entrypoints.openai.tool_parsers.abstract_tool_parser import (
-    ToolParser, ToolParserManager)
+    ToolParser,
+    ToolParserManager,
+)
 from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
+
 
 class StreamState(str, Enum):
     """State machine states for XML to JSON streaming conversion."""
@@ -34,8 +38,10 @@ class StreamState(str, Enum):
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
 
+
 def random_tool_call_id() -> str:
     return f"chatcmpl-tool-{random_uuid()}"
+
 
 def get_argument_type(
     func_name: str, arg_key: str, defined_tools: list[ChatCompletionToolsParam]
@@ -81,6 +87,7 @@ def get_argument_type(
         return infer_type_from_json_schema(arg_spec)
 
     return None
+
 
 def _convert_to_number(value: str) -> Any:
     """Convert string to appropriate number type (int or float).
@@ -149,6 +156,7 @@ def parse_arguments(
         return json.loads(quoted_value), True
     except (json.JSONDecodeError, ValueError):
         return json_value, False
+
 
 def infer_type_from_json_schema(schema: dict[str, Any]) -> Optional[str]:
     """
@@ -252,6 +260,7 @@ def infer_type_from_json_schema(schema: dict[str, Any]) -> Optional[str]:
 
     return None
 
+
 @ToolParserManager.register_module("glm47")
 class Glm47MoeModelToolParser(ToolParser):
 
@@ -269,20 +278,20 @@ class Glm47MoeModelToolParser(ToolParser):
 
         self.tool_calls_start_token = self.tool_call_start_token
 
-        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>",
-                                          re.DOTALL)
+        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
         self.func_detail_regex = re.compile(
-            r"<tool_call>([^\n<]*)\n?(.*)</tool_call>", re.DOTALL)
+            r"<tool_call>([^\n<]*)\n?(.*)</tool_call>", re.DOTALL
+        )
         self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
-            re.DOTALL)
+            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
+        )
         if not self.model_tokenizer:
             raise ValueError(
                 "The model tokenizer must be passed to the ToolParser "
-                "constructor during construction.")
+                "constructor during construction."
+            )
 
-        self.tool_call_start_token_id = self.vocab.get(
-            self.tool_call_start_token)
+        self.tool_call_start_token_id = self.vocab.get(self.tool_call_start_token)
         self.tool_call_end_token_id = self.vocab.get(self.tool_call_end_token)
         self._buffer = ""
         self._reset_streaming_state()
@@ -308,16 +317,21 @@ class Glm47MoeModelToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
 
         def _is_string_type(
-                tool_name: str, arg_name: str,
-                tools: Optional[list[ChatCompletionToolsParam]]) -> bool:
+            tool_name: str,
+            arg_name: str,
+            tools: Optional[list[ChatCompletionToolsParam]],
+        ) -> bool:
             if tools is None:
                 return False
             for tool in tools:
                 if tool.function.name == tool_name:
                     if tool.function.parameters is None:
                         return False
-                    arg_type = tool.function.parameters.get(
-                        "properties", {}).get(arg_name, {}).get("type", None)
+                    arg_type = (
+                        tool.function.parameters.get("properties", {})
+                        .get(arg_name, {})
+                        .get("type", None)
+                    )
                     return arg_type == "string"
             logger.warning("No tool named '%s'.", tool_name)
             return False
@@ -349,28 +363,30 @@ class Glm47MoeModelToolParser(ToolParser):
                     arg_val = value.strip()
                     if not _is_string_type(tc_name, arg_key, request.tools):
                         arg_val = _deserialize(arg_val)
-                    logger.debug("arg_key = %s, arg_val = %s", arg_key,
-                                 arg_val)
+                    logger.debug("arg_key = %s, arg_val = %s", arg_key, arg_val)
                     arg_dct[arg_key] = arg_val
                 tool_calls.append(
-                    ToolCall(type="function",
-                             function=FunctionCall(
-                                 name=tc_name, arguments=json.dumps(arg_dct))))
+                    ToolCall(
+                        type="function",
+                        function=FunctionCall(
+                            name=tc_name, arguments=json.dumps(arg_dct)
+                        ),
+                    )
+                )
         except Exception:
             logger.exception("Failed to extract tool call spec")
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=model_output)
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
         else:
             if len(tool_calls) > 0:
-                content = model_output[:model_output.
-                                       find(self.tool_calls_start_token)]
-                return ExtractedToolCallInformation(tools_called=True,
-                                                    tool_calls=tool_calls,
-                                                    content=content)
-            return ExtractedToolCallInformation(tools_called=False,
-                                                tool_calls=[],
-                                                content=model_output)
+                content = model_output[: model_output.find(self.tool_calls_start_token)]
+                return ExtractedToolCallInformation(
+                    tools_called=True, tool_calls=tool_calls, content=content
+                )
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
 
     def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
         """Extract function name, arguments and end marker from regex match.
@@ -431,7 +447,10 @@ class Glm47MoeModelToolParser(ToolParser):
         )
 
     def _parse_argument_pairs(
-        self, pairs: list[tuple[str, str]], func_name: str, tools: list[ChatCompletionToolsParam]
+        self,
+        pairs: list[tuple[str, str]],
+        func_name: str,
+        tools: list[ChatCompletionToolsParam],
     ) -> dict[str, Any]:
         """Parse argument key-value pairs with type coercion.
 
@@ -566,7 +585,6 @@ class Glm47MoeModelToolParser(ToolParser):
             # For object/array types, return as-is (should already be valid JSON)
             return value
 
-
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: list[ChatCompletionToolsParam]
     ) -> str:
@@ -687,7 +705,9 @@ class Glm47MoeModelToolParser(ToolParser):
 
         return json_output
 
-    def _get_value_type(self, func_name: str, key: str, tools: list[ChatCompletionToolsParam]) -> str:
+    def _get_value_type(
+        self, func_name: str, key: str, tools: list[ChatCompletionToolsParam]
+    ) -> str:
         """Get parameter type from tool definition, with fallback to auto-detection.
 
         Args:
@@ -739,7 +759,6 @@ class Glm47MoeModelToolParser(ToolParser):
 
         # Default to string (safest fallback)
         return "string"
-
 
     def _process_arguments_streaming(
         self, func_name: str, func_args_raw: str, tools: list[ChatCompletionToolsParam]
@@ -803,7 +822,9 @@ class Glm47MoeModelToolParser(ToolParser):
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
                 self.tool_call_start_token.startswith(current_text[-i:])
-                for i in range(1, min(len(current_text), len(self.tool_call_start_token)) + 1)
+                for i in range(
+                    1, min(len(current_text), len(self.tool_call_start_token)) + 1
+                )
             )
 
             if not is_potential_start:
@@ -824,7 +845,7 @@ class Glm47MoeModelToolParser(ToolParser):
         output_text = ""
         first_bot_token_idx = current_text.find(self.tool_call_start_token)
         if first_bot_token_idx > 0:
-            output_text= current_text[:first_bot_token_idx]
+            output_text = current_text[:first_bot_token_idx]
             current_text = current_text[first_bot_token_idx:]
             # Update buffer to only include from the bot token onwards
             self._buffer = current_text
@@ -872,8 +893,8 @@ class Glm47MoeModelToolParser(ToolParser):
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
 
-             # Determine if function name is complete by checking for <arg_key> in the full text
-             # This is important for streaming scenarios where args come in later chunks
+            # Determine if function name is complete by checking for <arg_key> in the full text
+            # This is important for streaming scenarios where args come in later chunks
             has_arg_key = "<arg_key" in current_text
             # Send tool name if needed
             tool_name_item = self._send_tool_name_if_needed(
@@ -890,7 +911,10 @@ class Glm47MoeModelToolParser(ToolParser):
                 if arg_item:
                     calls.append(arg_item)
                 # Finalize tool call if end token is encountered
-                if is_tool_end == self.tool_call_end_token and not self._tool_call_completed:
+                if (
+                    is_tool_end == self.tool_call_end_token
+                    and not self._tool_call_completed
+                ):
                     finalize_calls = self._finalize_tool_call(
                         func_name,
                         func_args_raw,

@@ -23,4 +23,3 @@ msgstr ""
 #: ../../source/developer_guide/evaluation/accuracy_report/Qwen2.5-VL-7B-Instruct.md:1
 msgid "Qwen/Qwen2.5-VL-7B-Instruct"
 msgstr ""
-

@@ -23,4 +23,3 @@ msgstr ""
 #: ../../source/developer_guide/feature_guide/eplb_swift_balancer.md:1
 msgid "Expert Parallelism Load Balancer (EPLB)"
 msgstr ""
-

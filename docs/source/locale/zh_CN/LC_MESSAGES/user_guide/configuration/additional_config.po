@@ -242,4 +242,3 @@ msgstr "附加配置"
 
 #~ msgid "An example of additional configuration is as follows:"
 #~ msgstr "以下是额外配置的一个示例："
-

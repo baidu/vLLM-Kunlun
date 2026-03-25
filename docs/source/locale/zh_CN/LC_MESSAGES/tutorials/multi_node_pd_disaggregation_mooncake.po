@@ -27,4 +27,3 @@ msgstr ""
 #: ../../source/tutorials/multi_node_pd_disaggregation_mooncake.md:3
 msgid "Getting Start"
 msgstr ""
-

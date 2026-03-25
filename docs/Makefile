@@ -22,4 +22,3 @@ help:
 intl:
 	sphinx-intl build
 	@$(SPHINXBUILD) -b html -D language=zh_CN "$(SOURCEDIR)" "$(BUILDDIR)/html/zh-cn" $(SPHINXOPTS) $(O)
-

@@ -47,7 +47,6 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # The C compiler used for compiling the package. If not set, the default
     # value is None, which means the system default C compiler will be used.
     "C_COMPILER": lambda: os.getenv("C_COMPILER", None),
-
     "SOC_VERSION": lambda: os.getenv("SOC_VERSION", "KUNLUNP800"),
     # If set, vllm-kunlun will print verbose logs during compilation
     "VERBOSE": lambda: bool(int(os.getenv("VERBOSE", "0"))),

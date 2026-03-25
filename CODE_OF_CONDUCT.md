@@ -1,7 +1,7 @@
 <!--
 #
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-# 
+#
 # This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,6 @@
 
 # Code of Conduct
 
-We follow the vLLM community’s code of conduct: [vLLM - CODE OF CONDUCT](https://github.com/vllm-project/vllm/blob/main/CODE_OF_CONDUCT.md). 
+We follow the vLLM community’s code of conduct: [vLLM - CODE OF CONDUCT](https://github.com/vllm-project/vllm/blob/main/CODE_OF_CONDUCT.md).
 
 For more information, please refer to the [principles](https://vllm-kunlun.readthedocs.io/en/latest/community/governance.html#principles).

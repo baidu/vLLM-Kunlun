@@ -231,9 +231,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
 
     def __post_init__(self):
         """__post_init__"""
-        self.attn_bias: Optional[List[AttentionBias]] = None  # noqa: F821
-        self.encoder_attn_bias: Optional[List[AttentionBias]] = None  # noqa: F821
-        self.cross_attn_bias: Optional[List[AttentionBias]] = None  # noqa: F821
+        self.attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
+        self.encoder_attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
+        self.cross_attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
 
     @property
     def is_all_encoder_attn_metadata_set(self):

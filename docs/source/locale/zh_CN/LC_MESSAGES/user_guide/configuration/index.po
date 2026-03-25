@@ -29,4 +29,3 @@ msgstr "配置指南"
 #, fuzzy
 msgid "This section provides a detailed configuration guide of vLLM Kunlun."
 msgstr "本节提供了 vLLM Kunlun 的详细配置指南。"
-

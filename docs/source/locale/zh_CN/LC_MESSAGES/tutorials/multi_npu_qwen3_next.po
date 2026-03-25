@@ -23,4 +23,3 @@ msgstr ""
 #: ../../source/tutorials/multi_npu_qwen3_next.md:1
 msgid "Multi-XPU (Qwen3-Next)"
 msgstr ""
-

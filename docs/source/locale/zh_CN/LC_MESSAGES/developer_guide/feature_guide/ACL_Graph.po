@@ -23,4 +23,3 @@ msgstr ""
 #: ../../source/developer_guide/feature_guide/ACL_Graph.md:1
 msgid "Graph"
 msgstr ""
-

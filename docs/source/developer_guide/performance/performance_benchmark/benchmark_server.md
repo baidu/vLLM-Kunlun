@@ -88,7 +88,7 @@ Key Parameter Explanation:
 
 ### 2.Offline testing
 
-Comming soon...
+Coming soon...
 
 ## EvalScope
 

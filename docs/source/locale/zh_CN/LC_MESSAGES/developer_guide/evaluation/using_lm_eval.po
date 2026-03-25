@@ -59,4 +59,3 @@ msgstr "使用 lm-eval"
 #~ "你可以在 [Lm-eval 文档](https://github.com/EleutherAI"
 #~ "/lm-evaluation-harness/blob/main/docs/README.md) "
 #~ "上查看更多用法。"
-

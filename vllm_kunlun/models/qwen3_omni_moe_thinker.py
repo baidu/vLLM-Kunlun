@@ -49,6 +49,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
+from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -91,14 +92,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.platforms.interface import _Backend
 from vllm.sequence import IntermediateTensors
-
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
 
 # yapf: enable
 from .qwen2_5_vl import (
@@ -762,9 +755,11 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             # the audio to multiple of hop_length.
             hop_length = self.info.get_feature_extractor().hop_length
             mm_data["audio"] = [
-                pad_to_hop_length(audio, hop_length)
-                if isinstance(audio, np.ndarray)
-                else (pad_to_hop_length(audio[0], hop_length), audio[1])
+                (
+                    pad_to_hop_length(audio, hop_length)
+                    if isinstance(audio, np.ndarray)
+                    else (pad_to_hop_length(audio[0], hop_length), audio[1])
+                )
                 for audio in audios
             ]
             mm_kwargs = dict(
@@ -1518,7 +1513,11 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         image_idx = 0
         video_idx = 0
         audio_idx = 0
-        remain_images, remain_videos, remain_audios = image_nums, video_nums, audio_nums  # noqa: E501
+        remain_images, remain_videos, remain_audios = (
+            image_nums,
+            video_nums,
+            audio_nums,
+        )  # noqa: E501
         multimodal_nums = (
             image_nums + audio_nums
             if use_audio_in_video
@@ -1738,7 +1737,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 )
                 llm_pos_ids_list.append(eos_block)
                 llm_pos_ids_list.append(eos_block)
-                st += text_len + bos_len * 2 + audio_len + video_len + eos_len * 2  # noqa: E501
+                st += (
+                    text_len + bos_len * 2 + audio_len + video_len + eos_len * 2
+                )  # noqa: E501
                 audio_idx += 1
                 video_idx += 1
                 remain_videos -= 1

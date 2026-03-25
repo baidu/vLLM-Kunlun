@@ -181,7 +181,7 @@ def kunlun_build(
         # Use CPU to avoid GPU sync; breaking async scheduling
         requires_padding = (decode_lens_cpu.max() > decode_lens_cpu.min()).item()
 
-        seq_lens = common_attn_metadata.seq_lens[:num_decodes]
+        # seq_lens = common_attn_metadata.seq_lens[:num_decodes]
 
         decode_metadata = DeepSeekV32IndexerDecodeMetadata(
             block_table=common_attn_metadata.block_table_tensor[:num_decodes, ...],
@@ -221,6 +221,6 @@ DeepseekV32IndexerMetadataBuilder.build_one_prefill_chunk = (
 DeepseekV32IndexerMetadataBuilder.build = kunlun_build
 
 # Monkey patch: Upgrade cudagraph_support to UNIFORM_BATCH for spec-decode compatibility
-from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupport  # noqa
 
 DeepseekV32IndexerMetadataBuilder.cudagraph_support = AttentionCGSupport.UNIFORM_BATCH

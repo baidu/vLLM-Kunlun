@@ -74,4 +74,3 @@ msgstr ""
 
 #~ msgid "If you run this script successfully, you can see the info shown below:"
 #~ msgstr "如果你成功运行此脚本，你可以看到如下所示的信息："
-

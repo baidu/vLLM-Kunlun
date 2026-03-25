@@ -257,4 +257,3 @@ msgstr "安装"
 
 #~ msgid "The output will be like:"
 #~ msgstr "输出将会像这样："
-

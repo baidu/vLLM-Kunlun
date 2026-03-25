@@ -114,7 +114,6 @@ def register():
         # This happens before vllm's default lazy registration (which is
         # triggered when vllm.reasoning module is imported), so our path
         # takes precedence.
-
         # Custom parser for Qwen3.5 support
         ReasoningParserManager.register_lazy_module(
             name="qwen3",

@@ -1,7 +1,7 @@
 <!--
 #
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-# 
+#
 # This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,8 @@ Below is a list of maintainers for vLLM Kunlun, presented in no particular order
 
 ## Maintainers
 
-|                                                                           |                        Name                         |    Company    |  
-|:-------------------------------------------------------------------------:|:---------------------------------------------------:|:-------------:| 
+|                                                                           |                        Name                         |    Company    |
+|:-------------------------------------------------------------------------:|:---------------------------------------------------:|:-------------:|
 | <img width="30px" src="https://avatars.githubusercontent.com/u/129976105">  |         [xyDong0223](https://github.com/xyDong0223)         |     Baidu    |
 | <img width="30px" src="https://avatars.githubusercontent.com/u/28590172">  |         [baoqian426](https://github.com/baoqian426)         |     Baidu    |
 | <img width="30px" src="https://avatars.githubusercontent.com/u/249219756">  |         [ZhangJingYu0823](https://github.com/ZhangJingYu0823)         |     KunLunXin    |

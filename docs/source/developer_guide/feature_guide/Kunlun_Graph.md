@@ -61,7 +61,6 @@ Due to the increasing complexity of the attention layer in current LLM, we can't
 
 vLLM solves this problem with piecewise graph mode. We use eager mode to launch attention's ops, and use graph to deal with others. But it also bring some problems: The cost of launching ops has become large again, although much smaller than eager mode, but it will also lead to host bound when cpu is poor or `num_tokens` is small.
 
-
 ## How it be implemented?
 
 vLLM has already implemented most of the modules in graph mode. You can see more details at: [CUDA Graphs](https://docs.vllm.ai/en/latest/design/cuda_graphs.html)
@@ -73,4 +72,4 @@ vLLM has added `support_torch_compile` decorator to all models, this decorator w
 ## Limitation
 
 1. `FULL` and `FULL_AND_PIECEWISE` are not supported now;
-3. `use_inductor` is not supported now;
+2. `use_inductor` is not supported now;

@@ -16,21 +16,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 from typing import Optional
+
+import torch
 from torch.nn.parameter import Parameter
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod, ExllamaState
+from vllm.model_executor.layers.quantization.gptq import ExllamaState, GPTQLinearMethod
+
 logger = init_logger(__name__)
+
 
 class KunlunGPTQLinearMethod(GPTQLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # for torch.compile
-        logger.warning_once(f"Repacking INT4 for XPU ...")
+        logger.warning_once("Repacking INT4 for XPU ...")
         layer.qzeros = Parameter(
-            self.repack_int4_for_kunlun(layer.qzeros.data, self.quant_config.weight_bits)
-            if self.quant_config.weight_bits == 4 else layer.qzeros.data,
-            requires_grad=False
+            (
+                self.repack_int4_for_kunlun(
+                    layer.qzeros.data, self.quant_config.weight_bits
+                )
+                if self.quant_config.weight_bits == 4
+                else layer.qzeros.data
+            ),
+            requires_grad=False,
         )
         layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
         layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
@@ -42,15 +50,14 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
             if self.quant_config.desc_act:
                 layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
             else:
-                layer.g_idx.data = torch.empty((0, ),
-                                                dtype=torch.int,
-                                                device=layer.g_idx.device)
+                layer.g_idx.data = torch.empty(
+                    (0,), dtype=torch.int, device=layer.g_idx.device
+                )
             layer.exllama_state = ExllamaState.READY
 
             # No need shuffle on xpu
             # ops.gptq_shuffle(layer.qweight, layer.g_idx,
             #                  self.quant_config.weight_bits)
-
 
     def repack_int4_for_kunlun(self, packed: torch.Tensor, num_bits: int = 4):
         N, K = packed.shape
@@ -64,14 +71,70 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
 
         # Convert to KUNLUN order
         GPTQ_TO_KUNLUN_ORDER_FAST = [
-            32, 0, 33, 1, 34, 2, 35, 3,
-            36, 4, 37, 5, 38, 6, 39, 7,
-            40, 8, 41, 9, 42, 10, 43, 11,
-            44, 12, 45, 13, 46, 14, 47, 15,
-            48, 16, 49, 17, 50, 18, 51, 19,
-            52, 20, 53, 21, 54, 22, 55, 23,
-            56, 24, 57, 25, 58, 26, 59, 27,
-            60, 28, 61, 29, 62, 30, 63, 31,
+            32,
+            0,
+            33,
+            1,
+            34,
+            2,
+            35,
+            3,
+            36,
+            4,
+            37,
+            5,
+            38,
+            6,
+            39,
+            7,
+            40,
+            8,
+            41,
+            9,
+            42,
+            10,
+            43,
+            11,
+            44,
+            12,
+            45,
+            13,
+            46,
+            14,
+            47,
+            15,
+            48,
+            16,
+            49,
+            17,
+            50,
+            18,
+            51,
+            19,
+            52,
+            20,
+            53,
+            21,
+            54,
+            22,
+            55,
+            23,
+            56,
+            24,
+            57,
+            25,
+            58,
+            26,
+            59,
+            27,
+            60,
+            28,
+            61,
+            29,
+            62,
+            30,
+            63,
+            31,
         ]
         unpacked_gptq = unpacked_gptq.reshape(N, K // 8, 64)
         unpacked_kunlun = unpacked_gptq[..., GPTQ_TO_KUNLUN_ORDER_FAST]  # [N, K//8, 64]
@@ -84,11 +147,13 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
 
         return packed_kunlun
 
-
     def apply(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        out_shape = x.shape[:-1] + (layer.qweight.shape[-1], )
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         output = torch.ops.xspeedgate_ops.gptq_gemm(
@@ -103,10 +168,10 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
-    
+
 
 # monkey patch
-from vllm.model_executor.layers.quantization import gptq
+from vllm.model_executor.layers.quantization import gptq  # noqa
 
 gptq.GPTQLinearMethod = KunlunGPTQLinearMethod
 print(

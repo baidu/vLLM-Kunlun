@@ -351,9 +351,9 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                     "falling back to 'align' mode."
                 )
             if cache_config.mamba_cache_mode == "align":
-                assert vllm_config.scheduler_config.enable_chunked_prefill, (
-                    "Chunked prefill is required for mamba cache mode 'align'."
-                )
+                assert (
+                    vllm_config.scheduler_config.enable_chunked_prefill
+                ), "Chunked prefill is required for mamba cache mode 'align'."
                 assert not vllm_config.speculative_config, (
                     "Mamba cache mode 'align' is currently not compatible "
                     "with speculative decoding."
@@ -581,6 +581,7 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
             )
             cache_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
 
+
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -613,6 +614,7 @@ class VoyageQwen3BidirectionalEmbedModelConfig(VerifyAndUpdateConfig):
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
         model_config.hf_config.is_causal = False
         model_config.hf_config.embedding_size = model_config.hf_config.num_labels
+
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GteModel": SnowflakeGteNewModelConfig,

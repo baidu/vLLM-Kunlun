@@ -19,13 +19,12 @@
 from typing import Optional, Union
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.awq import (
-    AWQLinearMethod,
     AWQConfig,
+    AWQLinearMethod,
     is_layer_skipped_awq,
 )
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
@@ -66,14 +65,70 @@ class KunlunAWQLinearMethod(AWQLinearMethod):
 
             # Reverse AWQ order and convert to KUNLUN order
             AWQ_TO_KUNLUN_ORDER_FAST = [
-                32, 0, 36, 4, 33, 1, 37, 5,
-                34, 2, 38, 6, 35, 3, 39, 7,
-                40, 8, 44, 12, 41, 9, 45, 13,
-                42, 10, 46, 14, 43, 11, 47, 15,
-                48, 16, 52, 20, 49, 17, 53, 21,
-                50, 18, 54, 22, 51, 19, 55, 23,
-                56, 24, 60, 28, 57, 25, 61, 29,
-                58, 26, 62, 30, 59, 27, 63, 31
+                32,
+                0,
+                36,
+                4,
+                33,
+                1,
+                37,
+                5,
+                34,
+                2,
+                38,
+                6,
+                35,
+                3,
+                39,
+                7,
+                40,
+                8,
+                44,
+                12,
+                41,
+                9,
+                45,
+                13,
+                42,
+                10,
+                46,
+                14,
+                43,
+                11,
+                47,
+                15,
+                48,
+                16,
+                52,
+                20,
+                49,
+                17,
+                53,
+                21,
+                50,
+                18,
+                54,
+                22,
+                51,
+                19,
+                55,
+                23,
+                56,
+                24,
+                60,
+                28,
+                57,
+                25,
+                61,
+                29,
+                58,
+                26,
+                62,
+                30,
+                59,
+                27,
+                63,
+                31,
             ]
             unpacked_awq = unpacked_awq.reshape(N, K // 8, 64)
             unpacked_kunlun = unpacked_awq[
@@ -91,7 +146,7 @@ class KunlunAWQLinearMethod(AWQLinearMethod):
         return packed_kunlun
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        logger.warning_once(f"Repacking INT4 for XPU ...")
+        logger.warning_once("Repacking INT4 for XPU ...")
         layer.qweight = torch.nn.Parameter(
             (
                 self.repack_int4_for_kunlun(layer.qweight.data)
@@ -144,7 +199,7 @@ class KunlunAWQConfig(AWQConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[Union["LinearMethodBase", "QuantizeMethodBase"]]: # type: ignore
+    ) -> Optional[Union["LinearMethodBase", "QuantizeMethodBase"]]:  # type: ignore # noqa: F821
         if isinstance(layer, LinearBase):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
@@ -167,7 +222,7 @@ class KunlunAWQConfig(AWQConfig):
 
 
 # monkey patch
-from vllm.model_executor.layers.quantization import awq
+from vllm.model_executor.layers.quantization import awq  # noqa
 
 awq.AWQLinearMethod = KunlunAWQLinearMethod
 awq.AWQConfig = KunlunAWQConfig

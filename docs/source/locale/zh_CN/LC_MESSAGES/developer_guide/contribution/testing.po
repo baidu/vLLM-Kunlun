@@ -262,4 +262,3 @@ msgstr ""
 
 #~ msgid "Multi cards test"
 #~ msgstr "多卡测试"
-

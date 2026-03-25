@@ -75,4 +75,3 @@ msgstr "文档"
 #~ "for running vLLM on the Kunlun "
 #~ "XPU."
 #~ msgstr "vLLM Kunlun 插件（vllm-kunlun）是一个由社区维护的硬件插件，用于在 Kunlun XPU 上运行 vLLM。"
-

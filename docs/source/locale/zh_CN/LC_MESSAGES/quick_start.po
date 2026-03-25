@@ -136,4 +136,3 @@ msgstr "支持的设备"
 
 #~ msgid "Finally, you can exit container by using `ctrl-D`."
 #~ msgstr "最后，你可以通过按 `ctrl-D` 退出容器。"
-
