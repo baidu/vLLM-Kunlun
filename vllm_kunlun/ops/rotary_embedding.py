@@ -15,32 +15,39 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+from typing import Optional, Tuple
+
 import torch
 import xspeedgate_ops
-import os
 from vllm.model_executor.layers.rotary_embedding import (
-    RotaryEmbedding, YaRNScalingRotaryEmbedding,
-    DynamicNTKScalingRotaryEmbedding, MRotaryEmbedding,
-    DeepseekScalingRotaryEmbedding)
-from typing import Optional, Tuple
+    DeepseekScalingRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
+    MRotaryEmbedding,
+    RotaryEmbedding,
+    YaRNScalingRotaryEmbedding,
+)
+
 
 def vllm_kunlun_compute_cos_sin_cache(self) -> torch.Tensor:
     """Compute the cos and sin cache."""
     inv_freq = self._compute_inv_freq(self.base)
-    if hasattr(self, 'scaling_factor'):
-        self.max_position_embeddings = int(self.max_position_embeddings * self.scaling_factor)
+    if hasattr(self, "scaling_factor"):
+        self.max_position_embeddings = int(
+            self.max_position_embeddings * self.scaling_factor
+        )
     t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
     freqs = torch.einsum("i,j -> ij", t, inv_freq)
     cos = freqs.cos()
     sin = freqs.sin()
-    #对于glm4-9b-chat，rope跑forward_native，所以需要cache保持特定的形状，这里通过环境变量控制
-    #对于qwen2.5-vl，rope跑mrope，也需要cache保持特定的形状
-    #也就是说跑glm4-9b-chat、qwen2.5-vl，需要设置GLM4_CHAT环境变量为1
-    if os.getenv('ROPE_NATIVE_2D') == "1":
+    # 对于glm4-9b-chat，rope跑forward_native，所以需要cache保持特定的形状，这里通过环境变量控制
+    # 对于qwen2.5-vl，rope跑mrope，也需要cache保持特定的形状
+    # 也就是说跑glm4-9b-chat、qwen2.5-vl，需要设置GLM4_CHAT环境变量为1
+    if os.getenv("ROPE_NATIVE_2D") == "1":
         cache = torch.cat((cos, sin), dim=-1)
         return cache
-    if os.getenv('USE_ORI_ROPE') == "0":
+    if os.getenv("USE_ORI_ROPE") == "0":
         cache_cos = torch.cat((cos, cos), dim=-1)
         cache_sin = torch.cat((sin, sin), dim=-1)
         # [2, self.max_position_embeddings, self.rotary_dim * 2]
@@ -51,30 +58,44 @@ def vllm_kunlun_compute_cos_sin_cache(self) -> torch.Tensor:
 
 
 def vllm_kunlun_forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """forward_cuda"""
-        from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+    self,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor] = None,
+    offsets: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """forward_cuda"""
+    from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
-        if self.cos_sin_cache.device != query.device or \
-            self.cos_sin_cache.dtype != query.dtype:
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device,
-                                                       dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
-        if offsets is not None:
-            ops.batched_rotary_embedding(positions, query, key, self.head_size,
-                                         self.cos_sin_cache,
-                                         self.is_neox_style, self.rotary_dim,
-                                         offsets)
-        else:
-            query, key = ops.rotary_embedding(positions, query, key, self.head_size,
-                                 self.cos_sin_cache, self.is_neox_style)
-        return query, key
+    if (
+        self.cos_sin_cache.device != query.device
+        or self.cos_sin_cache.dtype != query.dtype
+    ):
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+    # ops.rotary_embedding()/batched_rotary_embedding()
+    # are in-place operations that update the query and key tensors.
+    if offsets is not None:
+        ops.batched_rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+            self.rotary_dim,
+            offsets,
+        )
+    else:
+        query, key = ops.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
+    return query, key
+
 
 def vllm_ds_rope_forward_cuda(
     self,
@@ -93,20 +114,22 @@ def vllm_ds_rope_forward_cuda(
         key=key,
         offsets=offsets,
     )
-        
-def apply_interleaved_rope(x: torch.Tensor,
-                           mrope_section: list[int]) -> torch.Tensor:
+
+
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Apply interleaved MRoPE to 3D rotary embeddings.
     Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
     interleaved [THTHWHTHW...TT], preserving frequency continuity.
     """
     x_t = x[0].clone()
-    x_t[..., 1:mrope_section[1] * 3:3] = x[1, ..., 1:mrope_section[1] * 3:3]
-    x_t[..., 2:mrope_section[2] * 3:3] = x[2, ..., 2:mrope_section[2] * 3:3]
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
     return x_t
 
-def vllm_kunlun_apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                      is_neox_style: bool) -> torch.Tensor:
+
+def vllm_kunlun_apply_rotary_emb(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox_style: bool
+) -> torch.Tensor:
     """
     Args:
         x: [num_tokens, num_heads, head_size]
@@ -129,46 +152,51 @@ def vllm_kunlun_apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.
     else:
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
+
 def vllm_kunlun_mrope_forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """PyTorch-native implementation equivalent to forward().
+    self,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """PyTorch-native implementation equivalent to forward().
 
-        Args:
-            positions:
-                [num_tokens,] (text only) or
-                [3, num_tokens] (T/H/W positions with multimodal inputs)
-            query: [num_tokens, num_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
-        """
-        assert positions.ndim == 2
-        assert key is not None
-        
-        query, key = torch.ops.xspeedgate_ops.mrotary_embedding_fwd_v0(
-            query,
-            key,
-            positions.to(dtype=torch.int32),
-            self.cos_sin_cache,
-            self.mrope_interleaved,
-            self.is_neox_style,
-            self.head_size,
-            self.rotary_dim,
-            self.mrope_section[0],
-            self.mrope_section[1],
-            self.mrope_section[2]
-        )
+    Args:
+        positions:
+            [num_tokens,] (text only) or
+            [3, num_tokens] (T/H/W positions with multimodal inputs)
+        query: [num_tokens, num_heads * head_size]
+        key: [num_tokens, num_kv_heads * head_size]
+    """
+    assert positions.ndim == 2
+    assert key is not None
 
-        return query, key
+    query, key = torch.ops.xspeedgate_ops.mrotary_embedding_fwd_v0(
+        query,
+        key,
+        positions.to(dtype=torch.int32),
+        self.cos_sin_cache,
+        self.mrope_interleaved,
+        self.is_neox_style,
+        self.head_size,
+        self.rotary_dim,
+        self.mrope_section[0],
+        self.mrope_section[1],
+        self.mrope_section[2],
+    )
+
+    return query, key
+
 
 RotaryEmbedding.forward_cuda = vllm_kunlun_forward_cuda
 RotaryEmbedding.forward = vllm_kunlun_forward_cuda
+if os.getenv("USE_ORI_ROPE") == "0":
+    RotaryEmbedding._compute_cos_sin_cache = vllm_kunlun_compute_cos_sin_cache
 DeepseekScalingRotaryEmbedding.forward = vllm_ds_rope_forward_cuda
 DeepseekScalingRotaryEmbedding.forward_cuda = vllm_ds_rope_forward_cuda
 MRotaryEmbedding.forward_cuda = vllm_kunlun_mrope_forward_cuda
 MRotaryEmbedding.forward = vllm_kunlun_mrope_forward_cuda
+
 
 def Split_Norm_Rope(
     qkv: torch.Tensor,
@@ -179,27 +207,38 @@ def Split_Norm_Rope(
     max_position_embeddings: int,
     q_head_num: int,
     kv_head_num: int,
-    head_dim:int
+    head_dim: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_tokens = qkv.shape[0]
-    rotary_dim=head_dim
-    q_emb_out = torch.empty((num_tokens, q_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
-    k_emb_out = torch.empty((num_tokens, kv_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
-    v_out = torch.empty((num_tokens, kv_head_num * head_dim), dtype=qkv.dtype, device=qkv.device)
+    rotary_dim = head_dim
+    qkv = qkv.view(num_tokens, -1, head_dim)
+
+    q_emb_out = torch.empty(
+        (num_tokens, q_head_num, head_dim), dtype=qkv.dtype, device=qkv.device
+    )
+    k_emb_out = torch.empty(
+        (num_tokens, kv_head_num, head_dim), dtype=qkv.dtype, device=qkv.device
+    )
+    v_out = torch.empty(
+        (num_tokens, kv_head_num, head_dim), dtype=qkv.dtype, device=qkv.device
+    )
     torch.ops._C.split_norm_rope_neox(
-                        q_emb_out,                    
-                        k_emb_out,                     
-                        v_out,                          
-                        qkv,   
-                        cos_sin_cache, 
-                        q_norm_weight,
-                        k_norm_weight,   
-                        positions,  
-                        num_tokens,
-                        max_position_embeddings,                     
-                        q_head_num,                
-                        kv_head_num,               
-                        head_dim,                 
-                        rotary_dim,            
-                    )
-    return  q_emb_out, k_emb_out, v_out
+        q_emb_out,
+        k_emb_out,
+        v_out,
+        qkv,
+        cos_sin_cache,
+        q_norm_weight,
+        k_norm_weight,
+        positions,
+        num_tokens,
+        max_position_embeddings,
+        q_head_num,
+        kv_head_num,
+        head_dim,
+        rotary_dim,
+    )
+    q_emb_out = q_emb_out.view(num_tokens, -1)
+    k_emb_out = k_emb_out.view(num_tokens, -1)
+    v_out = v_out.view(num_tokens, -1)
+    return q_emb_out, k_emb_out, v_out
