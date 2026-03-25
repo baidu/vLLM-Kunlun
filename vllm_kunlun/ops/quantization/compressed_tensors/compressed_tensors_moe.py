@@ -16,30 +16,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, Optional, Union
 
 import torch
-from vllm.logger import init_logger
 from compressed_tensors.quantization import ActivationOrdering, QuantizationStrategy
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsW4A4MoeMethod,
+    CompressedTensorsW4A4Mxfp4MoEMethod,
     CompressedTensorsW4A8Int8MoEMethod,
-    CompressedTensorsW8A8Int8MoEMethod,
-    CompressedTensorsW8A8Int8MoEMethod,
     CompressedTensorsW8A8Fp8MoEMethod,
+    CompressedTensorsW8A8Int8MoEMethod,
     CompressedTensorsWNA16MoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
 )
+
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_native
+from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_kunlun
 
 logger = init_logger(__name__)
+
+# Environment variable to control which MoE implementation to use
+# USE_MOE_FC=1: use apply_moe_fc (original implementation with dequant)
+# USE_MOE_FC=0 or not set: use apply_moe_fc_v3 (optimized implementation)
+USE_MOE_FC = os.environ.get("USE_MOE_FC", "0") == "1"
 
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
-    def __init_(self, moe: FusedMoEConfig):
+    def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
 
     @staticmethod
@@ -88,10 +96,10 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "WNA16MoE is not supported with actorder=group/dynamic."
                 )
             # MarlinMoE kernel is not supported on XPU.
-            logger.warning_once(f"Using KunlunCompressedTensorsWNA16MoEMethod")
+            logger.warning_once("Using KunlunCompressedTensorsWNA16MoEMethod")
             return KunlunCompressedTensorsWNA16MoEMethod(quant_config, layer.moe_config)
         elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
-            return CompressedTensorsW4A4MoeMethod(layer.moe_config)
+            return CompressedTensorsW4A4Mxfp4MoEMethod(layer.moe_config)
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
             or quant_config._is_fp8_w8a8_sm100(weight_quant, input_quant)
@@ -290,7 +298,64 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
-    def apply(
+    def process_weights_after_loading_moe_fc(self, layer: torch.nn.Module) -> None:
+        """Preprocessing for apply_moe_fc: use parent class method.
+
+        This keeps the original uint8 format needed by apply_moe_fc.
+        """
+        super().process_weights_after_loading(layer)
+
+    def process_weights_after_loading_moe_fc_v3(self, layer: torch.nn.Module) -> None:
+        """Optimized preprocessing for apply_moe_fc_v3.
+
+        This method:
+        1. Transpose weights and scales
+        2. Convert weights to signed int8 format (XOR 0x88)
+        3. Multiply scales by 7.0 and convert to float32
+        4. Release unused parameters to save memory
+
+        Memory optimization:
+        - Process one tensor at a time and release memory immediately
+        - Modify .data directly instead of creating new Parameter to avoid double memory
+        """
+        # Release unused parameters FIRST to free memory before processing
+        # These are created by parent class but not needed for Kunlun implementation
+        del layer.w13_weight_shape
+        del layer.w2_weight_shape
+        del layer.w13_weight_g_idx
+        del layer.w2_weight_g_idx
+        del layer.w13_g_idx_sort_indices
+        del layer.w2_g_idx_sort_indices
+
+        with torch.no_grad():
+            # Process w13 weights: transpose -> view as int8 -> in-place XOR 0x88
+            # Modify .data directly to avoid creating new Parameter (saves memory)
+            w13_data = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
+            w13_data = w13_data.view(torch.int8)
+            w13_data.bitwise_xor_(0x88)  # in-place XOR
+            layer.w13_weight_packed.data = (
+                w13_data  # Direct assignment, no new Parameter
+            )
+
+            # Process w2 weights: same as w13
+            w2_data = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
+            w2_data = w2_data.view(torch.int8)
+            w2_data.bitwise_xor_(0x88)  # in-place XOR
+            layer.w2_weight_packed.data = w2_data  # Direct assignment, no new Parameter
+
+            # Process w13 scale: use in-place operations to reduce memory
+            w13_scale_data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
+            w13_scale_data.mul_(7.0)  # in-place multiply
+            w13_scale_data = w13_scale_data.to(torch.float32)  # type conversion
+            layer.w13_weight_scale.data = w13_scale_data  # Direct assignment
+
+            # Process w2 scale: same as w13
+            w2_scale_data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
+            w2_scale_data.mul_(7.0)  # in-place multiply
+            w2_scale_data = w2_scale_data.to(torch.float32)  # type conversion
+            layer.w2_weight_scale.data = w2_scale_data  # Direct assignment
+
+    def apply_moe_fc(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -313,16 +378,17 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Original implementation using dequant and fused_moe."""
         # dequant packed weights to float16
-        w13_weight = dequant_int4_native(
+        w13_weight = dequant_int4_kunlun(
             weight_packed_uint8=layer.w13_weight_packed,
             scale=self.moe_quant_config.w1_scale,
         )
-        w2_weight = dequant_int4_native(
+        w2_weight = dequant_int4_kunlun(
             weight_packed_uint8=layer.w2_weight_packed,
             scale=self.moe_quant_config.w2_scale,
         )
-        
+
         if self.moe.use_ep:
             return ops.fused_moe_ep(
                 x,
@@ -355,6 +421,73 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
             )
+
+    def apply_moe_fc_v3(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Optimized implementation using preprocessed weights and fuse_moe_ct_w4a16."""
+        # EP mode is not supported for int4 packed weights
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
+            )
+
+        # Use preprocessed weights and scales (processed in process_weights_after_loading)
+        # Weights are already int8 (XOR 0x88) and scales are already float32 (multiplied by 7.0)
+        return ops.fused_moe_ct_w4a16(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            router_logits=router_logits,
+            moe_top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+
+# Set methods based on USE_MOE_FC environment variable
+if USE_MOE_FC:
+    KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading = (
+        KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading_moe_fc
+    )
+    KunlunCompressedTensorsWNA16MoEMethod.apply = (
+        KunlunCompressedTensorsWNA16MoEMethod.apply_moe_fc
+    )
+    print("USE_MOE_FC=1: Using apply_moe_fc (original implementation with dequant)")
+else:
+    KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading = (
+        KunlunCompressedTensorsWNA16MoEMethod.process_weights_after_loading_moe_fc_v3
+    )
+    KunlunCompressedTensorsWNA16MoEMethod.apply = (
+        KunlunCompressedTensorsWNA16MoEMethod.apply_moe_fc_v3
+    )
+    print("USE_MOE_FC=0 (default): Using apply_moe_fc_v3 (optimized implementation)")
 
 
 # monkey patch

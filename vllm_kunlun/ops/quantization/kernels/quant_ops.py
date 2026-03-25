@@ -84,3 +84,13 @@ def dequant_int4_native(weight_packed_uint8: torch.Tensor, scale: torch.Tensor):
         1, 1, weight_upacked_fp16.shape[-1] // scale.shape[-1]
     )
     return weight_upacked_fp16
+
+
+def dequant_int4_kunlun(weight_packed_uint8: torch.Tensor, scale: torch.Tensor):
+    unpacked_shape = list(weight_packed_uint8.shape)
+    unpacked_shape[-1] *= 2
+    output = torch.empty(
+        unpacked_shape, dtype=torch.float16, device=weight_packed_uint8.device
+    )
+    torch.ops.xspeedgate_ops.dequant_int4(weight_packed_uint8, output, scale, None, 32)
+    return output

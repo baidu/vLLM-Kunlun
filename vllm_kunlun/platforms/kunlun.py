@@ -198,11 +198,8 @@ class KunlunPlatform(Platform):
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
             use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
-            )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            use_flashmla = True
+            from vllm_kunlun.ops.attention.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
