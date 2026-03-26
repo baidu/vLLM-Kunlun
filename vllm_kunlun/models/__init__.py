@@ -3,6 +3,7 @@ from vllm import ModelRegistry
 
 def register_model():
     # from .demo_model import DemoModel  # noqa: F401
+    from .kimi_k25 import KimiK25ForConditionalGeneration  # noqa: F401
     from .qwen2_5_vl import Qwen2_5_VLForConditionalGeneration  # noqa: F401
     from .qwen2_vl import Qwen2VLForConditionalGeneration  # noqa: F401
     from .qwen3_moe import Qwen3MoeForCausalLM  # noqa: F401
@@ -64,6 +65,16 @@ def register_model():
     ModelRegistry.register_model(
         "InternS1ForConditionalGeneration",
         "vllm_kunlun.models.interns1:InternS1ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "KimiK25ForConditionalGeneration",
+        "vllm_kunlun.models.kimi_k25:KimiK25ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "KimiK2_5ForConditionalGeneration",
+        "vllm_kunlun.models.kimi_k25:KimiK25ForConditionalGeneration",
     )
 
     ModelRegistry.register_model(
