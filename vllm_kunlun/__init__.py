@@ -49,10 +49,15 @@ def register():
     from .utils import redirect_output
     from .vllm_utils_wrapper import direct_register_custom_op, patch_annotations_for_schema
     
-    # Change for GLM5
-    if "vllm.transformers_utils.config" in sys.modules:
-        from .transformer_utils.config import _XPU_CONFIG_REGISTRY
-        sys.modules["vllm.transformers_utils.config"]._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
+    # Change for GLM5 and custom model configs.
+    import vllm.transformers_utils.config as config_module
+    from .transformer_utils.config import _XPU_CONFIG_REGISTRY
+    config_module._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
+
+    import vllm.transformers_utils.configs as configs_module
+    from .transformer_utils.kimi_k25 import KimiK25Config, KimiK25VisionConfig
+    setattr(configs_module, "KimiK25Config", KimiK25Config)
+    setattr(configs_module, "KimiK25VisionConfig", KimiK25VisionConfig)
     
     import vllm.config.model as model_module
     from .config.model import is_deepseek_mla

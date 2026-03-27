@@ -8,6 +8,7 @@ _XPU_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     deepseek_v32="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     kimi_vl="KimiVLConfig",
+    kimi_k25="KimiK25Config",
     Llama_Nemotron_Nano_VL="Nemotron_Nano_VL_Config",
     RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
     RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)

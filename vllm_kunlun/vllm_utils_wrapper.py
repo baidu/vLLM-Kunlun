@@ -197,7 +197,7 @@ def vllm_kunlun_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.T
         (world_size,) + input_size, dtype=input_.dtype, device=input_.device
     )
     # All-gather.
-    cast_output_tensor = output_tensor.view(-1, input_.shape[-1]) # for cudagraph
+    cast_output_tensor = output_tensor.view(-1, input_.shape[-1])  # for cudagraph
     torch.distributed.all_gather_into_tensor(
         cast_output_tensor, input_, group=self.device_group
     )
@@ -1400,6 +1400,121 @@ def fake_moe_fc(
 
 
 moe_fc.register_fake(fake_moe_fc)
+
+
+@custom_op("_C::moe_fc_v3", mutates_args=())
+def moe_fc_v3(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+) -> None:
+    kunlun_ops.moe_fc_v3(
+        x=x,
+        weight=weight,
+        sorted_tokens_num_lod=sorted_tokens_num_lod,
+        sorted_tokens_idx=sorted_tokens_idx,
+        moe_topk=moe_topk,
+        y=y,
+        act=act,
+        x_perchannel_max=x_perchannel_max,
+        w_perchannel_max=w_perchannel_max,
+        topk_ids=topk_ids,
+        topk_w=topk_w,
+        bias=bias,
+        tgemm_type=tgemm_type,
+        tweight_type=tweight_type,
+        scale_n=scale_n,
+        scale_k=scale_k,
+        use_pack_int4=use_pack_int4,
+        sort_mode=sort_mode,
+    )
+
+
+@impl("_C::moe_fc_v3", "CUDA")
+def moe_fc_v3_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+    recommended_expert_tokens: int = -1,
+) -> None:
+    kunlun_ops.moe_fc_v3(
+        x=x,
+        weight=weight,
+        sorted_tokens_num_lod=sorted_tokens_num_lod,
+        sorted_tokens_idx=sorted_tokens_idx,
+        moe_topk=moe_topk,
+        y=y,
+        act=act,
+        x_perchannel_max=x_perchannel_max,
+        w_perchannel_max=w_perchannel_max,
+        topk_ids=topk_ids,
+        topk_w=topk_w,
+        bias=bias,
+        tgemm_type=tgemm_type,
+        tweight_type=tweight_type,
+        scale_n=scale_n,
+        scale_k=scale_k,
+        use_pack_int4=use_pack_int4,
+        sort_mode=sort_mode,
+        recommended_expert_tokens=recommended_expert_tokens,
+    )
+
+
+def fake_moe_fc_v3(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+    recommended_expert_tokens: int = -1,
+) -> None:
+    return None
+
+
+moe_fc_v3.register_fake(fake_moe_fc_v3)
 
 
 @custom_op("_C::moe_post", mutates_args=())

@@ -1218,8 +1218,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         attn_out = torch.empty_like(q)
         ds_alpha = 1.8738542070926265
         tp_q_head_num=q.size(1)
-        softmax_lse = torch.zeros(tp_q_head_num, q.size(0), dtype=torch.float32, device=q.device)
-        softmax_lse.fill_(float('-inf'))
+        softmax_lse = torch.full((tp_q_head_num, q.size(0)), float('-inf'), dtype=torch.float32, device=q.device)
         kunlun_ops.attention(
             q=q,
             k_cache=k,
@@ -1238,7 +1237,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             v_trans=False,
             v_trans_threshold=0,
             alpha=ds_alpha,
-            softmax_lse=softmax_lse
+            softmax_lse=softmax_lse,
+            unpadded_lse=True,
         )
 
         # Unpack the output if there is multiple results
@@ -1312,7 +1312,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             k=k,
             v=v,
             context_seq_lod_xpu=prefill.query_start_loc,
-            context_seq_lod_cpu=prefill.chunked_context.cu_seq_lens_cpu[chunk_idx],
+            context_seq_lod_cpu=prefill.query_start_loc_cpu,
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
@@ -1745,7 +1745,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
-            output_lse = torch.empty_like(output)
+            output_lse = torch.empty_like(suffix_lse)
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
