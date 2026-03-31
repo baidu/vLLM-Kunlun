@@ -78,6 +78,12 @@ Copy the eval_frame.py patch:
 cp vllm_kunlun/patches/eval_frame.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
 ```
 
+ ### Replace quantization __init__.py
+
+```
+cp vllm_kunlun/quantization/__init__.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/python3.10/site-packages/vllm/model_executor/layers/quantization/__init__.py
+```
+
 ## Choose to download customized xpytorch
 
 ### Install the KL3-customized build of PyTorch

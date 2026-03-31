@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
 # Author: Li Wei, Tang Shiwen
 # Email: liwei157@baidu.com, tangshiwen@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
 from typing import Optional
 
@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -34,11 +35,16 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     get_linear_transform_schemes,
 )
 
-from vllm_kunlun.ops.quantization.compressed_tensors.compressed_tensors_moe import (
-    KunlunCompressedTensorsMoEMethod,
-)
+from vllm_kunlun.quantization.utils import _remove_quantization_method
+
+from .compressed_tensors_moe import KunlunCompressedTensorsMoEMethod
+
+# reove the original compressed-tensors quantization methods
+_remove_quantization_method("compressed-tensors")
 
 
+# register the kunlun compressed-tensors quantization methods
+@register_quantization_config("compressed-tensors")
 class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
     def get_quant_method(
         self,
@@ -72,17 +78,5 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
-            return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer)
+            return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
-
-
-# monkey patch
-from vllm.model_executor.layers.quantization.compressed_tensors import (  # noqa
-    compressed_tensors,
-)
-
-compressed_tensors.CompressedTensorsConfig = KunlunCompressedTensorsConfig
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors.CompressedTensorsConfig \
-      --> vllm_kunlun.ops.quantization.compressed_tensors.KunlunCompressedTensorsConfig"
-)

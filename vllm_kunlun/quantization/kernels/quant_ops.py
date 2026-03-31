@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
 # Author: Tang Shiwen, Li Wei
 # Email: tangshiwen@baidu.com, liwei157@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
 import torch
 

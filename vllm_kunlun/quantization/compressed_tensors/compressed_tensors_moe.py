@@ -1,8 +1,7 @@
 #
-# Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
+# Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
 # Author: Li Wei, Tang Shiwen
 # Email: liwei157@baidu.com, tangshiwen@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,95 +14,94 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
 from typing import Callable, Optional, Union
 
 import torch
-from compressed_tensors.quantization import ActivationOrdering, QuantizationStrategy
+from compressed_tensors import CompressionFormat
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    CompressedTensorsW4A4MoeMethod,
-    CompressedTensorsW4A8Int8MoEMethod,
-    CompressedTensorsW8A8Fp8MoEMethod,
     CompressedTensorsW8A8Int8MoEMethod,
     CompressedTensorsWNA16MoEMethod,
-    find_matched_target,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
+    WNA16_SUPPORTED_BITS,
 )
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_native
+from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
 logger = init_logger(__name__)
 
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
-
-    def __init_(self, moe: FusedMoEConfig):
-        super().__init__(moe)
-
     @staticmethod
     def get_moe_method(
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
         layer: torch.nn.Module,
-    ) -> "KunlunCompressedTensorsMoEMethod":
-        # TODO: @dsikka: refactor this to use schemes as other kernels
-        # are supported + check if the layer is being ignored.
-        # Check if a using "Linear" to select schemes
-        if "Linear" in quant_config.target_scheme_map:
-            matched_target = "Linear"
-        else:
-            # May have instead defined the linear layers in the fused model
-            fused_layers = ["re:.*down_proj.*", "re:.*gate_proj.*", "re:.*up_proj.*"]
-            current_scheme = None
-            for fused_layer in fused_layers:
-                # Check if one of the fused layers are defined in quant_config
-                matched_target = find_matched_target(
-                    layer_name=fused_layer,
-                    module=layer,
-                    targets=quant_config.target_scheme_map.keys(),
-                    fused_mapping=quant_config.packed_modules_mapping,
-                )
+        layer_name: str,
+    ) -> FusedMoEMethodBase:
+        # FusedMoE was made by combining multiple Linears so need to
+        # make sure quantization config for Linear can target it
+        quant_config._add_fused_moe_to_target_scheme_map()
+        unfused_names = [
+            layer_name + proj_name
+            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        ]
+        # TODO: refactor this to use expert_mapping and check all layer numbers
+        all_scheme_dicts = [
+            quant_config.get_scheme_dict(layer, name) for name in unfused_names
+        ]
+        scheme_dict = all_scheme_dicts.pop()
 
-                # Only valid if down_proj, gate_proj, and up_proj
-                # are mapped to the same quant scheme in the quant_config
-                if current_scheme is None:
-                    current_scheme = quant_config.target_scheme_map.get(matched_target)
-                else:
-                    assert current_scheme == quant_config.target_scheme_map.get(
-                        matched_target
-                    )
+        # multiple schemes found
+        if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
+            raise ValueError(
+                "All MoE projections need to have same "
+                "quantization scheme but found multiple"
+            )
 
-        weight_quant = quant_config.target_scheme_map[matched_target].get("weights")
-        input_quant = quant_config.target_scheme_map[matched_target].get(
-            "input_activations"
-        )
+        if scheme_dict is None:  # ignored layer
+            return UnquantizedFusedMoEMethod(layer.moe_config)
+
+        weight_quant = scheme_dict.get("weights")
+        input_quant = scheme_dict.get("input_activations")
+        format = scheme_dict.get("format")
+
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-            if (
-                weight_quant.strategy in QuantizationStrategy.GROUP
-                and weight_quant.actorder
-                in (ActivationOrdering.GROUP, ActivationOrdering.DYNAMIC)
-            ):
+
+            valid_format_and_bits = (
+                weight_quant.num_bits in WNA16_SUPPORTED_BITS
+                and format == CompressionFormat.pack_quantized.value
+            )
+
+            if not valid_format_and_bits:
                 raise ValueError(
-                    "WNA16MoE is not supported with actorder=group/dynamic."
+                    "For Fused MoE layers, only format: ",
+                    f"{CompressionFormat.pack_quantized.value} ",
+                    f" and bits: {WNA16_SUPPORTED_BITS} is supported ",
+                    f"but got format: {CompressionFormat.pack_quantized.value} "
+                    f" and bits: {weight_quant.num_bits}",
                 )
-            # MarlinMoE kernel is not supported on XPU.
-            logger.warning_once("Using KunlunCompressedTensorsWNA16MoEMethod")
-            return KunlunCompressedTensorsWNA16MoEMethod(quant_config, layer.moe_config)
-        elif quant_config._is_fp4a4_nvfp4(weight_quant, input_quant):
-            return CompressedTensorsW4A4MoeMethod(layer.moe_config)
-        elif (
-            quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)
-            or quant_config._is_fp8_w8a8_sm100(weight_quant, input_quant)
-            or quant_config._is_fp8_w8a8(weight_quant, input_quant)
-        ):
-            return CompressedTensorsW8A8Fp8MoEMethod(quant_config, layer.moe_config)
+
+            logger.info_once("Using CompressedTensorsWNA16MoEMethod")
+            return KunlunCompressedTensorsWNA16MoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
-                quant_config, layer.moe_config
+                weight_quant, input_quant, layer.moe_config
             )
-        elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
-            return CompressedTensorsW4A8Int8MoEMethod(quant_config, layer.moe_config)
+        # TODO: @liwei support w4a8
+        # elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+        #     return CompressedTensorsW4A8Int8MoEMethod(
+        #         weight_quant, input_quant, layer.moe_config
+        #     )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -111,6 +109,9 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    @property
+    def is_monolithic(self) -> bool:
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # NOTE: kunlun_ops use max as scale
@@ -118,33 +119,23 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             layer.w13_weight_scale.mul_(127.0)
             layer.w2_weight_scale.mul_(127.0)
 
-    def apply(
+    def apply_monolithic(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
         M, N = hidden_states.shape
         hidden_dim = layer.w2_weight.shape[1]
+        top_k = self.moe.experts_per_token
         normed_score = torch.empty(
             M, top_k, dtype=torch.float32, device=hidden_states.device
         )
@@ -355,31 +346,3 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
             )
-
-
-# monkey patch
-from vllm.model_executor.layers.quantization.compressed_tensors import (  # noqa
-    compressed_tensors_moe,
-)
-
-compressed_tensors_moe.CompressedTensorsW8A8Int8MoEMethod = (
-    KunlunCompressedTensorsW8A8Int8MoEMethod
-)
-compressed_tensors_moe.CompressedTensorsMoEMethod = KunlunCompressedTensorsMoEMethod
-compressed_tensors_moe.CompressedTensorsWNA16MoEMethod = (
-    KunlunCompressedTensorsWNA16MoEMethod
-)
-KunlunCompressedTensorsWNA16MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
-
-logger.info_once(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.CompressedTensorsW8A8Int8MoEMethod \
-      --> vllm_kunlun.ops.quantization.compressed_tensors_moe.KunlunCompressedTensorsW8A8Int8MoEMethod"
-)
-logger.info_once(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.CompressedTensorsMoEMethod \
-      --> vllm_kunlun.ops.quantization.compressed_tensors_moe.KunlunCompressedTensorsMoEMethod"
-)
-logger.info_once(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.CompressedTensorsWNA16MoEMethod \
-      --> vllm_kunlun.ops.quantization.compressed_tensors_moe.KunlunCompressedTensorsWNA16MoEMethod"
-)

@@ -2,7 +2,6 @@
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
 # Author: Li Wei, Pan Xiakai, You Zeyu, Tang Shiwen
 # Email: liwei157@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
 from typing import Optional, Union
 
@@ -22,14 +22,51 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
-from vllm.model_executor.layers.quantization.awq import (
-    AWQConfig,
-    AWQLinearMethod,
-    is_layer_skipped_awq,
-)
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.awq import AWQConfig, AWQLinearMethod
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+
+from vllm_kunlun.quantization.utils import _remove_quantization_method
 
 logger = init_logger(__name__)
+
+
+# reove the original awq quantization method
+_remove_quantization_method("awq")
+
+
+# register the kunlun awq quantization method
+@register_quantization_config("awq")
+class KunlunAWQConfig(AWQConfig):
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[Union["LinearMethodBase", "QuantizeMethodBase"]]:  # type: ignore # noqa: F821
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix,
+                self.modules_to_not_convert,
+                self.packed_modules_mapping,
+                skip_with_substr=True,
+            ):
+                return UnquantizedLinearMethod()
+            return KunlunAWQLinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            logger.warning_once(
+                f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
+                "Falling back to Moe WNA16 kernels."
+            )
+            config = {
+                "quant_method": "awq",
+                "bits": self.weight_bits,
+                "group_size": self.group_size,
+                "zero_point": self.zero_point,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+
+        return None
 
 
 class KunlunAWQLinearMethod(AWQLinearMethod):
@@ -65,70 +102,9 @@ class KunlunAWQLinearMethod(AWQLinearMethod):
 
             # Reverse AWQ order and convert to KUNLUN order
             AWQ_TO_KUNLUN_ORDER_FAST = [
-                32,
-                0,
-                36,
-                4,
-                33,
-                1,
-                37,
-                5,
-                34,
-                2,
-                38,
-                6,
-                35,
-                3,
-                39,
-                7,
-                40,
-                8,
-                44,
-                12,
-                41,
-                9,
-                45,
-                13,
-                42,
-                10,
-                46,
-                14,
-                43,
-                11,
-                47,
-                15,
-                48,
-                16,
-                52,
-                20,
-                49,
-                17,
-                53,
-                21,
-                50,
-                18,
-                54,
-                22,
-                51,
-                19,
-                55,
-                23,
-                56,
-                24,
-                60,
-                28,
-                57,
-                25,
-                61,
-                29,
-                58,
-                26,
-                62,
-                30,
-                59,
-                27,
-                63,
-                31,
+                j + 8 * i
+                for i in range(4)
+                for j in [32, 0, 36, 4, 33, 1, 37, 5, 34, 2, 38, 6, 35, 3, 39, 7]
             ]
             unpacked_awq = unpacked_awq.reshape(N, K // 8, 64)
             unpacked_kunlun = unpacked_awq[
@@ -193,44 +169,3 @@ class KunlunAWQLinearMethod(AWQLinearMethod):
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
-
-
-class KunlunAWQConfig(AWQConfig):
-
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[Union["LinearMethodBase", "QuantizeMethodBase"]]:  # type: ignore # noqa: F821
-        if isinstance(layer, LinearBase):
-            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
-                return UnquantizedLinearMethod()
-            return KunlunAWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
-            logger.warning_once(
-                f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
-                "Falling back to Moe WNA16 kernels."
-            )
-            config = {
-                "quant_method": "awq",
-                "bits": self.weight_bits,
-                "group_size": self.group_size,
-                "zero_point": self.zero_point,
-                "lm_head": False,
-            }
-            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
-
-        return None
-
-
-# monkey patch
-from vllm.model_executor.layers.quantization import awq  # noqa
-
-awq.AWQLinearMethod = KunlunAWQLinearMethod
-awq.AWQConfig = KunlunAWQConfig
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.awq.AWQLinearMethod \
-      --> vllm_kunlun.ops.quantization.awq.KunlunAWQLinearMethod"
-)
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.awq.AWQConfig \
-      --> vllm_kunlun.ops.quantization.awq.KunlunAWQConfig"
-)

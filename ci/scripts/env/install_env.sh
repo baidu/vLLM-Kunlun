@@ -54,6 +54,10 @@ docker exec "${DOCKER_NAME}" bash -lc "
   # Patch torch dynamo eval_frame
   cp vllm_kunlun/patches/eval_frame.py \
     /root/miniconda/envs/${CONDA_ENV}/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
+  
+  # Patch quantization __init__.py
+  cp vllm_kunlun/quantization/__init__.py \
+    /root/miniconda/envs/${CONDA_ENV}/lib/python3.10/site-packages/vllm/model_executor/layers/quantization/__init__.py
 
   ########################################
   # Kunlun runtime dependencies

@@ -336,12 +336,40 @@ def _load_fused_module_from_checkpoint(
         self.weight_loader_v2(param, loaded_weight_shard, shard_id)
 
 
+def validate_shard_id(self, loaded_shard_id: int | tuple[int, ...] | None):
+    if loaded_shard_id is None:
+        return
+    if isinstance(loaded_shard_id, tuple):
+        for idx in loaded_shard_id:
+            if not (0 <= idx < len(self.output_sizes)):
+                raise ValueError(
+                    f"Shard id index {idx} should be between 0 and "
+                    f"{len(self.output_sizes) - 1}. Got shard id {loaded_shard_id}."
+                )
+        if len(loaded_shard_id) > 1 and any(
+            b - a != 1 for a, b in zip(loaded_shard_id[:-1], loaded_shard_id[1:])
+        ):
+            raise ValueError(
+                "Shard id with multiple indices should be consecutive. "
+                f"Got shard id {loaded_shard_id}."
+            )
+        return
+    elif isinstance(loaded_shard_id, int):
+        if loaded_shard_id < 0 or loaded_shard_id >= len(self.output_sizes):
+            raise ValueError(
+                f"Shard id should be between 0 and {len(self.output_sizes) - 1}. "
+                f"Got shard id {loaded_shard_id}."
+            )
+        return
+
+
 def weight_loader_v2(
     self,
     param: BasevLLMParameter,
     loaded_weight: torch.Tensor,
     loaded_shard_id: tuple[int, ...] | int | None = None,
 ):
+    self.validate_shard_id(loaded_shard_id)
     if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
         if isinstance(param, PerTensorScaleParameter):
             param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
@@ -349,9 +377,6 @@ def weight_loader_v2(
         elif type(param) in (RowvLLMParameter, BasevLLMParameter):
             param.load_merged_column_weight(loaded_weight=loaded_weight)
             return
-        # TODO: @dsikka - move to parameter.py
-        self._load_fused_module_from_checkpoint(param, loaded_weight)
-        return
         output_sizes = (
             [self.output_sizes[idx] for idx in loaded_shard_id]
             if loaded_shard_id
@@ -363,6 +388,7 @@ def weight_loader_v2(
                 adjust_block_scale_shard(weight_block_size, size, 0)[0]
                 for size in (output_sizes or self.output_sizes)
             ]
+        # TODO: @dsikka - move to parameter.py
         self._load_fused_module_from_checkpoint(
             param, loaded_weight, output_sizes=output_sizes
         )
@@ -394,6 +420,7 @@ MergedColumnParallelLinear.weight_loader = weight_loader
 MergedColumnParallelLinear._load_fused_module_from_checkpoint = (
     _load_fused_module_from_checkpoint
 )
+MergedColumnParallelLinear.validate_shard_id = validate_shard_id
 MergedColumnParallelLinear.weight_loader_v2 = weight_loader_v2
 
 

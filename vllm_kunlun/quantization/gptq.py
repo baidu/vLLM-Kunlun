@@ -2,7 +2,6 @@
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
 # Author: Li Wei, You Zeyu
 # Email: liwei157@baidu.com, youzeyu@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,15 +14,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
-from typing import Optional
+
+from typing import Optional, Union
 
 import torch
 from torch.nn.parameter import Parameter
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.gptq import ExllamaState, GPTQLinearMethod
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.gptq import (
+    ExllamaState,
+    GPTQConfig,
+    GPTQLinearMethod,
+)
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    get_linear_quant_method,
+)
+
+from vllm_kunlun.quantization.utils import _remove_quantization_method
 
 logger = init_logger(__name__)
+
+
+# reove the original gptq quantization method
+_remove_quantization_method("gptq")
+
+
+# register the kunlun gptq quantization method
+@register_quantization_config("gptq")
+class KunlunGPTQConfig(GPTQConfig):
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Union["GPTQLinearMethod", "QuantizeMethodBase"] | None:
+        if isinstance(layer, FusedMoE):
+            from .moe_wna16 import MoeWNA16Config
+
+            config = {
+                "quant_method": "gptq",
+                "bits": self.weight_bits,
+                "group_size": self.group_size,
+                "sym": True,  # GPTQ typically uses symmetric quantization
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+
+        return get_linear_quant_method(self, layer, prefix, KunlunGPTQLinearMethod)
 
 
 class KunlunGPTQLinearMethod(GPTQLinearMethod):
@@ -70,72 +108,7 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
         ) & 0xF  # [N, K//8, 8, 8]
 
         # Convert to KUNLUN order
-        GPTQ_TO_KUNLUN_ORDER_FAST = [
-            32,
-            0,
-            33,
-            1,
-            34,
-            2,
-            35,
-            3,
-            36,
-            4,
-            37,
-            5,
-            38,
-            6,
-            39,
-            7,
-            40,
-            8,
-            41,
-            9,
-            42,
-            10,
-            43,
-            11,
-            44,
-            12,
-            45,
-            13,
-            46,
-            14,
-            47,
-            15,
-            48,
-            16,
-            49,
-            17,
-            50,
-            18,
-            51,
-            19,
-            52,
-            20,
-            53,
-            21,
-            54,
-            22,
-            55,
-            23,
-            56,
-            24,
-            57,
-            25,
-            58,
-            26,
-            59,
-            27,
-            60,
-            28,
-            61,
-            29,
-            62,
-            30,
-            63,
-            31,
-        ]
+        GPTQ_TO_KUNLUN_ORDER_FAST = [i + d for i in range(32) for d in [32, 0]]
         unpacked_gptq = unpacked_gptq.reshape(N, K // 8, 64)
         unpacked_kunlun = unpacked_gptq[..., GPTQ_TO_KUNLUN_ORDER_FAST]  # [N, K//8, 64]
 
@@ -168,13 +141,3 @@ class KunlunGPTQLinearMethod(GPTQLinearMethod):
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
-
-
-# monkey patch
-from vllm.model_executor.layers.quantization import gptq  # noqa
-
-gptq.GPTQLinearMethod = KunlunGPTQLinearMethod
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.gptq.GPTQLinearMethod \
-      --> vllm_kunlun.ops.quantization.gptq.KunlunGPTQLinearMethod"
-)

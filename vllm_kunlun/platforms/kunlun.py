@@ -7,6 +7,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 if TYPE_CHECKING:
@@ -375,3 +376,15 @@ class KunlunPlatform(Platform):
     @classmethod
     def support_static_graph_mode(cls) -> bool:
         return True
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: FlexibleArgumentParser | None = None
+    ) -> None:
+        from vllm_kunlun.quantization.awq import KunlunAWQConfig  # noqa
+        from vllm_kunlun.quantization.compressed_tensors import (  # noqa
+            KunlunCompressedTensorsConfig,
+        )
+        from vllm_kunlun.quantization.gptq import KunlunGPTQConfig  # noqa
+        from vllm_kunlun.quantization.kernels import _POSSIBLE_INT8_KERNELS  # noqa
+        from vllm_kunlun.quantization.kernels import _POSSIBLE_KERNELS  # noqa

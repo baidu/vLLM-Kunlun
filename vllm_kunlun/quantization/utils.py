@@ -1,5 +1,7 @@
 #
-# Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
+# Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
+# Author: Li Wei
+# Email: liwei157@baidu.com
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +14,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# This file is a part of the vllm-ascend project.
-#
+# This file is a part of the vllm-kunlun project.
 
-import vllm_kunlun.ops._custom_ops
-import vllm_kunlun.ops.fused_moe.layer
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 
-# base layers
-import vllm_kunlun.ops.layernorm
-import vllm_kunlun.ops.linear
 
-# embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
-import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
-
-# TODO @xyDong0223 remove v0.16.0
-# import vllm_kunlun.ops.mla
+def _remove_quantization_method(quant_method: str):
+    if quant_method in QUANTIZATION_METHODS:
+        QUANTIZATION_METHODS.remove(quant_method)

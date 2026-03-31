@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Baidu, Inc. All Rights Reserved.
 # Author: Tang Shiwen, Li Wei
 # Email: tangshiwen@baidu.com, liwei157@baidu.com
-# This file is a part of the vllm-kunlun project.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# This file is a part of the vllm-kunlun project.
 
 from typing import Callable, Optional, Union
 
@@ -287,12 +287,3 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
             )
-
-
-from vllm.model_executor.layers.quantization import moe_wna16  # noqa
-
-moe_wna16.MoeWNA16Method = KunlunMoeWNA16Method
-print(
-    "[Monkey Patch Applied] >>> vllm.model_executor.layers.quantization.moe_wna16.MoeWNA16Method \
-      --> vllm_kunlun.ops.quantization.moe_wna16.KunlunMoeWNA16Method"
-)
