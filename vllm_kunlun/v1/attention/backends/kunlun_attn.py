@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
+import copy
 import inspect
 
 from vllm.utils.math_utils import cdiv
@@ -676,6 +677,18 @@ class KunlunAttentionMetadataBuilder:
         # Full CUDA Graph always supported (FA2 support checked separately)
         return True
 
+    def update_block_table(
+        self,
+        metadata: KunlunMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> KunlunMetadata:
+        """update_block_table"""
+        new_metadata = copy.copy(metadata)
+        new_metadata.block_tables = blk_table
+        new_metadata.slot_mapping = slot_mapping
+        return new_metadata
+
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         """use_cascade_attention"""
         return use_cascade_attention(*args, **kwargs)
@@ -804,9 +817,9 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
 
         if prefill_meta := attn_metadata.prefill_metadata:
             # Prompt run.
-            prefill_query = query[num_decode_tokens : attn_metadata.num_actual_tokens]
-            prefill_key = key[num_decode_tokens : attn_metadata.num_actual_tokens]
-            prefill_value = value[num_decode_tokens : attn_metadata.num_actual_tokens]
+            prefill_query = query[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
+            prefill_key = key[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
+            prefill_value = value[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
 
             # For hybrid Attention (Qwen3-Next.)
             if key_cache.is_contiguous():
