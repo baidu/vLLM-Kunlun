@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
@@ -169,9 +170,6 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 scale=routed_scaling_factor,
             )
 
-        moe_expand = torch.empty(
-            (M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
-        )  # [M, top_k, N], float
         expert_m = torch.zeros(
             global_num_experts, dtype=torch.int32, device=hidden_states.device
         )  # [E]
@@ -180,7 +178,34 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )  # [E+1]
         sorted_tokens_idx = torch.zeros(
             M * top_k, dtype=torch.int32, device=hidden_states.device
+        )  # [M * top_k]
+
+        y_numel = M * top_k * layer.w13_weight.shape[1]
+        out_numel = M * top_k * layer.w2_weight.shape[1]
+        out1_numel = M * top_k * hidden_dim
+        moe_expand_numel = M * top_k * N
+
+        # Live ranges:
+        #   M < 1024:
+        #     workspace_a: moe_expand -> out1
+        #     workspace_b: y -> out
+        #   M >= 1024:
+        #     workspace_a: moe_expand -> out
+        #     workspace_b: y
+        workspace_a_numel = max(moe_expand_numel, out_numel)
+        workspace_b_numel = y_numel
+
+        if M < 1024:
+            workspace_a_numel = max(moe_expand_numel, out1_numel)
+            workspace_b_numel = max(y_numel, out_numel)
+
+        workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
+            ((workspace_a_numel,), hidden_states.dtype),
+            ((workspace_b_numel,), hidden_states.dtype),
         )
+        moe_expand = workspace_a[:moe_expand_numel].view(
+            M * top_k, N
+        )  # [M * top_k, N], float
 
         torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
@@ -194,13 +219,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             sorted_tokens_num_lod=sorted_tokens_num_lod,
         )
 
-        y = torch.empty(
-            M,
-            top_k,
-            layer.w13_weight.shape[1],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        y = workspace_b[:y_numel].view(M, top_k, layer.w13_weight.shape[1])
 
         moe_expand = moe_expand.view(M * top_k, hidden_dim)
 
@@ -226,8 +245,9 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )
 
         d = y.shape[-1] // 2
-        output_shape = y.shape[:-1] + (d,)
-        out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
+        # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
+        # needed.
+        out1 = workspace_a[:out1_numel].view(M, top_k, d)
         torch.ops._C.silu_and_mul(out1, y)
 
         del y
@@ -240,13 +260,14 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )
         torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
         del out1, moe_expand
-        out = torch.empty(
-            M,
-            top_k,
-            layer.w2_weight.shape[1],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        if M < 1024:
+            # Reuse `workspace_b` for `out` after `y` has been consumed by
+            # the first FC.
+            out = workspace_b[:out_numel].view(M, top_k, layer.w2_weight.shape[1])
+        else:
+            # Reuse `workspace_a` for `out` after `moe_expand` is no longer
+            # needed.
+            out = workspace_a[:out_numel].view(M, top_k, layer.w2_weight.shape[1])
 
         torch.ops._C.moe_fc(
             x=x_q,
