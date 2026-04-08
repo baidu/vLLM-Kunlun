@@ -11,7 +11,12 @@ This document describes how to install vllm-kunlun manually.
   - vLLM (same version as vllm-kunlun)
 
 ## Setup environment using container
-We provide a clean, minimal base image for your use`iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base`.You can pull it using the docker pull command.
+We provide a clean and minimal base image for your use.You can pull it using the docker pull command.
+- **Internal registry (Baidu intranet only)**  
+  `iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base`
+- **Public registry**  
+  `wjie520/vllm_kunlun:uv_base`
+
 ### Container startup script
 
 :::::{tab-set}
