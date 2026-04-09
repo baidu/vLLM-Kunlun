@@ -84,6 +84,8 @@ This plugin provides a hardware-pluggable interface that decouples the integrati
 | DeepSeek-R1 | ✅ | ✅ | | ✅ |
 | DeepSeek-V3 | ✅ | ✅ | | ✅ |
 | DeepSeek-V3.2 | ✅ | ✅ | | ✅ |
+| Kimi-K2 | ✅ | ✅ | | ✅ |
+| Minimax-M2.5 | ✅ | ✅ | | ✅ |
 
 ### Multimodal Language Models
 
@@ -97,6 +99,7 @@ This plugin provides a hardware-pluggable interface that decouples the integrati
 | InternVL-2.5 | ✅ | | | ✅ |
 | InternVL-3.5 | ✅ | | | ✅ |
 | InternS1 | ✅ | | | ✅ |
+| Kimi-K2.5 | ✅ | ✅ | | ✅ |
 
 ---
 
