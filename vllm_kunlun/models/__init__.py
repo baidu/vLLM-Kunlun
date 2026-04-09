@@ -98,6 +98,11 @@ def register_model():
         "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
     )
 
+    ModelRegistry.register_model(
+        "Qwen3_5ForConditionalGeneration",
+        "vllm_kunlun.models.qwen3_5:Qwen3_5ForConditionalGeneration",
+    )
+
 
 def register_quant_method():
     """to do"""
