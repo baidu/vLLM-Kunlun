@@ -170,22 +170,6 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 scale=routed_scaling_factor,
             )
 
-        moe_expand_numel = M * top_k * N
-        y_numel = M * top_k * layer.w13_weight.shape[1]
-        out1_numel = M * top_k * (layer.w13_weight.shape[1] // 2)
-        out_numel = M * top_k * layer.w2_weight.shape[1]
-
-        workspace_a_numel = max(moe_expand_numel, out1_numel)
-        workspace_b_numel = max(y_numel, out_numel)
-
-        workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
-            ((workspace_a_numel,), hidden_states.dtype),
-            ((workspace_b_numel,), hidden_states.dtype),
-        )
-
-        moe_expand = workspace_a[:moe_expand_numel].view(
-            M * top_k, N
-        )  # [M, top_k, N], float
         expert_m = torch.zeros(
             global_num_experts, dtype=torch.int32, device=hidden_states.device
         )  # [E]
@@ -194,7 +178,35 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )  # [E+1]
         sorted_tokens_idx = torch.zeros(
             M * top_k, dtype=torch.int32, device=hidden_states.device
+        )  # [M * top_k]
+
+        moe_expand_numel = M * top_k * N
+        y_numel = M * top_k * layer.w13_weight.shape[1]
+        out1_numel = M * top_k * (layer.w13_weight.shape[1] // 2)
+        out_numel = M * top_k * layer.w2_weight.shape[1]
+
+        # Reuse the workspace according to live ranges:
+        #   M < 1024:
+        #     workspace_a: moe_expand -> out1
+        #     workspace_b: y -> out
+        #   M >= 1024:
+        #     workspace_a: moe_expand -> out
+        #     workspace_b: y
+        workspace_a_numel = max(moe_expand_numel, out_numel)
+        workspace_b_numel = y_numel
+
+        if M < 1024:
+            workspace_a_numel = max(moe_expand_numel, out1_numel)
+            workspace_b_numel = max(y_numel, out_numel)
+
+        workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
+            ((workspace_a_numel,), hidden_states.dtype),
+            ((workspace_b_numel,), hidden_states.dtype),
         )
+
+        moe_expand = workspace_a[:moe_expand_numel].view(
+            M * top_k, N
+        )  # [M * top_k, N], float
 
         torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
@@ -208,12 +220,6 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             sorted_tokens_num_lod=sorted_tokens_num_lod,
         )
 
-        y = workspace_b[:y_numel].view(
-            M,
-            top_k,
-            layer.w13_weight.shape[1],
-        )
-
         moe_expand = moe_expand.view(M * top_k, hidden_dim)
 
         x_shape = moe_expand.shape
@@ -223,40 +229,71 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )
         torch.ops._C.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
 
-        torch.ops._C.moe_fc(
-            x=x_q,
-            x_perchannel_max=x_scale,
-            weight=layer.w13_weight,
-            w_perchannel_max=layer.w13_weight_scale,
-            sorted_tokens_num_lod=sorted_tokens_num_lod,
-            sorted_tokens_idx=sorted_tokens_idx,
-            moe_topk=top_k,
-            y=y,
-            topk_ids=topk_ids,
-            # sort_mode=False,
-            act=None,
-        )
+        y = workspace_b[:y_numel].view(M, top_k, layer.w13_weight.shape[1])
 
-        d = y.shape[-1] // 2
-        output_shape = y.shape[:-1] + (d,)
-        out1 = workspace_a[:out1_numel].view(output_shape)
-        torch.ops._C.silu_and_mul(out1, y)
+        if M < 1024:
+            torch.ops._C.moe_fc(
+                x=x_q,
+                x_perchannel_max=x_scale,
+                weight=layer.w13_weight,
+                w_perchannel_max=layer.w13_weight_scale,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+                sorted_tokens_idx=sorted_tokens_idx,
+                moe_topk=top_k,
+                y=y,
+                topk_ids=topk_ids,
+                # sort_mode=False,
+                act=None,
+            )
 
-        del y
+            d = y.shape[-1] // 2
+            # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
+            # needed.
+            out1 = workspace_a[:out1_numel].view(M, top_k, d)
+            torch.ops._C.silu_and_mul(out1, y)
+            del y
 
-        out1 = out1.reshape(-1, out1.shape[-1])
-        x_shape = out1.shape
-        x_q = torch.empty(x_shape, dtype=torch.int8, device=moe_expand.device)
-        x_scale = torch.empty(
-            (x_shape[0], 1), dtype=torch.float32, device=moe_expand.device
-        )
-        torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
-        del out1, moe_expand
-        out = workspace_b[:out_numel].view(
-            M,
-            top_k,
-            layer.w2_weight.shape[1],
-        )
+            out1 = out1.reshape(-1, out1.shape[-1])
+            x_shape = out1.shape
+            x_q = torch.empty(x_shape, dtype=torch.int8, device=out1.device)
+            x_scale = torch.empty(
+                (x_shape[0], 1), dtype=torch.float32, device=out1.device
+            )
+            torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
+            del out1, moe_expand
+
+            # Reuse `workspace_b` for `out` after `y` has been consumed by
+            # the first FC.
+            out = workspace_b[:out_numel].view(M, top_k, layer.w2_weight.shape[1])
+        else:
+            torch.ops._C.moe_fc(
+                x=x_q,
+                x_perchannel_max=x_scale,
+                weight=layer.w13_weight,
+                w_perchannel_max=layer.w13_weight_scale,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+                sorted_tokens_idx=sorted_tokens_idx,
+                moe_topk=top_k,
+                y=y,
+                topk_ids=topk_ids,
+                # sort_mode=False,
+                act="SWISH_GLU",
+            )
+            del x_q, x_scale, moe_expand
+
+            y = y[..., : y.shape[-1] // 2]
+            out1 = y.reshape(-1, y.shape[-1])
+            x_shape = out1.shape
+            x_q = torch.empty(x_shape, dtype=torch.int8, device=out1.device)
+            x_scale = torch.empty(
+                (x_shape[0], 1), dtype=torch.float32, device=out1.device
+            )
+            torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
+            del out1, y
+
+            # Reuse `workspace_a` for `out` after `moe_expand` is no longer
+            # needed.
+            out = workspace_a[:out_numel].view(M, top_k, layer.w2_weight.shape[1])
 
         torch.ops._C.moe_fc(
             x=x_q,
