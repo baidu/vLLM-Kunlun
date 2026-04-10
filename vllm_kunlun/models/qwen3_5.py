@@ -76,6 +76,10 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
+from vllm_kunlun.hf_config_compat import (
+    QWEN3_5_CONFIG_TYPES,
+    QWEN3_5_MOE_CONFIG_TYPES,
+)
 from vllm_kunlun.ops.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -105,12 +109,12 @@ logger = init_logger(__name__)
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5Config)
+        return self.ctx.get_hf_config(QWEN3_5_CONFIG_TYPES)
 
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        return self.ctx.get_hf_config(QWEN3_5_MOE_CONFIG_TYPES)
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):

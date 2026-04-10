@@ -19,7 +19,7 @@
 from typing import Optional
 
 import torch
-from vllm.model_executor.layers.quantization.kernels.scaled_mm import (
+from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassInt8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
@@ -27,7 +27,6 @@ from vllm.platforms import current_platform
 
 
 class KunlunScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
-
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None

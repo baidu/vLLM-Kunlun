@@ -71,6 +71,7 @@ docker exec "${DOCKER_NAME}" bash -lc "
   pip install \
     \"https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xtorch_ops-0.1.2209%2B6752ad20-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-05T06%3A18%3A00Z%2F-1%2Fhost%2F14936c2b7e7c557c1400e4c467c79f7a9217374a7aa4a046711ac4d948f460cd\"
 
+  # TODO: replace this transitional Triton wheel once the 0.19.0 artifact is published.
   pip install \
     \"https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl\"
 
@@ -87,14 +88,14 @@ docker exec "${DOCKER_NAME}" bash -lc "
   source \"${GITHUB_WORKSPACE}/vLLM-Kunlun/setup_env.sh\"
 
   ########################################
-  # 3. Install upstream vLLM 0.11.0
+  # 3. Install upstream vLLM 0.19.0
   ########################################
-  echo '===== Installing vLLM==0.11.0 ====='
+  echo '===== Installing vLLM==0.19.0 ====='
 
   pip uninstall -y vllm || true
   env | grep -i proxy || true
 
-  pip install vllm==0.11.0 \
+  pip install vllm==0.19.0 \
     --no-build-isolation \
     --no-deps \
     --index-url https://pip.baidu-int.com/simple/

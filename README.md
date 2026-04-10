@@ -197,7 +197,7 @@ Please use the following recommended versions to get started quickly:
 
 | Version | Release type | Doc |
 |----------|---------------|-----|
-| v0.15.1 | Latest development version | [QuickStart](https://vllm-kunlun.readthedocs.io/en/latest/quick_start.html) and [Installation](https://vllm-kunlun.readthedocs.io/en/latest/installation.html) for more details |
+| v0.19.0 | Target development version | [QuickStart](https://vllm-kunlun.readthedocs.io/en/latest/quick_start.html) and [Installation](https://vllm-kunlun.readthedocs.io/en/latest/installation.html) for more details |
 
 ---
 

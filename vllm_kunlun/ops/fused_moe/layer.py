@@ -25,6 +25,11 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
       routing internally with device-optimized kernels.
     """
 
+    def __init__(self, moe):
+        super().__init__(moe)
+        self._is_monolithic = True
+        self.apply_monolithic = self._apply_monolithic_kunlun
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -33,7 +38,7 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         """Skip _setup_kernel() since Kunlun does not need Triton kernels."""
         FusedMoEMethodBase.process_weights_after_loading(self, layer)
 
-    def apply_monolithic(
+    def _apply_monolithic_kunlun(
         self,
         layer,
         x: torch.Tensor,

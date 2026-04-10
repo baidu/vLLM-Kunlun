@@ -43,7 +43,6 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessor,
 )
 from transformers.models.whisper import WhisperFeatureExtractor
-from vllm.attention.layer import check_upstream_fa_availability
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -92,6 +91,8 @@ from vllm.multimodal.processing import (
 )
 from vllm.platforms.interface import _Backend
 from vllm.sequence import IntermediateTensors
+
+from ..attention_compat import check_upstream_fa_availability
 
 # yapf: enable
 from .qwen2_5_vl import (
