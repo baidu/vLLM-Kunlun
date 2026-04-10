@@ -203,13 +203,16 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
         workspace_c_numel = x_q_numel
 
-        workspace_a, workspace_b, workspace_c, workspace_d = (
-            current_workspace_manager().get_simultaneous(
-                ((workspace_a_numel,), hidden_states.dtype),
-                ((workspace_b_numel,), hidden_states.dtype),
-                ((workspace_c_numel,), torch.int8),
-                (x_scale_shape, torch.float32),
-            )
+        (
+            workspace_a,
+            workspace_b,
+            workspace_c,
+            workspace_d,
+        ) = current_workspace_manager().get_simultaneous(
+            ((workspace_a_numel,), hidden_states.dtype),
+            ((workspace_b_numel,), hidden_states.dtype),
+            ((workspace_c_numel,), torch.int8),
+            (x_scale_shape, torch.float32),
         )
 
         moe_expand = workspace_a[:moe_expand_numel].view(
@@ -230,7 +233,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
         moe_expand = moe_expand.view(M * top_k, hidden_dim)
 
-        x_q = workspace_c[:moe_expand.numel()].view(moe_expand.shape)
+        x_q = workspace_c[: moe_expand.numel()].view(moe_expand.shape)
         x_scale = workspace_d
         torch.ops._C.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
 
@@ -259,7 +262,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             del y
 
             out1 = out1.reshape(-1, out1.shape[-1])
-            x_q = workspace_c[:out1.numel()].view(out1.shape)
+            x_q = workspace_c[: out1.numel()].view(out1.shape)
             x_scale = workspace_d
             torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
             del out1, moe_expand
@@ -285,7 +288,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
             y = y[..., : y.shape[-1] // 2]
             out1 = y.reshape(-1, y.shape[-1])
-            x_q = workspace_c[:out1.numel()].view(out1.shape)
+            x_q = workspace_c[: out1.numel()].view(out1.shape)
             x_scale = workspace_d
             torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
             del out1, y
