@@ -184,6 +184,8 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         y_numel = M * top_k * layer.w13_weight.shape[1]
         out1_numel = M * top_k * (layer.w13_weight.shape[1] // 2)
         out_numel = M * top_k * layer.w2_weight.shape[1]
+        x_q_numel = max(moe_expand_numel, out1_numel)
+        x_scale_shape = (M * top_k, 1)
 
         # Reuse the workspace according to live ranges:
         #   M < 1024:
@@ -199,9 +201,15 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             workspace_a_numel = max(moe_expand_numel, out1_numel)
             workspace_b_numel = max(y_numel, out_numel)
 
-        workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
-            ((workspace_a_numel,), hidden_states.dtype),
-            ((workspace_b_numel,), hidden_states.dtype),
+        workspace_c_numel = x_q_numel
+
+        workspace_a, workspace_b, workspace_c, workspace_d = (
+            current_workspace_manager().get_simultaneous(
+                ((workspace_a_numel,), hidden_states.dtype),
+                ((workspace_b_numel,), hidden_states.dtype),
+                ((workspace_c_numel,), torch.int8),
+                (x_scale_shape, torch.float32),
+            )
         )
 
         moe_expand = workspace_a[:moe_expand_numel].view(
@@ -222,11 +230,8 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
         moe_expand = moe_expand.view(M * top_k, hidden_dim)
 
-        x_shape = moe_expand.shape
-        x_q = torch.empty(x_shape, dtype=torch.int8, device=moe_expand.device)
-        x_scale = torch.empty(
-            (x_shape[0], 1), dtype=torch.float32, device=moe_expand.device
-        )
+        x_q = workspace_c[:moe_expand.numel()].view(moe_expand.shape)
+        x_scale = workspace_d
         torch.ops._C.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
 
         y = workspace_b[:y_numel].view(M, top_k, layer.w13_weight.shape[1])
@@ -254,11 +259,8 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             del y
 
             out1 = out1.reshape(-1, out1.shape[-1])
-            x_shape = out1.shape
-            x_q = torch.empty(x_shape, dtype=torch.int8, device=out1.device)
-            x_scale = torch.empty(
-                (x_shape[0], 1), dtype=torch.float32, device=out1.device
-            )
+            x_q = workspace_c[:out1.numel()].view(out1.shape)
+            x_scale = workspace_d
             torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
             del out1, moe_expand
 
@@ -283,11 +285,8 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
             y = y[..., : y.shape[-1] // 2]
             out1 = y.reshape(-1, y.shape[-1])
-            x_shape = out1.shape
-            x_q = torch.empty(x_shape, dtype=torch.int8, device=out1.device)
-            x_scale = torch.empty(
-                (x_shape[0], 1), dtype=torch.float32, device=out1.device
-            )
+            x_q = workspace_c[:out1.numel()].view(out1.shape)
+            x_scale = workspace_d
             torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
             del out1, y
 
