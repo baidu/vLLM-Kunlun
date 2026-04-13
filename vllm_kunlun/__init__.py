@@ -48,21 +48,29 @@ def register():
     """Register the Kunlun platform"""
     from .utils import redirect_output
     from .vllm_utils_wrapper import direct_register_custom_op, patch_annotations_for_schema
-    
-    # Change for GLM5 and custom model configs.
+    from .compilation_attention_patch import patch_compilation_attention_ops_for_kunlun
+
+    patch_compilation_attention_ops_for_kunlun()
+
+    # GLM / XPU: 替换 HF config registry，并补齐 configs 模块上缺失的 Glm4* 类名（供 LazyConfigDict 解析）
     import vllm.transformers_utils.config as config_module
-    from .transformer_utils.config import _XPU_CONFIG_REGISTRY
+    from .transformer_utils.config import (
+        _XPU_CONFIG_REGISTRY,
+        patch_transformers_utils_configs_for_glm4,
+    )
+
+    patch_transformers_utils_configs_for_glm4()
     config_module._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
 
     import vllm.transformers_utils.configs as configs_module
     from .transformer_utils.kimi_k25 import KimiK25Config, KimiK25VisionConfig
     setattr(configs_module, "KimiK25Config", KimiK25Config)
     setattr(configs_module, "KimiK25VisionConfig", KimiK25VisionConfig)
-    
+
     import vllm.config.model as model_module
     from .config.model import is_deepseek_mla
     model_module.ModelConfig.is_deepseek_mla = property(is_deepseek_mla)
-    
+
     import_hook()
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
 
