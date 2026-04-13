@@ -9,6 +9,7 @@ Tool parser registration module for vLLM Kunlun.
 TOOL_PARSERS = {
     "minimax_m2": (".minimax_m2_tool_parser", "MinimaxM2ToolParser"),
     "glm47": (".glm47_moe_tool_parser", "Glm47MoeModelToolParser"),
+    "kimi_k2": (".kimi_k2_tool_parser", "KimiK2ToolParser"),
 }
 
 
