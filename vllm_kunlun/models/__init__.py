@@ -122,6 +122,30 @@ def register_model():
     )
 
     ModelRegistry.register_model(
+        "GlmForCausalLM", "vllm_kunlun.models.glm:GlmForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "Glm4ForCausalLM", "vllm_kunlun.models.glm4:Glm4ForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "Glm4MoeForCausalLM", "vllm_kunlun.models.glm4_moe:Glm4MoeForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "Glm4MoeMTPModel", "vllm_kunlun.models.glm4_moe_mtp:Glm4MoeMTP"
+    )
+
+    ModelRegistry.register_model(
+        "Glm4MoeLiteForCausalLM", "vllm_kunlun.models.glm4_moe_lite:Glm4MoeLiteForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "Glm4MoeLiteMTPModel", "vllm_kunlun.models.glm4_moe_lite_mtp:Glm4MoeLiteMTP"
+    )
+
+    ModelRegistry.register_model(
         "MiniMaxM2ForCausalLM", "vllm_kunlun.models.minimax_m2:MiniMaxM2ForCausalLM"
     )
 
