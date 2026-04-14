@@ -14,6 +14,8 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 #
+import copy
+import inspect
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import (
@@ -31,7 +33,9 @@ from typing import (
 import kunlun_ops
 import numpy as np
 import torch
+
 from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -41,20 +45,18 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_kunlun.ops.paged_attn import PagedAttention, PagedAttentionMetadata
+from vllm_kunlun.ops.paged_attn import (
+    PagedAttention,
+    PagedAttentionMetadata,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
-
-import inspect
-
-from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
-from vllm.v1.kv_cache_interface import AttentionSpec
-
 
 class KunlunAttentionBackend(AttentionBackend):
     """KunlunAttentionBackend"""
@@ -676,6 +678,17 @@ class KunlunAttentionMetadataBuilder:
         # Full CUDA Graph always supported (FA2 support checked separately)
         return True
 
+    def update_block_table(
+        self,
+        metadata: KunlunMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> KunlunMetadata:
+        new_metadata = copy.copy(metadata)
+        new_metadata.block_tables = blk_table
+        new_metadata.slot_mapping = slot_mapping
+        return new_metadata
+        
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         """use_cascade_attention"""
         return use_cascade_attention(*args, **kwargs)
