@@ -109,10 +109,10 @@ python vllm_kunlun/patches/patch_torch251.py
 uv pip install "https://baidu-kunlun-customer.su.bcebos.com/aiak/mimo/20260227/kunlun_ops-0.1.58+ee39020a-cp310-cp310-linux_x86_64.whl"
 
 # Install xspeedgate_ops
-uv pip install "http://vllm-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20260228_173659/xspeedgate_ops-1.0.0+04b2a8c-cp310-cp310-linux_x86_64.whl"
+uv pip install "https://vllm-ai-models.bj.bcebos.com/aiak_share/20260403/xspeedgate_ops-1.1.0+53992ca-cp310-cp310-linux_x86_64.whl"
 
 # Install cocopod
-uv pip install "https://vllm-ai-models.bj.bcebos.com/link/20260228_163304/cocopod-1.0.0-cp310-cp310-linux_x86_64.whl"
+uv pip install "https://vllm-ai-models.bj.bcebos.com/aiak_share/20260403/cocopod-1.1.0-cp310-cp310-linux_x86_64.whl"
 ```
 
 ## Quick Start
