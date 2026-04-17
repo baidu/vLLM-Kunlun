@@ -13,7 +13,10 @@ ROOT_DIR = os.path.dirname(__file__)
 ext_modules = [
     CppExtension(
         name="vllm_kunlun._kunlun",
-        sources=["vllm_kunlun/csrc/utils.cpp"],
+        sources=[
+            "vllm_kunlun/csrc/utils.cpp",
+            "vllm_kunlun/csrc/eagle_prepare_next_token_ids.cpp",
+        ],
         include_dirs=[
             "vllm_kunlun/csrc",
             "/usr/local/cuda/include",
@@ -30,8 +33,9 @@ class CustomBuildExt(BuildExtension):
         for ext in self.extensions:
             ext_path = self.get_ext_fullpath(ext.name)
             file_name = os.path.basename(ext_path)
-            target_path = os.path.join("vllm_kunlun", file_name)
+            target_path = os.path.join(ROOT_DIR, "vllm_kunlun", file_name)
 
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
             if os.path.exists(target_path):
                 os.remove(target_path)
             shutil.copyfile(ext_path, target_path)
