@@ -35,6 +35,11 @@ vllm serve Qwen3-8B-Instruct
 
 Below is a more detailed online example with additional configuration options.
 
+KunlunGraph selects the required attention split operators automatically. Avoid
+passing `compilation_config.splitting_ops` unless you are debugging graph
+partitioning. If you do pass it, use the `vllm::op_name` format and include all
+attention split operators required by vLLM piecewise cudagraphs.
+
 Online example:
 
 ```shell
@@ -74,5 +79,5 @@ python -m vllm.entrypoints.openai.api_server \
       --no-enable-chunked-prefill \
       --distributed-executor-backend mp \
       --served-model-name Qwen3-8B-Instruct \
-      --enforce_eager
+      --enforce-eager
 ```

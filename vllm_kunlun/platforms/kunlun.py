@@ -18,6 +18,58 @@ else:
 
 logger = init_logger(__name__)
 
+_KUNLUN_ATTENTION_SPLIT_OP = "vllm::unified_attention_with_output_kunlun"
+
+
+def _normalize_splitting_op(op_name: str) -> str:
+    if op_name.startswith("vllm.") and "::" not in op_name:
+        return f"vllm::{op_name.removeprefix('vllm.')}"
+    return op_name
+
+
+def _dedupe_splitting_ops(splitting_ops: list[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for op_name in splitting_ops:
+        if op_name not in seen:
+            deduped.append(op_name)
+            seen.add(op_name)
+    return deduped
+
+
+def _ensure_kunlun_piecewise_splitting_ops(compilation_config) -> None:
+    from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+
+    if compilation_config.mode != CompilationMode.VLLM_COMPILE:
+        return
+
+    cudagraph_mode = compilation_config.cudagraph_mode
+    if (
+        cudagraph_mode == CUDAGraphMode.NONE
+        or not cudagraph_mode.requires_piecewise_compilation()
+    ):
+        return
+
+    if not compilation_config.splitting_ops:
+        return
+
+    splitting_ops = [
+        _normalize_splitting_op(op_name) for op_name in compilation_config.splitting_ops
+    ]
+    known_attention_ops = set(CompilationConfig._attention_ops)
+    has_attention_op = any(
+        op_name in known_attention_ops or op_name == _KUNLUN_ATTENTION_SPLIT_OP
+        for op_name in splitting_ops
+    )
+    if not has_attention_op:
+        return
+
+    compilation_config.splitting_ops = _dedupe_splitting_ops(
+        splitting_ops
+        + [_KUNLUN_ATTENTION_SPLIT_OP]
+        + list(CompilationConfig._attention_ops)
+    )
+
 
 class KunlunPlatform(Platform):
     """KunlunPlatform"""
@@ -240,6 +292,7 @@ class KunlunPlatform(Platform):
             vllm_config.compilation_config.backend = "eager"
         # v0.15.1: set backend="eager" to avoid inductor/Triton
         if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            _ensure_kunlun_piecewise_splitting_ops(vllm_config.compilation_config)
             vllm_config.compilation_config.custom_ops = ["all"]
             vllm_config.compilation_config.pass_config.enable_fusion = False
             vllm_config.compilation_config.backend = "eager"
