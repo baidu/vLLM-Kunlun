@@ -20,7 +20,23 @@ We will support the kunlun4 M100 platform in early 2026.
 
 ### 2. How to get our docker containers?
 
-**base**:`docker pull wjie520/vllm_kunlun:v0.0.1`.
+Use the public Docker Hub image:
+
+```bash
+docker pull wjie520/vllm_kunlun:uv_base
+```
+
+To check whether the tag exists before downloading the full image, run:
+
+```bash
+docker manifest inspect wjie520/vllm_kunlun:uv_base >/dev/null
+```
+
+If the manifest check succeeds but `docker pull` times out, the tag exists and
+the failure is usually caused by Docker Hub connectivity, proxy, or registry
+mirror configuration. If the manifest check also times out, configure your
+Docker network access first and retry the check. The internal registry image
+listed in the installation guide is only available from the Baidu intranet.
 
 ### 3. How vllm-kunlun work with vLLM?
 
