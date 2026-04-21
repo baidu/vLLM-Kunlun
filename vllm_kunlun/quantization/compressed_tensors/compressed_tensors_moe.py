@@ -169,30 +169,42 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 scale=routed_scaling_factor,
             )
 
-        moe_expand = torch.empty(
-            (M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
-        )  # [M, top_k, N], float
-        expert_m = torch.zeros(
-            global_num_experts, dtype=torch.int32, device=hidden_states.device
-        )  # [E]
-        sorted_tokens_num_lod = torch.zeros(
-            global_num_experts + 1, dtype=torch.int32, device=hidden_states.device
-        )  # [E+1]
-        sorted_tokens_idx = torch.zeros(
-            M * top_k, dtype=torch.int32, device=hidden_states.device
-        )
+        if M * top_k > 768:
+            moe_expand = torch.empty(
+                (M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
+            )  # [M, top_k, N], float
+            expert_m = torch.zeros(
+                global_num_experts, dtype=torch.int32, device=hidden_states.device
+            )  # [E]
+            sorted_tokens_num_lod = torch.zeros(
+                global_num_experts + 1, dtype=torch.int32, device=hidden_states.device
+            )  # [E+1]
+            sorted_tokens_idx = torch.zeros(
+                M * top_k, dtype=torch.int32, device=hidden_states.device
+            )
 
-        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+            torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
-        torch.ops._C.moe_pre_sorted(
-            x=hidden_states,
-            topk_index=topk_ids,
-            block_statistic=block_statistic,
-            moe_expand=moe_expand,
-            moe_index=sorted_tokens_idx,
-            expert_m=expert_m,
-            sorted_tokens_num_lod=sorted_tokens_num_lod,
-        )
+            torch.ops._C.moe_pre_sorted(
+                x=hidden_states,
+                topk_index=topk_ids,
+                block_statistic=block_statistic,
+                moe_expand=moe_expand,
+                moe_index=sorted_tokens_idx,
+                expert_m=expert_m,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+            )
+            del expert_m
+        else:
+            sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
+                torch.ops.xspeedgate_ops.moe_pre_small(
+                    topk_ids,
+                    global_num_experts,
+                    index_have_neg=False,
+                    sort_mode=True,
+                    x=hidden_states,
+                )
+            )
 
         y = torch.empty(
             M,
@@ -261,7 +273,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             # sort_mode=False,
             act=None,
         )
-        del x_q, x_scale, sorted_tokens_num_lod, expert_m
+        del x_q, x_scale, sorted_tokens_num_lod
 
         dequant_scale = torch.ones([M, top_k], dtype=torch.float32, device=out.device)
         output = torch.empty(
