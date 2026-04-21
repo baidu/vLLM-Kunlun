@@ -53,21 +53,25 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ::::
 :::::
 ## Install vLLM-kunlun
-### Install vLLM 0.15.1
+### Install vLLM
 
-```
-uv pip install vllm==0.15.1 --no-build-isolation --no-deps
+```{code-block} bash
+:substitutions:
+
+uv pip install vllm==|pip_vllm_version| --no-build-isolation --no-deps
 ```
 
 ### Build and Install
 Navigate to the vllm-kunlun directory and build the package:
 
-```
+```{code-block} bash
+:substitutions:
+
 git clone https://github.com/baidu/vLLM-Kunlun
 
 cd vLLM-Kunlun
 
-git checkout v0.15.1-dev
+git checkout |vllm_kunlun_version|
 
 uv pip install -r requirements.txt
 

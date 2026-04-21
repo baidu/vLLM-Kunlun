@@ -69,7 +69,7 @@ myst_substitutions = {
     # the branch of vllm-kunlun, used in vllm-kunlun clone and image tag
     # - main branch: 'main'
     # - vX.Y.Z branch: latest vllm-kunlun release tag
-    "vllm_kunlun_version": "v0.15.1",
+    "vllm_kunlun_version": "main",
     # the newest release version of vllm-kunlun and matched vLLM, used in pip install.
     # This value should be updated when cut down release.
     "pip_vllm_kunlun_version": "0.15.1",
@@ -116,7 +116,7 @@ html_logo = "logos/vllm-kunlun-logo-text-light.png"
 html_theme_options = {
     "path_to_docs": "docs/source",
     "repository_url": "https://github.com/baidu/vLLM-Kunlun",
-    "repository_branch": "v0.15.1-dev",
+    "repository_branch": "main",
     "use_repository_button": True,
     "use_edit_page_button": True,
 }
