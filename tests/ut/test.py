@@ -48,6 +48,30 @@ def test_qwen3_vl_text_config_inherits_top_level_tie_word_embeddings():
     assert text_config.tie_word_embeddings is False
 
 
+def test_qwen3_vl_text_config_inherits_from_string_architecture():
+    text_config = SimpleNamespace()
+    hf_config = SimpleNamespace(
+        architectures="Qwen3VLForConditionalGeneration",
+        text_config=text_config,
+        tie_word_embeddings=True,
+    )
+
+    _check_platform_config(_make_platform_config(hf_config))
+
+    assert text_config.tie_word_embeddings is True
+
+
+def test_qwen3_vl_config_type_is_detected_without_architectures():
+    text_config = SimpleNamespace()
+    hf_config = type("Qwen3VLConfig", (), {})()
+    hf_config.text_config = text_config
+    hf_config.tie_word_embeddings = False
+
+    _check_platform_config(_make_platform_config(hf_config))
+
+    assert text_config.tie_word_embeddings is False
+
+
 def test_qwen3_vl_text_config_existing_tie_word_embeddings_is_preserved():
     text_config = SimpleNamespace(tie_word_embeddings=True)
     hf_config = SimpleNamespace(
@@ -67,6 +91,18 @@ def test_non_qwen3_vl_text_config_is_not_modified():
         architectures=["Qwen3ForCausalLM"],
         text_config=text_config,
         tie_word_embeddings=False,
+    )
+
+    _check_platform_config(_make_platform_config(hf_config))
+
+    assert not hasattr(text_config, "tie_word_embeddings")
+
+
+def test_qwen3_vl_text_config_without_top_level_tie_word_embeddings_is_not_modified():
+    text_config = SimpleNamespace()
+    hf_config = SimpleNamespace(
+        architectures=["Qwen3VLForConditionalGeneration"],
+        text_config=text_config,
     )
 
     _check_platform_config(_make_platform_config(hf_config))

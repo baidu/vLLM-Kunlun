@@ -40,7 +40,10 @@ def _patch_qwen3_vl_text_config(hf_config) -> None:
     if text_config is None or hasattr(text_config, "tie_word_embeddings"):
         return
 
-    text_config.tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
+    if not hasattr(hf_config, "tie_word_embeddings"):
+        return
+
+    text_config.tie_word_embeddings = hf_config.tie_word_embeddings
 
 
 class KunlunPlatform(Platform):
