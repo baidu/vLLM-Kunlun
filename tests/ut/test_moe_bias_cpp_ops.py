@@ -23,6 +23,7 @@ import sys
 import types
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import vllm_kunlun._kunlun  # noqa: F401
@@ -173,6 +174,73 @@ def test_moe_bias_fused_respects_ep_rank_global_ids():
         None,
     )
     torch.testing.assert_close(result, expected)
+
+
+def test_moe_bias_fused_rejects_mismatched_token_dimensions():
+    hidden_states = torch.randn(2, 3)
+    w1 = torch.randn(2, 4, 3)
+    w2 = torch.randn(2, 3, 2)
+    topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    normed_score = torch.tensor([[0.7, 0.3], [0.1, 0.9]], dtype=hidden_states.dtype)
+
+    with pytest.raises(
+        RuntimeError,
+        match="topk_ids.size\\(0\\) must equal hidden_states.size\\(0\\)",
+    ):
+        torch.ops._C.moe_bias_fused(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            normed_score,
+            0,
+            None,
+            None,
+        )
+
+
+def test_moe_bias_fused_rejects_incompatible_expert_shapes():
+    hidden_states = torch.randn(2, 3)
+    w1 = torch.randn(2, 6, 3)
+    w2 = torch.randn(3, 3, 3)
+    topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    normed_score = torch.tensor([[0.7, 0.3], [0.1, 0.9]], dtype=hidden_states.dtype)
+
+    with pytest.raises(RuntimeError, match="w2.size\\(0\\) must equal w1.size\\(0\\)"):
+        torch.ops._C.moe_bias_fused(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            normed_score,
+            0,
+            None,
+            None,
+        )
+
+
+def test_moe_bias_fused_rejects_incompatible_bias_shapes():
+    hidden_states = torch.randn(2, 3)
+    w1 = torch.randn(2, 4, 3)
+    w2 = torch.randn(2, 3, 2)
+    topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    normed_score = torch.tensor([[0.7, 0.3], [0.1, 0.9]], dtype=hidden_states.dtype)
+    w1_bias = torch.randn(2, 3)
+    w2_bias = torch.randn(2, 4)
+
+    with pytest.raises(
+        RuntimeError, match="w1_bias.size\\(1\\) must equal w1.size\\(1\\)"
+    ):
+        torch.ops._C.moe_bias_fused(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            normed_score,
+            0,
+            w1_bias,
+            w2_bias,
+        )
 
 
 def test_kunlun_fused_moe_uses_cpp_bias_fast_path():

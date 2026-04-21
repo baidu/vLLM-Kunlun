@@ -47,11 +47,106 @@ torch::Tensor moe_bias_fused(
     TORCH_CHECK(w2.dim() == 3, "w2 must be 3D");
     TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D");
     TORCH_CHECK(normed_score.dim() == 2, "normed_score must be 2D");
+    TORCH_CHECK(
+        w1.device() == hidden_states.device(),
+        "w1 must be on the same device as hidden_states");
+    TORCH_CHECK(
+        w2.device() == hidden_states.device(),
+        "w2 must be on the same device as hidden_states");
+    TORCH_CHECK(
+        topk_ids.device() == hidden_states.device(),
+        "topk_ids must be on the same device as hidden_states");
+    TORCH_CHECK(
+        normed_score.device() == hidden_states.device(),
+        "normed_score must be on the same device as hidden_states");
 
     const auto global_num_experts = w1.size(0);
     const auto moe_top_k = topk_ids.size(1);
     const auto hidden_dim = hidden_states.size(1);
     const auto num_tokens = hidden_states.size(0);
+    TORCH_CHECK(
+        w2.size(0) == global_num_experts,
+        "w2.size(0) must equal w1.size(0), but got ",
+        w2.size(0),
+        " and ",
+        global_num_experts);
+    TORCH_CHECK(
+        topk_ids.size(0) == num_tokens,
+        "topk_ids.size(0) must equal hidden_states.size(0), but got ",
+        topk_ids.size(0),
+        " and ",
+        num_tokens);
+    TORCH_CHECK(
+        normed_score.size(0) == num_tokens,
+        "normed_score.size(0) must equal hidden_states.size(0), but got ",
+        normed_score.size(0),
+        " and ",
+        num_tokens);
+    TORCH_CHECK(
+        normed_score.size(1) == moe_top_k,
+        "normed_score.size(1) must equal topk_ids.size(1), but got ",
+        normed_score.size(1),
+        " and ",
+        moe_top_k);
+    TORCH_CHECK(
+        w1.size(2) == hidden_dim,
+        "w1.size(2) must equal hidden_states.size(1), but got ",
+        w1.size(2),
+        " and ",
+        hidden_dim);
+    TORCH_CHECK(
+        w2.size(1) == hidden_dim,
+        "w2.size(1) must equal hidden_states.size(1), but got ",
+        w2.size(1),
+        " and ",
+        hidden_dim);
+    TORCH_CHECK(
+        w1.size(1) % 2 == 0,
+        "w1.size(1) must be even for SwiGLU split, but got ",
+        w1.size(1));
+    TORCH_CHECK(
+        w1.size(1) / 2 == w2.size(2),
+        "w1.size(1) / 2 must equal w2.size(2), but got ",
+        w1.size(1) / 2,
+        " and ",
+        w2.size(2));
+
+    if (w1_bias.has_value() && w1_bias->defined()) {
+        TORCH_CHECK(w1_bias->dim() == 2, "w1_bias must be 2D");
+        TORCH_CHECK(
+            w1_bias->device() == hidden_states.device(),
+            "w1_bias must be on the same device as hidden_states");
+        TORCH_CHECK(
+            w1_bias->size(0) == global_num_experts,
+            "w1_bias.size(0) must equal w1.size(0), but got ",
+            w1_bias->size(0),
+            " and ",
+            global_num_experts);
+        TORCH_CHECK(
+            w1_bias->size(1) == w1.size(1),
+            "w1_bias.size(1) must equal w1.size(1), but got ",
+            w1_bias->size(1),
+            " and ",
+            w1.size(1));
+    }
+    if (w2_bias.has_value() && w2_bias->defined()) {
+        TORCH_CHECK(w2_bias->dim() == 2, "w2_bias must be 2D");
+        TORCH_CHECK(
+            w2_bias->device() == hidden_states.device(),
+            "w2_bias must be on the same device as hidden_states");
+        TORCH_CHECK(
+            w2_bias->size(0) == global_num_experts,
+            "w2_bias.size(0) must equal w2.size(0), but got ",
+            w2_bias->size(0),
+            " and ",
+            global_num_experts);
+        TORCH_CHECK(
+            w2_bias->size(1) == hidden_dim,
+            "w2_bias.size(1) must equal hidden_states.size(1), but got ",
+            w2_bias->size(1),
+            " and ",
+            hidden_dim);
+    }
 
     auto repeated_hidden = hidden_states.repeat_interleave(moe_top_k, 0);
     auto topk_ids_flat = topk_ids.reshape({-1});
