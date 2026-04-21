@@ -105,8 +105,14 @@ class TorchCompileWithNoGuardsWrapper:
             return ctx.result
         return callable_fn(*args, **kwargs)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        compile_prefix: str = "",
+        is_encoder: bool = False,
+    ) -> None:
         self.compiled = False
+        self._compile_prefix = compile_prefix
+        self._is_encoder = is_encoder
 
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
@@ -117,7 +123,14 @@ class TorchCompileWithNoGuardsWrapper:
         if mode is None:
             raise RuntimeError("Compilation mode cannot be NO_COMPILATION")
 
-        backend = vllm_config.compilation_config.init_backend(vllm_config)
+        try:
+            backend = vllm_config.compilation_config.init_backend(
+                vllm_config,
+                prefix=compile_prefix,
+                is_encoder=is_encoder,
+            )
+        except TypeError:
+            backend = vllm_config.compilation_config.init_backend(vllm_config)
 
         # options is only safe to populate when backend is a plain string
         # (e.g. "inductor"). On PyTorch 2.5, passing a non-empty options dict
@@ -224,11 +237,12 @@ class TorchCompileWithNoGuardsWrapper:
                         self.forward, *args, **kwargs
                     )
         else:
-            ctx = (
-                nullcontext()
-                if self.first_compile or not self.evaluate_guards
-                else torch.compiler.set_stance("fail_on_recompile")
-            )
+            if self.first_compile or not self.evaluate_guards:
+                ctx = nullcontext()
+            elif hasattr(torch.compiler, "set_stance"):
+                ctx = torch.compiler.set_stance("fail_on_recompile")
+            else:
+                ctx = nullcontext()
             self.first_compile = False
             with _compilation_context(), ctx:
                 return self._call_with_optional_nvtx_range(
@@ -305,3 +319,52 @@ class TorchCompileWithNoGuardsWrapper:
             yield
         finally:
             self.__class__.forward.__code__ = original
+
+
+def reset_compile_wrapper(model: torch.nn.Module) -> None:
+    """
+    Reset compiled wrapper state so elastic EP can rebuild with new settings.
+    """
+    if not isinstance(model, TorchCompileWithNoGuardsWrapper) and hasattr(
+        model, "model"
+    ):
+        model = model.model
+    if not isinstance(model, TorchCompileWithNoGuardsWrapper):
+        return
+    if hasattr(model, "do_not_compile") and model.do_not_compile:
+        return
+
+    from vllm.compilation.counter import compilation_counter
+
+    compilation_counter.num_models_seen = 0
+    compilation_counter.num_graphs_seen = 0
+    compilation_counter.num_piecewise_graphs_seen = 0
+    compilation_counter.num_piecewise_capturable_graphs_seen = 0
+    compilation_counter.num_backend_compilations = 0
+    compilation_counter.num_gpu_runner_capture_triggers = 0
+    compilation_counter.num_cudagraph_captured = 0
+    compilation_counter.num_inductor_compiles = 0
+    compilation_counter.num_eager_compiles = 0
+    compilation_counter.num_cache_entries_updated = 0
+    compilation_counter.num_compiled_artifacts_saved = 0
+    compilation_counter.stock_torch_compile_count = 0
+    compilation_counter.num_aot_compiles = 0
+    compilation_counter.num_aot_artifacts_saved = 0
+    compilation_counter.num_aot_artifacts_loaded = 0
+
+    if hasattr(model, "aot_compiled_fn"):
+        model.aot_compiled_fn = None
+    if hasattr(model, "was_aot_compile_fn_loaded_from_disk"):
+        model.was_aot_compile_fn_loaded_from_disk = False
+
+    compilation_config = model.vllm_config.compilation_config
+    compilation_config.cache_dir = ""
+    if hasattr(compilation_config, "local_cache_dir"):
+        compilation_config.local_cache_dir = ""
+
+    model.__class__.forward.__code__ = model.original_code_object()
+    TorchCompileWithNoGuardsWrapper.__init__(
+        model,
+        compile_prefix=getattr(model, "_compile_prefix", ""),
+        is_encoder=getattr(model, "_is_encoder", False),
+    )

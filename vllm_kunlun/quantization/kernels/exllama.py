@@ -19,13 +19,59 @@
 from typing import Optional
 
 import torch
-from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
-    _POSSIBLE_KERNELS,
+from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
+from vllm.model_executor.kernels.linear.mixed_precision import MPLinearLayerConfig
+from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
+from vllm.platforms import PlatformEnum, current_platform
 
 
 class KunlunExllamaLinearKernel(ExllamaLinearKernel):
+    @classmethod
+    def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if not current_platform.is_out_of_tree():
+            return super().can_implement(c)
+
+        if c.has_g_idx and c.partition_weight_shape[0] != c.full_weight_shape[0]:
+            return (
+                False,
+                "Act reordering currently not supported by Exllama, "
+                "when the input features are partitioned across devices",
+            )
+
+        if c.partition_weight_shape[1] % (32 // c.weight_type.size_bits) != 0:
+            return (
+                False,
+                "Output features must be a multiple of the pack factor "
+                "(32 / num_bits) so that we can correctly pack the zero points",
+            )
+
+        if c.act_type != torch.float16:
+            return False, "Exllama only supports float16 activations"
+
+        if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
+            return (
+                False,
+                f"Quant type ({c.weight_type}) not supported by Exllama, "
+                f"supported types are: {cls.SUPPORTED_QUANT_TYPES}",
+            )
+
+        if c.group_size <= 0:
+            return (
+                False,
+                f"Group size ({c.group_size}) must be positive, "
+                "Exllama does not support channelwise quantization",
+            )
+
+        if c.full_weight_shape[0] % c.group_size != 0:
+            return (
+                False,
+                f"Group size ({c.group_size}) does not evenly divide the number "
+                f"of input features ({c.full_weight_shape[0]})",
+            )
+
+        return True, None
 
     def apply_weights(
         self,
@@ -51,6 +97,11 @@ class KunlunExllamaLinearKernel(ExllamaLinearKernel):
         return output.reshape(out_shape)
 
 
-# remove ExllamaLinearKernel and add KunlunExllamaLinearKernel
-_POSSIBLE_KERNELS.remove(ExllamaLinearKernel)
-_POSSIBLE_KERNELS.append(KunlunExllamaLinearKernel)
+_POSSIBLE_KERNELS.setdefault(PlatformEnum.OOT, [])
+_POSSIBLE_KERNELS[PlatformEnum.OOT] = [
+    kernel
+    for kernel in _POSSIBLE_KERNELS[PlatformEnum.OOT]
+    if kernel is not ExllamaLinearKernel
+]
+if KunlunExllamaLinearKernel not in _POSSIBLE_KERNELS[PlatformEnum.OOT]:
+    _POSSIBLE_KERNELS[PlatformEnum.OOT].append(KunlunExllamaLinearKernel)

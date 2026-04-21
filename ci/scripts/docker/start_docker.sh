@@ -76,7 +76,6 @@ docker run \
   --name="${DOCKER_NAME}" \
   -v /home:/home \
   -v "${WORKSPACE_MOUNT}" \
-  -v /ssd2:/ssd2 \
   -v /ssd1:/ssd1 \
   -v /ssd3:/ssd3 \
   -v /dev/shm:/dev/shm \

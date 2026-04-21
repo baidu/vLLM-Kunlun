@@ -1,5 +1,6 @@
 """kunlun"""
 
+import importlib
 from typing import TYPE_CHECKING, Optional
 
 import psutil
@@ -17,6 +18,21 @@ else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+
+def _resolve_backend_or_fallback(primary_backend: str, fallback_backend: str) -> str:
+    try:
+        importlib.import_module(primary_backend.rsplit(".", 1)[0])
+        return primary_backend
+    except Exception as exc:
+        logger.warning(
+            "Failed to import Kunlun attention backend %s; falling back to %s. "
+            "Original error: %s",
+            primary_backend,
+            fallback_backend,
+            exc,
+        )
+        return fallback_backend
 
 
 class KunlunPlatform(Platform):
@@ -145,6 +161,11 @@ class KunlunPlatform(Platform):
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        """Return the hardware compute-unit count exposed through torch.cuda."""
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """
         TODO Update here for v0.15.1
@@ -221,7 +242,8 @@ class KunlunPlatform(Platform):
         from vllm.config import CUDAGraphMode
 
         if (
-            envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
+            getattr(parallel_config, "all2all_backend", None)
+            == "deepep_high_throughput"
             and parallel_config.data_parallel_size > 1
             and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
@@ -249,6 +271,7 @@ class KunlunPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """
             Returns the class of attention backend based on the selected backend and other parameters.
@@ -265,6 +288,7 @@ class KunlunPlatform(Platform):
         Returns:
             str: Class name of the attention backend.
         """
+        del selected_backend, num_heads
         if attn_selector_config.use_mla:
             if attn_selector_config.use_sparse:
                 logger.info_once("Using Sparse MLA backend on V1 engine.")
@@ -274,8 +298,10 @@ class KunlunPlatform(Platform):
                 )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
         elif not attn_selector_config.use_mla:
-            return (
-                "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
+            return _resolve_backend_or_fallback(
+                "vllm_kunlun.v1.attention.backends.kunlun_attn."
+                "KunlunAttentionBackend",
+                "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend",
             )
         else:
             return (
@@ -382,9 +408,17 @@ class KunlunPlatform(Platform):
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:
         from vllm_kunlun.quantization.awq import KunlunAWQConfig  # noqa
-        from vllm_kunlun.quantization.compressed_tensors import (  # noqa
-            KunlunCompressedTensorsConfig,
-        )
         from vllm_kunlun.quantization.gptq import KunlunGPTQConfig  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_INT8_KERNELS  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_KERNELS  # noqa
+
+        try:
+            from vllm_kunlun.quantization.compressed_tensors import (  # noqa: F401
+                KunlunCompressedTensorsConfig,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping compressed-tensors quantization registration during "
+                "platform pre-registration: %s",
+                exc,
+            )

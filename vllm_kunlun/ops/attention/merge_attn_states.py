@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
 from typing import Optional
 
-import kunlun_ops
 import torch
+
+
+def _get_kunlun_ops():
+    return importlib.import_module("kunlun_ops")
 
 
 def merge_attn_states(
@@ -14,7 +18,6 @@ def merge_attn_states(
     suffix_lse: torch.Tensor,
     output_lse: Optional[torch.Tensor] = None,
 ) -> None:
-
-    return kunlun_ops.attention_merge_stage(
+    return _get_kunlun_ops().attention_merge_stage(
         prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
     )

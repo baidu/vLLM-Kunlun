@@ -21,26 +21,296 @@ from typing import Optional
 
 import cocopod  # noqa
 import torch
+import torch.nn.functional as F
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+kunlun_ops = None
 try:
-    import kunlun_ops
+    import kunlun_ops as _kunlun_ops
 
+    kunlun_ops = _kunlun_ops
     logger.info("Load custom ops library success!")
-except ImportError as e:
-    logger.warning("Import error msg: %s", e.msg)
+except (ImportError, OSError) as e:
+    logger.warning("Import error msg: %s", e)
 
 
 _per_token_smooth_quant = True
+_logged_native_moe_fallback = False
 
 
 def is_per_token_smooth_quant():
     """is per token smooth quant"""
     return _per_token_smooth_quant
+
+
+def _torch_op_exists(namespace: str, op_name: str) -> bool:
+    try:
+        getattr(getattr(torch.ops, namespace), op_name)
+        return True
+    except AttributeError:
+        return False
+
+
+def _grouped_topk_native(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    scoring_func: str,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scoring_func == "softmax":
+        scores = torch.softmax(gating_output.float(), dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = gating_output.float().sigmoid()
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    num_tokens = scores.shape[0]
+    if e_score_correction_bias is not None:
+        original_scores = scores
+        scores = scores + e_score_correction_bias.unsqueeze(0)
+        group_scores = (
+            scores.view(num_tokens, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+        )
+    else:
+        group_scores = scores.view(num_tokens, num_expert_group, -1).max(dim=-1).values
+
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_expert_group, scores.shape[-1] // num_expert_group)
+        .reshape(num_tokens, -1)
+    )
+    masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+
+    if e_score_correction_bias is not None:
+        topk_ids = torch.topk(masked_scores, k=topk, dim=-1, sorted=False)[1]
+        topk_weights = original_scores.gather(1, topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(masked_scores, k=topk, dim=-1, sorted=False)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(topk_weights.dtype).eps
+        )
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _select_experts_native(
+    router_logits: torch.Tensor,
+    moe_top_k: int,
+    renormalize: bool,
+    use_grouped_topk: bool,
+    num_expert_group: int | None,
+    topk_group: int | None,
+    scoring_func: str,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    router_logits = router_logits.float()
+
+    if use_grouped_topk:
+        if num_expert_group is None or topk_group is None:
+            raise ValueError("Grouped top-k requires expert-group metadata.")
+        return _grouped_topk_native(
+            gating_output=router_logits,
+            topk=moe_top_k,
+            renormalize=renormalize,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+    if scoring_func == "softmax":
+        topk_logits, topk_ids = torch.topk(
+            router_logits, k=moe_top_k, dim=-1, sorted=False
+        )
+        if renormalize:
+            topk_weights = torch.softmax(topk_logits, dim=-1)
+        else:
+            log_z = torch.logsumexp(router_logits, dim=-1, keepdim=True)
+            topk_weights = (topk_logits - log_z).exp()
+    elif scoring_func == "sigmoid":
+        scores = router_logits.sigmoid()
+        topk_weights, topk_ids = torch.topk(scores, k=moe_top_k, dim=-1, sorted=False)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(torch.finfo(topk_weights.dtype).eps)
+    else:
+        raise ValueError(f"Unsupported scoring function: {scoring_func}")
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _swiglu_native(x: torch.Tensor) -> torch.Tensor:
+    half = x.shape[-1] // 2
+    return F.silu(x[..., :half]) * x[..., half:]
+
+
+def _iter_local_moe_routes_cpu(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_top_k: int,
+    num_local_experts: int,
+    ep_rank: int,
+):
+    flat_topk_ids_cpu = topk_ids.reshape(-1).to(device="cpu", dtype=torch.int64)
+    flat_topk_weights_cpu = topk_weights.reshape(-1).to(
+        device="cpu", dtype=torch.float32
+    )
+
+    expert_id_offset = ep_rank * num_local_experts
+    if (
+        ep_rank != 0
+        and flat_topk_ids_cpu.numel() > 0
+        and int(flat_topk_ids_cpu.max().item()) < num_local_experts
+    ):
+        expert_id_offset = 0
+
+    local_expert_ids_cpu = flat_topk_ids_cpu - expert_id_offset
+    valid_mask = (local_expert_ids_cpu >= 0) & (
+        local_expert_ids_cpu < num_local_experts
+    )
+    if not bool(valid_mask.any()):
+        return
+
+    valid_route_indices_cpu = torch.nonzero(valid_mask, as_tuple=False).flatten()
+    local_expert_ids_cpu = local_expert_ids_cpu.index_select(0, valid_route_indices_cpu)
+    route_weights_cpu = flat_topk_weights_cpu.index_select(0, valid_route_indices_cpu)
+
+    sort_order = torch.argsort(local_expert_ids_cpu, stable=True)
+    sorted_route_indices_cpu = valid_route_indices_cpu.index_select(0, sort_order)
+    sorted_expert_ids_cpu = local_expert_ids_cpu.index_select(0, sort_order)
+    sorted_route_weights_cpu = route_weights_cpu.index_select(0, sort_order)
+    sorted_token_indices_cpu = torch.div(
+        sorted_route_indices_cpu,
+        moe_top_k,
+        rounding_mode="floor",
+    )
+
+    counts = torch.bincount(sorted_expert_ids_cpu, minlength=num_local_experts)
+    start = 0
+    for local_expert_id, count in enumerate(counts.tolist()):
+        if count == 0:
+            continue
+        end = start + count
+        yield (
+            local_expert_id,
+            sorted_token_indices_cpu[start:end],
+            sorted_route_weights_cpu[start:end],
+        )
+        start = end
+
+
+def _run_moe_native(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    router_logits: torch.Tensor,
+    ep_rank: int,
+    moe_top_k: int,
+    renormalize: bool,
+    use_grouped_topk: bool,
+    num_expert_group: int | None,
+    topk_group: int | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    scoring_func: str,
+    e_score_correction_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    topk_weights, topk_ids = _select_experts_native(
+        router_logits=router_logits,
+        moe_top_k=moe_top_k,
+        renormalize=renormalize,
+        use_grouped_topk=use_grouped_topk,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        scoring_func=scoring_func,
+        e_score_correction_bias=e_score_correction_bias,
+    )
+
+    token_count, hidden_size = hidden_states.shape
+    num_local_experts = w1.shape[0]
+    output = torch.zeros(
+        (token_count, hidden_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    for (
+        local_expert_id,
+        token_indices_cpu,
+        route_weights_cpu,
+    ) in _iter_local_moe_routes_cpu(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        moe_top_k=moe_top_k,
+        num_local_experts=num_local_experts,
+        ep_rank=ep_rank,
+    ):
+        token_indices = token_indices_cpu.to(
+            device=hidden_states.device, dtype=torch.long
+        )
+        route_weights = route_weights_cpu.to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        expert_hidden_states = hidden_states.index_select(0, token_indices)
+        gate_up = expert_hidden_states @ w1[local_expert_id].transpose(0, 1)
+        if w1_bias is not None:
+            gate_up = gate_up + w1_bias[local_expert_id]
+        activated = _swiglu_native(gate_up)
+        expert_output = activated @ w2[local_expert_id].transpose(0, 1)
+        if w2_bias is not None:
+            expert_output = expert_output + w2_bias[local_expert_id]
+        expert_output = expert_output * route_weights.unsqueeze(-1)
+        output.index_add_(0, token_indices, expert_output)
+
+    return output
+
+
+def _should_use_native_moe_fallback(
+    hidden_states: torch.Tensor,
+    scoring_func: str,
+    use_grouped_topk: bool,
+) -> bool:
+    if hidden_states.device.type == "cpu":
+        return True
+
+    if scoring_func == "softmax" and not use_grouped_topk:
+        required_ops = (
+            _torch_op_exists("_C", "moe_softmax_topk_norm"),
+            _torch_op_exists("xspeedgate_ops", "moe_pre_small"),
+            _torch_op_exists("xspeedgate_ops", "moe_active_expert_balance"),
+            _torch_op_exists("xspeedgate_ops", "fused_moe"),
+        )
+    elif scoring_func == "sigmoid" and use_grouped_topk:
+        required_ops = (_torch_op_exists("_C", "moe_sigmoid_group_topk_norm"),)
+    else:
+        required_ops = ()
+
+    return not all(required_ops)
+
+
+def _log_native_moe_fallback_once() -> None:
+    global _logged_native_moe_fallback
+    if _logged_native_moe_fallback:
+        return
+    _logged_native_moe_fallback = True
+    logger.warning(
+        "Falling back to native PyTorch MoE path because Kunlun MoE custom ops "
+        "are unavailable in the current runtime."
+    )
 
 
 class KunlunOps:
@@ -393,6 +663,29 @@ class KunlunOps:
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """fused_moe"""
+        if _should_use_native_moe_fallback(
+            hidden_states=hidden_states,
+            scoring_func=scoring_func,
+            use_grouped_topk=use_grouped_topk,
+        ):
+            _log_native_moe_fallback_once()
+            return _run_moe_native(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                router_logits=router_logits,
+                ep_rank=ep_rank,
+                moe_top_k=moe_top_k,
+                renormalize=renormalize,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+            )
+
         global_num_experts, up_gate_size, _ = w1.shape
         M, N = hidden_states.shape
         hidden_dim = w2.shape[1]

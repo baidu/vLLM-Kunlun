@@ -53,10 +53,10 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ::::
 :::::
 ## Install vLLM-kunlun
-### Install vLLM 0.15.1
+### Install vLLM 0.19.0
 
 ```
-uv pip install vllm==0.15.1 --no-build-isolation --no-deps
+uv pip install vllm==0.19.0 --no-build-isolation --no-deps
 ```
 
 ### Build and Install
@@ -67,13 +67,15 @@ git clone https://github.com/baidu/vLLM-Kunlun
 
 cd vLLM-Kunlun
 
-git checkout v0.15.1-dev
+git checkout main
 
 uv pip install -r requirements.txt
 
 python setup.py build
 
 python setup.py install
+
+python vllm_kunlun/patches/patch_torch251.py
 ```
 
 ### Replace eval_frame.py

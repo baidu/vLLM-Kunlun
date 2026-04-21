@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 import os
 from typing import Optional
 
-import kunlun_ops
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _get_kunlun_ops():
+    return importlib.import_module("kunlun_ops")
 
 
 class TopKTopPSampler(nn.Module):
@@ -23,8 +27,15 @@ class TopKTopPSampler(nn.Module):
     def __init__(self, logprobs_mode):
         super().__init__()
         self.logprobs_mode = logprobs_mode
-        logger.info_once("Using FlashInfer for top-p & top-k sampling.")
-        self.forward = self.forward_kunlun
+        self._disable_kunlun_sampling = logprobs_mode in (
+            "processed_logits",
+            "processed_logprobs",
+        )
+        if self._disable_kunlun_sampling:
+            self.forward = self.forward_native
+        else:
+            logger.info_once("Using Kunlun top-p & top-k sampling when available.")
+            self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
 
     def forward_native(
@@ -56,6 +67,8 @@ class TopKTopPSampler(nn.Module):
         p: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
+        if self._disable_kunlun_sampling:
+            return self.forward_native(logits, generators, k, p)
         if (k is None and p is None) or generators:
             if generators:
                 logger.debug_once(
@@ -64,10 +77,19 @@ class TopKTopPSampler(nn.Module):
                     "PyTorch-native implementation."
                 )
             return self.forward_native(logits, generators, k, p)
-        # flashinfer sampling functions expect contiguous logits.
-        # In flex_attn/triton_attn fp32 inference, logits can be non-contiguous
-        # because of slicing operation in logits_processor.
-        return flashinfer_sample(logits.contiguous(), k, p, generators), None
+        try:
+            # Kunlun sampling functions expect contiguous logits. In
+            # flex_attn/triton_attn fp32 inference, logits can be
+            # non-contiguous because of slicing operation in logits_processor.
+            return flashinfer_sample(logits.contiguous(), k, p, generators), None
+        except Exception as exc:
+            self._disable_kunlun_sampling = True
+            logger.warning_once(
+                "Kunlun sampling ops unavailable; falling back to "
+                "PyTorch-native top-k/top-p sampling. Original error: %s",
+                exc,
+            )
+            return self.forward_native(logits, generators, k, p)
 
 
 def apply_top_k_top_p(
@@ -196,6 +218,7 @@ def flashinfer_sample(
     """
     assert not (k is None and p is None)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
+    kunlun_ops = _get_kunlun_ops()
     if k is None:
         # Top-p only.
         next_token_ids = kunlun_ops.top_p_sampling_from_probs(

@@ -47,7 +47,6 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
     smart_resize as video_smart_resize,
 )
 from transformers.video_utils import VideoMetadata
-from vllm.attention.layer import check_upstream_fa_availability
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
@@ -99,6 +98,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
 from vllm.utils import is_list_of
 
+from vllm_kunlun.attention_compat import check_upstream_fa_availability
+
 from .qwen2_5_vl import (
     Qwen2_5_VisionAttention,
     Qwen2_5_VisionRotaryEmbedding,
@@ -117,7 +118,6 @@ _MAX_FRAMES_PER_VIDEO = 24576
 
 
 class Qwen3_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -147,7 +147,6 @@ class Qwen3_VisionPatchEmbed(nn.Module):
 
 
 class Qwen3_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -185,7 +184,6 @@ class Qwen3_VisionMLP(nn.Module):
 
 
 class Qwen3_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -245,7 +243,6 @@ class Qwen3_VisionBlock(nn.Module):
 
 
 class Qwen3_VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         d_model: int,
@@ -298,7 +295,6 @@ class Qwen3_VisionPatchMerger(nn.Module):
 
 
 class Qwen3_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -448,7 +444,6 @@ class Qwen3_VisionTransformer(nn.Module):
         return rotary_pos_emb
 
     def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
-
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
@@ -615,7 +610,6 @@ class Qwen3_VisionTransformer(nn.Module):
 
 
 class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
-
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3VLConfig)
 
@@ -782,7 +776,6 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
 
 
 class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
-
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
         num_videos = mm_counts.get("video", 0)
@@ -866,7 +859,6 @@ class Qwen3VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3VLProcessingInfo]):
 
 
 class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo]):
-
     def _get_data_parser(self) -> MultiModalDataParser:
         return MultiModalDataParser(video_needs_metadata=True)
 
@@ -1067,7 +1059,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
     }
 )
 class Qwen3LLMModel(Qwen3Model):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         if not get_pp_group().is_first_rank:
@@ -1125,7 +1116,6 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3ForCausalLM, self).__init__()
         config = vllm_config.model_config.hf_config.text_config
@@ -1400,7 +1390,6 @@ class Qwen3VLForConditionalGeneration(
     def _process_image_input(
         self, image_input: Qwen2_5_VLImageInputs
     ) -> tuple[torch.Tensor, ...]:
-
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
@@ -1428,7 +1417,6 @@ class Qwen3VLForConditionalGeneration(
     def _process_video_input(
         self, video_input: Qwen2_5_VLVideoInputs
     ) -> tuple[torch.Tensor, ...]:
-
         grid_thw = video_input["video_grid_thw"]
         assert grid_thw.ndim == 2
         grid_thw_list = grid_thw.tolist()
@@ -1480,7 +1468,6 @@ class Qwen3VLForConditionalGeneration(
     def get_multimodal_embeddings(
         self, **kwargs: object
     ) -> Optional[MultiModalEmbeddings]:
-
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
             return None
@@ -1513,12 +1500,13 @@ class Qwen3VLForConditionalGeneration(
         ]
         multimodal_embeddings_cat = torch.cat(multimodal_embeddings, dim=0)
 
-        multimodal_embeddings_main, multimodal_embeddings_multiscale = (
-            torch.split(  # noqa:E501
-                multimodal_embeddings_cat,
-                [self.visual_dim, self.multiscale_dim],
-                dim=-1,
-            )
+        (
+            multimodal_embeddings_main,
+            multimodal_embeddings_multiscale,
+        ) = torch.split(  # noqa:E501
+            multimodal_embeddings_cat,
+            [self.visual_dim, self.multiscale_dim],
+            dim=-1,
         )
 
         multimodal_embeddings = torch.split(
@@ -1556,10 +1544,11 @@ class Qwen3VLForConditionalGeneration(
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         if multimodal_embeddings is not None:
             if self.use_deepstack:
-                deepstack_input_embeds, multimodal_embeddings = (
-                    self._compute_deepstack_embeds(  # noqa:E501
-                        input_ids, inputs_embeds, multimodal_embeddings
-                    )
+                (
+                    deepstack_input_embeds,
+                    multimodal_embeddings,
+                ) = self._compute_deepstack_embeds(  # noqa:E501
+                    input_ids, inputs_embeds, multimodal_embeddings
                 )
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
@@ -1743,7 +1732,6 @@ class Qwen3VLForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-
         skip_prefixes = []
         if self.visual is None:
             skip_prefixes.extend(["visual."])

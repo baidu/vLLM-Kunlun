@@ -26,9 +26,10 @@ def register_model():
     #     "Qwen3ForCausalLM",
     #     "vllm_kunlun.models.qwen3:Qwen3ForCausalLM")
 
-    # ModelRegistry.register_model(
-    #     "Qwen3MoeForCausalLM",
-    #     "vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM")
+    ModelRegistry.register_model(
+        "Qwen3MoeForCausalLM",
+        "vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM",
+    )
 
     ModelRegistry.register_model(
         "Qwen3NextForCausalLM", "vllm_kunlun.models.qwen3_next:Qwen3NextForCausalLM"

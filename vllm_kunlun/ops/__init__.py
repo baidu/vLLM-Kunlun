@@ -15,17 +15,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import vllm_kunlun.ops._custom_ops
-import vllm_kunlun.ops.fused_moe.layer
+"""Kunlun ops package.
 
-# base layers
-import vllm_kunlun.ops.layernorm
-import vllm_kunlun.ops.linear
+Avoid eager side-effect imports here. vLLM 0.19 imports
+``vllm.v1.attention.ops.merge_attn_states`` during CLI argument parsing, and our
+import hook redirects that path into ``vllm_kunlun.ops.attention``. Pulling in
+``vllm_kunlun.ops`` package-wide side effects at that stage forces ``kunlun_ops``
+and ``torch_xmlir`` to load before the service is even configured.
 
-# embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
-import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
-
-# TODO @xyDong0223 remove v0.16.0
-# import vllm_kunlun.ops.mla
+The individual submodules still import and register their runtime pieces when
+they are imported explicitly by model/attention code.
+"""

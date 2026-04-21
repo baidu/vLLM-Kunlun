@@ -40,7 +40,7 @@
 
 #       - name: Install vLLM
 #         run: |
-#           pip install vllm==0.11.0 --no-build-isolation --no-deps --no-deps --index-url https://pip.baidu-int.com/simple/
+#           pip install vllm==0.19.0 --no-build-isolation --no-deps --no-deps --index-url https://pip.baidu-int.com/simple/
 
 #       - name: Run Unit Test
 #         run: |

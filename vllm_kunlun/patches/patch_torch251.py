@@ -1,98 +1,47 @@
-"""
-vLLM Compatibility Patch Script for PyTorch 2.5.1
-==================================================
+"""Patch vLLM 0.19.x so it can run on PyTorch 2.5.1."""
 
-Why are these patches necessary?
---------------------------------
-vLLM (v0.15.x) was developed and tested against newer versions of PyTorch
-(2.7+), which introduced several API changes that are NOT available in
-PyTorch 2.5.1. Running vLLM on PyTorch 2.5.1 without these patches will
-result in AttributeError or TypeError exceptions at runtime.
-
-Specifically, the following incompatibilities exist:
-
-1. `torch._functorch.config.bundled_autograd_cache` — This configuration
-   option was introduced in PyTorch 2.7+. It does not exist in PyTorch
-   2.5.1, so any code referencing it (either as a direct attribute or via
-   `torch._functorch.config.patch(...)`) will raise an AttributeError.
-
-2. `patched_inline_call(self_: Any)` signature — The inline call hook
-   signature changed between PyTorch versions. In PyTorch 2.5.1, it
-   expects `(parent, func, args, kwargs)` rather than `(self_: Any)`.
-
-3. `torch.Size(...)` constructor — In certain compilation contexts under
-   PyTorch 2.5.1, `torch.Size()` does not work correctly during tracing.
-   Using `torch.empty().size` is a compatible workaround.
-
-4. `list[int]` type hint — Python 3.10 supports `list[int]` in type
-   annotations, but certain runtime introspection paths (especially
-   within torch.compile / FX tracing) may fail to resolve built-in
-   generic aliases. Using `typing.List[int]` avoids this.
-
-When should these patches be removed?
---------------------------------------
-These patches are TEMPORARY workarounds for PyTorch 2.5.1 compatibility.
-They should be REMOVED once the environment is upgraded to PyTorch 2.9+,
-where all referenced APIs are stable and available. Keeping these patches
-on PyTorch 2.9+ may cause unexpected behavior.
-
-Usage:
-------
-    python patch_torch251.py           # Apply all patches
-    python patch_torch251.py --dry-run # Preview changes without modifying files
-    python patch_torch251.py --revert  # Restore all files from .bak backups
-"""
+from __future__ import annotations
 
 import os
 import shutil
 import site
 import sys
 
-# ============================================================
-# Base path for the target Python environment
-# ============================================================
-# Determine the site-packages directory dynamically to keep this
-# script portable across different Python installations.
-_site_packages_list = []
+_site_packages = []
 try:
-    _site_packages_list = site.getsitepackages()
+    _site_packages = site.getsitepackages()
 except Exception:
-    _site_packages_list = []
-if _site_packages_list:
-    # Prefer the first returned site-packages directory.
-    SITE_PACKAGES = _site_packages_list[0]
+    _site_packages = []
+
+if _site_packages:
+    SITE_PACKAGES = _site_packages[0]
 else:
-    # Fallback: use the current environment prefix.
     SITE_PACKAGES = sys.prefix
 
-# ============================================================
-# Patch definitions
-# Each patch contains:
-#   - file:      target file path (relative to SITE_PACKAGES)
-#   - desc:      human-readable description
-#   - lines:     original line numbers (for reference only)
-#   - old:       the exact code to find and replace
-#   - new:       the replacement code
-#   - count:     (optional) number of occurrences to replace.
-#                Defaults to 1. Use 0 to replace ALL occurrences.
-#
-# IMPORTANT: When multiple patches target the same file, the
-# import/header patches should come BEFORE the body patches to
-# ensure correct dependency order.
-# ============================================================
 PATCHES = [
-    # ----------------------------------------------------------
-    # Patch 1: decorators.py — Fix inline call signature
-    # ----------------------------------------------------------
+    {
+        "file": "vllm/compilation/passes/inductor_pass.py",
+        "lines": "22",
+        "desc": (
+            "Backfill torch._inductor.custom_graph_pass with a fallback base "
+            "class when PyTorch 2.5.1 does not ship this module."
+        ),
+        "old": "from torch._inductor.custom_graph_pass import CustomGraphPass",
+        "new": """\
+try:
+    from torch._inductor.custom_graph_pass import CustomGraphPass
+except ModuleNotFoundError:
+    class CustomGraphPass:
+        def __call__(self, graph):
+            return None
+
+        def uuid(self):
+            return self.__class__.__name__""",
+    },
     {
         "file": "vllm/compilation/decorators.py",
-        "desc": (
-            "Fix patched_inline_call signature. "
-            "PyTorch 2.5.1 uses (parent, func, args, kwargs) instead of "
-            "(self_: Any). The self_.f_code attribute does not exist in "
-            "2.5.1; use func.get_code() instead."
-        ),
-        "lines": "505-508",
+        "lines": "547-550",
+        "desc": "Adapt patched_inline_call to the PyTorch 2.5.1 callback signature.",
         "old": """\
         def patched_inline_call(self_: Any) -> Any:
             code = self_.f_code
@@ -100,29 +49,14 @@ PATCHES = [
             return inline_call(self_)""",
         "new": """\
         def patched_inline_call(parent, func, args, kwargs):
-            # [PyTorch 2.5.1 compat] Use func.get_code() instead of
-            # self_.f_code, which is not available in this version.
             code = func.get_code()
-
-            # Note: vLLM 0.15.x uses self.compilation_config directly
-            # (not self.vllm_config.compilation_config)
             self.compilation_config.traced_files.add(code.co_filename)
-
-            # Pass all four arguments as expected by PyTorch 2.5.1
             return inline_call(parent, func, args, kwargs)""",
     },
-    # ----------------------------------------------------------
-    # Patch 2: layer.py — Fix torch.Size during tracing
-    # ----------------------------------------------------------
     {
-        "file": "vllm/attention/layer.py",
-        "desc": (
-            "Replace torch.Size() with torch.empty().size. "
-            "In PyTorch 2.5.1, torch.Size() does not work correctly "
-            "during torch.compile tracing. torch.empty().size produces "
-            "a compatible result."
-        ),
-        "lines": "378-380",
+        "file": "vllm/model_executor/layers/attention/attention.py",
+        "lines": "437-440",
+        "desc": "Avoid torch.Size tracing issues on PyTorch 2.5.1.",
         "old": """\
                 output_shape = torch.Size(
                     (num_tokens, self.num_heads * self.head_size_v)
@@ -132,79 +66,50 @@ PATCHES = [
                     (num_tokens, self.num_heads * self.head_size_v)
                 ).size()""",
     },
-    # ----------------------------------------------------------
-    # Patch 3: piecewise_backend.py — Remove bundled_autograd_cache
-    #          context manager (serialize path)
-    # ----------------------------------------------------------
+    {
+        "file": "vllm/model_executor/models/openpangu.py",
+        "lines": "779-783",
+        "desc": "Avoid torch.Size tracing issues in OpenPangu attention output.",
+        "old": """\
+            output_shape=torch.Size(
+                [q.shape[0], q.shape[1] // self.head_dim * self.v_channels]
+            ),""",
+        "new": """\
+            output_shape=torch.empty(
+                [q.shape[0], q.shape[1] // self.head_dim * self.v_channels]
+            ).size(),""",
+        "required": False,
+    },
     {
         "file": "vllm/compilation/piecewise_backend.py",
+        "lines": "221-227",
         "desc": (
-            "Remove bundled_autograd_cache context manager around "
-            "serialization. torch._functorch.config.bundled_autograd_cache "
-            "does not exist in PyTorch 2.5.1."
+            "Remove bundled_autograd_cache patching during serialize because "
+            "that config flag does not exist on PyTorch 2.5.1."
         ),
-        "lines": "180-185",
         "old": """\
             with torch._functorch.config.patch("bundled_autograd_cache", True):
                 entry = fn.serialize()
 
                 f = io.BytesIO()
                 StandaloneCompiledArtifactsPickler(f).dump(entry)
-                result = f.getvalue()""",
+                result = f.getvalue()
+            return result""",
         "new": """\
             entry = fn.serialize()
 
             f = io.BytesIO()
             StandaloneCompiledArtifactsPickler(f).dump(entry)
-            result = f.getvalue()""",
+            result = f.getvalue()
+            return result""",
     },
-    # ----------------------------------------------------------
-    # Patch 4: piecewise_backend.py — Remove bundled_autograd_cache
-    #          context manager (compile path)
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/compilation/piecewise_backend.py",
-        "desc": (
-            "Remove bundled_autograd_cache context manager around "
-            "compilation. Same reason as above — the config option is "
-            "unavailable in PyTorch 2.5.1."
-        ),
-        "lines": "243-254",
-        "old": """\
-                with (
-                    torch._functorch.config.patch("bundled_autograd_cache", True),
-                ):
-                    range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                        self.graph,
-                        args_list,
-                        self.vllm_backend.inductor_config,
-                        self.compilation_config,
-                        compile_range=range_entry.compile_range,
-                        graph_index=self.piecewise_compile_index,
-                        num_graphs=self.total_piecewise_compiles,
-                    )""",
-        "new": """\
-                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                    self.graph,
-                    args_list,
-                    self.vllm_backend.inductor_config,
-                    self.compilation_config,
-                    compile_range=range_entry.compile_range,
-                    graph_index=self.piecewise_compile_index,
-                    num_graphs=self.total_piecewise_compiles,
-                )""",
-    },
-    # ----------------------------------------------------------
-    # Patch 5: compiler_interface.py — Comment out unavailable config
-    # ----------------------------------------------------------
     {
         "file": "vllm/compilation/compiler_interface.py",
+        "lines": "778-780",
         "desc": (
-            "Comment out bundled_autograd_cache assignment. "
-            "This attribute does not exist in torch._functorch.config "
-            "on PyTorch 2.5.1 and will raise AttributeError."
+            "Skip bundled_autograd_cache assignment because the attribute is "
+            "absent on PyTorch 2.5.1."
         ),
-        "lines": "654-656",
         "old": """\
 def set_functorch_config() -> None:
     if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
@@ -212,387 +117,106 @@ def set_functorch_config() -> None:
         "new": """\
 def set_functorch_config() -> None:
     if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
-        # [PyTorch 2.5.1 compat] bundled_autograd_cache is not available.
-        # TODO: Restore this line after upgrading to PyTorch 2.9+
-        # torch._functorch.config.bundled_autograd_cache = False
         pass""",
     },
-    # ----------------------------------------------------------
-    # Patch 6: parallel_state.py — Add List to typing imports
-    #          (must be applied BEFORE Patch 7)
-    # ----------------------------------------------------------
     {
         "file": "vllm/distributed/parallel_state.py",
-        "desc": (
-            "Add List to the typing import. Required by Patch 7 which "
-            "changes list[int] to List[int]. Without this import, "
-            "List would be undefined."
-        ),
-        "lines": "36",
-        "old": "from typing import Any, Optional",
-        "new": "from typing import Any, List, Optional",
+        "lines": "32",
+        "desc": "Import List so PyTorch 2.5 tracing does not trip on list[int].",
+        "old": "from typing import TYPE_CHECKING, Any, Protocol",
+        "new": "from typing import TYPE_CHECKING, Any, List, Protocol",
     },
-    # ----------------------------------------------------------
-    # Patch 7: parallel_state.py — Use List[int] instead of list[int]
-    # ----------------------------------------------------------
     {
         "file": "vllm/distributed/parallel_state.py",
-        "desc": (
-            "Replace built-in generic `list[int]` with `List[int]` from "
-            "typing. While Python 3.10 supports `list[int]` in annotations, "
-            "certain runtime introspection paths used by torch.compile / "
-            "FX tracing may fail to resolve it. Using `typing.List[int]` "
-            "is the safe, backward-compatible form."
-        ),
-        "lines": "173, 225",
-        # Replace ALL occurrences in the file
-        "count": 0,
+        "lines": "187,239",
+        "desc": "Replace list[int] annotations with typing.List[int].",
         "old": "    output_shape: list[int],",
         "new": "    output_shape: List[int],",
+        "count": 0,
     },
-    # ----------------------------------------------------------
-    # Patch 8: vllm/transformers_utils/config.py - add qwen3_5
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/transformers_utils/config.py",
-        "desc": ("support qwen3_5 in vllm0.15.1"),
-        "lines": "101",
-        "old": """\
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
-    afmoe="AfmoeConfig",
-    bagel="BagelConfig",
-    chatglm="ChatGLMConfig",
-    deepseek_vl_v2="DeepseekVLV2Config",
-    deepseek_v32="DeepseekV3Config",
-    flex_olmo="FlexOlmoConfig",
-    hunyuan_vl="HunYuanVLConfig",
-    isaac="IsaacConfig",
-    kimi_linear="KimiLinearConfig",
-    kimi_vl="KimiVLConfig",
-    kimi_k25="KimiK25Config",
-    RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
-    RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)
-    jais="JAISConfig",
-    mlp_speculator="MLPSpeculatorConfig",
-    medusa="MedusaConfig",
-    midashenglm="MiDashengLMConfig",
-    eagle="EAGLEConfig",
-    speculators="SpeculatorsConfig",
-    nemotron="NemotronConfig",
-    olmo3="Olmo3Config",
-    ovis="OvisConfig",
-    ultravox="UltravoxConfig",
-    step3_vl="Step3VLConfig",
-    step3_text="Step3TextConfig",
-    step3p5="Step3p5Config",
-    qwen3_asr="Qwen3ASRConfig",
-    qwen3_next="Qwen3NextConfig",
-    lfm2_moe="Lfm2MoeConfig",
-    tarsier2="Tarsier2Config",
-)""",
-        "new": """\
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
-    afmoe="AfmoeConfig",
-    bagel="BagelConfig",
-    chatglm="ChatGLMConfig",
-    deepseek_vl_v2="DeepseekVLV2Config",
-    deepseek_v32="DeepseekV3Config",
-    flex_olmo="FlexOlmoConfig",
-    hunyuan_vl="HunYuanVLConfig",
-    isaac="IsaacConfig",
-    kimi_linear="KimiLinearConfig",
-    kimi_vl="KimiVLConfig",
-    kimi_k25="KimiK25Config",
-    RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
-    RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)
-    jais="JAISConfig",
-    mlp_speculator="MLPSpeculatorConfig",
-    medusa="MedusaConfig",
-    midashenglm="MiDashengLMConfig",
-    eagle="EAGLEConfig",
-    speculators="SpeculatorsConfig",
-    nemotron="NemotronConfig",
-    olmo3="Olmo3Config",
-    ovis="OvisConfig",
-    ultravox="UltravoxConfig",
-    step3_vl="Step3VLConfig",
-    step3_text="Step3TextConfig",
-    step3p5="Step3p5Config",
-    qwen3_asr="Qwen3ASRConfig",
-    qwen3_next="Qwen3NextConfig",
-    qwen3_5="Qwen3_5Config",
-    qwen3_5_moe="Qwen3_5MoeConfig",
-    lfm2_moe="Lfm2MoeConfig",
-    tarsier2="Tarsier2Config",
-)""",
-    },
-    # ----------------------------------------------------------
-    # Patch 9: vllm/transformers_utils/configs/__init__.py
-    #                       add qwen3_5
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/transformers_utils/configs/__init__.py",
-        "desc": ("support qwen3_5 in vllm0.15.1"),
-        "lines": "55",
-        "old": """\
-_CLASS_TO_MODULE: dict[str, str] = {
-    "AfmoeConfig": "vllm.transformers_utils.configs.afmoe",
-    "BagelConfig": "vllm.transformers_utils.configs.bagel",
-    "ChatGLMConfig": "vllm.transformers_utils.configs.chatglm",
-    "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
-    "DotsOCRConfig": "vllm.transformers_utils.configs.dotsocr",
-    "EAGLEConfig": "vllm.transformers_utils.configs.eagle",
-    "FlexOlmoConfig": "vllm.transformers_utils.configs.flex_olmo",
-    "HunYuanVLConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "HunYuanVLTextConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "HunYuanVLVisionConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "IsaacConfig": "vllm.transformers_utils.configs.isaac",
-    # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
-    # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
-    # `FalconConfig` class from the official HuggingFace transformers library.
-    "RWConfig": "vllm.transformers_utils.configs.falcon",
-    "JAISConfig": "vllm.transformers_utils.configs.jais",
-    "Lfm2MoeConfig": "vllm.transformers_utils.configs.lfm2_moe",
-    "MedusaConfig": "vllm.transformers_utils.configs.medusa",
-    "MiDashengLMConfig": "vllm.transformers_utils.configs.midashenglm",
-    "MLPSpeculatorConfig": "vllm.transformers_utils.configs.mlp_speculator",
-    "MoonViTConfig": "vllm.transformers_utils.configs.moonvit",
-    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
-    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
-    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
-    "NemotronConfig": "vllm.transformers_utils.configs.nemotron",
-    "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
-    "Olmo3Config": "vllm.transformers_utils.configs.olmo3",
-    "OvisConfig": "vllm.transformers_utils.configs.ovis",
-    "PixelShuffleSiglip2VisionConfig": "vllm.transformers_utils.configs.isaac",
-    "RadioConfig": "vllm.transformers_utils.configs.radio",
-    "SpeculatorsConfig": "vllm.transformers_utils.configs.speculators.base",
-    "UltravoxConfig": "vllm.transformers_utils.configs.ultravox",
-    "Step3VLConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3VisionEncoderConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3TextConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3p5Config": "vllm.transformers_utils.configs.step3p5",
-    "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
-    "Qwen3NextConfig": "vllm.transformers_utils.configs.qwen3_next",
-    "Tarsier2Config": "vllm.transformers_utils.configs.tarsier2",
-    # Special case: DeepseekV3Config is from HuggingFace Transformers
-    "DeepseekV3Config": "transformers",
-}""",
-        "new": """\
-_CLASS_TO_MODULE: dict[str, str] = {
-    "AfmoeConfig": "vllm.transformers_utils.configs.afmoe",
-    "BagelConfig": "vllm.transformers_utils.configs.bagel",
-    "ChatGLMConfig": "vllm.transformers_utils.configs.chatglm",
-    "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
-    "DotsOCRConfig": "vllm.transformers_utils.configs.dotsocr",
-    "EAGLEConfig": "vllm.transformers_utils.configs.eagle",
-    "FlexOlmoConfig": "vllm.transformers_utils.configs.flex_olmo",
-    "HunYuanVLConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "HunYuanVLTextConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "HunYuanVLVisionConfig": "vllm.transformers_utils.configs.hunyuan_vl",
-    "IsaacConfig": "vllm.transformers_utils.configs.isaac",
-    # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
-    # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
-    # `FalconConfig` class from the official HuggingFace transformers library.
-    "RWConfig": "vllm.transformers_utils.configs.falcon",
-    "JAISConfig": "vllm.transformers_utils.configs.jais",
-    "Lfm2MoeConfig": "vllm.transformers_utils.configs.lfm2_moe",
-    "MedusaConfig": "vllm.transformers_utils.configs.medusa",
-    "MiDashengLMConfig": "vllm.transformers_utils.configs.midashenglm",
-    "MLPSpeculatorConfig": "vllm.transformers_utils.configs.mlp_speculator",
-    "MoonViTConfig": "vllm.transformers_utils.configs.moonvit",
-    "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
-    "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
-    "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
-    "NemotronConfig": "vllm.transformers_utils.configs.nemotron",
-    "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
-    "Olmo3Config": "vllm.transformers_utils.configs.olmo3",
-    "OvisConfig": "vllm.transformers_utils.configs.ovis",
-    "PixelShuffleSiglip2VisionConfig": "vllm.transformers_utils.configs.isaac",
-    "RadioConfig": "vllm.transformers_utils.configs.radio",
-    "SpeculatorsConfig": "vllm.transformers_utils.configs.speculators.base",
-    "UltravoxConfig": "vllm.transformers_utils.configs.ultravox",
-    "Step3VLConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3VisionEncoderConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3TextConfig": "vllm.transformers_utils.configs.step3_vl",
-    "Step3p5Config": "vllm.transformers_utils.configs.step3p5",
-    "Qwen3ASRConfig": "vllm.transformers_utils.configs.qwen3_asr",
-    "Qwen3NextConfig": "vllm.transformers_utils.configs.qwen3_next",
-    "Qwen3_5Config": "vllm_kunlun.transformers_utils.configs.qwen3_5",
-    "Qwen3_5TextConfig": "vllm_kunlun.transformers_utils.configs.qwen3_5",
-    "Qwen3_5MoeConfig": "vllm_kunlun.transformers_utils.configs.qwen3_5_moe",
-    "Qwen3_5MoeTextConfig": "vllm_kunlun.transformers_utils.configs.qwen3_5_moe",
-    "Tarsier2Config": "vllm.transformers_utils.configs.tarsier2",
-    # Special case: DeepseekV3Config is from HuggingFace Transformers
-    "DeepseekV3Config": "transformers",
-}""",
-    },
-    {
-        "file": "vllm/transformers_utils/configs/__init__.py",
-        "desc": ("support qwen3_5 in vllm0.15.1"),
-        "lines": "97",
-        "old": """\
-__all__ = [
-    "AfmoeConfig",
-    "BagelConfig",
-    "ChatGLMConfig",
-    "DeepseekVLV2Config",
-    "DeepseekV3Config",
-    "DotsOCRConfig",
-    "EAGLEConfig",
-    "FlexOlmoConfig",
-    "HunYuanVLConfig",
-    "HunYuanVLTextConfig",
-    "HunYuanVLVisionConfig",
-    "IsaacConfig",
-    "RWConfig",
-    "JAISConfig",
-    "Lfm2MoeConfig",
-    "MedusaConfig",
-    "MiDashengLMConfig",
-    "MLPSpeculatorConfig",
-    "MoonViTConfig",
-    "KimiLinearConfig",
-    "KimiVLConfig",
-    "KimiK25Config",
-    "NemotronConfig",
-    "NemotronHConfig",
-    "Olmo3Config",
-    "OvisConfig",
-    "PixelShuffleSiglip2VisionConfig",
-    "RadioConfig",
-    "SpeculatorsConfig",
-    "UltravoxConfig",
-    "Step3VLConfig",
-    "Step3VisionEncoderConfig",
-    "Step3TextConfig",
-    "Step3p5Config",
-    "Qwen3ASRConfig",
-    "Qwen3NextConfig",
-    "Tarsier2Config",
-]""",
-        "new": """\
-__all__ = [
-    "AfmoeConfig",
-    "BagelConfig",
-    "ChatGLMConfig",
-    "DeepseekVLV2Config",
-    "DeepseekV3Config",
-    "DotsOCRConfig",
-    "EAGLEConfig",
-    "FlexOlmoConfig",
-    "HunYuanVLConfig",
-    "HunYuanVLTextConfig",
-    "HunYuanVLVisionConfig",
-    "IsaacConfig",
-    "RWConfig",
-    "JAISConfig",
-    "Lfm2MoeConfig",
-    "MedusaConfig",
-    "MiDashengLMConfig",
-    "MLPSpeculatorConfig",
-    "MoonViTConfig",
-    "KimiLinearConfig",
-    "KimiVLConfig",
-    "KimiK25Config",
-    "NemotronConfig",
-    "NemotronHConfig",
-    "Olmo3Config",
-    "OvisConfig",
-    "PixelShuffleSiglip2VisionConfig",
-    "RadioConfig",
-    "SpeculatorsConfig",
-    "UltravoxConfig",
-    "Step3VLConfig",
-    "Step3VisionEncoderConfig",
-    "Step3TextConfig",
-    "Step3p5Config",
-    "Qwen3ASRConfig",
-    "Qwen3NextConfig",
-    "Qwen3_5Config",
-    "Qwen3_5TextConfig",
-    "Qwen3_5MoeConfig",
-    "Qwen3_5MoeTextConfig",
-    "Tarsier2Config",
-]""",
-    },
-    # ----------------------------------------------------------
-    # Patch 10: utils.py — Add backend="torch_native" to
-    #           apply_token_bitmask_inplace call
-    # ----------------------------------------------------------
     {
         "file": "vllm/v1/structured_output/utils.py",
+        "lines": "121",
         "desc": (
-            "Add backend='torch_native' parameter to "
-            "xgr.apply_token_bitmask_inplace call. Without this parameter, "
-            "the default backend may not be compatible with the Kunlun "
-            "platform on PyTorch 2.5.1."
+            "Force xgrammar torch-native backend to avoid backend selection "
+            "mismatches on Kunlun."
         ),
-        "lines": "119",
-        "old": (
-            "xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, "
-            "indices=index_tensor)"
-        ),
+        "old": "        xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, indices=index_tensor)",
         "new": (
-            "xgr.apply_token_bitmask_inplace(logits, grammar_bitmask, "
-            'indices=index_tensor, backend="torch_native")'
+            "        xgr.apply_token_bitmask_inplace("
+            'logits, grammar_bitmask, indices=index_tensor, backend="torch_native")'
         ),
+        "required": False,
+    },
+    {
+        "file": "vllm/compilation/wrapper.py",
+        "lines": "199-203",
+        "desc": "Fall back to nullcontext() when torch.compiler.set_stance is unavailable.",
+        "old": """\
+            ctx = (
+                nullcontext()
+                if self.first_compile or not self.evaluate_guards
+                else torch.compiler.set_stance("fail_on_recompile")
+            )""",
+        "new": """\
+            if self.first_compile or not self.evaluate_guards:
+                ctx = nullcontext()
+            elif hasattr(torch.compiler, "set_stance"):
+                ctx = torch.compiler.set_stance("fail_on_recompile")
+            else:
+                ctx = nullcontext()""",
+        "required": False,
     },
 ]
 
 
-# ============================================================
-# Core logic
-# ============================================================
-
-
 def get_full_path(relative_path: str) -> str:
-    """Construct the full file path from SITE_PACKAGES."""
     return os.path.join(SITE_PACKAGES, relative_path)
 
 
-def apply_patch(patch: dict, dry_run: bool = False) -> str:
-    """
-    Apply a single patch.
-    Returns: 'success', 'skipped', or 'failed'
-    """
-    file_path = get_full_path(patch["file"])
-    desc = patch["desc"]
-    # How many occurrences to replace: default 1, use 0 for all
-    count = patch.get("count", 1)
+def _backup_path(file_path: str) -> str:
+    return f"{file_path}.bak"
+
+
+def apply_patch(patch: dict[str, object], dry_run: bool = False) -> str:
+    file_path = get_full_path(str(patch["file"]))
+    required = bool(patch.get("required", True))
+    count = int(patch.get("count", 1))
 
     print(
         f"\n{'[DRY RUN] ' if dry_run else ''}"
         f"Patch: {patch['file']} (lines {patch['lines']})"
     )
-    print(f"  Description: {desc}")
+    print(f"  Description: {patch['desc']}")
 
-    # 1. Read the file
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        with open(file_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
     except FileNotFoundError:
-        print(f"  FAIL: File not found: {file_path}")
-        return "failed"
+        if required:
+            print(f"  FAIL: File not found: {file_path}")
+            return "failed"
+        print(f"  SKIP: Optional file not found: {file_path}")
+        return "skipped"
 
-    # 2. Check if already patched (idempotent)
-    if patch["new"] in content and patch["old"] not in content:
+    old = str(patch["old"])
+    new = str(patch["new"])
+
+    if new in content and old not in content:
         print("  SKIP: Already patched.")
         return "skipped"
 
-    # 3. Verify the original code exists
-    if patch["old"] not in content:
-        print(
-            "  FAIL: Original code not found. The file may have been "
-            "modified or the vLLM version may differ."
-        )
-        return "failed"
+    if old not in content:
+        if required:
+            print("  FAIL: Original code not found.")
+            return "failed"
+        print("  SKIP: Optional patch target not found.")
+        return "skipped"
 
-    # Count how many occurrences will be replaced
-    num_occurrences = content.count(patch["old"])
-    replacements = num_occurrences if count == 0 else min(count, num_occurrences)
+    occurrences = content.count(old)
+    replacements = occurrences if count == 0 else min(count, occurrences)
     print(
-        f"  Found {num_occurrences} occurrence(s), "
+        f"  Found {occurrences} occurrence(s), "
         f"will replace {'all' if count == 0 else replacements}."
     )
 
@@ -600,52 +224,46 @@ def apply_patch(patch: dict, dry_run: bool = False) -> str:
         print("  OK: Would apply patch.")
         return "success"
 
-    # 4. Backup (only once per file, never overwrite existing .bak)
-    backup_path = file_path + ".bak"
+    backup_path = _backup_path(file_path)
     if not os.path.exists(backup_path):
         shutil.copy2(file_path, backup_path)
         print(f"  Backup created: {backup_path}")
     else:
-        print(f"  Backup already exists, not overwriting: {backup_path}")
+        print(f"  Backup already exists: {backup_path}")
 
-    # 5. Replace and write back
     if count == 0:
-        # Replace ALL occurrences
-        new_content = content.replace(patch["old"], patch["new"])
+        new_content = content.replace(old, new)
     else:
-        new_content = content.replace(patch["old"], patch["new"], count)
+        new_content = content.replace(old, new, count)
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(new_content)
 
     print(f"  SUCCESS: Patch applied ({replacements} replacement(s)).")
     return "success"
 
 
-def revert_all():
-    """Restore all patched files from their .bak backups."""
+def revert_all() -> None:
     print("=" * 64)
     print("  Reverting all patches from .bak backups")
     print("=" * 64)
 
-    seen = set()
+    seen: set[str] = set()
     for patch in PATCHES:
-        file_path = get_full_path(patch["file"])
+        file_path = get_full_path(str(patch["file"]))
         if file_path in seen:
             continue
         seen.add(file_path)
 
-        backup_path = file_path + ".bak"
+        backup_path = _backup_path(file_path)
         if os.path.exists(backup_path):
             shutil.copy2(backup_path, file_path)
             print(f"  Restored: {file_path}")
         else:
             print(f"  No backup found for: {file_path}")
 
-    print("\nRevert complete.")
 
-
-def main():
+def main() -> None:
     dry_run = "--dry-run" in sys.argv
     revert = "--revert" in sys.argv
 
@@ -654,35 +272,28 @@ def main():
         return
 
     print("=" * 64)
-    print("  vLLM Compatibility Patch for PyTorch 2.5.1")
+    print("  vLLM 0.19.x Compatibility Patch for PyTorch 2.5.1")
+    print(f"  Site-packages: {SITE_PACKAGES}")
     print(f"  Total patches: {len(PATCHES)}")
     if dry_run:
-        print("  Mode: DRY RUN (no files will be modified)")
-    print("")
-    print("  NOTE: These patches are TEMPORARY. Remove them after")
-    print("        upgrading to PyTorch 2.9+.")
+        print("  Mode: DRY RUN")
     print("=" * 64)
 
     results = {"success": 0, "skipped": 0, "failed": 0}
-
     for patch in PATCHES:
         result = apply_patch(patch, dry_run=dry_run)
         results[result] += 1
 
     print("\n" + "=" * 64)
     print(
-        f"  Results: "
-        f"{results['success']} applied  |  "
-        f"{results['skipped']} skipped  |  "
-        f"{results['failed']} failed  |  "
-        f"{len(PATCHES)} total"
+        f"  Results: {results['success']} applied | "
+        f"{results['skipped']} skipped | {results['failed']} failed"
     )
     if not dry_run and results["success"] > 0:
-        print("  Original files backed up as .bak")
-        print("  To revert: python patch_torch251.py --revert")
+        print("  Original files are backed up as .bak")
+        print("  Revert with: python patch_torch251.py --revert")
     print("=" * 64)
 
-    # Exit with non-zero code if any patch failed
     if results["failed"] > 0:
         sys.exit(1)
 
