@@ -83,7 +83,7 @@ class KVBlockZeroer:
     def init_meta(
         self,
         attn_groups_iter: Iterable["AttentionGroup"],
-        kernel_block_sizes: list[int],
+        kernel_block_sizes: list[int | None],
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
@@ -99,6 +99,8 @@ class KVBlockZeroer:
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+            if kernel_bs is None:
+                continue
             ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
@@ -362,14 +364,15 @@ def select_common_block_size(
 
 def prepare_kernel_block_sizes(
     kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
-) -> list[int]:
+) -> list[int | None]:
     """Generate kernel block sizes matching each KV cache group."""
-    kernel_block_sizes = []
+    kernel_block_sizes: list[int | None] = []
     for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         kv_cache_spec = kv_cache_group.kv_cache_spec
         if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+            kernel_block_sizes.append(None)
             continue
         if isinstance(kv_cache_spec, AttentionSpec):
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size

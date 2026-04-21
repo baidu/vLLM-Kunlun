@@ -77,7 +77,6 @@ docker run \
   -v /home:/home \
   -v "${WORKSPACE_MOUNT}" \
   -v /ssd1:/ssd1 \
-  -v /ssd1:/ssd1 \
   -v /ssd3:/ssd3 \
   -v /dev/shm:/dev/shm \
   -v /usr/lib64/libcuda.so.1:/usr/lib64/libcuda.so.1 \
