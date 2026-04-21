@@ -11,11 +11,26 @@ This document describes how to install vllm-kunlun manually.
   - vLLM (same version as vllm-kunlun)
 
 ## Setup environment using container
-We provide a clean and minimal base image for your use.You can pull it using the docker pull command.
-- **Internal registry (Baidu intranet only)**  
-  `iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base`
-- **Public registry**  
+We provide clean and minimal base images for your use. Choose the image source
+based on your network:
+
+- **Public registry**:
   `wjie520/vllm_kunlun:uv_base`
+- **Internal registry (Baidu intranet only)**:
+  `iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base`
+
+Before pulling the image, you can verify that the public tag exists without
+downloading the full image:
+
+```bash
+docker manifest inspect wjie520/vllm_kunlun:uv_base >/dev/null
+```
+
+If the manifest check succeeds but `docker pull` times out, the image tag is
+available and the failure is usually caused by Docker Hub connectivity, proxy, or
+registry mirror configuration. If the manifest check also times out, configure
+your Docker network access first and retry the check. The internal registry is
+only reachable from the Baidu intranet.
 
 ### Container startup script
 
@@ -37,7 +52,7 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 export build_image="wjie520/vllm_kunlun:uv_base"
-# or export build_image="iregistry.baidu-int.com/xmlir/xmlir_ubuntu_2004_x86_64:v0.32"
+# or export build_image="iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base"
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
