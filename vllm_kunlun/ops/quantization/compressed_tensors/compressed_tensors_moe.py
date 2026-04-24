@@ -365,14 +365,14 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
             # Process w13 scale: use in-place operations to reduce memory
             w13_scale_data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
-            w13_scale_data.mul_(7.0)  # in-place multiply
             w13_scale_data = w13_scale_data.to(torch.float32)  # type conversion
+            w13_scale_data.mul_(7.0)  # in-place multiply
             layer.w13_weight_scale.data = w13_scale_data  # Direct assignment
 
             # Process w2 scale: same as w13
             w2_scale_data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
-            w2_scale_data.mul_(7.0)  # in-place multiply
             w2_scale_data = w2_scale_data.to(torch.float32)  # type conversion
+            w2_scale_data.mul_(7.0)  # in-place multiply
             layer.w2_weight_scale.data = w2_scale_data  # Direct assignment
 
     def apply(
