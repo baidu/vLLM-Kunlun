@@ -1,5 +1,7 @@
 """kunlun"""
 
+import importlib
+import os
 from typing import TYPE_CHECKING, Optional
 
 import psutil
@@ -17,6 +19,180 @@ else:
     VllmConfig = None
 
 logger = init_logger(__name__)
+
+
+def _resolve_backend_or_fallback(primary_backend: str, fallback_backend: str) -> str:
+    try:
+        importlib.import_module(primary_backend.rsplit(".", 1)[0])
+        return primary_backend
+    except Exception as exc:
+        logger.warning(
+            "Failed to import Kunlun attention backend %s; falling back to %s. "
+            "Original error: %s",
+            primary_backend,
+            fallback_backend,
+            exc,
+        )
+        return fallback_backend
+
+
+def _get_vllm_attention_backend() -> Optional[str]:
+    return getattr(envs, "VLLM_ATTENTION_BACKEND", None) or os.environ.get(
+        "VLLM_ATTENTION_BACKEND"
+    )
+
+
+def _check_flashmla_supported(flashmla_module=None) -> tuple[bool, Optional[str]]:
+    if flashmla_module is None:
+        try:
+            flashmla_module = __import__(
+                "vllm.attention.ops.flashmla",
+                fromlist=["is_flashmla_supported"],
+            )
+        except ModuleNotFoundError:
+            flashmla_module = importlib.import_module("vllm.v1.attention.ops.flashmla")
+    support_fn = getattr(flashmla_module, "is_flashmla_supported", None)
+    if support_fn is None:
+        support_fn = getattr(flashmla_module, "is_flashmla_dense_supported", None)
+    if support_fn is None:
+        return False, "FlashMLA support check is unavailable."
+    return support_fn()
+
+
+def _patch_quantization_config_loader() -> None:
+    import sys
+
+    import vllm.model_executor.layers.quantization as quant_module
+
+    method_specs = {
+        "awq": ("vllm.model_executor.layers.quantization.awq", "AWQConfig"),
+        "fp8": ("vllm.model_executor.layers.quantization.fp8", "Fp8Config"),
+        "fbgemm_fp8": (
+            "vllm.model_executor.layers.quantization.fbgemm_fp8",
+            "FBGEMMFp8Config",
+        ),
+        "modelopt": (
+            "vllm.model_executor.layers.quantization.modelopt",
+            "ModelOptFp8Config",
+        ),
+        "modelopt_fp4": (
+            "vllm.model_executor.layers.quantization.modelopt",
+            "ModelOptNvFp4Config",
+        ),
+        "modelopt_mxfp8": (
+            "vllm.model_executor.layers.quantization.modelopt",
+            "ModelOptMxFp8Config",
+        ),
+        "modelopt_mixed": (
+            "vllm.model_executor.layers.quantization.modelopt",
+            "ModelOptMixedPrecisionConfig",
+        ),
+        "bitblas": (
+            "vllm.model_executor.layers.quantization.bitblas",
+            "BitBLASConfig",
+        ),
+        "gguf": ("vllm.model_executor.layers.quantization.gguf", "GGUFConfig"),
+        "gptq_marlin_24": (
+            "vllm.model_executor.layers.quantization.gptq_marlin_24",
+            "GPTQMarlin24Config",
+        ),
+        "gptq_marlin": (
+            "vllm.model_executor.layers.quantization.gptq_marlin",
+            "GPTQMarlinConfig",
+        ),
+        "gptq_bitblas": (
+            "vllm.model_executor.layers.quantization.gptq_bitblas",
+            "GPTQBitBLASConfig",
+        ),
+        "awq_marlin": (
+            "vllm.model_executor.layers.quantization.awq_marlin",
+            "AWQMarlinConfig",
+        ),
+        "gptq": ("vllm.model_executor.layers.quantization.gptq", "GPTQConfig"),
+        "compressed-tensors": (
+            "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors",
+            "CompressedTensorsConfig",
+        ),
+        "bitsandbytes": (
+            "vllm.model_executor.layers.quantization.bitsandbytes",
+            "BitsAndBytesConfig",
+        ),
+        "ptpc_fp8": (
+            "vllm.model_executor.layers.quantization.ptpc_fp8",
+            "PTPCFp8Config",
+        ),
+        "experts_int8": (
+            "vllm.model_executor.layers.quantization.experts_int8",
+            "ExpertsInt8Config",
+        ),
+        "ipex": (
+            "vllm.model_executor.layers.quantization.ipex_quant",
+            "IPEXConfig",
+        ),
+        "quark": (
+            "vllm.model_executor.layers.quantization.quark.quark",
+            "QuarkConfig",
+        ),
+        "moe_wna16": (
+            "vllm.model_executor.layers.quantization.moe_wna16",
+            "MoeWNA16Config",
+        ),
+        "torchao": (
+            "vllm.model_executor.layers.quantization.torchao",
+            "TorchAOConfig",
+        ),
+        "auto-round": (
+            "vllm.model_executor.layers.quantization.inc",
+            "INCConfig",
+        ),
+        "inc": ("vllm.model_executor.layers.quantization.inc", "INCConfig"),
+        "mxfp4": ("vllm.model_executor.layers.quantization.mxfp4", "Mxfp4Config"),
+        "petit_nvfp4": (
+            "vllm.model_executor.layers.quantization.petit",
+            "PetitNvFp4Config",
+        ),
+        "cpu_awq": (
+            "vllm.model_executor.layers.quantization.cpu_wna16",
+            "CPUAWQConfig",
+        ),
+    }
+
+    available_methods = []
+    for method in quant_module.QUANTIZATION_METHODS:
+        module_name, _ = method_specs.get(method, ("", ""))
+        if not module_name or importlib.util.find_spec(module_name) is not None:
+            available_methods.append(method)
+
+    quant_module.QUANTIZATION_METHODS[:] = available_methods
+    quant_module.DEPRECATED_QUANTIZATION_METHODS[:] = [
+        method
+        for method in quant_module.DEPRECATED_QUANTIZATION_METHODS
+        if method in available_methods
+    ]
+
+    def _get_quantization_config(quantization: str):
+        if (
+            quantization not in quant_module.QUANTIZATION_METHODS
+            and quantization not in method_specs
+        ):
+            raise ValueError(f"Invalid quantization method: {quantization}")
+
+        custom_configs = getattr(
+            quant_module,
+            "_CUSTOMIZED_METHOD_TO_QUANT_CONFIG",
+            {},
+        )
+        if quantization in custom_configs:
+            return custom_configs[quantization]
+
+        module_name, class_name = method_specs[quantization]
+        module = importlib.import_module(module_name)
+        return getattr(module, class_name)
+
+    quant_module.get_quantization_config = _get_quantization_config
+    weight_utils = sys.modules.get("vllm.model_executor.model_loader.weight_utils")
+    if weight_utils is not None:
+        weight_utils.get_quantization_config = _get_quantization_config
 
 
 class KunlunPlatform(Platform):
@@ -145,6 +321,11 @@ class KunlunPlatform(Platform):
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        """Return the hardware compute-unit count exposed through torch.cuda."""
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """
         TODO Update here for v0.15.1
@@ -199,17 +380,11 @@ class KunlunPlatform(Platform):
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
             use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
-            )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            attention_backend = _get_vllm_attention_backend()
+            use_flashmla = attention_backend is None or attention_backend == "FLASHMLA"
+            flashmla_supported, _ = _check_flashmla_supported()
 
-            if (
-                use_flashmla
-                and is_flashmla_supported()[0]
-                and cache_config.block_size != 64
-            ):
+            if use_flashmla and flashmla_supported and cache_config.block_size != 64:
                 cache_config.block_size = 64
                 logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
             if use_sparse and cache_config.block_size != 64:
@@ -221,7 +396,8 @@ class KunlunPlatform(Platform):
         from vllm.config import CUDAGraphMode
 
         if (
-            envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput"
+            getattr(parallel_config, "all2all_backend", None)
+            == "deepep_high_throughput"
             and parallel_config.data_parallel_size > 1
             and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
@@ -249,6 +425,7 @@ class KunlunPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        num_heads: int | None = None,
     ) -> str:
         """
             Returns the class of attention backend based on the selected backend and other parameters.
@@ -265,7 +442,12 @@ class KunlunPlatform(Platform):
         Returns:
             str: Class name of the attention backend.
         """
+        del selected_backend, num_heads
         if attn_selector_config.use_mla:
+            attention_backend = _get_vllm_attention_backend()
+            if attention_backend == "FLASHMLA":
+                logger.info_once("Using dense FlashMLA backend on V1 engine.")
+                return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
             if attn_selector_config.use_sparse:
                 logger.info_once("Using Sparse MLA backend on V1 engine.")
                 return (
@@ -274,8 +456,10 @@ class KunlunPlatform(Platform):
                 )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
         elif not attn_selector_config.use_mla:
-            return (
-                "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
+            return _resolve_backend_or_fallback(
+                "vllm_kunlun.v1.attention.backends.kunlun_attn."
+                "KunlunAttentionBackend",
+                "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend",
             )
         else:
             return (
@@ -382,9 +566,18 @@ class KunlunPlatform(Platform):
         cls, parser: FlexibleArgumentParser | None = None
     ) -> None:
         from vllm_kunlun.quantization.awq import KunlunAWQConfig  # noqa
-        from vllm_kunlun.quantization.compressed_tensors import (  # noqa
-            KunlunCompressedTensorsConfig,
-        )
         from vllm_kunlun.quantization.gptq import KunlunGPTQConfig  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_INT8_KERNELS  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_KERNELS  # noqa
+
+        try:
+            from vllm_kunlun.quantization.compressed_tensors import (  # noqa: F401
+                KunlunCompressedTensorsConfig,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping compressed-tensors quantization registration during "
+                "platform pre-registration: %s",
+                exc,
+            )
+        _patch_quantization_config_loader()

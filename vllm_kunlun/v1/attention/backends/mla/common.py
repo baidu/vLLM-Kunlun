@@ -197,30 +197,30 @@ import torch
 import vllm.envs as envs
 from tqdm import tqdm
 from vllm import _custom_ops as ops
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionLayer,
-    AttentionMetadata,
-    MLAAttentionImpl,
-)
-from vllm.attention.backends.utils import get_mla_dims
 from vllm.attention.ops.common import cp_lse_ag_out_rs
 from vllm.attention.ops.merge_attn_states import merge_attn_states
-from vllm.attention.utils.fa_utils import get_flash_attn_version
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_dcp_group, is_global_first_rank
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
     UnquantizedLinearMethod,
 )
 from vllm.platforms import current_platform
-from vllm.utils import cdiv, round_down
 from vllm.utils.flashinfer import has_nvidia_artifactory
-from vllm.v1.attention.backends.utils import (
+from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionLayer,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    MLAAttentionImpl,
+)
+from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+from vllm.v1.attention.backends.utils import (
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
@@ -229,6 +229,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 import vllm_kunlun.platforms.envs as vllm_kunlun_envs
 
+flash_attn_varlen_func = None
+is_vllm_fa = False
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
@@ -236,8 +238,10 @@ try:
 except ImportError:
     # For rocm use upstream flash attention
     if current_platform.is_rocm():
-        from flash_attn import flash_attn_varlen_func
-    is_vllm_fa = False
+        try:
+            from flash_attn import flash_attn_varlen_func
+        except ImportError:
+            pass
 
 try:
     from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
@@ -429,13 +433,17 @@ M = TypeVar("M", bound=MLACommonMetadata)
 A = TypeVar("A")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    return bool(getattr(envs, name, default))
+
+
 def use_flashinfer_prefill() -> bool:
     # For blackwell default to flashinfer prefill if it's available since
     # it is faster than FA2.
     return (
-        not envs.VLLM_DISABLE_FLASHINFER_PREFILL
+        not _env_flag("VLLM_DISABLE_FLASHINFER_PREFILL")
         and flashinfer_available
-        and not envs.VLLM_USE_CUDNN_PREFILL
+        and not _env_flag("VLLM_USE_CUDNN_PREFILL")
         and current_platform.is_device_capability(100)
     )
 
@@ -443,7 +451,7 @@ def use_flashinfer_prefill() -> bool:
 def use_cudnn_prefill() -> bool:
     return (
         flashinfer_available
-        and envs.VLLM_USE_CUDNN_PREFILL
+        and _env_flag("VLLM_USE_CUDNN_PREFILL")
         and current_platform.is_device_capability(100)
         and has_nvidia_artifactory()
     )
@@ -1221,10 +1229,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             # RoCM and the latter has an additional parameter to control
             # FA2 vs FA3
             self.flash_attn_varlen_func = flash_attn_varlen_func
-            self.vllm_flash_attn_version = get_flash_attn_version()
+            self.vllm_flash_attn_version = None
+            if self.flash_attn_varlen_func is not None:
+                self.vllm_flash_attn_version = get_flash_attn_version()
             if self.vllm_flash_attn_version is not None:
                 self.flash_attn_varlen_func = functools.partial(
-                    flash_attn_varlen_func, fa_version=self.vllm_flash_attn_version
+                    self.flash_attn_varlen_func,
+                    fa_version=self.vllm_flash_attn_version,
                 )
 
             # For MLA the v head dim is smaller than qk head dim so we pad out
@@ -1237,12 +1248,70 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             )
 
         self.dcp_world_size: Optional[int] = None
+        self._ensure_dcp_world_size()
 
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
                 get_current_vllm_config()
             )
         )
+
+    def _torch_prefill_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        context_seq_lod_xpu: Optional[torch.Tensor],
+        context_seq_lod_cpu: Optional[torch.Tensor],
+        return_softmax_lse: bool,
+        causal: bool,
+        softmax_scale: Optional[float],
+    ):
+        scale = softmax_scale if softmax_scale is not None else q.shape[-1] ** -0.5
+        maybe_padded_v = v
+        if self._pad_v:
+            maybe_padded_v = torch.nn.functional.pad(
+                v, [0, q.shape[-1] - v.shape[-1]], value=0
+            )
+
+        out = q.new_empty((*q.shape[:-1], maybe_padded_v.shape[-1]))
+        softmax_lse = torch.empty(
+            q.size(1), q.size(0), dtype=torch.float32, device=q.device
+        )
+        softmax_lse.fill_(float("-inf"))
+
+        if context_seq_lod_cpu is not None:
+            seq_lens = context_seq_lod_cpu.tolist()
+        elif context_seq_lod_xpu is not None:
+            seq_lens = context_seq_lod_xpu.detach().cpu().tolist()
+        else:
+            seq_lens = [0, q.shape[0]]
+
+        for start, end in zip(seq_lens[:-1], seq_lens[1:]):
+            if end <= start:
+                continue
+
+            q_i = q[start:end].to(torch.float32)
+            k_i = k[start:end].to(torch.float32)
+            v_i = maybe_padded_v[start:end].to(torch.float32)
+
+            scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * scale
+            if causal:
+                q_len = end - start
+                causal_mask = torch.triu(
+                    torch.ones(q_len, q_len, dtype=torch.bool, device=q.device),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
+
+            probs = torch.softmax(scores, dim=-1)
+            out[start:end].copy_(torch.einsum("hqk,khd->qhd", probs, v_i).to(out.dtype))
+            if return_softmax_lse:
+                softmax_lse[:, start:end] = torch.logsumexp(scores, dim=-1)
+
+        if return_softmax_lse:
+            return out, softmax_lse
+        return out
 
     def _flash_attn_varlen_diff_headdims(
         self,
@@ -1283,26 +1352,38 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             tp_q_head_num, q.size(0), dtype=torch.float32, device=q.device
         )
         softmax_lse.fill_(float("-inf"))
-        kunlun_ops.attention(
-            q=q,
-            k_cache=k,
-            v_cache=maybe_padded_v,
-            out=attn_out,
-            is_causal=causal,
-            is_prefill=True,
-            prefill_len=0,
-            k_perchannel_scale=None,
-            v_perchannel_scale=None,
-            smooth=None,
-            context_seq_lod_cpu=context_seq_lod_cpu,
-            context_seq_lod_xpu=context_seq_lod_xpu,
-            slot_mapping_cpu=None,
-            slot_mapping_xpu=None,
-            v_trans=False,
-            v_trans_threshold=0,
-            alpha=ds_alpha,
-            softmax_lse=softmax_lse,
-        )
+        try:
+            kunlun_ops.attention(
+                q=q,
+                k_cache=k,
+                v_cache=maybe_padded_v,
+                out=attn_out,
+                is_causal=causal,
+                is_prefill=True,
+                prefill_len=0,
+                k_perchannel_scale=None,
+                v_perchannel_scale=None,
+                smooth=None,
+                context_seq_lod_cpu=context_seq_lod_cpu,
+                context_seq_lod_xpu=context_seq_lod_xpu,
+                slot_mapping_cpu=None,
+                slot_mapping_xpu=None,
+                v_trans=False,
+                v_trans_threshold=0,
+                alpha=ds_alpha,
+                softmax_lse=softmax_lse,
+            )
+        except (RuntimeError, ValueError):
+            return self._torch_prefill_attention(
+                q=q,
+                k=k,
+                v=v,
+                context_seq_lod_xpu=context_seq_lod_xpu,
+                context_seq_lod_cpu=context_seq_lod_cpu,
+                return_softmax_lse=return_softmax_lse,
+                causal=causal,
+                softmax_scale=softmax_scale,
+            )
 
         # Unpack the output if there is multiple results
         if isinstance(attn_out, tuple):
@@ -1851,6 +1932,46 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         raise NotImplementedError
+
+    def _ensure_dcp_world_size(self) -> None:
+        if self.dcp_world_size is not None:
+            return
+        try:
+            self.dcp_world_size = get_dcp_group().world_size
+        except AssertionError:
+            self.dcp_world_size = 1
+
+    def forward_mha(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: M,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        self._ensure_dcp_world_size()
+        output.copy_(
+            self._forward_prefill(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+            )
+        )
+
+    def forward_mqa(
+        self,
+        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: M,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        self._ensure_dcp_world_size()
+        return self._forward_decode(q, kv_c_and_k_pe_cache, attn_metadata, layer)
 
     def forward(
         self,

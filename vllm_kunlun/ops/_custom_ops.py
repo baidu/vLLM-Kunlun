@@ -1627,9 +1627,101 @@ def _fake_concat_and_cache_mla(
 concat_and_cache_mla.register_fake(_fake_concat_and_cache_mla)
 
 
+if not hasattr(torch.ops._C_cache_ops, "concat_and_cache_mla"):
+
+    @custom_op("_C_cache_ops::concat_and_cache_mla", mutates_args=())
+    def concat_and_cache_mla_vllm019(
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        scale: torch.Tensor,
+    ) -> None:
+        kunlun_ops.concat_and_cache_mla(
+            kv_c=kv_c,
+            k_pe=k_pe,
+            slot_mapping=slot_mapping,
+            kv_cache=kv_cache,
+        )
+
+    @impl("_C_cache_ops::concat_and_cache_mla", "CUDA")
+    def concat_and_cache_mla_vllm019_cuda(
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        scale: torch.Tensor,
+    ) -> None:
+        kunlun_ops.concat_and_cache_mla(
+            kv_c=kv_c,
+            k_pe=k_pe,
+            slot_mapping=slot_mapping,
+            kv_cache=kv_cache,
+        )
+
+    def _fake_concat_and_cache_mla_vllm019(
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        scale: torch.Tensor,
+    ) -> None:
+        return None
+
+    concat_and_cache_mla_vllm019.register_fake(_fake_concat_and_cache_mla_vllm019)
+
+
 ######################################################
 # -------------- scaled_int8_quant -------------------
 ######################################################
+def _scaled_int8_quant_torch_fallback(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    x_2d = x.reshape(-1, x.shape[-1]).to(torch.float32)
+    scale_2d = scale.reshape(-1, 1)
+    if scale_2d.shape[0] != x_2d.shape[0]:
+        raise RuntimeError(
+            "scaled_int8_quant fallback expected one scale per input row, "
+            f"got scale rows={scale_2d.shape[0]} and input rows={x_2d.shape[0]}"
+        )
+
+    absmax = torch.amax(torch.abs(x_2d), dim=-1, keepdim=True)
+    denom = torch.where(absmax > 0, absmax, torch.ones_like(absmax))
+    quantized = torch.round(x_2d * (127.0 / denom)).clamp_(-127, 127)
+
+    x_q.reshape(-1, x.shape[-1]).copy_(quantized.to(torch.int8))
+    scale_2d.copy_(absmax)
+
+
+def _dynamic_scaled_int8_quant(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    x_contiguous = x.contiguous()
+    try:
+        # NOTE: For quant2d ops, scale represents max.
+        ret = kunlun_ops.quant2d(
+            x=x_contiguous,
+            y=x_q,
+            max=scale,
+            force_sdnn=True,
+        )
+    except RuntimeError:
+        _scaled_int8_quant_torch_fallback(x_contiguous, x_q, scale)
+        return
+
+    if ret in (None, 0):
+        return
+
+    _scaled_int8_quant_torch_fallback(x_contiguous, x_q, scale)
+
+
 @custom_op("_C::scaled_int8_quant", mutates_args=())
 def scaled_int8_quant(
     x: torch.Tensor,
@@ -1648,8 +1740,7 @@ def scaled_int8_quant(
         )
         azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
         if symmetric:
-            # NOTE: For quant2d ops, scale represents max.
-            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            _dynamic_scaled_int8_quant(x, x_q, scale)
         else:
             torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
                 x_q, x.contiguous(), scale, azp
@@ -1675,8 +1766,7 @@ def scaled_int8_quant_cuda(
         )
         azp = None if symmetric else torch.empty_like(scale, dtype=torch.int32)
         if symmetric:
-            # NOTE: For quant2d ops, scale represents max.
-            kunlun_ops.quant2d(x=x.contiguous(), y=x_q, max=scale, force_sdnn=True)
+            _dynamic_scaled_int8_quant(x, x_q, scale)
         else:
             torch.ops.xspeedgate_ops.dynamic_scaled_int8_quant(
                 x_q, x.contiguous(), scale, azp

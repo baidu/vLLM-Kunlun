@@ -8,7 +8,6 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadataBuilder,
     kv_spans_from_batches,
-    split_prefill_chunks,
 )
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
@@ -16,6 +15,32 @@ from vllm.v1.attention.backends.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def split_prefill_chunks(
+    seq_lens_cpu: torch.Tensor,
+    max_prefill_buffer_size: int,
+    num_decodes: int,
+) -> list[tuple[int, int]]:
+    chunks: list[tuple[int, int]] = []
+    start = num_decodes
+    cur = start
+    total_seq_lens = 0
+
+    for req_idx in range(num_decodes, len(seq_lens_cpu)):
+        seq_len = int(seq_lens_cpu[req_idx].item())
+        if cur > start and total_seq_lens + seq_len > max_prefill_buffer_size:
+            chunks.append((start, cur))
+            start = cur
+            total_seq_lens = 0
+
+        cur = req_idx + 1
+        total_seq_lens += seq_len
+
+    if cur > start:
+        chunks.append((start, cur))
+
+    return chunks
 
 
 @dataclass

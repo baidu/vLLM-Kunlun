@@ -30,8 +30,9 @@ class CustomBuildExt(BuildExtension):
         for ext in self.extensions:
             ext_path = self.get_ext_fullpath(ext.name)
             file_name = os.path.basename(ext_path)
-            target_path = os.path.join("vllm_kunlun", file_name)
+            target_path = os.path.join(ROOT_DIR, "vllm_kunlun", file_name)
 
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
             if os.path.exists(target_path):
                 os.remove(target_path)
             shutil.copyfile(ext_path, target_path)
@@ -42,12 +43,12 @@ if __name__ == "__main__":
 
     setup(
         name="vllm_kunlun",
-        version="0.15.1",
+        version="0.19.0",
         author="vLLM-Kunlun team",
         license="Apache 2.0",
         description="vLLM Kunlun3 backend plugin",
         packages=find_packages(exclude=("docs", "examples", "tests*")),
-        package_data={"vllm_kunlun": ["_kunlun.so", "so/*.so", "include/*.h"]},
+        package_data={"vllm_kunlun": ["_kunlun*.so", "so/*.so", "include/*.h"]},
         python_requires=">=3.10",
         ext_modules=ext_modules,
         cmdclass={
@@ -63,6 +64,5 @@ if __name__ == "__main__":
             "vllm.plugins": [
                 "kunlun_fused_moe = vllm_kunlun.ops.fused_moe:register_kunlun_fused_moe_ops"
             ],
-            "console_scripts": ["vllm_kunlun = vllm_kunlun.entrypoints.main:main"],
         },
     )

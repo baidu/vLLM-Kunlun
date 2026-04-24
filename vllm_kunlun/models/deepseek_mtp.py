@@ -21,6 +21,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from .deepseek_v2 import DeepseekV2DecoderLayer, get_spec_layer_idx_from_weight_name
+from .fused_moe_compat import make_expert_params_mapping
 
 
 class SharedHead(nn.Module):
@@ -188,7 +189,9 @@ class DeepSeekMTP(nn.Module, SupportsPP):
             ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
         ]
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        expert_params_mapping = make_expert_params_mapping(
+            FusedMoE,
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

@@ -2,7 +2,7 @@
 
 ## Version Specific FAQs
 
-- [[v0.15.1] FAQ & Feedback]
+- [[v0.19.0] FAQ & Feedback]
 
 ## General FAQs
 
@@ -24,7 +24,7 @@ We will support the kunlun4 M100 platform in early 2026.
 
 ### 3. How vllm-kunlun work with vLLM?
 
-vllm-kunlun is a hardware plugin for vLLM. Basically, the version of vllm-kunlun is the same as the version of vllm. For example, if you use vllm 0.15.1, you should use vllm-kunlun 0.15.1 as well. For main branch, we will make sure `vllm-kunlun` and `vllm` are compatible by each commit.
+vllm-kunlun is a hardware plugin for vLLM. Basically, the version of vllm-kunlun is the same as the version of vllm. For example, if you use vllm 0.19.0, you should use vllm-kunlun 0.19.0 as well. For main branch, we will make sure `vllm-kunlun` and `vllm` are compatible by each commit.
 
 ### 4. How to handle the out-of-memory issue?
 

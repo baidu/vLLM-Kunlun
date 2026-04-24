@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-kunlun"
-version = "0.15.1.dev0"
+version = "0.19.0"
 description = "vLLM Kunlun3 backend plugin"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,19 +12,24 @@ license = { text = "MIT" }
 authors = [{ name = "kunlun"}]
 dependencies = []
 
-[project.scripts]
-vllm-kunlun = "vllm_kunlun.cmdline:main"
-
 [project.entry-points."vllm.platform_plugins"]
 kunlun = "vllm_kunlun:register"
 
 [project.entry-points."vllm.general_plugins"]
 kunlun_model = "vllm_kunlun:register_model"
+kunlun_quant = "vllm_kunlun.models:register_quant_method"
+
+[project.entry-points."vllm.plugins"]
+kunlun_fused_moe = "vllm_kunlun.ops.fused_moe:register_kunlun_fused_moe_ops"
 
 [tool.hatch.build]
 packages = ["vllm_kunlun"]
 include = ["vllm_kunlun/conf/*", "vllm_kunlun/data/*"]
 
+[tool.hatch.build.targets.sdist]
+artifacts = ["vllm_kunlun/*.so"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_kunlun"]
+artifacts = ["vllm_kunlun/*.so"]
 output-dir = "output/dist"

@@ -10,7 +10,6 @@ import torch
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -88,6 +87,7 @@ from vllm.transformers_utils.configs import Qwen3NextConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 
+from vllm_kunlun.attention_compat import Attention
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
 # from vllm_kunlun.ops.attention.layer import Attention
