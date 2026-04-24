@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
+import os
 from typing import Optional, Tuple
 
 import kunlun_ops
@@ -58,6 +59,56 @@ def get_mla_metadata(
     return cache_seqlens_cpu, cache_seqlens
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _torch_mla_decode(
+    q_c: torch.Tensor,
+    q_r: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    batch_size, seq_len_q, num_heads_q, kv_lora_rank = q_c.shape
+    page_block_size = k_cache.shape[2]
+    head_dim = k_cache.shape[3]
+    qk_rope_head_dim = q_r.shape[-1]
+    flat_cache = k_cache[:, 0]
+
+    out = torch.empty(
+        batch_size,
+        seq_len_q,
+        num_heads_q,
+        kv_lora_rank,
+        dtype=q_c.dtype,
+        device=q_c.device,
+    )
+    for batch_idx in range(batch_size):
+        seq_len = int(cache_seqlens[batch_idx].item())
+        if seq_len == 0:
+            out[batch_idx].zero_()
+            continue
+
+        num_blocks = (seq_len + page_block_size - 1) // page_block_size
+        block_ids = block_table[batch_idx, :num_blocks].to(torch.long)
+        seq_cache = flat_cache.index_select(0, block_ids).reshape(-1, head_dim)[
+            :seq_len
+        ]
+        seq_cache = seq_cache.to(device=q_c.device, dtype=q_c.dtype, non_blocking=True)
+        kv_c = seq_cache[:, :kv_lora_rank]
+        k_pe = seq_cache[:, kv_lora_rank : kv_lora_rank + qk_rope_head_dim]
+
+        scores = torch.einsum("qhd,kd->qhk", q_c[batch_idx], kv_c)
+        scores = scores + torch.einsum("qhr,kr->qhk", q_r[batch_idx], k_pe)
+        scores = scores.float() * softmax_scale
+        probs = torch.softmax(scores, dim=-1).to(q_c.dtype)
+        out[batch_idx] = torch.einsum("qhk,kd->qhd", probs, kv_c)
+
+    return out
+
+
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -102,16 +153,28 @@ def flash_mla_with_kvcache(
     page_block_size = k_cache.shape[1]
     k_cache = k_cache.view(-1, 1, page_block_size, head_dim)
 
-    # todo: optimize memcp
-    # q_c = q[..., : kv_lora_rank].contiguous()
-    # q_r = q[..., kv_lora_rank :].contiguous()
+    q_c = q[..., :kv_lora_rank].contiguous()
+    q_r = q[..., kv_lora_rank:].contiguous()
+
+    if _env_flag("VLLM_KUNLUN_MLA_DECODE_FALLBACK"):
+        return (
+            _torch_mla_decode(
+                q_c=q_c,
+                q_r=q_r,
+                k_cache=k_cache,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                softmax_scale=softmax_scale,
+            ),
+            softmax_lse,
+        )
 
     is_context = False
     vo_head_dim = -1
 
     kunlun_ops.paged_attention(
         out,
-        q,
+        q_c,
         k_cache,
         None,
         block_table,
@@ -123,7 +186,7 @@ def flash_mla_with_kvcache(
         kv_lora_rank,
         qk_rope_head_dim,
         softmax_scale,
-        q_r=q,
+        q_r=q_r,
     )
     return out, softmax_lse
 

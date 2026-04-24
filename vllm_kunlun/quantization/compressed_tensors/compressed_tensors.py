@@ -51,7 +51,10 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.attention.layer import Attention  # Avoid circular import
+        try:
+            from vllm.attention.layer import Attention  # Avoid circular import
+        except ModuleNotFoundError:
+            from vllm.model_executor.layers.attention import Attention
 
         if isinstance(layer, LinearBase):
             # collect schemes

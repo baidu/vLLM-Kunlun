@@ -26,6 +26,44 @@ from vllm.model_executor.kernels.linear.scaled_mm import (
 from vllm.platforms import current_platform
 
 
+def _torch_scaled_int8_mm_fallback(
+    x_q: torch.Tensor,
+    w_q: torch.Tensor,
+    x_max: torch.Tensor,
+    w_max: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    orig_shape = x_q.shape[:-1]
+    device = x_q.device
+    x_2d = x_q.reshape(-1, x_q.shape[-1]).to(torch.float32)
+
+    x_scale = x_max.reshape(-1, 1).to(device=device, dtype=torch.float32) / 127.0
+    if x_scale.shape[0] == 1 and x_2d.shape[0] != 1:
+        x_scale = x_scale.expand(x_2d.shape[0], 1)
+    if x_scale.shape[0] != x_2d.shape[0]:
+        raise RuntimeError(
+            "scaled int8 fallback expected one activation scale per row, "
+            f"got scale rows={x_scale.shape[0]} and input rows={x_2d.shape[0]}"
+        )
+
+    w_scale = w_max.reshape(-1).to(device=device, dtype=torch.float32) / 127.0
+    if w_scale.numel() == 1 and w_q.shape[1] != 1:
+        w_scale = w_scale.expand(w_q.shape[1])
+    if w_scale.numel() != w_q.shape[1]:
+        raise RuntimeError(
+            "scaled int8 fallback expected one weight scale per output column, "
+            f"got scales={w_scale.numel()} and output columns={w_q.shape[1]}"
+        )
+
+    x_dequant = x_2d * x_scale
+    w_dequant = w_q.to(device=device, dtype=torch.float32) * w_scale.reshape(1, -1)
+    out = torch.matmul(x_dequant, w_dequant)
+    if bias is not None:
+        out = out + bias.to(device=device, dtype=torch.float32)
+    return out.to(out_dtype).reshape(*orig_shape, w_q.shape[1])
+
+
 class KunlunScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     @classmethod
     def is_supported(
@@ -79,14 +117,28 @@ class KunlunScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
                 bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             )
         else:  # symmetric
-            return torch.ops._C.matmul(
-                x=x_q,
-                w=w_q.transpose(0, 1),
-                out_dtype=x.dtype,
-                x_pc_max=x_s * 127.0 if static else x_s,
-                w_pc_max=w_s,
-                bias=bias.to(torch.float32).contiguous() if bias is not None else None,
+            x_max = x_s * 127.0 if static else x_s
+            bias_fp32 = (
+                bias.to(torch.float32).contiguous() if bias is not None else None
             )
+            try:
+                return torch.ops._C.matmul(
+                    x=x_q,
+                    w=w_q.transpose(0, 1),
+                    out_dtype=x.dtype,
+                    x_pc_max=x_max,
+                    w_pc_max=w_s,
+                    bias=bias_fp32,
+                )
+            except (RuntimeError, ValueError):
+                return _torch_scaled_int8_mm_fallback(
+                    x_q=x_q,
+                    w_q=w_q,
+                    x_max=x_max,
+                    w_max=w_s,
+                    out_dtype=x.dtype,
+                    bias=bias_fp32,
+                )
 
             # backup option: lower performance
             # return torch.ops._C.cutlass_scaled_mm(

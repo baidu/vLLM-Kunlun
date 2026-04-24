@@ -20,6 +20,30 @@ apply_torch251_compat_shims()
 OLD_IMPORT_HOOK = builtins.__import__
 
 
+def _has_scaled_int8_quant_op() -> bool:
+    import torch
+
+    return hasattr(torch.ops._C, "scaled_int8_quant")
+
+
+def _has_cache_concat_mla_op() -> bool:
+    import torch
+
+    return hasattr(torch.ops._C_cache_ops, "concat_and_cache_mla")
+
+
+def _has_required_python_custom_ops() -> bool:
+    return _has_scaled_int8_quant_op() and _has_cache_concat_mla_op()
+
+
+def _ensure_python_custom_ops_registered(logger: logging.Logger) -> None:
+    if _has_required_python_custom_ops():
+        return
+
+    importlib.import_module("vllm_kunlun.ops._custom_ops")
+    logger.info("[KunlunPlugin] Python custom op definitions loaded")
+
+
 def _configure_kunlun_logger() -> logging.Logger:
     """Reuse vLLM's handler for the vllm_kunlun logger tree."""
     from vllm.logger import init_logger as init_vllm_logger
@@ -44,6 +68,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
         "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
         "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
         "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
+        "vllm.attention.ops.common": "vllm.v1.attention.ops.common",
+        "vllm.attention.ops.flashmla": "vllm.v1.attention.ops.flashmla",
         "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
         "vllm.v1.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
         "vllm.model_executor.models.config": "vllm_kunlun.models.config",
@@ -124,6 +150,12 @@ def register():
         logger.info("[KunlunPlugin] _kunlun native extension loaded")
     except ImportError as e:
         logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", e)
+
+    try:
+        _ensure_python_custom_ops_registered(logger)
+    except Exception:
+        logger.exception("[KunlunPlugin] Python custom op registration failed")
+        raise
 
     # --- import wrapper & patch utils ---
     try:

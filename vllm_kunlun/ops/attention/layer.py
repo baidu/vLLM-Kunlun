@@ -5,9 +5,6 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch.library import custom_op
-from vllm.attention import Attention as VllmAttention
-from vllm.attention import AttentionType
-from vllm.attention.layer import MultiHeadAttention as VllmMultiHeadAttention
 from vllm.config import CacheConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -15,8 +12,16 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention import Attention as VllmAttention
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.platforms import _Backend
+from vllm.v1.attention.backend import AttentionType
+
+
+class _Backend:
+    FLASH_ATTN = "FLASH_ATTN"
+    XFORMERS = "XFORMERS"
+    TORCH_SDPA = "TORCH_SDPA"
+    PALLAS_VLLM_V1 = "PALLAS_VLLM_V1"
 
 
 class Attention(VllmAttention):
@@ -117,8 +122,8 @@ class Attention(VllmAttention):
                 return unified_attention(query, key, value, self.layer_name)
 
 
-# 重写自 vllm.attention.layer 中的 MultiHeadAttention 类
-class MultiHeadAttention(VllmMultiHeadAttention):
+# 重写自旧版 vllm.attention.layer 中的 MultiHeadAttention 类
+class MultiHeadAttention(torch.nn.Module):
     def __init__(
         self,
         num_heads: int,
@@ -126,12 +131,12 @@ class MultiHeadAttention(VllmMultiHeadAttention):
         scale: float,
         num_kv_heads: Optional[int] = None,
     ):
-        super().__init__(
-            num_heads=num_heads,
-            head_size=head_size,
-            scale=scale,
-            num_kv_heads=num_kv_heads,
-        )
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         # kunlun只支持flash_attn
         self.attn_backend = _Backend.FLASH_ATTN
 

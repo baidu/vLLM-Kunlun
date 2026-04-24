@@ -119,6 +119,153 @@ def test_import_patches_v1_block_table_slot_mapping_kernel():
     assert slot_mapping.tolist() == [16, 17, 29, -1, -1]
 
 
+def test_register_imports_python_custom_ops_when_missing(monkeypatch):
+    import vllm_kunlun
+
+    imported_modules = []
+    monkeypatch.setattr(vllm_kunlun, "_has_required_python_custom_ops", lambda: False)
+    monkeypatch.setattr(
+        vllm_kunlun.importlib,
+        "import_module",
+        lambda name: imported_modules.append(name),
+    )
+
+    vllm_kunlun._ensure_python_custom_ops_registered(
+        SimpleNamespace(info=lambda *args, **kwargs: None)
+    )
+
+    assert imported_modules == ["vllm_kunlun.ops._custom_ops"]
+
+
+def test_register_skips_python_custom_ops_when_present(monkeypatch):
+    import vllm_kunlun
+
+    monkeypatch.setattr(vllm_kunlun, "_has_required_python_custom_ops", lambda: True)
+    monkeypatch.setattr(
+        vllm_kunlun.importlib,
+        "import_module",
+        lambda name: pytest.fail(f"unexpected import: {name}"),
+    )
+
+    vllm_kunlun._ensure_python_custom_ops_registered(
+        SimpleNamespace(info=lambda *args, **kwargs: None)
+    )
+
+
+def test_register_requires_vllm019_cache_mla_custom_op(monkeypatch):
+    import vllm_kunlun
+
+    monkeypatch.setattr(vllm_kunlun, "_has_scaled_int8_quant_op", lambda: True)
+    monkeypatch.setattr(vllm_kunlun, "_has_cache_concat_mla_op", lambda: False)
+
+    assert vllm_kunlun._has_required_python_custom_ops() is False
+
+
+def test_custom_ops_registers_vllm019_cache_mla_alias():
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+
+    assert hasattr(torch.ops._C_cache_ops, "concat_and_cache_mla")
+
+
+def test_scaled_int8_quant_torch_fallback_uses_per_token_absmax():
+    from vllm_kunlun.ops import _custom_ops
+
+    x = torch.tensor(
+        [
+            [[0.0, 1.0, -2.0], [3.0, -3.0, 1.5]],
+            [[0.0, 0.0, 0.0], [1.2, -1.2, 0.6]],
+        ],
+        dtype=torch.float32,
+    )
+    x_q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((x.numel() // x.shape[-1], 1), dtype=torch.float32)
+
+    _custom_ops._scaled_int8_quant_torch_fallback(x, x_q, scale)
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    expected_scale = torch.amax(torch.abs(x_2d), dim=-1, keepdim=True)
+    denom = torch.where(
+        expected_scale > 0,
+        expected_scale,
+        torch.ones_like(expected_scale),
+    )
+    expected_q = torch.round(x_2d * (127.0 / denom)).clamp_(-127, 127)
+
+    torch.testing.assert_close(scale, expected_scale)
+    assert x_q.reshape(-1, x.shape[-1]).tolist() == expected_q.to(torch.int8).tolist()
+
+
+def test_dynamic_scaled_int8_quant_falls_back_when_quant2d_fails(monkeypatch):
+    from vllm_kunlun.ops import _custom_ops
+
+    def fail_quant2d(**kwargs):
+        raise RuntimeError("quant2d failed")
+
+    monkeypatch.setattr(_custom_ops.kunlun_ops, "quant2d", fail_quant2d)
+    x = torch.tensor([[1.0, -2.0, 0.5]], dtype=torch.float32)
+    x_q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((1, 1), dtype=torch.float32)
+
+    _custom_ops._dynamic_scaled_int8_quant(x, x_q, scale)
+
+    torch.testing.assert_close(scale, torch.tensor([[2.0]]))
+    assert x_q.tolist() == [[64, -127, 32]]
+
+
+def test_dynamic_scaled_int8_quant_uses_torch_after_sdnn_failure(monkeypatch):
+    from vllm_kunlun.ops import _custom_ops
+
+    calls = []
+
+    def quant2d(**kwargs):
+        calls.append(kwargs["force_sdnn"])
+        raise RuntimeError("sdnn quant2d failed")
+
+    monkeypatch.setattr(_custom_ops.kunlun_ops, "quant2d", quant2d)
+    x = torch.tensor([[1.0, -2.0, 0.5]], dtype=torch.float32)
+    x_q = torch.empty_like(x, dtype=torch.int8)
+    scale = torch.empty((1, 1), dtype=torch.float32)
+
+    _custom_ops._dynamic_scaled_int8_quant(x, x_q, scale)
+
+    assert calls == [True]
+    torch.testing.assert_close(scale, torch.tensor([[2.0]]))
+    assert x_q.tolist() == [[64, -127, 32]]
+
+
+def test_scaled_int8_mm_torch_fallback_dequantizes_per_token_and_channel():
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.quantization.kernels.scale_mm import (
+        _torch_scaled_int8_mm_fallback,
+    )
+
+    x_q = torch.tensor([[127, -64], [0, 127]], dtype=torch.int8)
+    w_q = torch.tensor([[127, 0, -64], [-127, 64, 127]], dtype=torch.int8)
+    x_max = torch.tensor([[2.0], [4.0]], dtype=torch.float32)
+    w_max = torch.tensor([[8.0], [6.0], [10.0]], dtype=torch.float32)
+    bias = torch.tensor([1.0, -1.0, 0.5], dtype=torch.float32)
+
+    out = _torch_scaled_int8_mm_fallback(
+        x_q=x_q,
+        w_q=w_q,
+        x_max=x_max,
+        w_max=w_max,
+        out_dtype=torch.float32,
+        bias=bias,
+    )
+
+    expected = torch.matmul(
+        x_q.to(torch.float32) * (x_max / 127.0),
+        w_q.to(torch.float32) * (w_max.reshape(1, -1) / 127.0),
+    )
+    expected = expected + bias
+    torch.testing.assert_close(out, expected)
+
+
 def test_default_unquantized_gemm_supports_torch_compile_with_vllm_parameter():
     from vllm.model_executor.layers import utils as layer_utils
     from vllm.model_executor.parameter import ModelWeightParameter
@@ -251,6 +398,580 @@ def test_register_model_imports_vllm_on_torch251():
         and call.args[1] == "vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM"
         for call in mock_register_model.call_args_list
     )
+    assert any(
+        call.args[0] == "DeepseekV32ForCausalLM"
+        and getattr(call.args[1], "__name__", None) == "DeepseekV3ForCausalLM"
+        for call in mock_register_model.call_args_list
+    )
+
+
+def test_kunlun_platform_allows_missing_vllm_attention_backend(monkeypatch):
+    from vllm_kunlun.platforms import kunlun
+
+    monkeypatch.delattr(kunlun.envs, "VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    assert kunlun._get_vllm_attention_backend() is None
+
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASHMLA")
+    assert kunlun._get_vllm_attention_backend() == "FLASHMLA"
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+
+    monkeypatch.setattr(
+        kunlun.envs,
+        "VLLM_ATTENTION_BACKEND",
+        "FLASHMLA",
+        raising=False,
+    )
+    assert kunlun._get_vllm_attention_backend() == "FLASHMLA"
+
+
+def test_kunlun_platform_accepts_renamed_flashmla_support_check():
+    from vllm_kunlun.platforms import kunlun
+
+    legacy_module = SimpleNamespace(is_flashmla_supported=lambda: (True, None))
+    dense_module = SimpleNamespace(is_flashmla_dense_supported=lambda: (False, "x"))
+
+    assert kunlun._check_flashmla_supported(legacy_module) == (True, None)
+    assert kunlun._check_flashmla_supported(dense_module) == (False, "x")
+
+
+def test_kunlun_platform_flashmla_env_overrides_sparse_mla(monkeypatch):
+    from vllm_kunlun.platforms import kunlun
+
+    monkeypatch.setattr(kunlun, "_get_vllm_attention_backend", lambda: "FLASHMLA")
+
+    backend_cls = kunlun.KunlunPlatform.get_attn_backend_cls(
+        selected_backend=SimpleNamespace(),
+        attn_selector_config=SimpleNamespace(use_mla=True, use_sparse=True),
+    )
+
+    assert backend_cls == (
+        "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
+    )
+
+
+def test_kunlun_quantization_loader_skips_missing_optional_backends(monkeypatch):
+    from vllm_kunlun.platforms import kunlun
+
+    kunlun._patch_quantization_config_loader()
+
+    import vllm.model_executor.layers.quantization as quant_module
+
+    optional_backend = "vllm.model_executor.layers.quantization.bitblas"
+    if importlib.util.find_spec(optional_backend) is None:
+        assert "bitblas" not in quant_module.QUANTIZATION_METHODS
+
+    class FakeCompressedTensorsConfig:
+        pass
+
+    monkeypatch.setitem(
+        quant_module._CUSTOMIZED_METHOD_TO_QUANT_CONFIG,
+        "compressed-tensors",
+        FakeCompressedTensorsConfig,
+    )
+    quant_config = quant_module.get_quantization_config("compressed-tensors")
+    assert quant_config is FakeCompressedTensorsConfig
+
+    class FakeModelOptMxFp8Config:
+        pass
+
+    def fake_import_module(name):
+        if name == "vllm.model_executor.layers.quantization.modelopt":
+            return SimpleNamespace(ModelOptMxFp8Config=FakeModelOptMxFp8Config)
+        return importlib.import_module(name)
+
+    with patch.object(
+        kunlun.importlib, "import_module", side_effect=fake_import_module
+    ):
+        assert (
+            quant_module.get_quantization_config("modelopt_mxfp8")
+            is FakeModelOptMxFp8Config
+        )
+
+    weight_utils = SimpleNamespace(get_quantization_config=lambda _: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.weight_utils",
+        weight_utils,
+    )
+    kunlun._patch_quantization_config_loader()
+    assert weight_utils.get_quantization_config is quant_module.get_quantization_config
+
+
+def test_kunlun_compressed_tensors_accepts_vllm019_attention_path():
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.quantization.compressed_tensors.compressed_tensors import (
+        KunlunCompressedTensorsConfig,
+    )
+
+    quant_config = KunlunCompressedTensorsConfig(
+        target_scheme_map={},
+        ignore=[],
+        quant_format="int-quantized",
+        sparsity_scheme_map={},
+        sparsity_ignore_list=[],
+    )
+
+    assert quant_config.get_quant_method(torch.nn.Module(), prefix="x") is None
+
+
+def test_deepseek_rope_compat_supports_vllm019_signature():
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.models.deepseek_v2 import _get_rope_compat
+
+    calls = {}
+
+    def fake_get_rope(
+        head_size,
+        max_position,
+        is_neox_style=True,
+        rope_parameters=None,
+        dtype=None,
+        dual_chunk_attention_config=None,
+    ):
+        calls.update(
+            head_size=head_size,
+            max_position=max_position,
+            is_neox_style=is_neox_style,
+            rope_parameters=rope_parameters,
+        )
+        return "rope"
+
+    result = _get_rope_compat(
+        64,
+        rotary_dim=64,
+        max_position=32768,
+        base=1000000.0,
+        rope_scaling={"factor": 40, "rope_type": "deepseek_yarn"},
+        is_neox_style=False,
+        rope_fn=fake_get_rope,
+    )
+
+    assert result == "rope"
+    assert calls["head_size"] == 64
+    assert calls["max_position"] == 32768
+    assert calls["is_neox_style"] is False
+    assert calls["rope_parameters"]["rope_theta"] == 1000000.0
+    assert calls["rope_parameters"]["rope_type"] == "deepseek_yarn"
+
+
+def test_deepseek_v32_mla_passes_indexer_rotary_emb(monkeypatch):
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    import vllm_kunlun.models.deepseek_v2 as deepseek_module
+
+    captured = {}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeIndexer(torch.nn.Module):
+        topk_tokens = 1
+
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class FakeMLAWrapper(torch.nn.Module):
+        def __init__(
+            self,
+            _hidden_size,
+            _num_local_heads,
+            _scaling,
+            _qk_nope_head_dim,
+            _qk_rope_head_dim,
+            _v_head_dim,
+            _q_lora_rank,
+            _kv_lora_rank,
+            mla_modules,
+            *_args,
+            **_kwargs,
+        ):
+            super().__init__()
+            captured["mla_modules"] = mla_modules
+
+    def fake_get_rope_compat(*_args, is_neox_style, **_kwargs):
+        return f"rope-{is_neox_style}"
+
+    monkeypatch.setattr(
+        deepseek_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(deepseek_module, "_get_rope_compat", fake_get_rope_compat)
+    monkeypatch.setattr(deepseek_module, "MergedColumnParallelLinear", FakeModule)
+    monkeypatch.setattr(deepseek_module, "ReplicatedLinear", FakeModule)
+    monkeypatch.setattr(deepseek_module, "ColumnParallelLinear", FakeModule)
+    monkeypatch.setattr(deepseek_module, "RowParallelLinear", FakeModule)
+    monkeypatch.setattr(deepseek_module, "RMSNorm", FakeModule)
+    monkeypatch.setattr(deepseek_module, "LayerNorm", FakeModule)
+    monkeypatch.setattr(deepseek_module, "Indexer", FakeIndexer)
+    monkeypatch.setattr(
+        deepseek_module,
+        "MultiHeadLatentAttentionWrapper",
+        FakeMLAWrapper,
+    )
+
+    config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        index_topk=2048,
+        index_n_heads=64,
+        index_head_dim=128,
+        qk_rope_head_dim=64,
+    )
+
+    deepseek_module.DeepseekV2MLAAttention(
+        vllm_config=SimpleNamespace(),
+        config=config,
+        hidden_size=16,
+        num_heads=1,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=8,
+        v_head_dim=8,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        rope_scaling={"factor": 40},
+        cache_config=SimpleNamespace(),
+    )
+
+    mla_modules = captured["mla_modules"]
+    assert mla_modules.rotary_emb == "rope-False"
+    assert mla_modules.indexer_rotary_emb == "rope-True"
+
+
+def test_deepseek_v32_indexer_rope_outputs_restore_token_shapes():
+    from vllm_kunlun.models.deepseek_v2 import _reshape_indexer_rope_outputs
+
+    q_pe, k_pe = _reshape_indexer_rope_outputs(
+        torch.zeros(1, 2, 64, 64),
+        torch.zeros(1, 2, 1, 64),
+        n_head=64,
+        rope_dim=64,
+    )
+
+    assert q_pe.shape == (2, 64, 64)
+    assert k_pe.shape == (2, 1, 64)
+
+
+def test_deepseek_v32_indexer_passes_whole_kv_cache():
+    from vllm_kunlun.models.deepseek_v2 import _get_indexer_kv_cache
+
+    kv_cache = torch.tensor([])
+
+    assert _get_indexer_kv_cache(SimpleNamespace(kv_cache=kv_cache)) is kv_cache
+
+
+def test_flashmla_sparse_impl_uses_sparse_mla_interface():
+    import inspect as py_inspect
+
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm.v1.attention.backend import SparseMLAAttentionImpl
+
+    from vllm_kunlun.v1.attention.backends.mla.flashmla_sparse import (
+        FlashMLASparseImpl,
+    )
+
+    assert not py_inspect.isabstract(FlashMLASparseImpl)
+    assert issubclass(FlashMLASparseImpl, SparseMLAAttentionImpl)
+
+
+def test_flashmla_dense_backend_imports_vllm19_attention_symbols():
+    import inspect as py_inspect
+
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    from vllm_kunlun.v1.attention.backends.mla.flashmla import (
+        FlashMLABackend,
+        FlashMLAImpl,
+        FlashMLAMetadataBuilder,
+    )
+
+    assert FlashMLABackend.get_name() == "FLASHMLA"
+    assert not py_inspect.isabstract(FlashMLAImpl)
+    assert FlashMLAMetadataBuilder.cudagraph_support is AttentionCGSupport.UNIFORM_BATCH
+
+
+def test_flashmla_decode_paged_attention_splits_q_c_and_q_r(monkeypatch):
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.ops.attention import flashmla
+
+    captured = {}
+
+    def fake_paged_attention(
+        out,
+        x,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens_cpu,
+        context_lens_xpu,
+        is_context,
+        is_causal,
+        vo_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        mla_scale,
+        **kwargs,
+    ):
+        captured.update(
+            out=out,
+            x=x,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens_cpu=context_lens_cpu,
+            context_lens_xpu=context_lens_xpu,
+            is_context=is_context,
+            is_causal=is_causal,
+            vo_head_dim=vo_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            mla_scale=mla_scale,
+            q_r=kwargs["q_r"],
+        )
+        return 0
+
+    monkeypatch.setattr(flashmla.kunlun_ops, "paged_attention", fake_paged_attention)
+
+    q = torch.arange(2 * 1 * 3 * 6, dtype=torch.float32).reshape(2, 1, 3, 6)
+    k_cache = torch.zeros(4, 8, 1, 6)
+    block_table = torch.zeros(2, 1, dtype=torch.int32)
+    cache_lens = torch.ones(2, dtype=torch.int32)
+
+    out, _ = flashmla.flash_mla_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        block_table=block_table,
+        cache_seqlens=cache_lens,
+        head_dim_v=4,
+        tile_scheduler_metadata=cache_lens.cpu(),
+        num_splits=cache_lens,
+        softmax_scale=0.5,
+        causal=True,
+    )
+
+    assert captured["out"] is out
+    assert captured["x"].shape == (2, 1, 3, 4)
+    assert captured["q_r"].shape == (2, 1, 3, 2)
+    assert torch.equal(captured["x"], q[..., :4])
+    assert torch.equal(captured["q_r"], q[..., 4:])
+    assert captured["k_cache"].shape == (4, 1, 8, 6)
+    assert captured["v_cache"] is None
+    assert captured["kv_lora_rank"] == 4
+    assert captured["qk_rope_head_dim"] == 2
+    assert captured["mla_scale"] == 0.5
+
+
+def test_flashmla_decode_torch_fallback_matches_reference(monkeypatch):
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.ops.attention import flashmla
+
+    monkeypatch.setenv("VLLM_KUNLUN_MLA_DECODE_FALLBACK", "1")
+
+    q = torch.tensor(
+        [[[[0.1, -0.2, 0.3, 0.4, 0.5, -0.6], [0.2, 0.1, -0.4, 0.3, -0.1, 0.7]]]],
+        dtype=torch.float32,
+    )
+    k_cache = torch.tensor(
+        [
+            [
+                [[0.2, 0.0, -0.1, 0.4, 0.1, -0.2]],
+                [[-0.3, 0.2, 0.5, 0.1, -0.4, 0.3]],
+            ],
+            [
+                [[0.6, -0.5, 0.2, 0.0, 0.2, 0.1]],
+                [[9.0, 9.0, 9.0, 9.0, 9.0, 9.0]],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cache_lens = torch.tensor([3], dtype=torch.int32)
+
+    out, _ = flashmla.flash_mla_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        block_table=block_table,
+        cache_seqlens=cache_lens,
+        head_dim_v=4,
+        tile_scheduler_metadata=cache_lens.cpu(),
+        num_splits=cache_lens,
+        softmax_scale=0.5,
+        causal=True,
+    )
+
+    kv_tokens = torch.cat([k_cache[0, :, 0], k_cache[1, :1, 0]], dim=0)
+    q_c = q[..., :4]
+    q_r = q[..., 4:]
+    kv_c = kv_tokens[:, :4]
+    k_pe = kv_tokens[:, 4:]
+    scores = torch.einsum("qhd,kd->qhk", q_c[0], kv_c)
+    scores = scores + torch.einsum("qhr,kr->qhk", q_r[0], k_pe)
+    probs = torch.softmax(scores * 0.5, dim=-1)
+    expected = torch.einsum("qhk,kd->qhd", probs, kv_c).unsqueeze(0)
+
+    assert torch.allclose(out, expected)
+
+
+def test_mla_common_prefill_env_flags_default_when_missing(monkeypatch):
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.v1.attention.backends.mla import common
+
+    assert "flash_attn_varlen_func" in vars(common)
+
+    monkeypatch.delattr(
+        common.envs,
+        "VLLM_DISABLE_FLASHINFER_PREFILL",
+        raising=False,
+    )
+    monkeypatch.delattr(common.envs, "VLLM_USE_CUDNN_PREFILL", raising=False)
+    monkeypatch.setattr(common, "flashinfer_available", True)
+    monkeypatch.setattr(
+        common,
+        "current_platform",
+        SimpleNamespace(is_device_capability=lambda capability: True),
+    )
+    monkeypatch.setattr(common, "has_nvidia_artifactory", lambda: True)
+
+    assert common.use_flashinfer_prefill() is True
+    assert common.use_cudnn_prefill() is False
+
+    monkeypatch.setattr(common.envs, "VLLM_USE_CUDNN_PREFILL", True, raising=False)
+
+    assert common.use_flashinfer_prefill() is False
+    assert common.use_cudnn_prefill() is True
+
+
+def test_mla_common_impl_defaults_dcp_world_size_when_group_missing(monkeypatch):
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.v1.attention.backends.mla import common
+
+    class FakeMLAImpl(common.MLACommonImpl):
+        def _forward_decode(self, *_args, **_kwargs):
+            raise NotImplementedError
+
+    def raise_missing_dcp_group():
+        raise AssertionError
+
+    monkeypatch.setattr(common, "get_dcp_group", raise_missing_dcp_group)
+    monkeypatch.setattr(common, "use_flashinfer_prefill", lambda: False)
+    monkeypatch.setattr(common, "use_cudnn_prefill", lambda: False)
+    monkeypatch.setattr(
+        common.MLACommonMetadataBuilder,
+        "determine_chunked_prefill_workspace_size",
+        staticmethod(lambda _config: 1),
+    )
+    monkeypatch.setattr(common, "get_current_vllm_config", lambda: SimpleNamespace())
+
+    impl = FakeMLAImpl(
+        num_heads=1,
+        head_size=6,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        qk_head_dim=4,
+        v_head_dim=4,
+        kv_b_proj=SimpleNamespace(),
+    )
+
+    assert impl.dcp_world_size == 1
+
+
+def test_mla_common_torch_prefill_attention_matches_reference():
+    import vllm_kunlun
+
+    vllm_kunlun.register()
+    from vllm_kunlun.v1.attention.backends.mla import common
+
+    class FakeMLAImpl(common.MLACommonImpl):
+        def _forward_decode(self, *_args, **_kwargs):
+            raise NotImplementedError
+
+    impl = object.__new__(FakeMLAImpl)
+    impl._pad_v = True
+
+    q = torch.tensor(
+        [
+            [[0.2, -0.1, 0.3], [0.5, 0.1, -0.4]],
+            [[-0.3, 0.4, 0.2], [0.2, -0.5, 0.6]],
+            [[0.1, 0.3, -0.2], [-0.2, 0.4, 0.5]],
+        ],
+        dtype=torch.float32,
+    )
+    k = torch.tensor(
+        [
+            [[0.4, -0.2, 0.1], [0.3, 0.2, -0.1]],
+            [[-0.2, 0.5, 0.3], [0.1, -0.4, 0.6]],
+            [[0.6, 0.1, -0.3], [-0.5, 0.2, 0.4]],
+        ],
+        dtype=torch.float32,
+    )
+    v = torch.tensor(
+        [
+            [[0.7, -0.1], [0.2, 0.5]],
+            [[-0.4, 0.3], [0.6, -0.2]],
+            [[0.1, 0.8], [-0.3, 0.4]],
+        ],
+        dtype=torch.float32,
+    )
+    seq_lens = torch.tensor([0, 2, 3], dtype=torch.int32)
+
+    out, lse = impl._torch_prefill_attention(
+        q=q,
+        k=k,
+        v=v,
+        context_seq_lod_xpu=None,
+        context_seq_lod_cpu=seq_lens,
+        return_softmax_lse=True,
+        causal=True,
+        softmax_scale=0.5,
+    )
+
+    padded_v = F.pad(v, [0, q.shape[-1] - v.shape[-1]], value=0)
+    expected_out = torch.empty_like(q)
+    expected_lse = torch.full((q.size(1), q.size(0)), float("-inf"))
+    for start, end in [(0, 2), (2, 3)]:
+        scores = torch.einsum("qhd,khd->hqk", q[start:end], k[start:end]) * 0.5
+        mask = torch.triu(
+            torch.ones(end - start, end - start, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        expected_out[start:end] = torch.einsum(
+            "hqk,khd->qhd", probs, padded_v[start:end]
+        )
+        expected_lse[:, start:end] = torch.logsumexp(scores, dim=-1)
+
+    torch.testing.assert_close(out, expected_out)
+    torch.testing.assert_close(lse, expected_lse)
 
 
 def test_import_hook_installs_kunlun_fused_moe_override():
@@ -556,6 +1277,50 @@ def test_import_hook_maps_attention_backend_abstract_alias():
         assert sys.modules[alias_name] is sentinel_module
         assert sys.modules[target_module_name] is sentinel_module
         assert mock_import_module.call_count == 1
+    finally:
+        for module_name, module in backups.items():
+            if module is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = module
+
+
+def test_import_hook_maps_attention_ops_aliases():
+    import vllm_kunlun
+
+    alias_pairs = [
+        ("vllm.attention.ops.common", "vllm.v1.attention.ops.common"),
+        ("vllm.attention.ops.flashmla", "vllm.v1.attention.ops.flashmla"),
+    ]
+    module_names = [module_name for pair in alias_pairs for module_name in pair]
+    backups = {
+        module_name: sys.modules.get(module_name) for module_name in module_names
+    }
+
+    for module_name in module_names:
+        sys.modules.pop(module_name, None)
+
+    try:
+        with patch.object(vllm_kunlun.importlib, "import_module") as mock_import_module:
+            with patch.object(
+                vllm_kunlun,
+                "OLD_IMPORT_HOOK",
+                side_effect=AssertionError("mapped imports must not fall back"),
+            ):
+                for alias_name, target_module_name in alias_pairs:
+                    sentinel_module = types.ModuleType(target_module_name)
+                    mock_import_module.return_value = sentinel_module
+
+                    imported_module = vllm_kunlun._custom_import(
+                        alias_name, fromlist=["sentinel"]
+                    )
+
+                    assert imported_module is sentinel_module
+                    assert sys.modules[alias_name] is sentinel_module
+                    assert sys.modules[target_module_name] is sentinel_module
+                    mock_import_module.assert_called_with(target_module_name)
+
+        assert mock_import_module.call_count == len(alias_pairs)
     finally:
         for module_name, module in backups.items():
             if module is None:
@@ -881,6 +1646,84 @@ def test_qwen3_moe_loader_compat_patch_skips_unmatched_expert_weights(
     assert "layers.47.mlp.experts.0.down_proj.weight" in loaded
 
 
+def test_mla_attention_weight_device_patch_runs_after_processing(monkeypatch):
+    from vllm_kunlun import compat
+
+    class FakeMLAAttention:
+        def __init__(self):
+            self.called = None
+            self.W_UK_T = torch.zeros(1, dtype=torch.float16)
+
+        def process_weights_after_loading(self, act_dtype):
+            self.called = act_dtype
+            return "processed"
+
+        def forward_impl(self, q, marker=None):
+            return ("forwarded", q, marker)
+
+    fake_module = SimpleNamespace(MLAAttention=FakeMLAAttention)
+    moved = []
+    device = torch.device("cpu")
+
+    monkeypatch.setattr(compat, "_current_cuda_device", lambda: device)
+    monkeypatch.setattr(
+        compat,
+        "_move_mla_runtime_tensor_attrs",
+        lambda instance, target_device: moved.append((instance, target_device)),
+    )
+
+    compat._patch_mla_attention_runtime_weight_device(fake_module)
+    attention = FakeMLAAttention()
+
+    assert attention.process_weights_after_loading(torch.bfloat16) == "processed"
+    assert attention.called is torch.bfloat16
+    assert moved == [(attention, device)]
+    assert getattr(
+        FakeMLAAttention.process_weights_after_loading,
+        "_vllm_kunlun_patched",
+        False,
+    )
+
+    q = torch.empty(1, dtype=torch.float32)
+    result, runtime_q, marker = attention.forward_impl(q, marker="x")
+    assert result == "forwarded"
+    assert runtime_q.dtype is torch.float16
+    assert marker == "x"
+    assert moved[-1] == (attention, q.device)
+    assert getattr(
+        FakeMLAAttention.forward_impl,
+        "_vllm_kunlun_patched",
+        False,
+    )
+
+
+def test_mla_attention_weight_patch_copies_runtime_output_to_original_dtype():
+    from vllm_kunlun import compat
+
+    class FakeMLAAttention:
+        def __init__(self):
+            self.W_UK_T = torch.zeros(1, dtype=torch.float16)
+
+        def forward_impl(self, q, output=None):
+            assert q.dtype is torch.float16
+            assert output.dtype is torch.float16
+            output.fill_(2)
+            return output
+
+    fake_module = SimpleNamespace(MLAAttention=FakeMLAAttention)
+    compat._patch_mla_attention_runtime_weight_device(fake_module)
+
+    attention = FakeMLAAttention()
+    q = torch.empty(1, dtype=torch.float32)
+    output = torch.empty(1, dtype=torch.float32)
+
+    result = attention.forward_impl(q, output=output)
+
+    assert result is output
+    assert output.dtype is torch.float32
+    assert output.item() == 2
+
+
 def test_custom_qwen3_moe_model_skips_unmatched_expert_weights(monkeypatch):
     from vllm_kunlun.models.qwen3_moe import Qwen3MoeModel
 
@@ -938,6 +1781,47 @@ def test_custom_qwen3_moe_model_skips_unmatched_expert_weights(monkeypatch):
     assert loaded_names == [("model.layers.47.mlp.experts.w2_weight", "w2", 0)]
     assert "model.layers.47.mlp.experts.w2_weight" in loaded
     assert all("layers.48" not in name for name in loaded)
+
+
+def test_fused_moe_expert_mapping_accepts_vllm019_model_arg():
+    from vllm_kunlun.models.fused_moe_compat import make_expert_params_mapping
+
+    class FakeModel(torch.nn.Module):
+        pass
+
+    class FakeNewFusedMoE:
+        @classmethod
+        def make_expert_params_mapping(cls, model, **kwargs):
+            return [("new", model, kwargs["num_experts"])]
+
+    model = FakeModel()
+
+    assert make_expert_params_mapping(
+        FakeNewFusedMoE,
+        model,
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=4,
+    ) == [("new", model, 4)]
+
+
+def test_fused_moe_expert_mapping_keeps_legacy_signature():
+    from vllm_kunlun.models.fused_moe_compat import make_expert_params_mapping
+
+    class FakeOldFusedMoE:
+        @classmethod
+        def make_expert_params_mapping(cls, **kwargs):
+            return [("old", kwargs["num_experts"])]
+
+    assert make_expert_params_mapping(
+        FakeOldFusedMoE,
+        torch.nn.Module(),
+        ckpt_gate_proj_name="gate_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="up_proj",
+        num_experts=4,
+    ) == [("old", 4)]
 
 
 if __name__ == "__main__":

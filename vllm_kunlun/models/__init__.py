@@ -4,6 +4,7 @@ from vllm import ModelRegistry
 def register_model():
 
     # TODO Remove all of models registration below
+    from vllm_kunlun.models.deepseek_v2 import DeepseekV3ForCausalLM
 
     # from .demo_model import DemoModel  # noqa: F401
 
@@ -79,11 +80,13 @@ def register_model():
     )
 
     ModelRegistry.register_model(
-        "DeepseekV3ForCausalLM", "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM"
+        "DeepseekV3ForCausalLM",
+        DeepseekV3ForCausalLM,
     )
 
     ModelRegistry.register_model(
-        "DeepseekV32ForCausalLM", "vllm_kunlun.models.deepseek_v2:DeepseekV3ForCausalLM"
+        "DeepseekV32ForCausalLM",
+        DeepseekV3ForCausalLM,
     )
 
     ModelRegistry.register_model(

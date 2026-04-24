@@ -619,6 +619,128 @@ def apply_qwen3_moe_loader_compat_patch(module: Any | None = None) -> None:
     model_cls.load_weights = patched_load_weights
 
 
+def _current_cuda_device() -> torch.device | None:
+    if not torch.cuda.is_available():
+        return None
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _move_mla_runtime_tensor_attrs(
+    instance: Any,
+    device: torch.device,
+) -> None:
+    for attr_name in (
+        "W_UK_T",
+        "W_UV",
+        "W_K",
+        "W_K_scale",
+        "W_V",
+        "W_V_scale",
+        "W_UK_SCALE",
+        "W_UV_SCALE",
+    ):
+        tensor = getattr(instance, attr_name, None)
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.device != device:
+            setattr(instance, attr_name, tensor.to(device=device))
+
+
+def _get_mla_runtime_compute_dtype(
+    instance: Any,
+    fallback: torch.dtype,
+) -> torch.dtype:
+    for attr_name in ("W_UK_T", "W_UV", "W_K", "W_V"):
+        tensor = getattr(instance, attr_name, None)
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+            return tensor.dtype
+    return fallback
+
+
+def _cast_mla_runtime_tensor(
+    tensor: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if tensor.is_floating_point() and tensor.dtype != dtype:
+        return tensor.to(dtype=dtype)
+    return tensor
+
+
+def _patch_mla_attention_runtime_weight_device(module: Any | None = None) -> None:
+    if module is None:
+        module = import_module("vllm.model_executor.layers.attention.mla_attention")
+
+    attention_cls = getattr(module, "MLAAttention", None)
+    if attention_cls is None:
+        return
+
+    current_process = getattr(attention_cls, "process_weights_after_loading", None)
+    if current_process is not None and not getattr(
+        current_process,
+        "_vllm_kunlun_patched",
+        False,
+    ):
+
+        def patched_process_weights_after_loading(
+            self: Any,
+            act_dtype: torch.dtype,
+        ) -> Any:
+            result = current_process(self, act_dtype)
+            device = _current_cuda_device()
+            if device is not None:
+                _move_mla_runtime_tensor_attrs(self, device)
+            return result
+
+        patched_process_weights_after_loading._vllm_kunlun_patched = True  # type: ignore[attr-defined]
+        attention_cls.process_weights_after_loading = (
+            patched_process_weights_after_loading
+        )
+
+    current_forward = getattr(attention_cls, "forward_impl", None)
+    if current_forward is not None and not getattr(
+        current_forward,
+        "_vllm_kunlun_patched",
+        False,
+    ):
+
+        def patched_forward_impl(self: Any, q: torch.Tensor, *args: Any, **kwargs: Any):
+            _move_mla_runtime_tensor_attrs(self, q.device)
+            compute_dtype = _get_mla_runtime_compute_dtype(self, q.dtype)
+            runtime_q = _cast_mla_runtime_tensor(q, compute_dtype)
+            runtime_args = tuple(
+                (
+                    _cast_mla_runtime_tensor(arg, compute_dtype)
+                    if index < 2 and isinstance(arg, torch.Tensor)
+                    else arg
+                )
+                for index, arg in enumerate(args)
+            )
+            output = kwargs.get("output")
+            if (
+                isinstance(output, torch.Tensor)
+                and output.is_floating_point()
+                and output.dtype != compute_dtype
+            ):
+                runtime_kwargs = dict(kwargs)
+                runtime_output = torch.empty_like(output, dtype=compute_dtype)
+                runtime_kwargs["output"] = runtime_output
+                current_forward(self, runtime_q, *runtime_args, **runtime_kwargs)
+                output.copy_(runtime_output.to(dtype=output.dtype))
+                return output
+
+            result = current_forward(self, runtime_q, *runtime_args, **kwargs)
+            if (
+                isinstance(result, torch.Tensor)
+                and result.is_floating_point()
+                and result.dtype != q.dtype
+            ):
+                return result.to(dtype=q.dtype)
+            return result
+
+        patched_forward_impl._vllm_kunlun_patched = True  # type: ignore[attr-defined]
+        attention_cls.forward_impl = patched_forward_impl
+
+
 def apply_torch251_compat_shims() -> None:
     """Apply the compatibility shims needed by vLLM 0.19.x on torch 2.5.1."""
     _ensure_custom_graph_pass_module()

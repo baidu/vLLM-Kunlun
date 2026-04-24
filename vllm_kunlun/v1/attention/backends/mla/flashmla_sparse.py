@@ -6,22 +6,22 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionLayer,
-    AttentionMetadata,
-)
-from vllm.attention.backends.utils import get_mla_dims
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.mla.common import MLACommonBaseImpl
-from vllm.v1.attention.backends.utils import (
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
+    AttentionLayer,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    SparseMLAAttentionImpl,
+)
+from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
     split_decodes_and_prefills,
@@ -591,7 +591,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         return metadata
 
 
-class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
+class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
     def __init__(
         self,
@@ -610,19 +610,19 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         indexer: Optional["Indexer"] = None,
         **mla_args,
     ) -> None:
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            num_kv_heads,
-            alibi_slopes,
-            sliding_window,
-            kv_cache_dtype,
-            logits_soft_cap,
-            attn_type,
-            kv_sharing_target_layer_name,
-            **mla_args,
-        )
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing is not supported for sparse MLA")
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_lora_rank = mla_args["kv_lora_rank"]
+        self.qk_nope_head_dim = mla_args["qk_nope_head_dim"]
+        self.qk_rope_head_dim = mla_args["qk_rope_head_dim"]
+        self.qk_head_dim = mla_args["qk_head_dim"]
+        self.v_head_dim = mla_args["v_head_dim"]
+        self.q_pad_num_heads = mla_args.get("q_pad_num_heads")
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
@@ -745,6 +745,30 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         )
 
         return _attn_out
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+
+        num_actual_toks = q.shape[0]
+        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            raise NotImplementedError("Only support --kv-cache-dtype bfloat16")
+
+        attn_out = self._forward_bf16_kv(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            attn_metadata,
+        )
+        return attn_out, None
 
     def forward(
         self,

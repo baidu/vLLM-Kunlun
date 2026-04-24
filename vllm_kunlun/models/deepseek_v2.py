@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import inspect
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -45,7 +46,8 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.fused_moe import FusedMoE, SharedFusedMoE
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -53,10 +55,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttention
+from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.shared_fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -82,11 +83,14 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_kunlun.ops.activation import SiluAndMul
+from vllm_kunlun.compat import _patch_mla_attention_runtime_weight_device
+from vllm_kunlun.models.fused_moe_compat import make_expert_params_mapping
 from vllm_kunlun.ops.attention.layer import Attention
 from vllm_kunlun.ops.deep_gemm import int8_mqa_logits, int8_paged_mqa_logits
 from vllm_kunlun.ops.linear import ReplicatedLinear
 from vllm_kunlun.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+
+_patch_mla_attention_runtime_weight_device()
 
 if current_platform.is_cuda_alike():
     pass
@@ -95,6 +99,50 @@ elif current_platform.is_xpu():
 
 _is_kunlun = True
 logger = init_logger(__name__)
+
+
+def _get_rope_compat(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: Optional[dict[str, Any]],
+    is_neox_style: bool,
+    rope_fn: Callable[..., Any] = get_rope,
+):
+    if "rope_parameters" in inspect.signature(rope_fn).parameters:
+        rope_parameters = dict(rope_scaling or {})
+        rope_parameters.setdefault("rope_theta", base)
+        if rotary_dim != head_size:
+            rope_parameters["partial_rotary_factor"] = rotary_dim / head_size
+        return rope_fn(
+            head_size,
+            max_position=max_position,
+            is_neox_style=is_neox_style,
+            rope_parameters=rope_parameters,
+        )
+
+    return rope_fn(
+        head_size,
+        rotary_dim=rotary_dim,
+        max_position=max_position,
+        base=base,
+        rope_scaling=rope_scaling,
+        is_neox_style=is_neox_style,
+    )
+
+
+def _reshape_indexer_rope_outputs(
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    n_head: int,
+    rope_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return q_pe.reshape(-1, n_head, rope_dim), k_pe.reshape(-1, 1, rope_dim)
+
+
+def _get_indexer_kv_cache(k_cache: Any) -> torch.Tensor:
+    return k_cache.kv_cache
 
 
 class DeepseekV2MLP(nn.Module):
@@ -406,7 +454,7 @@ class DeepseekV2Attention(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = _get_rope_compat(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
@@ -747,6 +795,9 @@ class Indexer(nn.Module):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        q_pe, k_pe = _reshape_indexer_rope_outputs(
+            q_pe, k_pe, self.n_head, self.rope_dim
+        )
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
 
@@ -773,7 +824,7 @@ class Indexer(nn.Module):
         torch.ops.vllm.sparse_attn_indexer_vllm_kunlun(
             hidden_states,
             self.k_cache.prefix,
-            self.k_cache.kv_cache[0],
+            _get_indexer_kv_cache(self.k_cache),
             q_fp8,
             k,
             weights,
@@ -888,7 +939,7 @@ class DeepseekV2MLAAttention(nn.Module):
 
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
-        self.rotary_emb = get_rope(
+        self.rotary_emb = _get_rope_compat(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
@@ -905,6 +956,14 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            self.indexer_rope_emb = _get_rope_compat(
+                qk_rope_head_dim,
+                rotary_dim=qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+            )
             self.indexer = Indexer(
                 vllm_config,
                 config,
@@ -916,6 +975,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 f"{prefix}.indexer",
             )
         else:
+            self.indexer_rope_emb = None
             self.indexer = None
 
         mla_modules = MLAModules(
@@ -933,11 +993,12 @@ class DeepseekV2MLAAttention(nn.Module):
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
             indexer=self.indexer,
+            indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        self.mla_attn = MultiHeadLatentAttention(
+        self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
             self.scaling,
@@ -1263,6 +1324,9 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1293,7 +1357,9 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        expert_params_mapping = make_expert_params_mapping(
+            FusedMoE,
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
