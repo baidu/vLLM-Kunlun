@@ -2,13 +2,21 @@
 from .platforms import current_platform
 import sys
 import importlib
+import logging
 import warnings
 import builtins
 import os
 import time
 import vllm.envs as envs
+
+logger = logging.getLogger(__name__)
+
 OLD_IMPORT_HOOK = builtins.__import__
+_kv_admission_patched = False
+_kv_scheduler_patched = False
+
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
+    global _kv_admission_patched, _kv_scheduler_patched
     try:
         module_mappings = {
             "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
@@ -29,16 +37,39 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             module = importlib.import_module(target_module)
             sys.modules[module_name] = module
             sys.modules[target_module] = module
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("vllm_kunlun: failed to remap module %s: %s", module_name, e)
 
-    return OLD_IMPORT_HOOK(
+    result = OLD_IMPORT_HOOK(
         module_name,
         globals=globals,
         locals=locals,
         fromlist=fromlist,
         level=level
     )
+
+    # Apply KV admission gate patch after kv_cache_manager is fully loaded.
+    # Deferred to avoid importing vllm internals during early platform registration.
+    if (not _kv_admission_patched
+            and module_name == "vllm.v1.core.kv_cache_manager"):
+        try:
+            from vllm_kunlun.patches.kv_admission import apply as _apply_kv
+            _apply_kv()
+            _kv_admission_patched = True
+        except Exception as e:
+            logger.warning("vllm_kunlun: failed to apply KV admission patch: %s", e)
+
+    # Apply partial-prefill concurrency limit patch after scheduler is loaded.
+    if (not _kv_scheduler_patched
+            and module_name == "vllm.v1.core.sched.scheduler"):
+        try:
+            from vllm_kunlun.patches.kv_admission import apply_scheduler as _apply_sched
+            _apply_sched()
+            _kv_scheduler_patched = True
+        except Exception as e:
+            logger.warning("vllm_kunlun: failed to apply scheduler patch: %s", e)
+
+    return result
 
 def import_hook():
     """Apply import hook for VLLM Kunlun"""

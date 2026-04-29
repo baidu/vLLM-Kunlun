@@ -19,6 +19,12 @@ def merge_attn_states(
     # kunlun_ops.attention_merge_stage expects: [num_tokens, num_heads]
     # Must transpose before passing to the kernel and transpose back afterwards.
     num_tokens, num_heads = output.shape[0], output.shape[1]
+    assert prefix_lse.shape == (num_heads, num_tokens), (
+        f"prefix_lse must be [num_heads, num_tokens]=({num_heads}, {num_tokens}), "
+        f"got {tuple(prefix_lse.shape)}")
+    assert suffix_lse.shape == (num_heads, num_tokens), (
+        f"suffix_lse must be [num_heads, num_tokens]=({num_heads}, {num_tokens}), "
+        f"got {tuple(suffix_lse.shape)}")
     out_lse_kernel = torch.empty(num_tokens, num_heads,
                                  dtype=torch.float32,
                                  device=output.device)

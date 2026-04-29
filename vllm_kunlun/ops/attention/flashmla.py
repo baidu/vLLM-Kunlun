@@ -90,7 +90,7 @@ def flash_mla_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     softmax_lse = None
-    out = torch.ones(q.size(0), q.size(1), q.size(2), head_dim_v, dtype= q.dtype, device=q.device)
+    out = torch.empty(q.size(0), q.size(1), q.size(2), head_dim_v, dtype=q.dtype, device=q.device)
     kv_lora_rank = head_dim_v
     qk_rope_head_dim = q.size(3) - head_dim_v
     head_dim = k_cache.shape[3]
