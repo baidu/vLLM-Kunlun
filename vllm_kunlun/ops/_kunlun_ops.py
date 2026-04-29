@@ -24,6 +24,8 @@ import torch
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import current_workspace_manager
+import os
+DISABLE_SMALL_MOE = os.environ.get("KUNLUN_DISABLE_SMALL_MOE", "0") == "1"
 
 logger = init_logger(__name__)
 
@@ -475,7 +477,7 @@ class KunlunOps:
             #     attn_metadata = attn_metadata[prefix]
 
             # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
-            if M * moe_top_k < 400:
+            if M * moe_top_k < 400 and not DISABLE_SMALL_MOE:
                 sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
                     torch.ops.xspeedgate_ops.moe_pre_small(
                         topk_ids, global_num_experts, False, False, hidden_states
