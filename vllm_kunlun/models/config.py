@@ -585,27 +585,19 @@ class NemotronHForCausalLMConfig(VerifyAndUpdateConfig):
 class Qwen3_5ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        """Update mamba_ssm_cache_dtype for Qwen3.5 models when set to 'auto'
-        (or not explicitly set), to the value specified in the HF config's
-        mamba_ssm_dtype field. Warn if the user explicitly overrides it to a
-        different value.
-        """
-        cache_config = vllm_config.cache_config
+        # TODO: Once vllm_kunlun supports float32 GDN forward, restore
+        # propagation of hf_text_config.mamba_ssm_dtype to
+        # cache_config.mamba_ssm_cache_dtype so that temporal_state can
+        # be allocated at float32 as the HF config specifies.
         hf_text_config = vllm_config.model_config.hf_text_config
         mamba_ssm_dtype = getattr(hf_text_config, "mamba_ssm_dtype", None)
-        if cache_config.mamba_ssm_cache_dtype == "auto":
-            if mamba_ssm_dtype is not None:
-                cache_config.mamba_ssm_cache_dtype = mamba_ssm_dtype
-        elif (
-            mamba_ssm_dtype is not None
-            and cache_config.mamba_ssm_cache_dtype != mamba_ssm_dtype
-        ):
+        if mamba_ssm_dtype is not None and mamba_ssm_dtype == "float32":
             logger.warning(
                 "Qwen3.5 model specifies mamba_ssm_dtype='%s' in its config, "
-                "but --mamba-ssm-cache-dtype='%s' was passed. "
-                "Using the user-specified value.",
+                "but vllm_kunlun does not support float32 GDN forward. "
+                "Ignoring this setting; KVCache will use model_dtype instead "
+                "to avoid wasting memory.",
                 mamba_ssm_dtype,
-                cache_config.mamba_ssm_cache_dtype,
             )
 
 
