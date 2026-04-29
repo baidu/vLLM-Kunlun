@@ -38,14 +38,23 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Monolithic mode entry point.
         When is_monolithic=True, FusedMoE.forward_impl calls this method
         directly with (layer, hidden_states, router_logits), bypassing
         the default routing logic.
+
+        Note: upstream forward_impl does not pass routed_scaling_factor,
+        so we read it from the layer attribute (consistent with the CPU
+        monolithic path in upstream vLLM).
         """
         from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+
+        scaling_factor = getattr(
+            layer, "routed_scaling_factor", routed_scaling_factor
+        )
 
         if self.moe.use_ep:
             return ops.fused_moe_ep(
@@ -78,4 +87,5 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 e_score_correction_bias=layer.e_score_correction_bias,
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
+                router_scaling_factor=scaling_factor,
             )

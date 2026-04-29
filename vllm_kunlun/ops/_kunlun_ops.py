@@ -18,12 +18,14 @@
 """kunlun custom op entry"""
 
 from typing import Optional
-
+import os
 import cocopod  # noqa
 import torch
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import current_workspace_manager
+
+DISABLE_SMALL_MOE = os.environ.get("KUNLUN_DISABLE_SMALL_MOE", "0") == "1"
 
 logger = init_logger(__name__)
 
@@ -391,6 +393,7 @@ class KunlunOps:
         w2_bias: Optional[torch.Tensor] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor:
         """fused_moe"""
         global_num_experts, up_gate_size, _ = w1.shape
@@ -419,15 +422,28 @@ class KunlunOps:
                 stable=False,
             )
         elif scoring_func == "sigmoid":
+            if use_grouped_topk:
+                if num_expert_group is None or topk_group is None:
+                    raise ValueError("num_expert_group and topk_group must be set")
+                n_group = int(num_expert_group)
+                n_topk_group = int(topk_group)
+                if n_group <= 0 or n_topk_group <= 0:
+                    raise ValueError("num_expert_group and topk_group must be positive")
+                if n_topk_group > n_group:
+                    raise ValueError("topk_group must be less than or equal to num_expert_group")
+            else:
+                n_group = 1
+                n_topk_group = 1
+            
             torch.ops._C.moe_sigmoid_group_topk_norm(
                 x=router_logits,
                 topk_index=topk_ids,
                 norm_score=normed_score,
                 block_static=block_statistic,
                 bias=e_score_correction_bias,
-                scale=1.0,
-                n_group=num_expert_group,
-                topk_group=topk_group,
+                scale=routed_scaling_factor,
+                n_group=n_group,
+                topk_group=n_topk_group,
             )
 
         if w1_bias is not None or w2_bias is not None:
@@ -475,7 +491,7 @@ class KunlunOps:
             #     attn_metadata = attn_metadata[prefix]
 
             # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
-            if M * moe_top_k < 400:
+            if M * moe_top_k < 400 and not DISABLE_SMALL_MOE:
                 sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
                     torch.ops.xspeedgate_ops.moe_pre_small(
                         topk_ids, global_num_experts, False, False, hidden_states
