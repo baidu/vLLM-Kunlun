@@ -685,9 +685,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             # Even if there are no new key/value pairs to cache,
             # we still need to break out key_cache and value_cache
             # i.e. for later use by paged attention
-            key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size
-            )
+            key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache=kv_cache)
 
             if (key is not None) and (value is not None):
 
