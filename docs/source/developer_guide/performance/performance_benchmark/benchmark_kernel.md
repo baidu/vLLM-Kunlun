@@ -44,9 +44,9 @@ More parameters can be found in the command-line parameters section later.
 
 The time mode is used to track user programs for a period of time. This method is suitable for tasks that need to run for a long time.
 
-Using the -t or --time command-line parameter, XPorfiler will run for the specified time and then exit, in seconds. In this mode, the application needs to be started separately. An example is as follows:
+Using the -t or --time command-line parameter, XProfiler will run for the specified time and then exit, in seconds. In this mode, the application needs to be started separately. An example is as follows:
 
-(1) Starting XPorfiler
+(1) Starting XProfiler
 
 ```bash
 /xxxx/xxxx/xprofiler -r 500 --xpu=0 -t600 # Time mode collects events within a specified time period, measured in seconds (s).
@@ -63,7 +63,7 @@ export XPU_TRACING_OUTPUT_NAME=<xprofiler execution directory>/xprofiler.sock
 python xxx.py
 ```
 
-#### deamon mode
+#### daemon mode
 
 The daemon mode is used to track the event timeline of a specified code segment, eliminating interference from redundant information. The startup command is the same as in fork mode.
 
@@ -81,9 +81,9 @@ xtorch_ops.kunlun_profiler_start()
 xtorch_ops.kunlun_profiler_end()
 ```
 
-(2) Launch X profiler in a terminal
+(2) Launch XProfiler in a terminal
 
-```python
+```bash
 # Specify the output file as the trace_output file in the current path.
 /xxxx/xxxx/xprofiler-Linux_x86_64-2.0.2.0/bin/xprofiler -r 500 --xpu=0 -e ./trace_output -d
 ```
@@ -96,7 +96,7 @@ xprofiler.sock
 
 (3) Launch your own program on another terminal.
 
-```python
+```bash
 export XPU_ENABLE_PROFILER_TRACING=1
 # Here, the path to the .sock file from step 2 is used for assignment.
 export XPU_TRACING_OUTPUT_NAME=<xprofiler execution directory>/xprofiler.sock
