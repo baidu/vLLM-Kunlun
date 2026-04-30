@@ -34,6 +34,7 @@ from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_linear_quant_method,
 )
 
+from vllm_kunlun.quantization.moe_wna16 import KunlunMoeWNA16Method
 from vllm_kunlun.quantization.utils import _remove_quantization_method
 
 logger = init_logger(__name__)
@@ -59,7 +60,8 @@ class KunlunGPTQConfig(GPTQConfig):
                 "sym": True,  # GPTQ typically uses symmetric quantization
                 "lm_head": False,
             }
-            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+            moe_wna16_config = MoeWNA16Config.from_config(config)
+            return KunlunMoeWNA16Method(moe_wna16_config, layer.moe_config)
 
         return get_linear_quant_method(self, layer, prefix, KunlunGPTQLinearMethod)
 
