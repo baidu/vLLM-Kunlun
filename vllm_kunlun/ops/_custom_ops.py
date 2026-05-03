@@ -1141,6 +1141,56 @@ def fake_gen_block_statistic(
 gen_block_statistic.register_fake(fake_gen_block_statistic)
 
 
+@custom_op("_C::moe_align_block_size", mutates_args=())
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    token_nums: torch.Tensor,
+) -> None:
+    kunlun_ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        token_nums,
+    )
+
+@impl("_C::moe_align_block_size", "CUDA")
+def moe_align_block_size_cuda(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    token_nums: torch.Tensor,
+) -> None:
+    kunlun_ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        token_nums,
+    )
+
+def fake_moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    token_nums: torch.Tensor,
+) -> None:
+    return None
+
+
+moe_align_block_size.register_fake(fake_moe_align_block_size)
+
+
 @custom_op("_C::moe_pre_sorted", mutates_args=())
 def moe_pre_sorted(
     x: torch.Tensor,
