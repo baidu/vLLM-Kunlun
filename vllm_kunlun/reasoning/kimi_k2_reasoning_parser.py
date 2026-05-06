@@ -68,6 +68,11 @@ class KimiK2ReasoningParser(ReasoningParser):
                 "tokens in the tokenizer!"
             )
 
+        # Tracks whether the model is in pure-content mode (thinking disabled
+        # in the prompt via chat_template_kwargs={"thinking": false}).
+        # Set to True on the first streaming token when no <think> is seen.
+        self._content_mode: bool = False
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
@@ -159,8 +164,19 @@ class KimiK2ReasoningParser(ReasoningParser):
             return self._identity_parser.extract_reasoning(model_output, request)
 
         # thinking does not require a think start token but consume it if present
-        start_token_index = model_output.find(self._start_token)
-        start_token_index = 0 if start_token_index != 0 else len(self._start_token)
+        raw_start = model_output.find(self._start_token)
+
+        # If neither <think> nor </think> appears in the output, the model was
+        # in non-thinking mode (thinking=false in chat_template_kwargs caused
+        # the prompt to be pre-filled with <think></think>).
+        # Treat the entire output as content.
+        if raw_start == -1 and model_output.find(self._end_token) == -1:
+            tool_section_index = model_output.find(self._tool_section_start_token)
+            if tool_section_index != -1:
+                return (None, model_output[tool_section_index:] or None)
+            return (None, model_output or None)
+
+        start_token_index = 0 if raw_start != 0 else len(self._start_token)
         end_token_index = model_output.find(self._end_token)
 
         if end_token_index != -1:
@@ -204,6 +220,10 @@ class KimiK2ReasoningParser(ReasoningParser):
                 delta_token_ids,
             )
 
+        # If content mode detected (thinking disabled in prompt), treat all output as content
+        if self._content_mode:
+            return DeltaMessage(content=delta_text)
+
         # If reasoning has already ended in previous tokens, this is content
         if self.is_reasoning_end(previous_token_ids):
             return DeltaMessage(content=delta_text)
@@ -215,19 +235,46 @@ class KimiK2ReasoningParser(ReasoningParser):
         ]:
             return None
 
+        # Detect non-thinking mode: if the first generated tokens don't start
+        # with <think>, the prompt was pre-filled with <think></think> and the
+        # model is outputting pure content. Switch to content mode.
+        if not previous_token_ids and delta_token_ids and \
+                self._start_token_id not in delta_token_ids:
+            self._content_mode = True
+            return DeltaMessage(content=delta_text)
+
         if self._end_token_id in delta_token_ids:
             end_index = delta_text.find(self._end_token)
             reasoning = delta_text[:end_index]
             content = delta_text[end_index + len(self._end_token) :]
             return DeltaMessage(
-                reasoning=reasoning, content=content if content else None
+                reasoning_content=reasoning, content=content if content else None
             )
 
         if self._tool_section_start_token_id in delta_token_ids:
             tool_index = delta_text.find(self._tool_section_start_token)
             reasoning = delta_text[:tool_index]
             content = delta_text[tool_index:]
-            return DeltaMessage(reasoning=reasoning, content=content)
+            return DeltaMessage(reasoning_content=reasoning, content=content)
 
         # still reasoning (no end token)
-        return DeltaMessage(reasoning=delta_text)
+        return DeltaMessage(reasoning_content=delta_text)
+
+    def extract_reasoning_content_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+    ) -> DeltaMessage | None:
+        """Alias for extract_reasoning_streaming to match vllm base class API."""
+        return self.extract_reasoning_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+        )
