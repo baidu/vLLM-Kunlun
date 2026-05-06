@@ -16,7 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 
-from typing import Callable, Optional, Union
+from typing import Callable
 
 import torch
 import xspeedgate_ops  # noqa: F401
@@ -57,7 +57,7 @@ def _restore_qweight_from_moe_wna16_gemm(qweight: torch.Tensor) -> torch.Tensor:
 def dequant_awq_moe(
     qweight: torch.Tensor,
     scale: torch.Tensor,
-    zp: Optional[torch.Tensor],
+    zp: torch.Tensor | None,
     group_size: int,
     qweight_is_gemm_aligned: bool = False,
 ) -> torch.Tensor:
@@ -98,9 +98,9 @@ def _route_moe(
     router_logits: torch.Tensor,
     top_k: int,
     scoring_func: str,
-    num_expert_group: Optional[int],
-    topk_group: Optional[int],
-    e_score_correction_bias: Optional[torch.Tensor],
+    num_expert_group: int | None,
+    topk_group: int | None,
+    e_score_correction_bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = router_logits.shape[0]
     router_logits = router_logits.to(torch.float)
@@ -153,7 +153,7 @@ def _build_small_batch_routing(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     block_size_m: int = MOE_WNA16_BLOCK_SIZE_M,
-) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+)     -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     flat_topk_ids = topk_ids.reshape(-1).to(torch.int32)
     if flat_topk_ids.numel() == 0:
         return None
@@ -186,7 +186,7 @@ def _moe_wna16_gemm(
     output: torch.Tensor,
     qweight: torch.Tensor,
     scale: torch.Tensor,
-    zp: Optional[torch.Tensor],
+    zp: torch.Tensor | None,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -218,18 +218,18 @@ def fused_moe_wna16(
     w2_qweight: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    w13_zp: Optional[torch.Tensor],
-    w2_zp: Optional[torch.Tensor],
+    w13_zp: torch.Tensor | None,
+    w2_zp: torch.Tensor | None,
     group_size: int,
     weight_bits: int,
     ep_rank: int,
     top_k: int,
     renormalize: bool,
     use_grouped_topk: bool = False,
-    num_expert_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
+    num_expert_group: int | None = None,
+    topk_group: int | None = None,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None,
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert ep_rank == 0, "fused_moe_wna16 expects non-EP execution with ep_rank == 0"
 
@@ -373,7 +373,7 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         quant_config = self._get_moe_quant_config(layer)
         assert quant_config is not None
         assert not self.moe.use_ep, "KunlunMoeWNA16Method only supports non-EP mode"
@@ -409,21 +409,21 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
         global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
+        expert_map: torch.Tensor | None = None,
+        custom_routing_function: Callable | None = None,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        expert_load_view: torch.Tensor | None = None,
+        logical_to_physical_map: torch.Tensor | None = None,
+        logical_replica_count: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         quant_config = self._get_moe_quant_config(layer)
         assert quant_config is not None
         assert not self.moe.use_ep, "KunlunMoeWNA16Method only supports non-EP mode"
