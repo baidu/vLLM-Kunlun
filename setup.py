@@ -58,6 +58,7 @@ if __name__ == "__main__":
             "vllm.general_plugins": [
                 "kunlun_model = vllm_kunlun:register_model",
                 "kunlun_quant = vllm_kunlun:register_quant_method",
+                "kunlun_reasoning_parser = vllm_kunlun:register_reasoning_parser",
             ],
             # FusedMoE CustomOp OOT
             "vllm.plugins": [

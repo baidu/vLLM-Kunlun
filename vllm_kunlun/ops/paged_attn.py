@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 
 import torch
-from vllm.platforms import current_platform
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
@@ -20,7 +18,7 @@ class PagedAttentionMetadata:
 
     # (batch_size,). The length of sequences (entire tokens seen so far) per
     # sequence.
-    seq_lens_tensor: Optional[torch.Tensor]
+    seq_lens_tensor: torch.Tensor | None
     # Maximum sequence length in the batch. 0 if it is prefill-only batch.
     max_decode_seq_len: int
     # (batch_size, max_blocks_per_seq).
@@ -29,14 +27,17 @@ class PagedAttentionMetadata:
     # in the kv cache. Each block can contain up to block_size tokens.
     # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
     # captured.
-    block_tables: Optional[torch.Tensor]
+    block_tables: torch.Tensor | None
 
 
 class PagedAttention:
+    """Static helper methods for paged KV-cache attention on Kunlun."""
 
     @staticmethod
-    def get_supported_head_sizes() -> List[int]:
-        return [32, 64, 80, 96, 112, 120, 128, 192, 256]
+    def get_supported_head_sizes() -> list[int]:
+        """Return the list of head dimensions supported by the Kunlun
+        paged-attention kernels."""
+        return [32, 64, 80, 96, 112, 120, 128, 192, 256, 512]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -44,58 +45,25 @@ class PagedAttention:
         block_size: int,
         num_kv_heads: int,
         head_size: int,
-    ) -> Tuple[int, ...]:
-        """
-            获取KV缓存的形状，根据是否在芯片上进行计算返回不同的形状。
-        如果在芯片上（is_kunlun()为True），则返回形状(2, num_blocks, num_kv_heads, block_size, head_size)；
-        否则，返回形状(2, num_blocks, block_size * num_kv_heads * head_size)。
+    ) -> tuple[int, ...]:
+        """Return the KV-cache tensor shape.
 
-        Args:
-            num_blocks (int): 块数量。
-            block_size (int): 每个块大小。
-            num_kv_heads (int): KV头数量。
-            head_size (int): 每个头大小。
-
-        Returns:
-            Tuple[int, ...]: KV缓存的形状，包括两个元素：第一个元素为2，表示维度数量为2；第二个元素为num_blocks、num_kv_heads、block_size和head_size中的任意一个。
+        On Kunlun the layout is
+        ``(2, num_blocks, num_kv_heads, block_size, head_size)``  (BHLD)
+        where the leading dimension of 2 separates key and value caches.
         """
-        if current_platform.is_kunlun():
-            return (2, num_blocks, num_kv_heads, block_size, head_size)
-        return (2, num_blocks, block_size * num_kv_heads * head_size)
+        return (2, num_blocks, num_kv_heads, block_size, head_size)
 
     @staticmethod
-    def split_kv_cache(
-        kv_cache: torch.Tensor,
-        num_kv_heads: int,
-        head_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split a joint KV-cache tensor into separate key and value caches.
+
+        On Kunlun the cache is stored as
+        ``(2, num_blocks, num_kv_heads, block_size, head_size)``  (BHLD),
+        so ``kv_cache[0]`` / ``kv_cache[1]`` can be used directly.
         """
-            将一个缓存张量（包含key和value）分成两部分，每个部分是一个张量。
-        如果在KUNLUN上运行，则返回的第一个张量是key缓存，第二个张量是value缓存。
-        否则，第一个张量是key缓存，第二个张量是key缓存的view，其形状为(num_blocks, num_kv_heads, head_size//x, -1, x)，
-        第三个张量是value缓存，其形状为(num_blocks, num_kv_heads, head_size, -1)。
-
-        Args:
-            kv_cache (torch.Tensor): 包含key和value的张量，形状为(2, num_blocks, kv_cache_size)。
-            num_kv_heads (int): 多头注意力中的头数。
-            head_size (int): 每个头的大小。
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - key_cache (torch.Tensor): 形状为(num_blocks, num_kv_heads, head_size//x, -1, x)，包含key缓存。
-                - value_cache (torch.Tensor): 形状为(num_blocks, num_kv_heads, head_size, -1)，包含value缓存。
-        """
-        x = 16 // kv_cache.element_size()
-        num_blocks = kv_cache.shape[1]
-
-        if current_platform.is_kunlun():
-            key_cache = kv_cache[0]
-            value_cache = kv_cache[1]
-        else:
-            key_cache = kv_cache[0]
-            key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x, -1, x)
-            value_cache = kv_cache[1]
-            value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
+        key_cache = kv_cache[0]
+        value_cache = kv_cache[1]
         return key_cache, value_cache
 
     @staticmethod
@@ -128,12 +96,12 @@ class PagedAttention:
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         context_lens_cpu: torch.Tensor,
-        is_context,
+        is_context: bool,
         max_seq_len: int,
         kv_cache_dtype: str,
         num_kv_heads: int,
         scale: float,
-        alibi_slopes: Optional[torch.Tensor],
+        alibi_slopes: torch.Tensor | None,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
         tp_rank: int = 0,
@@ -246,8 +214,8 @@ class PagedAttention:
         query_start_loc: torch.Tensor,
         seq_lens_tensor: torch.Tensor,
         max_query_len: int,
-        alibi_slopes: Optional[torch.Tensor],
-        sliding_window: Optional[int],
+        alibi_slopes: torch.Tensor | None,
+        sliding_window: int | None,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
     ) -> torch.Tensor:
@@ -290,7 +258,7 @@ class PagedAttention:
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
         key_caches = [kv_cache[0] for kv_cache in kv_caches]

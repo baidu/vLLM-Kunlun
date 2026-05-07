@@ -20,6 +20,7 @@ kunlun = "vllm_kunlun:register"
 
 [project.entry-points."vllm.general_plugins"]
 kunlun_model = "vllm_kunlun:register_model"
+kunlun_reasoning_parser = "vllm_kunlun:register_reasoning_parser"
 
 [tool.hatch.build]
 packages = ["vllm_kunlun"]
