@@ -75,4 +75,4 @@ Before submitting a pull request, please make sure that:
 By contributing to
 [vLLM Kunlun](https://github.com/baidu/vLLM-Kunlun),
 you agree that your contributions will be licensed under the
-[Apache License 2.0](https://github.com/baidu/vLLM-Kunlun/blob/main/LICENSE.txt).
+[Apache License 2.0](https://github.com/baidu/vLLM-Kunlun/blob/main/LICENSE).

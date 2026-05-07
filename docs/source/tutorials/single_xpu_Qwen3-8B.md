@@ -16,7 +16,9 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 
-export build_image="xxxxxxxxxxxxxxxxx"
+export build_image="wjie520/vllm_kunlun:uv_base"
+# For Baidu intranet, use:
+# export build_image="iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base"
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
