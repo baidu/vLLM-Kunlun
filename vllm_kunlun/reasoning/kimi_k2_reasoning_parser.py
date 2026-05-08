@@ -5,14 +5,8 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from transformers import PreTrainedTokenizerBase
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    DeltaMessage,
-    ResponsesRequest,
-)
+from vllm.entrypoints.openai.protocol import DeltaMessage
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
-
-from vllm_kunlun.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ResponsesRequest
@@ -27,7 +21,9 @@ class KimiK2ReasoningParser(ReasoningParser):
     <|tool_calls_section_begin|>.
     Thinking may also begin without a </think> token.
 
-    Kimi's thinking mode can be disabled via chat_template_kwargs.
+    To disable thinking mode, pass chat_template_kwargs={"enable_thinking": False}
+    in the API request. When disabled, the serving layer bypasses this parser
+    and returns all output as plain content.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
@@ -38,17 +34,6 @@ class KimiK2ReasoningParser(ReasoningParser):
                 "The model tokenizer must be passed to the ReasoningParser "
                 "constructor during construction."
             )
-
-        # Check if thinking is disabled via chat_template_kwargs
-        chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        thinking = bool(chat_kwargs.get("thinking", True))
-
-        # If thinking is not enabled, use identity parser to fall through
-        self._identity_parser: IdentityReasoningParser | None
-        if not thinking:
-            self._identity_parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
-        else:
-            self._identity_parser = None
 
         # Token definitions
         self._start_token = "<think>"
@@ -69,7 +54,7 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         # Tracks whether the model is in pure-content mode (thinking disabled
-        # in the prompt via chat_template_kwargs={"thinking": false}).
+        # in the prompt via chat_template_kwargs={"enable_thinking": False}).
         # Set to True on the first streaming token when no <think> is seen.
         self._content_mode: bool = False
 
@@ -81,9 +66,6 @@ class KimiK2ReasoningParser(ReasoningParser):
         1. The end token (</think>)
         2. The tool section start token (<|tool_calls_section_begin|>)
         """
-        if self._identity_parser is not None:
-            return self._identity_parser.is_reasoning_end(input_ids)
-
         start_token_id = self._start_token_id
         end_token_id = self._end_token_id
         tool_section_start_token_id = self._tool_section_start_token_id
@@ -107,11 +89,6 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Check if the reasoning content ends in the input_ids on a decode step.
         """
-        if self._identity_parser is not None:
-            return self._identity_parser.is_reasoning_end_streaming(
-                input_ids, delta_ids
-            )
-
         # Materialize iterable for membership checks
         delta_ids_set = set(delta_ids)
 
@@ -127,9 +104,6 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract content token ids from the input_ids.
         """
-        if self._identity_parser is not None:
-            return self._identity_parser.extract_content_ids(input_ids)
-
         if self._end_token_id in input_ids:
             end_token_index = (
                 len(input_ids) - 1 - input_ids[::-1].index(self._end_token_id)
@@ -160,15 +134,12 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract reasoning content from the model output.
         """
-        if self._identity_parser is not None:
-            return self._identity_parser.extract_reasoning(model_output, request)
-
         # thinking does not require a think start token but consume it if present
         raw_start = model_output.find(self._start_token)
 
         # If neither <think> nor </think> appears in the output, the model was
-        # in non-thinking mode (thinking=false in chat_template_kwargs caused
-        # the prompt to be pre-filled with <think></think>).
+        # in non-thinking mode (enable_thinking=False caused the prompt to be
+        # pre-filled with <think></think>).
         # Treat the entire output as content.
         if raw_start == -1 and model_output.find(self._end_token) == -1:
             tool_section_index = model_output.find(self._tool_section_start_token)
@@ -210,16 +181,6 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract reasoning content from a delta message during streaming.
         """
-        if self._identity_parser is not None:
-            return self._identity_parser.extract_reasoning_streaming(
-                previous_text,
-                current_text,
-                delta_text,
-                previous_token_ids,
-                current_token_ids,
-                delta_token_ids,
-            )
-
         # If content mode detected (thinking disabled in prompt), treat all output as content
         if self._content_mode:
             return DeltaMessage(content=delta_text)
@@ -238,8 +199,11 @@ class KimiK2ReasoningParser(ReasoningParser):
         # Detect non-thinking mode: if the first generated tokens don't start
         # with <think>, the prompt was pre-filled with <think></think> and the
         # model is outputting pure content. Switch to content mode.
-        if not previous_token_ids and delta_token_ids and \
-                self._start_token_id not in delta_token_ids:
+        if (
+            not previous_token_ids
+            and delta_token_ids
+            and self._start_token_id not in delta_token_ids
+        ):
             self._content_mode = True
             return DeltaMessage(content=delta_text)
 

@@ -148,8 +148,13 @@ class KimiK2ToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
-        # sanity check; avoid unnecessary processing
-        if self.tool_calls_start_token not in model_output:
+        # sanity check; avoid unnecessary processing — check all section start variants
+        section_start_positions = [
+            model_output.find(variant)
+            for variant in self.tool_calls_start_token_variants
+            if variant in model_output
+        ]
+        if not section_start_positions:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -194,7 +199,9 @@ class KimiK2ToolParser(ToolParser):
                         )
                     )
 
-                content = model_output[: model_output.find(self.tool_calls_start_token)]
+                # Slice content before the earliest section start marker
+                content_end = min(section_start_positions)
+                content = model_output[:content_end]
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=tool_calls,
@@ -402,7 +409,7 @@ class KimiK2ToolParser(ToolParser):
                 if diff:
                     diff = (
                         diff.encode("utf-8").decode("unicode_escape")
-                        if diff is str
+                        if isinstance(diff, str)
                         else diff
                     )
                     if '"}' not in delta_text:

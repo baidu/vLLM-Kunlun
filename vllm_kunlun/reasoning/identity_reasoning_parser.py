@@ -45,7 +45,7 @@ class IdentityReasoningParser(ReasoningParser):
         # Identity: return all tokens as content
         return input_ids
 
-    def extract_reasoning_streaming(
+    def extract_reasoning_content_streaming(
         self,
         previous_text: str,
         current_text: str,
@@ -59,7 +59,7 @@ class IdentityReasoningParser(ReasoningParser):
             return DeltaMessage(content=delta_text)
         return None
 
-    def extract_reasoning(
+    def extract_reasoning_content(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
         # No reasoning separation: return None for reasoning,
