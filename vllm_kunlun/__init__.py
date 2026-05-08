@@ -106,6 +106,40 @@ def _install_import_hook(logger: logging.Logger) -> None:
     _completed_steps.add("import_hook")
 
 
+def _patch_xgrammar_backend(logger: logging.Logger) -> None:
+    """Patch xgrammar to use torch_native backend on XPU devices.
+
+    xgrammar's ``apply_token_bitmask_inplace`` defaults to
+    ``backend="auto"``, which routes XPU tensors to the
+    ``torch_compile`` backend.  That path uses ``@torch.compile``
+    with the default inductor backend, which in turn requires
+    libcuda.so — a library that does not exist on pure XPU
+    machines.  By intercepting the call and forcing
+    ``backend="torch_native"`` for XPU tensors we avoid the
+    CUDA dependency while keeping the original auto behaviour
+    for every other device type.
+    """
+    if "xgrammar" in _completed_steps:
+        return
+    try:
+        import xgrammar as xgr
+
+        _original_apply = xgr.apply_token_bitmask_inplace
+
+        def _xpu_aware_apply(
+            logits, bitmask, vocab_size=None, indices=None, backend="auto"
+        ):
+            if backend == "auto":
+                backend = "torch_native"
+            return _original_apply(logits, bitmask, vocab_size, indices, backend)
+
+        xgr.apply_token_bitmask_inplace = _xpu_aware_apply
+        logger.info("[KunlunPlugin] xgrammar patched for XPU backend")
+    except ImportError:
+        logger.debug("[KunlunPlugin] xgrammar not installed, skipping backend patch")
+    _completed_steps.add("xgrammar")
+
+
 # =========================================================================
 # Public API
 # =========================================================================
@@ -130,6 +164,7 @@ def register():
     _load_native_extension(logger)
     _patch_schema_utils(logger)  # fatal: raises on failure
     _install_import_hook(logger)  # fatal: raises on failure
+    _patch_xgrammar_backend(logger)
 
     if first_call:
         logger.info("[KunlunPlugin] register() done")
