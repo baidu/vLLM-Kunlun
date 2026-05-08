@@ -1359,11 +1359,47 @@ class Gemma4ForConditionalGeneration(
                     "embed_audio.",
                 ]
             )
+        # Gemma4ClippableLinear registers input_max/input_min/output_max/
+        # output_min as buffers (not parameters), so AutoWeightsLoader cannot
+        # find them via named_parameters(). We intercept these weights here,
+        # load them directly into the corresponding buffer, and hide them
+        # from the loader.
+        clip_suffixes = (
+            ".input_max",
+            ".output_max",
+            ".input_min",
+            ".output_min",
+        )
+
+        def _route_clip_buffers(ws):
+            for name, tensor in ws:
+                if name.endswith(clip_suffixes):
+                    # Resolve module by hierarchical name, e.g.
+                    # audio_tower.layers.0.feed_forward1.ffw_layer_1.input_max
+                    module_path, _, buf_name = name.rpartition(".")
+                    module = self
+                    try:
+                        for attr in module_path.split("."):
+                            module = (
+                                getattr(module, attr)
+                                if not attr.isdigit()
+                                else module[int(attr)]
+                            )
+                        if hasattr(module, buf_name):
+                            buf = getattr(module, buf_name)
+                            buf.data.copy_(tensor.to(buf.device, buf.dtype))
+                    except (AttributeError, IndexError):
+                        pass
+                    continue
+                yield name, tensor
+
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(
+            _route_clip_buffers(weights), mapper=self.hf_to_vllm_mapper
+        )
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping
