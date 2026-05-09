@@ -431,41 +431,18 @@ class KunlunOps:
             )
 
         if w1_bias is not None or w2_bias is not None:
-            # Rignt now this branch is for gpt oss
+            # Right now this branch is for gpt oss
             # TODO (@xyDong23): faster here using moe_fc kernel
-            normed_score = normed_score.to(hidden_states.dtype)
-            out = torch.zeros(
-                M * moe_top_k, N, dtype=hidden_states.dtype, device=hidden_states.device
+            return torch.ops._C.moe_bias_fused(
+                hidden_states,
+                w1,
+                w2,
+                topk_ids,
+                normed_score.to(hidden_states.dtype),
+                ep_rank,
+                w1_bias,
+                w2_bias,
             )
-            repeat_x = hidden_states.repeat_interleave(moe_top_k, dim=0)
-            topk_ids_flat = topk_ids.flatten()
-            for i in range(global_num_experts):
-                experts_id = ep_rank * global_num_experts + i
-                selected_token = topk_ids_flat == experts_id
-                if selected_token.sum():
-                    cur_token = repeat_x[selected_token]
-                    up_gate = torch.empty(
-                        selected_token.sum(),
-                        up_gate_size // 2,
-                        dtype=cur_token.dtype,
-                        device=cur_token.device,
-                    )
-                    groupgemm1 = cur_token @ w1[i].T
-                    # Add w13 bias
-                    if w1_bias is not None:
-                        groupgemm1 = groupgemm1 + w1_bias[i]
-                    up_gate = torch.ops._C.swigluoai_and_mul(groupgemm1)
-                    groupgemm2 = up_gate @ w2[i].T
-                    # Add w2 bias
-                    if w2_bias is not None:
-                        groupgemm2 = groupgemm2 + w2_bias[i]
-                    out[selected_token] = groupgemm2
-            ouput = (
-                (out.view(M, moe_top_k, N) * normed_score.unsqueeze(2))
-                .sum(dim=1)
-                .to(hidden_states.dtype)
-            )
-            return ouput
         else:
             # from vllm.forward_context import get_forward_context
             # forward_context = get_forward_context()
