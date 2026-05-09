@@ -746,10 +746,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
+        # TODO: Once vllm_kunlun supports float32 GDN forward, switch to
+        # using hf_text_config.mamba_ssm_dtype and the kunlun version of
+        # mamba_utils (3-param gated_delta_net_state_dtype) to allow
+        # separate dtype control for conv_state and temporal_state.
+        # Currently we use cache_config.mamba_cache_dtype (default "auto"
+        # -> model_dtype) because kunlun always runs GDN in float16.
+        # Allocating KVCache as float32 would waste half the memory.
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod
