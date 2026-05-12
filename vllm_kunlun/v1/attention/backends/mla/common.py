@@ -1192,6 +1192,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                                          v,
                                          context_seq_lod_xpu=None,
                                          context_seq_lod_cpu=None,
+                                         context_kvlen_lod_xpu=None,
+                                         context_kvlen_lod_cpu=None,
                                          return_softmax_lse=False,
                                          causal=True,
                                          softmax_scale=None,
@@ -1216,7 +1218,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         #     **kwargs,
         # )
         attn_out = torch.empty_like(q)
-        ds_alpha = 1.8738542070926265
+        # XFA kernel internally divides by sqrt(qk_head_dim), so alpha is an
+        # additional multiplier: effective_scale = alpha / sqrt(d).
+        # To match H20's softmax_scale (self.scale = 192**-0.5 * mscale^2 ≈ 0.14468):
+        #   alpha = self.scale * sqrt(d)  => effective_scale = self.scale  ✓
+        # The previous hardcoded 1.8738 gave effective_scale ≈ 0.1352 (7% off vs H20).
+        _base_scale = softmax_scale if softmax_scale is not None else self.scale
+        ds_alpha = _base_scale * (q.shape[-1] ** 0.5)
         tp_q_head_num=q.size(1)
         softmax_lse = torch.full((tp_q_head_num, q.size(0)), float('-inf'), dtype=torch.float32, device=q.device)
         kunlun_ops.attention(
@@ -1234,6 +1242,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             context_seq_lod_xpu=context_seq_lod_xpu,
             slot_mapping_cpu=None,
             slot_mapping_xpu=None,
+            context_kvlen_lod_cpu=context_kvlen_lod_cpu,
+            context_kvlen_lod_xpu=context_kvlen_lod_xpu,
             v_trans=False,
             v_trans_threshold=0,
             alpha=ds_alpha,
@@ -1307,12 +1317,20 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
     def _run_prefill_context_chunk_fa(self, prefill: MLACommonPrefillMetadata,
                                       chunk_idx: int, q, k, v):
         assert prefill.chunked_context is not None
+        # context cross-attention: Q = new tokens, KV = cached context tokens.
+        # Their per-request boundaries differ, so we must pass separate LODs:
+        #   context_seq_lod     = query_start_loc  (Q boundaries)
+        #   context_kvlen_lod   = cu_seq_lens[i]   (KV/context boundaries)
+        # Without the KV LOD, the kernel cannot split the KV tensor correctly
+        # for multi-request batches, causing cross-request attention pollution.
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
             v=v,
             context_seq_lod_xpu=prefill.query_start_loc,
             context_seq_lod_cpu=prefill.query_start_loc_cpu,
+            context_kvlen_lod_xpu=prefill.chunked_context.cu_seq_lens[chunk_idx],
+            context_kvlen_lod_cpu=prefill.chunked_context.cu_seq_lens_cpu[chunk_idx],
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,

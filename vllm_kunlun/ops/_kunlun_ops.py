@@ -726,17 +726,6 @@ class KunlunOps:
             device=hidden_states.device,
         )
 
-        # Pre-allocate perchannel_max buffer for both w13 and w2 (memory reuse)
-        # w13 needs shape [M*top_k, N], w2 needs shape [M*top_k, up_gate_size//2]
-        max_perchannel_dim = max(N, up_gate_size // 2)
-        perchannel_max_buffer = torch.ones(
-            M * moe_top_k,
-            max_perchannel_dim,
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        x_perchannel_max = perchannel_max_buffer[:, :N]
-
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
         torch.ops._C.moe_fc_v3(
             x=moe_expand,
@@ -745,12 +734,12 @@ class KunlunOps:
             sorted_tokens_idx=sorted_tokens_idx,
             moe_topk=moe_top_k,
             y=y,
-            x_perchannel_max=x_perchannel_max,
+            x_perchannel_max=None,
             w_perchannel_max=w13_scale,
             use_pack_int4=True,
             sort_mode=True,
         )
-        del moe_expand, x_perchannel_max  # Release after first FC
+        del moe_expand  # Release after first FC
 
         # Activation: silu_and_mul
         d = y.shape[-1] // 2
@@ -768,8 +757,6 @@ class KunlunOps:
         )
 
         out1 = out1.reshape(-1, out1.shape[-1])
-        # Reuse perchannel_max_buffer for w2 (memory optimization)
-        x2_perchannel_max = perchannel_max_buffer[:, :d]
 
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
         torch.ops._C.moe_fc_v3(
@@ -779,13 +766,13 @@ class KunlunOps:
             sorted_tokens_idx=sorted_tokens_idx,
             moe_topk=moe_top_k,
             y=out,
-            x_perchannel_max=x2_perchannel_max,
+            x_perchannel_max=None,
             w_perchannel_max=w2_scale,
             use_pack_int4=True,
             sort_mode=True,
         )
 
-        del out1, x2_perchannel_max, perchannel_max_buffer
+        del out1
 
         # Post-processing: reshape and weight by normed_score
         dequant_scale = torch.ones(
