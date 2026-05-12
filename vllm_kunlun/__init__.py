@@ -18,6 +18,7 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
         module_mappings = {
             "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
             "vllm.v1.worker.utils": "vllm_kunlun.v1.worker.utils",
+            "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
             "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
             "vllm.model_executor.layers.sampler": "vllm_kunlun.ops.sample.sampler",
             "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
@@ -70,10 +71,16 @@ def import_hook():
 
 def register():
     """Register the Kunlun platform"""
+
+    # import for patch some codes
     # Change for GLM5 and custom model configs.
     import vllm.transformers_utils.config as config_module
 
     from .transformer_utils.config import _XPU_CONFIG_REGISTRY
+    from .utils import redirect_output  # noqa: F401
+
+    # import for patch some codes
+    from .vllm_utils_wrapper import direct_register_custom_op  # noqa: F401
 
     config_module._CONFIG_REGISTRY = _XPU_CONFIG_REGISTRY
 
