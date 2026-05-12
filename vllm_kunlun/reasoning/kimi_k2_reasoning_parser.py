@@ -21,9 +21,10 @@ class KimiK2ReasoningParser(ReasoningParser):
     <|tool_calls_section_begin|>.
     Thinking may also begin without a </think> token.
 
-    To disable thinking mode, pass chat_template_kwargs={"enable_thinking": False}
-    in the API request. When disabled, the serving layer bypasses this parser
-    and returns all output as plain content.
+    To disable thinking mode, pass chat_template_kwargs={"thinking": False}
+    in the API request. The chat template checks the `thinking` variable and
+    pre-fills <think></think> so the model skips reasoning and outputs plain
+    content directly.
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
@@ -54,7 +55,7 @@ class KimiK2ReasoningParser(ReasoningParser):
             )
 
         # Tracks whether the model is in pure-content mode (thinking disabled
-        # in the prompt via chat_template_kwargs={"enable_thinking": False}).
+        # in the prompt via chat_template_kwargs={"thinking": False}).
         # Set to True on the first streaming token when no <think> is seen.
         self._content_mode: bool = False
 
