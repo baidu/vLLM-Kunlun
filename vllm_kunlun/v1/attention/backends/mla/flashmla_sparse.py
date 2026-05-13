@@ -116,6 +116,11 @@ class MLASparsePrefillMetadata:
     request_ids: torch.Tensor = None
     query_start_loc: torch.Tensor = None
     query_start_loc_cpu: torch.Tensor = None
+    # KV LOD: cumulative offsets of total seq_lens (context + query) per
+    # prefill request.  Used by the sparse prefill kernel for correct
+    # causal masking in multi-turn conversations where kv_len != q_len.
+    kv_start_loc: torch.Tensor = None
+    kv_start_loc_cpu: torch.Tensor = None
 
 @dataclass
 class FlashMLASparseDecodeAndContextMetadata:
@@ -464,6 +469,8 @@ class FlashMLASparseMetadataBuilder(
             (vllm_config.scheduler_config.max_num_batched_tokens, ),
             dtype=torch.int32,
             device=device)
+        # Pre-allocated buffer for kv_lod CPU tensor, reused across build calls.
+        self._kv_lod_cpu_buf = None
     def build(self,
               common_prefix_len: int,
               common_attn_metadata: CommonAttentionMetadata,
@@ -510,9 +517,30 @@ class FlashMLASparseMetadataBuilder(
         # For mixed batches, it will have -1 for decode and request_id for prefill
         prefill_metadata = None
         if num_prefills > 0:
+            # Compute kv_lod from seq_lens for multi-turn correctness.
+            # kv_lod = cumsum of total sequence lengths (context + query),
+            # which differs from q_lod (cumsum of query lengths only) when
+            # there is existing KV cache from prior turns.
+            prefill_seq_lens_cpu = common_attn_metadata.seq_lens_cpu[
+                num_decodes:]
+            if self._kv_lod_cpu_buf is None or self._kv_lod_cpu_buf.shape[
+                    0] != num_prefills + 1:
+                self._kv_lod_cpu_buf = torch.zeros(num_prefills + 1,
+                                                    dtype=torch.int32,
+                                                    device="cpu")
+            kv_lod_cpu = self._kv_lod_cpu_buf
+            kv_lod_cpu.zero_()
+            kv_lod_cpu[1:] = prefill_seq_lens_cpu.to(
+                torch.int32).cumsum(dim=0)
+            kv_lod_xpu = kv_lod_cpu.to(self.device)
+
+            q_start = common_attn_metadata.query_start_loc[num_decodes]
+            q_start_cpu = common_attn_metadata.query_start_loc_cpu[num_decodes]
             prefill_metadata = MLASparsePrefillMetadata(
-                query_start_loc = common_attn_metadata.query_start_loc[num_decodes:] - common_attn_metadata.query_start_loc[num_decodes], #因为prefiil、decode请求是分离，所以需要对q进行切分，故需调整该值
-                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[num_decodes:] - common_attn_metadata.query_start_loc_cpu[num_decodes],
+                query_start_loc = common_attn_metadata.query_start_loc[num_decodes:] - q_start, #因为prefiil、decode请求是分离，所以需要对q进行切分，故需调整该值
+                query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[num_decodes:] - q_start_cpu,
+                kv_start_loc=kv_lod_xpu,
+                kv_start_loc_cpu=kv_lod_cpu,
             )
 
         decode_metadata = None
@@ -623,11 +651,13 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             # NOTE: 只有prefill阶段attn_metadata.query_start_loc是符合klx算子需求的
             _attn_out = flash_mla_sparse_prefill(
                 q=q,
-                kv=kv_c_and_k_pe_cache, 
+                kv=kv_c_and_k_pe_cache,
                 indices=topk_indices,
                 sm_scale=self.softmax_scale,
                 q_lod_xpu=prefill_metadata.query_start_loc,
-                q_lod_cpu=prefill_metadata.query_start_loc_cpu
+                q_lod_cpu=prefill_metadata.query_start_loc_cpu,
+                kv_lod_xpu=prefill_metadata.kv_start_loc,
+                kv_lod_cpu=prefill_metadata.kv_start_loc_cpu,
             )[0]
             return _attn_out
 

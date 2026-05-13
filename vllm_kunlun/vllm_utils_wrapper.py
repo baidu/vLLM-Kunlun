@@ -2365,6 +2365,8 @@ def sparse_prefill_fwd_opt(
     d_v: Optional[int] = -1,
     is_causal: Optional[bool] = True,
     use_xfa_boost: Optional[bool] = False,
+    side_stream: Optional[int] = -1,
+    p_out: Optional[torch.Tensor] = None,
 ) -> None:
     kunlun_ops.sparse_prefill_fwd_opt(
         q=q,
@@ -2373,6 +2375,7 @@ def sparse_prefill_fwd_opt(
         out=out,
         max_logits=max_logits,
         lse=lse,
+        p_out=p_out,
         sm_scale=sm_scale,
         qlod_cpu=qlod_cpu,
         qlod_xpu=qlod_xpu,
@@ -2401,6 +2404,8 @@ def sparse_prefill_fwd_opt_cuda(
     d_v: Optional[int] = -1,
     is_causal: Optional[bool] = True,
     use_xfa_boost: Optional[bool] = False,
+    side_stream: Optional[int] = -1,
+    p_out: Optional[torch.Tensor] = None,
 ) -> None:
     kunlun_ops.sparse_prefill_fwd_opt(
         q=q,
@@ -2409,6 +2414,7 @@ def sparse_prefill_fwd_opt_cuda(
         out=out,
         max_logits=max_logits,
         lse=lse,
+        p_out=p_out,
         sm_scale=sm_scale,
         qlod_cpu=qlod_cpu,
         qlod_xpu=qlod_xpu,
@@ -2436,6 +2442,8 @@ def _fake_sparse_prefill_fwd_opt(
     d_v: Optional[int] = -1,
     is_causal: Optional[bool] = True,
     use_xfa_boost: Optional[bool] = False,
+    side_stream: Optional[int] = -1,
+    p_out: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
