@@ -88,7 +88,11 @@ def int8_paged_mqa_logits(
     num_blocks, block_size, _, _ = kv_cache_fp8.shape
     
     kv_cache_fp8 = kv_cache_fp8.view(num_blocks, -1)
-    k_val = kv_cache_fp8[:, :block_size * D].view(torch.int8)
+    # NOTE: kv_cache_fp8[:, :block_size * D] 是非连续视图（stride[0] = block_size*(D+4)，非 block_size*D）。
+    # I8_paged_mqa_logits kernel 假设 k_val 连续，内部按 physical_block_id * block_size * D
+    # 计算偏移；若不 contiguous，block_id>0 时会读到错误地址（scale字节混入K数据）。
+    # Perf: contiguous() 每次 decode step 会复制 ~num_blocks*block_size*D 字节（典型配置约80MB）。
+    k_val = kv_cache_fp8[:, :block_size * D].contiguous().view(torch.int8)
     k_val = k_val.view(-1, block_size, 1, D)
     
     block_indices = block_tables.flatten()

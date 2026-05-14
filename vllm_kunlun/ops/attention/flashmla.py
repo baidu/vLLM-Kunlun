@@ -194,6 +194,8 @@ def flash_mla_sparse_prefill(
     sm_scale: float,
     q_lod_xpu: torch.Tensor,
     q_lod_cpu: torch.Tensor,
+    kv_lod_xpu: Optional[torch.Tensor] = None,
+    kv_lod_cpu: Optional[torch.Tensor] = None,
     d_v: int = 512,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -206,6 +208,8 @@ def flash_mla_sparse_prefill(
         Invalid indices should be set to -1 or numbers >= s_kv
     - sm_scale: float
     - q_lod_xpu: [batch+1], int32, q的每个seq长度的累加信息, 长度为batch_num + 1 (为空则表示q定长). 
+    - kv_lod_xpu: [batch+1], int32, kv的每个seq长度的累加信息(含context). None时fallback到q_lod.
+    - kv_lod_cpu: [batch+1], int32, kv的每个seq长度的累加信息(含context). None时fallback到q_lod.
     - d_v: The dimension of value vectors. Can only be 512
 
     Returns:
@@ -222,17 +226,23 @@ def flash_mla_sparse_prefill(
     max_logits = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
     lse = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
 
+    # For multi-turn conversations, kv_lod (total sequence lengths) differs
+    # from q_lod (new tokens only). Fall back to q_lod if not provided
+    # (single-turn where qlod == kvlod).
+    _kvlod_cpu = kv_lod_cpu if kv_lod_cpu is not None else q_lod_cpu
+    _kvlod_xpu = kv_lod_xpu if kv_lod_xpu is not None else q_lod_xpu
+
     torch.ops._C.sparse_prefill_fwd_opt(
         q=q,
         kv=kv,
         indices=indices,
         qlod_cpu=q_lod_cpu,
         qlod_xpu=q_lod_xpu,
-        kvlod_cpu=q_lod_cpu,
-        kvlod_xpu=q_lod_xpu,
+        kvlod_cpu=_kvlod_cpu,
+        kvlod_xpu=_kvlod_xpu,
         sm_scale=sm_scale,
         d_v=d_v,
-        is_causal=True, #aiak这个值为true，这是为啥
+        is_causal=True,
         out=out,
         max_logits=max_logits,
         lse=lse,
