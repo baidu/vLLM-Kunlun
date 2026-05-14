@@ -64,6 +64,9 @@ With vLLM installed, you can start generating texts for list of input prompts (i
 
 Try to run below Python script directly or use `python3` shell to generate texts:
 
+KunlunGraph configures the required attention split operators automatically, so
+you do not need to pass `compilation_config` in normal usage.
+
 <!-- tests/e2e/doctest/001-quickstart-test.sh should be considered updating as well -->
 
 ```python
@@ -89,20 +92,6 @@ def main():
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
         served_model_name="Qwen3-VL",
-        compilation_config={
-            "splitting_ops": [
-                "vllm.unified_attention",
-                "vllm.unified_attention_with_output",
-                "vllm.unified_attention_with_output_kunlun",
-                "vllm.mamba_mixer2",
-                "vllm.mamba_mixer",
-                "vllm.short_conv",
-                "vllm.linear_attention",
-                "vllm.plamo2_mamba_mixer",
-                "vllm.gdn_attention",
-                "vllm.sparse_attn_indexer",
-            ]
-        },
     )
 
     # === test chat ===
