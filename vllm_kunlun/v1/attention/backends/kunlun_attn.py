@@ -603,13 +603,6 @@ class KunlunAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
-        seq_start_loc = list(accumulate(seq_lens, initial=0))
-
-        seq_start_loc_tensor = torch.empty(
-            len(seq_start_loc), dtype=torch.int32, device=self.device
-        )
-        seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
-
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)

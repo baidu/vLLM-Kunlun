@@ -169,8 +169,7 @@ def random_sample(
             q = q.clamp(min=1e-12)
         else:
             for i, generator in generators.items():
-                q[i].exponential_(generator=generator)
-
+                torch.ops.xspeedgate_ops.inplace_exponential(q[i], generator=generator)
     return probs.div_(q).argmax(dim=-1).view(-1)
 
 
