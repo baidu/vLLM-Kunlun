@@ -132,6 +132,17 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
+
+        # Read correct config from FusedMoE layer attributes (MiniMax-M2.7 fix)
+        if hasattr(layer, "scoring_func") and scoring_func == "softmax":
+            scoring_func = layer.scoring_func
+        if hasattr(layer, "e_score_correction_bias") and e_score_correction_bias is None:
+            e_score_correction_bias = layer.e_score_correction_bias
+        if hasattr(layer, "num_expert_group") and num_expert_group is None:
+            num_expert_group = layer.num_expert_group
+        if hasattr(layer, "topk_group") and topk_group is None:
+            topk_group = layer.topk_group
+
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
         M, N = hidden_states.shape
         hidden_dim = layer.w2_weight.shape[1]

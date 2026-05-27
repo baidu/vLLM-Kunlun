@@ -10,6 +10,7 @@ Reasoning parser registration module for vLLM Kunlun.
 REASONING_PARSERS = {
     "qwen3": (".qwen3_reasoning_parser", "Qwen3ReasoningParser"),
     "gemma4": (".gemma4_reasoning_parser", "Gemma4ReasoningParser"),
+    "minimax_m2": (".minimax_m2_reasoning_parser", "MiniMaxM2ReasoningParser"),
 }
 
 

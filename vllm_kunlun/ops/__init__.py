@@ -27,5 +27,8 @@ import vllm_kunlun.ops.rotary_embedding
 import vllm_kunlun.ops.vocab_parallel_embedding
 import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
 
+# activation ops (SiluAndMul, GeluAndMul OOT registration)
+import vllm_kunlun.ops.activation
+
 # TODO @xyDong0223 remove v0.16.0
 # import vllm_kunlun.ops.mla
