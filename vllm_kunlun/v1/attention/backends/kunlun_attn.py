@@ -790,14 +790,26 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 value = value.contiguous()
-                kunlun_ops.reshape_and_cache_flash(
-                    key[: attn_metadata.num_actual_tokens],
-                    value[: attn_metadata.num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    updated_slot_mapping,
-                    BLHD_LAYOUT=False,
-                )
+                if self.num_kv_heads > 1:
+                    # Note: When num_kv_heads > 1, reshape_and_cache_flash
+                    # has a value_cache write bug; fall back to
+                    # reshape_and_cache instead.
+                    kunlun_ops.reshape_and_cache(
+                        key[: attn_metadata.num_actual_tokens],
+                        value[: attn_metadata.num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        updated_slot_mapping,
+                    )
+                else:
+                    kunlun_ops.reshape_and_cache_flash(
+                        key[: attn_metadata.num_actual_tokens],
+                        value[: attn_metadata.num_actual_tokens],
+                        key_cache,
+                        value_cache,
+                        updated_slot_mapping,
+                        BLHD_LAYOUT=False,
+                    )
 
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
