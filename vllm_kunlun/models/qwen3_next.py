@@ -10,7 +10,6 @@ import torch
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -29,9 +28,13 @@ from vllm.distributed import (
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
 
 # yapf: enable
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -87,6 +90,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
@@ -206,20 +210,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
 
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_expert,
             gate=self.gate,
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=False,
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
+            n_shared_experts=1 if self.shared_expert is None else None,
+            shared_expert_gate=(
+                self.shared_expert_gate if self.shared_expert is None else None
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -243,26 +250,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-        if self.shared_expert is not None:
-            final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
-
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states
-            )
 
         return final_hidden_states.view(orig_shape)
 
 
 class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
     @property
-    def mamba_type(self) -> str:
-        return "gdn_attention"
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.GDN_ATTN
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
@@ -580,7 +580,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_state_indices_tensor_cpu = (
             attn_metadata.non_spec_state_indices_tensor_cpu
         )
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        self_kv_cache = self.kv_cache
         conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -708,11 +708,41 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            # initial_state = ssm_state[non_spec_state_indices_tensor]
+            # initial_state[~has_initial_state] = 0
+            # initial_state = initial_state.transpose(-1, -2).contiguous()
+            slot_mapping = torch.full(
+                (ssm_state.shape[0],), -1, dtype=torch.int32, device="cuda"
+            )
+            slot_mapping[non_spec_state_indices_tensor] = torch.arange(
+                len(non_spec_state_indices_tensor), dtype=torch.int32, device="cuda"
+            )
+
+            initial_state_shape = (
+                non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
+            )
+            initial_state = torch.empty(
+                initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
+            )
+            initial_state = initial_state.view(
+                initial_state.shape[0], 1, -1, initial_state.shape[-1]
+            )
+            cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
+
+            kunlun_ops.reshape_and_cache_flash(
+                cast_ssm_state,
+                cast_ssm_state,
+                initial_state,
+                initial_state,
+                slot_mapping,
+            )
+            initial_state = initial_state.view(initial_state_shape)
+
             initial_state = initial_state * has_initial_state.view(
                 has_initial_state.shape[0], 1, 1, 1
             )
             initial_state = initial_state.transpose(-1, -2).contiguous()
+
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -728,6 +758,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 cu_seqlens=non_spec_query_start_loc,
             )
             # Init cache
+            # ssm_state[non_spec_state_indices_tensor] = (
+            #     last_recurrent_state.transpose(-1, -2)
+            #     .contiguous()
+            #     .to(ssm_state.dtype)
+            # )
             last_recurrent_state = (
                 last_recurrent_state.transpose(-1, -2)
                 .contiguous()
@@ -869,51 +904,73 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+            -1, self.num_heads * self.head_dim
+        )
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+            -1, self.num_kv_heads * self.head_dim
+        )
+
+        q, k = self.rotary_emb(positions, q, k)
+
         # MRoPE (multimodal) passes positions as [3, num_tokens] (T/H/W dims).
         # The fused XPU kernel xspeedgate_ops.split_norm_rope_neox only supports
         # 1-D positions [num_tokens], so fall back to the non-fused path when
-        # a 2-D MRoPE position tensor is detected.
-        if positions.dim() == 2:
-            # --- Non-fused fallback path for MRoPE positions ---
-            # Split qkv (and gate if attn_output_gate is enabled)
-            if self.attn_output_gate:
-                q_gate, k, v = qkv.split(
-                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-                )
-                orig_shape = q_gate.shape[:-1]
-                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-                q, gate = torch.chunk(q_gate, 2, dim=-1)
-                q = q.reshape(*orig_shape, -1)
-                gate = gate.reshape(*orig_shape, -1)
-            else:
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # # a 2-D MRoPE position tensor is detected.
+        # if positions.dim() == 2:
+        #     # --- Non-fused fallback path for MRoPE positions ---
+        #     # Split qkv (and gate if attn_output_gate is enabled)
+        #     if self.attn_output_gate:
+        #         q_gate, k, v = qkv.split(
+        #             [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+        #         )
+        #         orig_shape = q_gate.shape[:-1]
+        #         q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+        #         q, gate = torch.chunk(q_gate, 2, dim=-1)
+        #         q = q.reshape(*orig_shape, -1)
+        #         gate = gate.reshape(*orig_shape, -1)
+        #     else:
+        #         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-                -1, self.num_heads * self.head_dim
-            )
-            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-                -1, self.num_kv_heads * self.head_dim
-            )
+        #     q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+        #         -1, self.num_heads * self.head_dim
+        #     )
+        #     k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+        #         -1, self.num_kv_heads * self.head_dim
+        #     )
 
-            q, k = self.rotary_emb(positions, q, k)
-        else:
-            # --- Fused path for standard 1-D positions ---
-            q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
-                qkv=qkv,
-                q_weights=self.q_norm.weight,
-                k_weights=self.k_norm.weight,
-                positions=positions,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
-                q_size=self.q_size,
-                kv_size=self.kv_size,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                rotary_dim=self.rotary_dim,
-                attn_output_gate=self.attn_output_gate,
-            )
+        #     q, k = self.rotary_emb(positions, q, k)
+        # else:
+        #     # --- Fused path for standard 1-D positions ---
+        #     q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
+        #         qkv=qkv,
+        #         q_weights=self.q_norm.weight,
+        #         k_weights=self.k_norm.weight,
+        #         positions=positions,
+        #         cos_sin_cache=self.rotary_emb.cos_sin_cache,
+        #         q_size=self.q_size,
+        #         kv_size=self.kv_size,
+        #         num_q_heads=self.num_heads,
+        #         num_kv_heads=self.num_kv_heads,
+        #         head_dim=self.head_dim,
+        #         rotary_dim=self.rotary_dim,
+        #         attn_output_gate=self.attn_output_gate,
+        #     )
 
         attn_output = self.attn(q, k, v)
+        # attn_output = q
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
@@ -1143,7 +1200,7 @@ class Qwen3NextModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return SharedFusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",

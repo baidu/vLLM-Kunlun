@@ -84,172 +84,168 @@ PATCHES = [
     # ----------------------------------------------------------
     # Patch 1: decorators.py — Fix inline call signature
     # ----------------------------------------------------------
-    {
-        "file": "vllm/compilation/decorators.py",
-        "desc": (
-            "Fix patched_inline_call signature. "
-            "PyTorch 2.5.1 uses (parent, func, args, kwargs) instead of "
-            "(self_: Any). The self_.f_code attribute does not exist in "
-            "2.5.1; use func.get_code() instead."
-        ),
-        "lines": "505-508",
-        "old": """\
-        def patched_inline_call(self_: Any) -> Any:
-            code = self_.f_code
-            self.compilation_config.traced_files.add(code.co_filename)
-            return inline_call(self_)""",
-        "new": """\
-        def patched_inline_call(parent, func, args, kwargs):
-            # [PyTorch 2.5.1 compat] Use func.get_code() instead of
-            # self_.f_code, which is not available in this version.
-            code = func.get_code()
-
-            # Note: vLLM 0.15.x uses self.compilation_config directly
-            # (not self.vllm_config.compilation_config)
-            self.compilation_config.traced_files.add(code.co_filename)
-
-            # Pass all four arguments as expected by PyTorch 2.5.1
-            return inline_call(parent, func, args, kwargs)""",
-    },
-    # ----------------------------------------------------------
-    # Patch 2: layer.py — Fix torch.Size during tracing
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/attention/layer.py",
-        "desc": (
-            "Replace torch.Size() with torch.empty().size. "
-            "In PyTorch 2.5.1, torch.Size() does not work correctly "
-            "during torch.compile tracing. torch.empty().size produces "
-            "a compatible result."
-        ),
-        "lines": "378-380",
-        "old": """\
-                output_shape = torch.Size(
-                    (num_tokens, self.num_heads * self.head_size_v)
-                )""",
-        "new": """\
-                output_shape = torch.empty(
-                    (num_tokens, self.num_heads * self.head_size_v)
-                ).size()""",
-    },
-    # ----------------------------------------------------------
-    # Patch 3: piecewise_backend.py — Remove bundled_autograd_cache
-    #          context manager (serialize path)
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/compilation/piecewise_backend.py",
-        "desc": (
-            "Remove bundled_autograd_cache context manager around "
-            "serialization. torch._functorch.config.bundled_autograd_cache "
-            "does not exist in PyTorch 2.5.1."
-        ),
-        "lines": "180-185",
-        "old": """\
-            with torch._functorch.config.patch("bundled_autograd_cache", True):
-                entry = fn.serialize()
-
-                f = io.BytesIO()
-                StandaloneCompiledArtifactsPickler(f).dump(entry)
-                result = f.getvalue()""",
-        "new": """\
-            entry = fn.serialize()
-
-            f = io.BytesIO()
-            StandaloneCompiledArtifactsPickler(f).dump(entry)
-            result = f.getvalue()""",
-    },
-    # ----------------------------------------------------------
-    # Patch 4: piecewise_backend.py — Remove bundled_autograd_cache
-    #          context manager (compile path)
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/compilation/piecewise_backend.py",
-        "desc": (
-            "Remove bundled_autograd_cache context manager around "
-            "compilation. Same reason as above — the config option is "
-            "unavailable in PyTorch 2.5.1."
-        ),
-        "lines": "243-254",
-        "old": """\
-                with (
-                    torch._functorch.config.patch("bundled_autograd_cache", True),
-                ):
-                    range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                        self.graph,
-                        args_list,
-                        self.vllm_backend.inductor_config,
-                        self.compilation_config,
-                        compile_range=range_entry.compile_range,
-                        graph_index=self.piecewise_compile_index,
-                        num_graphs=self.total_piecewise_compiles,
-                    )""",
-        "new": """\
-                range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                    self.graph,
-                    args_list,
-                    self.vllm_backend.inductor_config,
-                    self.compilation_config,
-                    compile_range=range_entry.compile_range,
-                    graph_index=self.piecewise_compile_index,
-                    num_graphs=self.total_piecewise_compiles,
-                )""",
-    },
-    # ----------------------------------------------------------
-    # Patch 5: compiler_interface.py — Comment out unavailable config
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/compilation/compiler_interface.py",
-        "desc": (
-            "Comment out bundled_autograd_cache assignment. "
-            "This attribute does not exist in torch._functorch.config "
-            "on PyTorch 2.5.1 and will raise AttributeError."
-        ),
-        "lines": "654-656",
-        "old": """\
-def set_functorch_config() -> None:
-    if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
-        torch._functorch.config.bundled_autograd_cache = False""",
-        "new": """\
-def set_functorch_config() -> None:
-    if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
-        # [PyTorch 2.5.1 compat] bundled_autograd_cache is not available.
-        # TODO: Restore this line after upgrading to PyTorch 2.9+
-        # torch._functorch.config.bundled_autograd_cache = False
-        pass""",
-    },
-    # ----------------------------------------------------------
-    # Patch 6: parallel_state.py — Add List to typing imports
-    #          (must be applied BEFORE Patch 7)
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/distributed/parallel_state.py",
-        "desc": (
-            "Add List to the typing import. Required by Patch 7 which "
-            "changes list[int] to List[int]. Without this import, "
-            "List would be undefined."
-        ),
-        "lines": "36",
-        "old": "from typing import Any, Optional",
-        "new": "from typing import Any, List, Optional",
-    },
-    # ----------------------------------------------------------
-    # Patch 7: parallel_state.py — Use List[int] instead of list[int]
-    # ----------------------------------------------------------
-    {
-        "file": "vllm/distributed/parallel_state.py",
-        "desc": (
-            "Replace built-in generic `list[int]` with `List[int]` from "
-            "typing. While Python 3.10 supports `list[int]` in annotations, "
-            "certain runtime introspection paths used by torch.compile / "
-            "FX tracing may fail to resolve it. Using `typing.List[int]` "
-            "is the safe, backward-compatible form."
-        ),
-        "lines": "173, 225",
-        # Replace ALL occurrences in the file
-        "count": 0,
-        "old": "    output_shape: list[int],",
-        "new": "    output_shape: List[int],",
-    },
+    #     {
+    #         "file": "vllm/compilation/decorators.py",
+    #         "desc": (
+    #             "Fix patched_inline_call signature. "
+    #             "PyTorch 2.5.1 uses (parent, func, args, kwargs) instead of "
+    #             "(self_: Any). The self_.f_code attribute does not exist in "
+    #             "2.5.1; use func.get_code() instead."
+    #         ),
+    #         "lines": "505-508",
+    #         "old": """\
+    #         def patched_inline_call(self_: Any) -> Any:
+    #             code = self_.f_code
+    #             self.compilation_config.traced_files.add(code.co_filename)
+    #             return inline_call(self_)""",
+    #         "new": """\
+    #         def patched_inline_call(parent, func, args, kwargs):
+    #             # [PyTorch 2.5.1 compat] Use func.get_code() instead of
+    #             # self_.f_code, which is not available in this version.
+    #             code = func.get_code()
+    #             # Note: vLLM 0.15.x uses self.compilation_config directly
+    #             # (not self.vllm_config.compilation_config)
+    #             self.compilation_config.traced_files.add(code.co_filename)
+    #             # Pass all four arguments as expected by PyTorch 2.5.1
+    #             return inline_call(parent, func, args, kwargs)""",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 2: layer.py — Fix torch.Size during tracing
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/attention/layer.py",
+    #         "desc": (
+    #             "Replace torch.Size() with torch.empty().size. "
+    #             "In PyTorch 2.5.1, torch.Size() does not work correctly "
+    #             "during torch.compile tracing. torch.empty().size produces "
+    #             "a compatible result."
+    #         ),
+    #         "lines": "378-380",
+    #         "old": """\
+    #                 output_shape = torch.Size(
+    #                     (num_tokens, self.num_heads * self.head_size_v)
+    #                 )""",
+    #         "new": """\
+    #                 output_shape = torch.empty(
+    #                     (num_tokens, self.num_heads * self.head_size_v)
+    #                 ).size()""",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 3: piecewise_backend.py — Remove bundled_autograd_cache
+    #     #          context manager (serialize path)
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/compilation/piecewise_backend.py",
+    #         "desc": (
+    #             "Remove bundled_autograd_cache context manager around "
+    #             "serialization. torch._functorch.config.bundled_autograd_cache "
+    #             "does not exist in PyTorch 2.5.1."
+    #         ),
+    #         "lines": "180-185",
+    #         "old": """\
+    #             with torch._functorch.config.patch("bundled_autograd_cache", True):
+    #                 entry = fn.serialize()
+    #                 f = io.BytesIO()
+    #                 StandaloneCompiledArtifactsPickler(f).dump(entry)
+    #                 result = f.getvalue()""",
+    #         "new": """\
+    #             entry = fn.serialize()
+    #             f = io.BytesIO()
+    #             StandaloneCompiledArtifactsPickler(f).dump(entry)
+    #             result = f.getvalue()""",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 4: piecewise_backend.py — Remove bundled_autograd_cache
+    #     #          context manager (compile path)
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/compilation/piecewise_backend.py",
+    #         "desc": (
+    #             "Remove bundled_autograd_cache context manager around "
+    #             "compilation. Same reason as above — the config option is "
+    #             "unavailable in PyTorch 2.5.1."
+    #         ),
+    #         "lines": "243-254",
+    #         "old": """\
+    #                 with (
+    #                     torch._functorch.config.patch("bundled_autograd_cache", True),
+    #                 ):
+    #                     range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+    #                         self.graph,
+    #                         args_list,
+    #                         self.vllm_backend.inductor_config,
+    #                         self.compilation_config,
+    #                         compile_range=range_entry.compile_range,
+    #                         graph_index=self.piecewise_compile_index,
+    #                         num_graphs=self.total_piecewise_compiles,
+    #                     )""",
+    #         "new": """\
+    #                 range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+    #                     self.graph,
+    #                     args_list,
+    #                     self.vllm_backend.inductor_config,
+    #                     self.compilation_config,
+    #                     compile_range=range_entry.compile_range,
+    #                     graph_index=self.piecewise_compile_index,
+    #                     num_graphs=self.total_piecewise_compiles,
+    #                 )""",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 5: compiler_interface.py — Comment out unavailable config
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/compilation/compiler_interface.py",
+    #         "desc": (
+    #             "Comment out bundled_autograd_cache assignment. "
+    #             "This attribute does not exist in torch._functorch.config "
+    #             "on PyTorch 2.5.1 and will raise AttributeError."
+    #         ),
+    #         "lines": "654-656",
+    #         "old": """\
+    # def set_functorch_config() -> None:
+    #     if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+    #         torch._functorch.config.bundled_autograd_cache = False""",
+    #         "new": """\
+    # def set_functorch_config() -> None:
+    #     if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+    #         # [PyTorch 2.5.1 compat] bundled_autograd_cache is not available.
+    #         # TODO: Restore this line after upgrading to PyTorch 2.9+
+    #         # torch._functorch.config.bundled_autograd_cache = False
+    #         pass""",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 6: parallel_state.py — Add List to typing imports
+    #     #          (must be applied BEFORE Patch 7)
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/distributed/parallel_state.py",
+    #         "desc": (
+    #             "Add List to the typing import. Required by Patch 7 which "
+    #             "changes list[int] to List[int]. Without this import, "
+    #             "List would be undefined."
+    #         ),
+    #         "lines": "36",
+    #         "old": "from typing import Any, Optional",
+    #         "new": "from typing import Any, List, Optional",
+    #     },
+    #     # ----------------------------------------------------------
+    #     # Patch 7: parallel_state.py — Use List[int] instead of list[int]
+    #     # ----------------------------------------------------------
+    #     {
+    #         "file": "vllm/distributed/parallel_state.py",
+    #         "desc": (
+    #             "Replace built-in generic `list[int]` with `List[int]` from "
+    #             "typing. While Python 3.10 supports `list[int]` in annotations, "
+    #             "certain runtime introspection paths used by torch.compile / "
+    #             "FX tracing may fail to resolve it. Using `typing.List[int]` "
+    #             "is the safe, backward-compatible form."
+    #         ),
+    #         "lines": "173, 225",
+    #         # Replace ALL occurrences in the file
+    #         "count": 0,
+    #         "old": "    output_shape: list[int],",
+    #         "new": "    output_shape: List[int],",
+    #     },
     # ----------------------------------------------------------
     # Patch 8: vllm/transformers_utils/config.py - add qwen3_5
     # ----------------------------------------------------------
@@ -538,6 +534,26 @@ __all__ = [
             'indices=index_tensor, backend="torch_native")'
         ),
     },
+    # # ----------------------------------------------------------
+    # # Patch 11: block_table.py — update slot_mapping dtype
+    # #           from int64 to int32
+    # # ----------------------------------------------------------
+    # {
+    #     "file": "vllm/v1/worker/block_table.py",
+    #     "desc": (
+    #         "Update slot_mapping dtype from int64 to int32. This is required "
+    #         "for compatibility with the Kunlun platform on PyTorch 2.5.1."
+    #     ),
+    #     "lines": "73",
+    #     "old": """\
+    #     self.slot_mapping = self._make_buffer(
+    #         self.max_num_batched_tokens, dtype=torch.int64
+    #     )""",
+    #     "new": """\
+    #     self.slot_mapping = self._make_buffer(
+    #         self.max_num_batched_tokens, dtype=torch.int32
+    #     )""",
+    # },
 ]
 
 

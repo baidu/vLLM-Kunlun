@@ -24,7 +24,10 @@ class TopKTopPSampler(nn.Module):
         super().__init__()
         self.logprobs_mode = logprobs_mode
         logger.info_once("Using FlashInfer for top-p & top-k sampling.")
-        self.forward = self.forward_kunlun
+        if os.getenv("VLLM_KUNLUN_FORCE_NATIVE_SAMPLER", "0") == "1":
+            self.forward = self.forward_native
+        else:
+            self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
 
     def forward_native(

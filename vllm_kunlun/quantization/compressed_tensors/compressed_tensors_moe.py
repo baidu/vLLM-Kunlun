@@ -25,8 +25,10 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     UnquantizedFusedMoEMethod,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8 import (  # noqa: E501
     CompressedTensorsW8A8Int8MoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
     CompressedTensorsWNA16MoEMethod,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
@@ -130,6 +132,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape

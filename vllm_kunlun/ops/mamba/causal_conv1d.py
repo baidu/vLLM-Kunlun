@@ -1,9 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# Copyright (c) 2024, Tri Dao.
-# Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
-
 from typing import Optional, Union
 
 import kunlun_ops
@@ -194,25 +188,22 @@ def causal_conv1d_update(
     else:
         x = x.squeeze(-1).view(-1, max_query_len, dim)
     if num_accepted_tokens is None:
-        out = torch.empty_like(x)
-        import kunlun_ops
-
-        stride = conv_state.stride()[0]
+        # New ``causal_conv1d_update`` writes its output in-place into x.
+        # Drop the legacy ``state_seq_stride`` / ``act="SWISH"`` / paired
+        # ``*_cpu`` + ``*_xpu`` arguments.
+        silu_activation = activation in ("silu", "swish")
         kunlun_ops.causal_conv1d_update(
             x,
-            weight,
-            out,
             conv_state,
-            None,
-            bias,
-            conv_state_indices_cpu=conv_state_indices_cpu,
-            conv_state_indices_xpu=conv_state_indices,
-            act="SWISH",
-            state_seq_stride=stride,
+            weight,
+            bias=bias,
+            silu_activation=silu_activation,
+            cache_seqlens=None,
+            conv_state_indices=conv_state_indices,
             is_ncw=False,
+            pad_slot_id=pad_slot_id,
         )
-        out = out.squeeze(1)
-        return out
+        return x.squeeze(1)
     else:
         return torch_causal_conv1d_update_spec(
             x,

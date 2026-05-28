@@ -105,7 +105,13 @@ class TorchCompileWithNoGuardsWrapper:
             return ctx.result
         return callable_fn(*args, **kwargs)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        compile_prefix: str = "",
+        is_encoder: bool = False,
+    ) -> None:
+        self._compile_prefix = compile_prefix
+        self._is_encoder = is_encoder
         self.compiled = False
 
         vllm_config = get_current_vllm_config()
@@ -305,3 +311,8 @@ class TorchCompileWithNoGuardsWrapper:
             yield
         finally:
             self.__class__.forward.__code__ = original
+
+
+def reset_compile_wrapper(model: torch.nn.Module) -> None:
+    """No-op stub for elastic EP path; kunlun does not use it."""
+    return

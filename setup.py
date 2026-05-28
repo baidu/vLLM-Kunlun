@@ -42,7 +42,7 @@ if __name__ == "__main__":
 
     setup(
         name="vllm_kunlun",
-        version="0.15.1",
+        version="0.21.0",
         author="vLLM-Kunlun team",
         license="Apache 2.0",
         description="vLLM Kunlun3 backend plugin",

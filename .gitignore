@@ -57,6 +57,16 @@ coverage.xml
 
 # DS Store
 .DS_Store
+# macOS AppleDouble metadata
+**/._*
+
+# Backup files
+*.bak
+*.bak_*
+
+# Misc local artifacts
+nohup.out
+.comate/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

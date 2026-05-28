@@ -475,25 +475,25 @@ class KunlunOps:
             #     attn_metadata = attn_metadata[prefix]
 
             # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
-            if M * moe_top_k < 400:
-                sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-                    torch.ops.xspeedgate_ops.moe_pre_small(
-                        topk_ids, global_num_experts, False, False, hidden_states
-                    )
-                )
-                experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(
-                    topk_ids, global_num_experts, False
-                )
-                out = torch.ops.xspeedgate_ops.fused_moe(
-                    hidden_states,
-                    w1,
-                    w2,
-                    normed_score.to(hidden_states.dtype),
-                    sorted_tokens_num_lod,
-                    sorted_tokens_idx,
-                    experts_num_lod,
-                )
-                return out.sum(1)
+            # if M * moe_top_k < 400:
+            #     sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
+            #         torch.ops.xspeedgate_ops.moe_pre_small(
+            #             topk_ids, global_num_experts, False, False, hidden_states
+            #         )
+            #     )
+            #     experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(
+            #         topk_ids, global_num_experts, False
+            #     )
+            #     out = torch.ops.xspeedgate_ops.fused_moe(
+            #         hidden_states,
+            #         w1,
+            #         w2,
+            #         normed_score.to(hidden_states.dtype),
+            #         sorted_tokens_num_lod,
+            #         sorted_tokens_idx,
+            #         experts_num_lod,
+            #     )
+            #     return out.sum(1)
 
             # Allocate two shared workspaces for the large temporary buffers
             # used by the preprocess, W1, activation, and W2 stages.

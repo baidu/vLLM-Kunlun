@@ -1,6 +1,6 @@
 setuptools==80.9.0
 opencv-python-headless==4.12.0.88
-llguidance==0.7.11
+llguidance==1.3.0
 black==23.3.0
 blake3==1.0.5
 cachetools==6.1.0
@@ -21,16 +21,27 @@ pyzmq==27.0.1
 ray==2.48.0
 setproctitle==1.3.7
 watchfiles==1.1.0
-pydantic==2.11.7
+# vllm 0.18.0 requires pydantic>=2.12.0
+pydantic==2.12.0
 tokenizers>=0.21.2
 uvloop==0.21.0
 prometheus-fastapi-instrumentator==7.1.0
+# NOTE: vllm 0.18.0 metadata pins transformers<5,>=4.56.0, but Qwen3.5 models
+# require transformers 5.x. We deliberately override to 5.2.0; if pip resolver
+# complains, install vllm with --no-deps or use this requirements.txt last.
 transformers==5.2.0
-mistral-common==1.9.1
+# vllm 0.18.0 requires mistral_common[image]>=1.10.0
+mistral-common==1.11.2
 model_hosting_container_standards
 xgrammar
 lm-format-enforcer
 ijson
+# vllm 0.18.0 newly required runtime deps (not in 0.15.1)
+anthropic>=0.71.0
+mcp
+depyf==0.20.0
+python-json-logger
+ninja
 
 # basic
 hatchling>=1.25

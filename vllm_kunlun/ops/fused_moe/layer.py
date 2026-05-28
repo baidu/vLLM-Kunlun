@@ -29,6 +29,13 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    def _select_monolithic(self):
+        """Override parent: parent's __init__ assigns
+        ``self.apply_monolithic = self._select_monolithic()`` which would
+        otherwise shadow the class-level ``apply_monolithic`` defined below
+        with ``forward_monolithic_cuda``. Return the class method instead."""
+        return KunlunUnquantizedFusedMoEMethod.apply_monolithic.__get__(self)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Skip _setup_kernel() since Kunlun does not need Triton kernels."""
         FusedMoEMethodBase.process_weights_after_loading(self, layer)
@@ -38,6 +45,7 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Monolithic mode entry point.

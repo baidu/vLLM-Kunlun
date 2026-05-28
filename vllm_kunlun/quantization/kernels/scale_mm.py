@@ -19,7 +19,7 @@
 from typing import Optional
 
 import torch
-from vllm.model_executor.layers.quantization.kernels.scaled_mm import (
+from vllm.model_executor.kernels.linear import (
     CutlassInt8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
 )
