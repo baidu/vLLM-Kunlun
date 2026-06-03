@@ -99,6 +99,12 @@ class KimiK2ToolParser(ToolParser):
                 "tokens in the tokenizer!"
             )
 
+    def _ensure_current_tool_slots(self) -> None:
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+
     def _check_and_strip_markers(self, text: str) -> tuple[str, bool, bool]:
         """
         Check for section begin/end markers in text and strip them.
@@ -405,6 +411,7 @@ class KimiK2ToolParser(ToolParser):
                     if deferred_section_exit and self.in_tool_section:
                         self._reset_section_state()
                     return None
+                self._ensure_current_tool_slots()
                 diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
                 if diff:
                     diff = (
@@ -424,6 +431,7 @@ class KimiK2ToolParser(ToolParser):
                         "been streamed yet: %s",
                         diff,
                     )
+                    self._ensure_current_tool_slots()
                     self.streamed_args_for_tool[self.current_tool_id] += diff
                     # Handle deferred section exit before returning
                     if deferred_section_exit and self.in_tool_section:
@@ -485,10 +493,10 @@ class KimiK2ToolParser(ToolParser):
             # case - we haven't sent the tool name yet. If it's available, send
             #   it. otherwise, wait until it's available.
             if not self.current_tool_name_sent:
-                if current_tool_call is None:
-                    return None
                 function_name: str | None = current_tool_call.get("name")
                 tool_id = current_tool_call.get("id")
+                if not function_name:
+                    return None
 
                 # Validate function name against available tools
                 if request and request.tools:
@@ -548,10 +556,7 @@ class KimiK2ToolParser(ToolParser):
                 "Trying to parse current tool call with ID %s", self.current_tool_id
             )
 
-            # if we're starting a new tool call, push an empty object in as
-            #   a placeholder for the arguments
-            if len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
+            self._ensure_current_tool_slots()
 
             # main logic for tool parsing here - compare prev. partially-parsed
             #   JSON to the current partially-parsed JSON
