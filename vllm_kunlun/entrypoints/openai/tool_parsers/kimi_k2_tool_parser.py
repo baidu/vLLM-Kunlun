@@ -493,10 +493,10 @@ class KimiK2ToolParser(ToolParser):
             # case - we haven't sent the tool name yet. If it's available, send
             #   it. otherwise, wait until it's available.
             if not self.current_tool_name_sent:
-                if current_tool_call is None:
-                    return None
                 function_name: str | None = current_tool_call.get("name")
                 tool_id = current_tool_call.get("id")
+                if not function_name:
+                    return None
 
                 # Validate function name against available tools
                 if request and request.tools:
