@@ -309,14 +309,10 @@ class KunlunPlatform(Platform):
                     "FlashMLASparseBackend"
                 )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
-        elif not attn_selector_config.use_mla:
-            return (
-                "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
-            )
-        else:
-            return (
-                "vllm_kunlun.v1.attention.backends.kunlun_mla.KunlunMLAAttentionBackend"
-            )
+
+        return (
+            "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
+        )
 
     @classmethod
     def get_current_memory_usage(
