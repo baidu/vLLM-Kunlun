@@ -451,7 +451,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=has_initial_state,
             has_initial_state_cpu=(
-                has_initial_state.cpu() if has_initial_state is not None else None
+                has_initial_state.to("cpu", non_blocking=True) if has_initial_state is not None else None
             ),
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
@@ -461,7 +461,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_tensor_cpu=(
-                non_spec_state_indices_tensor.cpu()
+                non_spec_state_indices_tensor.to("cpu", non_blocking=True)
                 if non_spec_state_indices_tensor is not None
                 else None
             ),

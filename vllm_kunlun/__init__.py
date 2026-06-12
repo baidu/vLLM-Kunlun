@@ -173,6 +173,22 @@ _register_post_import_hook(
 )
 
 
+# --- hook 5: SiluAndMul.forward_native ------------------------------
+# Replace SiluAndMul.forward_native with fused silu_and_mul kernel.
+def _activation_applied(mod):
+    cls = getattr(mod, "SiluAndMul", None)
+    return cls is None or getattr(cls, "_kunlun_silu_and_mul_patched", False)
+
+
+def _activation_apply(mod):
+    import vllm_kunlun.ops.activation  # noqa: F401  (self-applies on import)
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.activation", _activation_applied, _activation_apply
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
@@ -330,18 +346,3 @@ def register_model():
 
     _reg()
 
-
-def register_reasoning_parser():
-    """Register reasoning parsers for inference."""
-    from .reasoning import register_reasoning_parser as _reg_reasoning_parser
-
-    _reg_reasoning_parser()
-
-
-def register_tool_parser():
-    """Register tool parsers for inference."""
-    from .entrypoints.openai.tool_parsers import (
-        register_tool_parser as _reg_tool_parser,
-    )
-
-    _reg_tool_parser()

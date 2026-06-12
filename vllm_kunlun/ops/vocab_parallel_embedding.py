@@ -107,7 +107,7 @@ class KunlunVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
 
         # Get the embeddings
-        output_parallel = self.quant_method.embedding(self, masked_input.long())
+        output_parallel = self.quant_method.embedding(self, masked_input)
 
         # Mask the output embedding
         if self.tp_size > 1:
