@@ -25,11 +25,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.gptq import (
-    ExllamaState,
-    GPTQConfig,
-    GPTQLinearMethod,
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQConfig as GPTQConfig,
+    AutoGPTQLinearMethod as GPTQLinearMethod,
 )
+
+class ExllamaState:
+    UNINITIALIZED = 0
+    READY = 1
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_linear_quant_method,
 )

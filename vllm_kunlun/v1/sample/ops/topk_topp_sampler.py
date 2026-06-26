@@ -12,6 +12,27 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def flashinfer_sampler_supported() -> bool:
+    """Kunlun always uses its own sampler."""
+    return True
+
+
+def empty_exponential_noise_like(
+    probs: torch.Tensor, use_fp64_gumbel: bool = False
+) -> torch.Tensor:
+    dtype = torch.float64 if use_fp64_gumbel else probs.dtype
+    return torch.empty(probs.shape, dtype=dtype, device=probs.device)
+
+
+def sample_with_exponential_noise(probs: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    if q.dtype == probs.dtype:
+        scores = probs.div_(q)
+    else:
+        scores = q.reciprocal_()
+        scores.mul_(probs)
+    return scores.argmax(dim=-1).view(-1)
+
+
 class TopKTopPSampler(nn.Module):
     """
     Module that performs optional top-k and top-p filtering followed by
@@ -20,9 +41,10 @@ class TopKTopPSampler(nn.Module):
     Implementations may update the logits tensor in-place.
     """
 
-    def __init__(self, logprobs_mode):
+    def __init__(self, logprobs_mode, use_fp64_gumbel=False):
         super().__init__()
         self.logprobs_mode = logprobs_mode
+        self.use_fp64_gumbel = use_fp64_gumbel
         logger.info_once("Using FlashInfer for top-p & top-k sampling.")
         self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
