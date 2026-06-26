@@ -235,7 +235,7 @@ _register_post_import_hook(
     _qwen_triton_warmup_apply,
 )
 
-# --- hook 5: select_int8_moe_backend in w8a8_int8 module ---------------
+# --- hook 6: select_int8_moe_backend in w8a8_int8 module ---------------
 # CompressedTensorsW8A8Int8MoEMethod.__init__ calls select_int8_moe_backend()
 # which only supports Triton/CUDA backends. On Kunlun XPU is_cuda()==False so
 # all backends get skipped, raising NotImplementedError.
