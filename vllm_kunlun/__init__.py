@@ -257,7 +257,6 @@ def _w8a8_int8_moe_apply(mod):
     # may not be bound yet (the "from oracle.int8 import ..." is still in flight).
     if not hasattr(mod, "select_int8_moe_backend"):
         return
-    _orig = mod.select_int8_moe_backend
 
     def _kunlun_select_int8_moe_backend(
         config, weight_key=None, activation_key=None
