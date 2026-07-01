@@ -136,12 +136,20 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         # Read correct config from FusedMoE layer attributes (MiniMax-M2.7 fix)
         if hasattr(layer, "scoring_func") and scoring_func == "softmax":
             scoring_func = layer.scoring_func
-        if hasattr(layer, "e_score_correction_bias") and e_score_correction_bias is None:
+        if (
+            hasattr(layer, "e_score_correction_bias")
+            and e_score_correction_bias is None
+        ):
             e_score_correction_bias = layer.e_score_correction_bias
         if hasattr(layer, "num_expert_group") and num_expert_group is None:
             num_expert_group = layer.num_expert_group
         if hasattr(layer, "topk_group") and topk_group is None:
             topk_group = layer.topk_group
+        # Step-3.5-Flash fix
+        routed_scaling_factor = getattr(
+            layer, "routed_scaling_factor", routed_scaling_factor
+        )
+        activation = getattr(layer, "activation", "silu")
 
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
         M, N = hidden_states.shape
@@ -169,14 +177,21 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 stable=True,
             )
         elif scoring_func == "sigmoid":
+            # 与 ops.fused_moe 保持一致：use_grouped_topk=False 时用 n_group=1, topk_group=1
+            if num_expert_group is not None and topk_group is not None:
+                n_group = int(num_expert_group)
+                n_topk_group = int(topk_group)
+            else:
+                n_group = 1
+                n_topk_group = 1
             torch.ops._C.moe_sigmoid_group_topk_norm(
                 x=router_logits,
                 norm_score=normed_score,
                 topk_index=topk_ids,
                 block_static=block_statistic,
                 bias=e_score_correction_bias,
-                n_group=num_expert_group,
-                topk_group=topk_group,
+                n_group=n_group,
+                topk_group=n_topk_group,
                 scale=routed_scaling_factor,
             )
 
@@ -251,8 +266,10 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         d = y.shape[-1] // 2
         output_shape = y.shape[:-1] + (d,)
         out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-        torch.ops._C.silu_and_mul(out1, y)
-
+        if activation == "swiglustep":
+            torch.ops._C.swiglustep(out1, y)
+        else:
+            torch.ops._C.silu_and_mul(out1, y)
         del y
 
         out1 = out1.reshape(-1, out1.shape[-1])

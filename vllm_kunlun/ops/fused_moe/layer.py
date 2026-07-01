@@ -38,6 +38,7 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        routed_scaling_factor: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Monolithic mode entry point.
@@ -78,4 +79,8 @@ class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 e_score_correction_bias=layer.e_score_correction_bias,
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
+                routed_scaling_factor=getattr(
+                    layer, "routed_scaling_factor", routed_scaling_factor
+                ),
+                activation=getattr(layer, "activation", "silu"),
             )
