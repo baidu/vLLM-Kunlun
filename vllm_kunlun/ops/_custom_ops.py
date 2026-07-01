@@ -716,6 +716,20 @@ def silu_and_mul_cuda(
     )
 
 
+@custom_op("_C::swiglustep", mutates_args=())
+def swiglustep(
+    out: torch.Tensor, x: torch.Tensor, limit: float, axis: int = -1, turn: bool = True
+) -> None:
+    kunlun_ops.swiglustep(x=x, y=out, limit=limit)
+
+
+@impl("_C::swiglustep", "CUDA")
+def swiglustep_cuda(
+    out: torch.Tensor, x: torch.Tensor, limit: float, axis: int = -1, turn: bool = True
+) -> None:
+    kunlun_ops.swiglustep(x=x, y=out, limit=limit)
+
+
 def _fake_silu_and_mul(
     out: torch.Tensor, x: torch.Tensor, axis: int = -1, turn: bool = True
 ):
