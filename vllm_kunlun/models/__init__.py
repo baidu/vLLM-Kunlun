@@ -104,6 +104,10 @@ def register_model():
     )
 
     ModelRegistry.register_model(
+        "Qwen3_5MoeMTP", "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP"
+    )
+
+    ModelRegistry.register_model(
         "Gemma4ForCausalLM", "vllm_kunlun.models.gemma4:Gemma4ForCausalLM"
     )
 

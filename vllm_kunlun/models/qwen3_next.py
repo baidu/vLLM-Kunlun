@@ -576,6 +576,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
+        spec_conv_state_indices_tensor = (
+            attn_metadata.spec_conv_state_indices_tensor
+        )
+        spec_conv_state_indices_tensor_cpu = (
+            attn_metadata.spec_conv_state_indices_tensor_cpu
+        )
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor_cpu = (
             attn_metadata.non_spec_state_indices_tensor_cpu
@@ -585,6 +591,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        num_accepted_tokens_cpu = attn_metadata.num_accepted_tokens_cpu
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
@@ -608,20 +615,42 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
+            actual_num = attn_metadata.num_spec_decode_tokens
+            tmp_mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv_spec[:actual_num],
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
+                conv_state_indices=(
+                    spec_conv_state_indices_tensor[
+                        : attn_metadata.num_spec_decodes
+                    ]
+                    if spec_conv_state_indices_tensor is not None
+                    else spec_state_indices_tensor[:, 0][
+                        : attn_metadata.num_spec_decodes
+                    ]
+                ),
+                conv_state_indices_cpu=(
+                    spec_conv_state_indices_tensor_cpu[
+                        : attn_metadata.num_spec_decodes
+                    ]
+                    if spec_conv_state_indices_tensor_cpu is not None
+                    else None
+                ),
+                num_accepted_tokens=num_accepted_tokens[
                     : attn_metadata.num_spec_decodes
                 ],
-                num_accepted_tokens=num_accepted_tokens,
+                num_accepted_tokens_cpu=(
+                    num_accepted_tokens_cpu[: attn_metadata.num_spec_decodes]
+                    if num_accepted_tokens_cpu is not None
+                    else None
+                ),
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+            mixed_qkv_spec[:actual_num] = tmp_mixed_qkv_spec
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -690,19 +719,31 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
-                g=g_spec,
-                beta=beta_spec,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
+            core_attn_out_spec = torch.empty_like(value_spec)
+            tmp_cu_seqlens = spec_query_start_loc[
+                : attn_metadata.num_spec_decodes + 1
+            ]
+            recurrent_num_accepted_tokens = num_accepted_tokens[
+                : attn_metadata.num_spec_decodes
+            ].to(dtype=torch.int32)
+            tmp_core_attn_out_spec, last_recurrent_state = (
+                fused_recurrent_gated_delta_rule(
+                    q=query_spec[:, :actual_num],
+                    k=key_spec[:, :actual_num],
+                    v=value_spec[:, :actual_num],
+                    g=g_spec[:, :actual_num],
+                    beta=beta_spec[:, :actual_num],
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=tmp_cu_seqlens,
+                    ssm_state_indices=spec_state_indices_tensor[
+                        : attn_metadata.num_spec_decodes
+                    ],
+                    num_accepted_tokens=recurrent_num_accepted_tokens,
+                    use_qk_l2norm_in_kernel=True,
+                )
             )
+            core_attn_out_spec[:, :actual_num] = tmp_core_attn_out_spec
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
@@ -726,6 +767,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens_cpu=non_spec_query_start_loc_cpu,
             )
             # Init cache
             last_recurrent_state = (
@@ -931,7 +973,7 @@ class Qwen3NextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
+        config = vllm_config.model_config.hf_text_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
@@ -963,9 +1005,11 @@ class Qwen3NextDecoderLayer(nn.Module):
         mlp_only_layers = (
             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         )
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        num_experts = getattr(config, "num_experts", 0)
         if (self.layer_idx not in mlp_only_layers) and (
-            config.num_experts > 0
-            and (self.layer_idx + 1) % config.decoder_sparse_step == 0
+            num_experts > 0
+            and (self.layer_idx + 1) % decoder_sparse_step == 0
         ):
             self.mlp = Qwen3NextSparseMoeBlock(
                 vllm_config=vllm_config,

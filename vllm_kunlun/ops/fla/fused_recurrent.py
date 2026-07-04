@@ -31,6 +31,15 @@ class FusedRecurrentFunction(torch.autograd.Function):
         num_accepted_tokens: Optional[torch.Tensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
+        def _to_i32(t):
+            if t is None or t.dtype == torch.int32:
+                return t
+            return t.to(torch.int32)
+
+        cu_seqlens = _to_i32(cu_seqlens)
+        ssm_state_indices = _to_i32(ssm_state_indices)
+        num_accepted_tokens = _to_i32(num_accepted_tokens)
+
         o, final_state = kunlun_ops.fused_recurrent_gated_delta_rule_fwdv2(
             q.contiguous(),
             k.contiguous(),

@@ -179,6 +179,7 @@ class Qwen3_5MoeConfig(PretrainedConfig):
         text_config=None,
         vision_config=None,
         image_token_id=248056,
+        image_token_index=None,
         video_token_id=248057,
         vision_start_token_id=248053,
         vision_end_token_id=248054,
@@ -196,6 +197,9 @@ class Qwen3_5MoeConfig(PretrainedConfig):
             self.text_config = self.sub_configs["text_config"]()
 
         self.image_token_id = image_token_id
+        self.image_token_index = (
+            image_token_id if image_token_index is None else image_token_index
+        )
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
