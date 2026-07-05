@@ -6,18 +6,18 @@ from dataclasses import replace
 
 import torch
 import torch.nn as nn
-
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+
 from vllm_kunlun.v1.sample.rejection_sampler_patch import (
-    _KernelLauncher,
     _expand_impl,
     _greedy_impl,
+    _KernelLauncher,
     _random_impl,
     _sample_recovered_impl,
 )
@@ -110,9 +110,9 @@ class RejectionSampler(nn.Module):
             predict_bonus_token=True,
             # Override the logprobs mode to return logits because they are
             # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
+            logprobs_mode_override=(
+                "processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+            ),
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
@@ -132,21 +132,22 @@ class RejectionSampler(nn.Module):
             target_logits, sampling_metadata, metadata
         )
 
-        fast_output_token_ids = rejection_sample_small_spec_topk(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
-        )
-        if fast_output_token_ids is not None:
-            return SamplerOutput(
-                sampled_token_ids=fast_output_token_ids,
-                logprobs_tensors=None,
+        if getattr(metadata, "_kunlun_qwen35_mtp", False):
+            fast_output_token_ids = rejection_sample_small_spec_topk(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
             )
+            if fast_output_token_ids is not None:
+                return SamplerOutput(
+                    sampled_token_ids=fast_output_token_ids,
+                    logprobs_tensors=None,
+                )
 
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -490,9 +491,8 @@ def rejection_sample_small_spec_topk(
 
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
-    if (
-        num_tokens != batch_size * max_spec_len
-        or any(n != max_spec_len for n in num_draft_tokens)
+    if num_tokens != batch_size * max_spec_len or any(
+        n != max_spec_len for n in num_draft_tokens
     ):
         return None
     assert cu_num_draft_tokens.ndim == 1
@@ -521,11 +521,7 @@ def rejection_sample_small_spec_topk(
     topk_vals, order = topk_vals.sort(dim=1, descending=True)
     topk_idx = topk_idx.gather(1, order)
     if sampling_metadata.top_k.numel() != 1:
-        k_idx = (
-            (top_k.to(torch.long) - 1)
-            .clamp_(min=0, max=select_k - 1)
-            .unsqueeze(1)
-        )
+        k_idx = (top_k.to(torch.long) - 1).clamp_(min=0, max=select_k - 1).unsqueeze(1)
         k_threshold = topk_vals.gather(1, k_idx)
         topk_vals = topk_vals.masked_fill(topk_vals < k_threshold, -float("inf"))
 
@@ -569,9 +565,7 @@ def rejection_sample_small_spec_topk(
     if len(sampling_metadata.generators) != batch_size:
         q.exponential_()
     for req_idx, generator in sampling_metadata.generators.items():
-        start_idx = (
-            0 if req_idx == 0 else int(cu_num_draft_tokens[req_idx - 1].item())
-        )
+        start_idx = 0 if req_idx == 0 else int(cu_num_draft_tokens[req_idx - 1].item())
         end_idx = int(cu_num_draft_tokens[req_idx].item())
         if end_idx > start_idx:
             q[start_idx:end_idx].exponential_(generator=generator)
@@ -644,7 +638,9 @@ def rejection_sample_small_spec_topk(
     output_token_ids[:, max_spec_len] = torch.where(
         accepted_prefix[:, -1],
         bonus_token_ids.view(-1).to(torch.int32),
-        torch.full((batch_size,), PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+        torch.full(
+            (batch_size,), PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device
+        ),
     )
     return output_token_ids
 

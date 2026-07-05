@@ -145,8 +145,7 @@ def _pad_spec_hidden_states(
     for index, length in enumerate(lengths):
         if length > max_query_len:
             raise ValueError(
-                f"spec conv length {length} exceeds max_query_len "
-                f"{max_query_len}."
+                f"spec conv length {length} exceeds max_query_len " f"{max_query_len}."
             )
         padded[index, :length].copy_(hidden_states[offset : offset + length])
         offset += length

@@ -12,6 +12,7 @@ This module provides shims that mimic the ``kernel[grid](args...)`` launch
 protocol while running a PyTorch implementation instead. The behavior is kept
 in sync with the upstream kernels at vLLM 0.15.1.
 """
+
 from __future__ import annotations
 
 from typing import Callable

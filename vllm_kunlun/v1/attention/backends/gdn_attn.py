@@ -5,7 +5,6 @@
 from dataclasses import dataclass
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -19,7 +18,6 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 
@@ -247,7 +245,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_conv_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
             non_spec_state_indices_tensor_cpu = (
-                block_table_tensor_cpu[:, 0] if block_table_tensor_cpu is not None else None
+                block_table_tensor_cpu[:, 0]
+                if block_table_tensor_cpu is not None
+                else None
             )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
@@ -297,9 +297,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_sequence_masks, : self.num_spec + 1
                 ]
                 spec_state_indices_tensor_cpu = (
-                    block_table_tensor_cpu[
-                        spec_sequence_masks_cpu, : self.num_spec + 1
-                    ]
+                    block_table_tensor_cpu[spec_sequence_masks_cpu, : self.num_spec + 1]
                     if block_table_tensor_cpu is not None
                     else None
                 )
@@ -322,9 +320,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_sequence_masks, : self.num_spec + 1
                 ]
                 spec_state_indices_tensor_cpu = (
-                    block_table_tensor_cpu[
-                        spec_sequence_masks_cpu, : self.num_spec + 1
-                    ]
+                    block_table_tensor_cpu[spec_sequence_masks_cpu, : self.num_spec + 1]
                     if block_table_tensor_cpu is not None
                     else None
                 )

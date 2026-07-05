@@ -154,9 +154,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
     # Lazy patch for MambaBase.get_kv_cache_spec. Importing this module during
     # register() triggers `from vllm.config import VllmConfig` while vllm.config
     # is still initializing.
-    if (
-        module_name == "vllm.model_executor.layers.mamba.abstract"
-        and not getattr(_custom_import, "_mamba_spec_patched", False)
+    if module_name == "vllm.model_executor.layers.mamba.abstract" and not getattr(
+        _custom_import, "_mamba_spec_patched", False
     ):
         _custom_import._mamba_spec_patched = True
         try:
@@ -170,9 +169,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
                 "[KunlunPlugin] lazy MambaBase.get_kv_cache_spec patch failed"
             )
 
-    if (
-        module_name == "vllm.config.speculative"
-        and not getattr(_custom_import, "_qwen35_mtp_spec_patched", False)
+    if module_name == "vllm.config.speculative" and not getattr(
+        _custom_import, "_qwen35_mtp_spec_patched", False
     ):
         _custom_import._qwen35_mtp_spec_patched = True
         try:

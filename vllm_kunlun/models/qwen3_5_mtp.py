@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
@@ -20,12 +19,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm_kunlun.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
-from vllm_kunlun.models.qwen3_next import QwenNextMixtureOfExperts
-from vllm.sequence import IntermediateTensors
-from vllm_kunlun.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
-from vllm_kunlun.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
-
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
@@ -39,6 +32,12 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
+from vllm.sequence import IntermediateTensors
+
+from vllm_kunlun.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+from vllm_kunlun.models.qwen3_next import QwenNextMixtureOfExperts
+from vllm_kunlun.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
+from vllm_kunlun.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
 logger = init_logger(__name__)
 
@@ -220,9 +219,9 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts
-            if hasattr(self.config, "num_experts")
-            else 0,
+            num_experts=(
+                self.config.num_experts if hasattr(self.config, "num_experts") else 0
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -462,7 +461,9 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                     # because MTP decoder layers use offset layer_idx to avoid
                     # KV cache collision with target model.
                     if name.startswith("model.layers."):
-                        parts = name.split(".", 3)  # ["model", "layers", "0", "rest..."]
+                        parts = name.split(
+                            ".", 3
+                        )  # ["model", "layers", "0", "rest..."]
                         if len(parts) >= 3 and parts[2].isdigit():
                             orig_idx = int(parts[2])
                             parts[2] = str(mtp_start + orig_idx)

@@ -29,16 +29,27 @@ def _is_mamba_group(group: Any) -> bool:
     return spec is not None and spec.__class__.__name__ == "MambaSpec"
 
 
+def _is_qwen35_mtp_runner(runner: Any) -> bool:
+    spec_config = getattr(runner, "speculative_config", None)
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    return getattr(hf_config, "model_type", None) == "qwen3_5_mtp"
+
+
 def _collect_new_mamba_block_ids(
     runner: Any, scheduler_output: Any
 ) -> dict[int, set[int]]:
     kv_cache_config = getattr(runner, "kv_cache_config", None)
     groups = getattr(kv_cache_config, "kv_cache_groups", ())
-    mamba_group_ids = [gid for gid, group in enumerate(groups) if _is_mamba_group(group)]
+    mamba_group_ids = [
+        gid for gid, group in enumerate(groups) if _is_mamba_group(group)
+    ]
     if not mamba_group_ids:
         return {}
 
-    new_block_ids_by_group: dict[int, set[int]] = {gid: set() for gid in mamba_group_ids}
+    new_block_ids_by_group: dict[int, set[int]] = {
+        gid: set() for gid in mamba_group_ids
+    }
 
     for new_req_data in getattr(scheduler_output, "scheduled_new_reqs", ()):
         if int(getattr(new_req_data, "num_computed_tokens", 0)) != 0:
@@ -55,9 +66,7 @@ def _collect_new_mamba_block_ids(
             )
 
     return {
-        gid: block_ids
-        for gid, block_ids in new_block_ids_by_group.items()
-        if block_ids
+        gid: block_ids for gid, block_ids in new_block_ids_by_group.items() if block_ids
     }
 
 
@@ -125,10 +134,21 @@ def _clear_new_mamba_blocks(runner: Any, scheduler_output: Any) -> int:
 
 def patch_gpu_model_runner_module(module: Any) -> None:
     runner_cls = getattr(module, "GPUModelRunner", None)
-    if runner_cls is None or getattr(runner_cls, "_kunlun_mtp_mamba_state_patched", False):
+    if runner_cls is None or getattr(
+        runner_cls, "_kunlun_mtp_mamba_state_patched", False
+    ):
         return
 
+    original_init = runner_cls.__init__
     original_update_states = runner_cls._update_states
+    original_calc_spec_decode_metadata = runner_cls._calc_spec_decode_metadata
+
+    def _patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        if _is_qwen35_mtp_runner(self) and hasattr(self, "rejection_sampler"):
+            from vllm_kunlun.v1.sample.rejection_sampler import RejectionSampler
+
+            self.rejection_sampler = RejectionSampler(self.sampler)
 
     def _patched_update_states(self: Any, scheduler_output: Any) -> Any:
         if getattr(self, "speculative_config", None) is None:
@@ -137,7 +157,15 @@ def patch_gpu_model_runner_module(module: Any) -> None:
         _clear_new_mamba_blocks(self, scheduler_output)
         return result
 
+    def _patched_calc_spec_decode_metadata(self: Any, *args: Any, **kwargs: Any) -> Any:
+        metadata = original_calc_spec_decode_metadata(self, *args, **kwargs)
+        if _is_qwen35_mtp_runner(self):
+            metadata._kunlun_qwen35_mtp = True
+        return metadata
+
+    runner_cls.__init__ = _patched_init
     runner_cls._update_states = _patched_update_states
+    runner_cls._calc_spec_decode_metadata = _patched_calc_spec_decode_metadata
     runner_cls._kunlun_mtp_mamba_state_patched = True
 
 

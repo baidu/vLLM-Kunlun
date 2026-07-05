@@ -16,19 +16,19 @@
 #
 
 import vllm_kunlun.ops._custom_ops
-import vllm_kunlun.ops.fused_moe.layer
-
-# base layers
-import vllm_kunlun.ops.layernorm
-import vllm_kunlun.ops.linear
-
-# embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
-import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
 
 # activation ops (SiluAndMul, GeluAndMul OOT registration)
-import vllm_kunlun.ops.activation
+import vllm_kunlun.ops.activation  # noqa: F401
+import vllm_kunlun.ops.fused_moe.layer  # noqa: F401
+
+# base layers
+import vllm_kunlun.ops.layernorm  # noqa: F401
+import vllm_kunlun.ops.linear  # noqa: F401
+
+# embedding
+import vllm_kunlun.ops.rotary_embedding  # noqa: F401
+import vllm_kunlun.ops.vocab_parallel_embedding  # noqa: F401
+import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
 
 # TODO @xyDong0223 remove v0.16.0
 # import vllm_kunlun.ops.mla
