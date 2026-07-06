@@ -8,7 +8,6 @@ from typing import Optional, Union
 
 import kunlun_ops
 import torch
-import torch.nn.functional as F
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 
@@ -74,45 +73,100 @@ def causal_conv1d_fn(
     return out
 
 
-def torch_causal_conv1d_update_spec(
-    hidden_states,
-    conv_state,
-    weight,
-    bias=None,
-    activation=None,
-    conv_state_indices=None,
-    num_accepted_tokens=None,
-):
+def causal_conv1d_update_spec_graphsafe(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    conv_state_indices: Optional[torch.Tensor] = None,
+    num_accepted_tokens: Optional[torch.Tensor] = None,
+    conv_state_indices_cpu: Optional[torch.Tensor] = None,
+    num_accepted_tokens_cpu: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if hidden_states.dim() != 3:
+        raise ValueError(
+            "causal_conv1d_update_spec_graphsafe expects "
+            "[batch, seq_len, hidden] hidden_states."
+        )
+    if (
+        conv_state_indices is None
+        or conv_state_indices_cpu is None
+        or num_accepted_tokens is None
+        or num_accepted_tokens_cpu is None
+    ):
+        raise ValueError(
+            "causal_conv1d_update_spec_graphsafe requires CPU and XPU "
+            "conv_state_indices and num_accepted_tokens."
+        )
     out = torch.empty_like(hidden_states)
-    _, seq_len, hidden_size = hidden_states.shape
-    for i in range(hidden_states.shape[0]):
-        tmp_conv_state = conv_state[conv_state_indices[i]]
-        state_len = tmp_conv_state.shape[-2]
-        hidden_states_i = hidden_states[i]
-        hidden_states_new = torch.cat(
-            [tmp_conv_state[: (2 + num_accepted_tokens[i]), :], hidden_states_i], dim=0
-        ).to(weight.dtype)
+    kunlun_ops.causal_conv1d_update(
+        hidden_states,
+        weight,
+        out,
+        conv_state,
+        None,
+        bias,
+        conv_state_indices_cpu=conv_state_indices_cpu,
+        conv_state_indices_xpu=conv_state_indices,
+        num_accepted_tokens_cpu=num_accepted_tokens_cpu,
+        num_accepted_tokens_xpu=num_accepted_tokens.to(torch.int32),
+        act="SWISH",
+        state_seq_stride=conv_state.stride(0),
+        is_ncw=False,
+    )
+    return out.view(-1, hidden_states.shape[-1])
 
-        hidden_states_new = hidden_states_new.unsqueeze(0)
 
-        conv_state[conv_state_indices[i]] = hidden_states_new[:, -state_len:, :]
-        for j in range(seq_len):
-            if j == seq_len - 1:
-                hidden_states_new_j = hidden_states_new
-            else:
-                hidden_states_new_j = hidden_states_new[:, : (1 - seq_len + j)]
-            hidden_states_new_j = hidden_states_new_j.transpose(-1, -2).contiguous()
-            out_i = F.conv1d(
-                hidden_states_new_j,
-                weight.unsqueeze(1),
-                bias,
-                padding=0,
-                groups=hidden_size,
+def _pad_spec_hidden_states(
+    hidden_states: torch.Tensor,
+    max_query_len: int,
+    num_accepted_tokens_cpu: torch.Tensor,
+) -> tuple[torch.Tensor, list[int]]:
+    dim = hidden_states.shape[-1]
+    num_spec_decodes = num_accepted_tokens_cpu.shape[0]
+    padded_num_tokens = num_spec_decodes * max_query_len
+
+    if hidden_states.shape[0] == padded_num_tokens:
+        return hidden_states.view(num_spec_decodes, max_query_len, dim), []
+
+    lengths = [int(length) for length in num_accepted_tokens_cpu.tolist()]
+    if sum(lengths) != hidden_states.shape[0]:
+        raise ValueError(
+            "spec conv token count does not match num_accepted_tokens_cpu: "
+            f"got {hidden_states.shape[0]} tokens, expected {sum(lengths)}."
+        )
+
+    first_length = lengths[0] if lengths else 0
+    if all(length == first_length for length in lengths):
+        return hidden_states.view(num_spec_decodes, first_length, dim), []
+
+    padded = hidden_states.new_zeros((num_spec_decodes, max_query_len, dim))
+    offset = 0
+    for index, length in enumerate(lengths):
+        if length > max_query_len:
+            raise ValueError(
+                f"spec conv length {length} exceeds max_query_len " f"{max_query_len}."
             )
-            out_i = F.silu(out_i[:, :, -1:])
-            out_i = out_i.to(hidden_states.dtype).squeeze(-1).unsqueeze(0)
-            out[i, j] = out_i
-    return out.view(-1, hidden_size)
+        padded[index, :length].copy_(hidden_states[offset : offset + length])
+        offset += length
+    return padded, lengths
+
+
+def _unpad_spec_hidden_states(
+    hidden_states: torch.Tensor,
+    lengths: list[int],
+) -> torch.Tensor:
+    if not lengths:
+        return hidden_states.view(-1, hidden_states.shape[-1])
+
+    dim = hidden_states.shape[-1]
+    total_num_tokens = sum(lengths)
+    unpadded = hidden_states.new_empty((total_num_tokens, dim))
+    offset = 0
+    for index, length in enumerate(lengths):
+        unpadded[offset : offset + length].copy_(hidden_states[index, :length])
+        offset += length
+    return unpadded
 
 
 def causal_conv1d_update(
@@ -125,6 +179,7 @@ def causal_conv1d_update(
     conv_state_indices: Optional[torch.Tensor] = None,
     conv_state_indices_cpu: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    num_accepted_tokens_cpu: Optional[torch.Tensor] = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
@@ -189,13 +244,25 @@ def causal_conv1d_update(
         assert weight.stride(1) == 1  # Need this
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
+    spec_lengths: list[int] = []
     if num_accepted_tokens is None:
         x = x.squeeze(-1).unsqueeze(1)
     else:
-        x = x.squeeze(-1).view(-1, max_query_len, dim)
+        if max_query_len <= 0:
+            max_query_len = seqlen
+        if num_accepted_tokens_cpu is None:
+            raise ValueError(
+                "spec conv requires num_accepted_tokens_cpu to handle "
+                "variable scheduled token counts."
+            )
+        x, spec_lengths = _pad_spec_hidden_states(
+            x.squeeze(-1),
+            max_query_len,
+            num_accepted_tokens_cpu,
+        )
+
     if num_accepted_tokens is None:
         out = torch.empty_like(x)
-        import kunlun_ops
 
         stride = conv_state.stride()[0]
         kunlun_ops.causal_conv1d_update(
@@ -214,12 +281,17 @@ def causal_conv1d_update(
         out = out.squeeze(1)
         return out
     else:
-        return torch_causal_conv1d_update_spec(
+        out = causal_conv1d_update_spec_graphsafe(
             x,
             conv_state,
             weight,
             bias,
-            activation,
             conv_state_indices=conv_state_indices,
+            conv_state_indices_cpu=conv_state_indices_cpu,
             num_accepted_tokens=num_accepted_tokens,
+            num_accepted_tokens_cpu=num_accepted_tokens_cpu,
+        )
+        return _unpad_spec_hidden_states(
+            out.view(x.shape[0], x.shape[1], dim),
+            spec_lengths,
         )
