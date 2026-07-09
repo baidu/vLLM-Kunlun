@@ -18,6 +18,33 @@ else:
 
 logger = init_logger(__name__)
 
+_QWEN3_VL_ARCHITECTURES = {"Qwen3VLForConditionalGeneration"}
+
+
+def _is_qwen3_vl_config(hf_config) -> bool:
+    config_type = type(hf_config).__name__
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+
+    return config_type == "Qwen3VLConfig" or any(
+        architecture in _QWEN3_VL_ARCHITECTURES for architecture in architectures
+    )
+
+
+def _patch_qwen3_vl_text_config(hf_config) -> None:
+    if hf_config is None or not _is_qwen3_vl_config(hf_config):
+        return
+
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is None or hasattr(text_config, "tie_word_embeddings"):
+        return
+
+    if not hasattr(hf_config, "tie_word_embeddings"):
+        return
+
+    text_config.tie_word_embeddings = hf_config.tie_word_embeddings
+
 
 class KunlunPlatform(Platform):
     """KunlunPlatform"""
@@ -179,6 +206,8 @@ class KunlunPlatform(Platform):
         parallel_config = vllm_config.parallel_config  # Not use scheduler_config
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
+        if model_config is not None:
+            _patch_qwen3_vl_text_config(getattr(model_config, "hf_config", None))
 
         if parallel_config.worker_cls == "auto":
             # v0.15.1 do not support v0.15.1, remove the if condition
