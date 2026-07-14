@@ -10,10 +10,11 @@ logger = logging.getLogger(__name__)
 OLD_IMPORT_HOOK = builtins.__import__
 _kv_admission_patched = False
 _kv_scheduler_patched = False
+_serving_chat_patched = False
 
 
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
-    global _kv_admission_patched, _kv_scheduler_patched
+    global _kv_admission_patched, _kv_scheduler_patched, _serving_chat_patched
     try:
         module_mappings = {
             "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
@@ -39,6 +40,20 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
     result = OLD_IMPORT_HOOK(
         module_name, globals=globals, locals=locals, fromlist=fromlist, level=level
     )
+
+    if (
+        not _serving_chat_patched
+        and module_name == "vllm.entrypoints.openai.serving_chat"
+    ):
+        try:
+            from vllm_kunlun.entrypoints.openai.serving_chat import (
+                apply as _apply_serving_chat,
+            )
+
+            _apply_serving_chat()
+            _serving_chat_patched = True
+        except Exception as e:
+            logger.warning("vllm_kunlun: failed to patch serving_chat: %s", e)
 
     # Apply KV admission gate patch after kv_cache_manager is fully loaded.
     # Deferred to avoid importing vllm internals during early platform registration.
@@ -96,6 +111,8 @@ def register():
     from .config.model import is_deepseek_mla
 
     model_module.ModelConfig.is_deepseek_mla = property(is_deepseek_mla)
+
+    import vllm_kunlun.entrypoints.openai.serving_chat  # noqa: F401
 
     import_hook()
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"

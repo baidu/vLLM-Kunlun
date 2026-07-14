@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 class KimiK2ReasoningParser(ReasoningParser):
+    supports_chat_template_kwargs = True
+
     """
     Reasoning parser for Kimi K2 model.
 
@@ -28,6 +30,8 @@ class KimiK2ReasoningParser(ReasoningParser):
     """
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
+        chat_template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        self._thinking_enabled = chat_template_kwargs.get("thinking", True)
         super().__init__(tokenizer, *args, **kwargs)
 
         if not self.model_tokenizer:
@@ -54,11 +58,6 @@ class KimiK2ReasoningParser(ReasoningParser):
                 "tokens in the tokenizer!"
             )
 
-        # Tracks whether the model is in pure-content mode (thinking disabled
-        # in the prompt via chat_template_kwargs={"thinking": False}).
-        # Set to True on the first streaming token when no <think> is seen.
-        self._content_mode: bool = False
-
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
         Check if the reasoning content ends in the input_ids.
@@ -67,6 +66,9 @@ class KimiK2ReasoningParser(ReasoningParser):
         1. The end token (</think>)
         2. The tool section start token (<|tool_calls_section_begin|>)
         """
+        if not self._thinking_enabled:
+            return True
+
         start_token_id = self._start_token_id
         end_token_id = self._end_token_id
         tool_section_start_token_id = self._tool_section_start_token_id
@@ -105,6 +107,9 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract content token ids from the input_ids.
         """
+        if not self._thinking_enabled:
+            return input_ids
+
         if self._end_token_id in input_ids:
             end_token_index = (
                 len(input_ids) - 1 - input_ids[::-1].index(self._end_token_id)
@@ -135,18 +140,24 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract reasoning content from the model output.
         """
+        if not self._thinking_enabled:
+            return None, model_output or None
+
         # thinking does not require a think start token but consume it if present
         raw_start = model_output.find(self._start_token)
 
-        # If neither <think> nor </think> appears in the output, the model was
-        # in non-thinking mode (enable_thinking=False caused the prompt to be
-        # pre-filled with <think></think>).
-        # Treat the entire output as content.
+        # If neither <think> nor </think> appears in the output and no tool
+        # section start is present, the reasoning was truncated (e.g., by
+        # max_tokens) before </think> was emitted. Treat the entire output
+        # as reasoning content.
         if raw_start == -1 and model_output.find(self._end_token) == -1:
             tool_section_index = model_output.find(self._tool_section_start_token)
             if tool_section_index != -1:
-                return (None, model_output[tool_section_index:] or None)
-            return (None, model_output or None)
+                return (
+                    model_output[:tool_section_index] or None,
+                    model_output[tool_section_index:] or None,
+                )
+            return (model_output or None, None)
 
         start_token_index = 0 if raw_start != 0 else len(self._start_token)
         end_token_index = model_output.find(self._end_token)
@@ -182,8 +193,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         Extract reasoning content from a delta message during streaming.
         """
-        # If content mode detected (thinking disabled in prompt), treat all output as content
-        if self._content_mode:
+        if not self._thinking_enabled:
             return DeltaMessage(content=delta_text)
 
         # If reasoning has already ended in previous tokens, this is content
@@ -196,17 +206,6 @@ class KimiK2ReasoningParser(ReasoningParser):
             self._end_token_id,
         ]:
             return None
-
-        # Detect non-thinking mode: if the first generated tokens don't start
-        # with <think>, the prompt was pre-filled with <think></think> and the
-        # model is outputting pure content. Switch to content mode.
-        if (
-            not previous_token_ids
-            and delta_token_ids
-            and self._start_token_id not in delta_token_ids
-        ):
-            self._content_mode = True
-            return DeltaMessage(content=delta_text)
 
         if self._end_token_id in delta_token_ids:
             end_index = delta_text.find(self._end_token)
