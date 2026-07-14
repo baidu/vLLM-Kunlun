@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 class KimiK2ReasoningParser(ReasoningParser):
+    supports_chat_template_kwargs = True
+
     """
     Reasoning parser for Kimi K2 model.
 
@@ -144,15 +146,18 @@ class KimiK2ReasoningParser(ReasoningParser):
         # thinking does not require a think start token but consume it if present
         raw_start = model_output.find(self._start_token)
 
-        # If neither <think> nor </think> appears in the output, the model was
-        # in non-thinking mode (enable_thinking=False caused the prompt to be
-        # pre-filled with <think></think>).
-        # Treat the entire output as content.
+        # If neither <think> nor </think> appears in the output and no tool
+        # section start is present, the reasoning was truncated (e.g., by
+        # max_tokens) before </think> was emitted. Treat the entire output
+        # as reasoning content.
         if raw_start == -1 and model_output.find(self._end_token) == -1:
             tool_section_index = model_output.find(self._tool_section_start_token)
             if tool_section_index != -1:
-                return (None, model_output[tool_section_index:] or None)
-            return (None, model_output or None)
+                return (
+                    model_output[:tool_section_index] or None,
+                    model_output[tool_section_index:] or None,
+                )
+            return (model_output or None, None)
 
         start_token_index = 0 if raw_start != 0 else len(self._start_token)
         end_token_index = model_output.find(self._end_token)
