@@ -12,6 +12,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def flashinfer_sampler_supported() -> bool:
+    """FlashInfer is not supported on Kunlun XPU, always return False."""
+    return False
+
+
 class TopKTopPSampler(nn.Module):
     """
     Module that performs optional top-k and top-p filtering followed by
@@ -20,9 +25,10 @@ class TopKTopPSampler(nn.Module):
     Implementations may update the logits tensor in-place.
     """
 
-    def __init__(self, logprobs_mode):
+    def __init__(self, logprobs_mode, use_fp64_gumbel: bool = False):
         super().__init__()
         self.logprobs_mode = logprobs_mode
+        self.use_fp64_gumbel = use_fp64_gumbel
         logger.info_once("Using FlashInfer for top-p & top-k sampling.")
         self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p

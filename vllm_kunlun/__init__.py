@@ -41,7 +41,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
     "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
     # "vllm.model_executor.models.config": "vllm_kunlun.models.config",
-    # "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
 }
 
@@ -313,6 +313,54 @@ def register():
         logger.info("[KunlunPlugin] import_hook() ok")
     except Exception:
         logger.exception("[KunlunPlugin] import_hook() failed")
+        raise
+
+    # --- patch _maybe_get_memory_pool_context for Kunlun XPU ---
+    # vllm 0.25.1 gpu_worker._maybe_get_memory_pool_context() gates on
+    # is_cuda_alike() and is_xpu(). KunlunPlatform is OOT so neither returns
+    # True, causing it to fall through to get_mem_allocator_instance() which
+    # raises RuntimeError. Patch the method to return nullcontext() for Kunlun.
+    try:
+        from contextlib import nullcontext as _nullcontext
+        from vllm.v1.worker import gpu_worker as _gpu_worker
+
+        _orig_maybe_get = _gpu_worker.Worker._maybe_get_memory_pool_context
+
+        def _kunlun_maybe_get_memory_pool_context(self, tag: str):
+            from vllm.platforms import current_platform
+            if type(current_platform).__name__ == "KunlunPlatform":
+                return _nullcontext()
+            return _orig_maybe_get(self, tag)
+
+        _gpu_worker.Worker._maybe_get_memory_pool_context = (
+            _kunlun_maybe_get_memory_pool_context
+        )
+        logger.info("[KunlunPlugin] patched Worker._maybe_get_memory_pool_context")
+    except Exception:
+        logger.exception("[KunlunPlugin] failed to patch _maybe_get_memory_pool_context")
+        raise
+
+    # --- patch torch.accelerator.get_memory_info for Kunlun XPU ---
+    # vllm 0.25.1 uses torch.accelerator.get_memory_info() which does not exist
+    # in torch_xmlir 2.9. Patch it to use torch.cuda.mem_get_info which works on XPU.
+    try:
+        import torch as _torch
+
+        def _kunlun_get_memory_info(device=None):
+            if device is None:
+                idx = _torch.cuda.current_device()
+            elif isinstance(device, _torch.device):
+                idx = device.index if device.index is not None else _torch.cuda.current_device()
+            elif isinstance(device, int):
+                idx = device
+            else:
+                idx = _torch.cuda.current_device()
+            return _torch.cuda.mem_get_info(idx)
+
+        _torch.accelerator.get_memory_info = _kunlun_get_memory_info
+        logger.info("[KunlunPlugin] patched torch.accelerator.get_memory_info")
+    except Exception:
+        logger.exception("[KunlunPlugin] failed to patch torch.accelerator.get_memory_info")
         raise
 
     # --- register reasoning parser override (lazy, to avoid circular import) ---
