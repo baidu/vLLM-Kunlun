@@ -7,20 +7,17 @@ from math import prod
 from typing import Any
 
 import torch
-
+import xspeedgate_ops  # noqa
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc,
-)
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import  AttentionSpec, KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
-import xspeedgate_ops
 
 
 @triton.jit
@@ -41,22 +38,25 @@ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
         data = tl.load(curr_src_ptr, mask=mask)
         tl.store(curr_dst_ptr, data, mask=mask)
 
+
 def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
     torch.ops.xspeedgate_ops.batch_memcpy(src_ptrs, dst_ptrs, sizes)
+
+
 #     grid = (batch,)
 #     BLOCK_SIZE = 1024
 #     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
-#def _make_uint8_view_from_ptr(ptr: int, size: int, device: torch.device) -> torch.Tensor:
+# def _make_uint8_view_from_ptr(ptr: int, size: int, device: torch.device) -> torch.Tensor:
 #    storage = torch._C._construct_storage_from_data_pointer(ptr, device, size)
 #    tensor = torch.empty(0, dtype=torch.uint8, device=device)
 #    return tensor.set_(storage, 0, (size,), (1,))
 
 
-#def batch_memcpy(src_ptrs, dst_ptrs, sizes):
+# def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 #    batch = src_ptrs.shape[0]
 #    assert dst_ptrs.shape[0] == batch
 #    assert sizes.shape[0] == batch
@@ -74,6 +74,7 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 #        src = _make_uint8_view_from_ptr(src_ptr, size, device)
 #        dst = _make_uint8_view_from_ptr(dst_ptr, size, device)
 #        dst.copy_(src, non_blocking=True)
+
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
@@ -339,6 +340,7 @@ def get_hybrid_attention_mamba_layout(
         attn_pack_idx = layer_idx % attn_pack_size
         storage_offset = attn_pack_idx * num_element_per_attn_pack
     return tuple(target_stride_list), storage_offset
+
 
 def postprocess_mamba(
     scheduler_output: SchedulerOutput,

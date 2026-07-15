@@ -187,6 +187,40 @@ _register_post_import_hook(
 )
 
 
+# --- hook 6: Worker._maybe_get_memory_pool_context -----------------------
+# vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
+# is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
+# fall through to get_mem_allocator_instance() which raises RuntimeError.
+# Patch the method to return nullcontext() for Kunlun.
+def _memory_pool_applied(mod):
+    cls = getattr(mod, "Worker", None)
+    return cls is None or getattr(cls, "_kunlun_memory_pool_patched", False)
+
+
+def _memory_pool_apply(mod):
+    from contextlib import nullcontext as _nullcontext
+
+    _orig = mod.Worker._maybe_get_memory_pool_context
+
+    def _patched(self, tag: str):
+        from vllm.platforms import current_platform
+
+        if type(current_platform).__name__ == "KunlunPlatform":
+            return _nullcontext()
+        return _orig(self, tag)
+
+    mod.Worker._maybe_get_memory_pool_context = _patched
+    mod.Worker._kunlun_memory_pool_patched = True
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched Worker._maybe_get_memory_pool_context"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu_worker", _memory_pool_applied, _memory_pool_apply
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
@@ -315,31 +349,6 @@ def register():
         logger.exception("[KunlunPlugin] import_hook() failed")
         raise
 
-    # --- patch _maybe_get_memory_pool_context for Kunlun XPU ---
-    # vllm 0.25.1 gpu_worker._maybe_get_memory_pool_context() gates on
-    # is_cuda_alike() and is_xpu(). KunlunPlatform is OOT so neither returns
-    # True, causing it to fall through to get_mem_allocator_instance() which
-    # raises RuntimeError. Patch the method to return nullcontext() for Kunlun.
-    try:
-        from contextlib import nullcontext as _nullcontext
-        from vllm.v1.worker import gpu_worker as _gpu_worker
-
-        _orig_maybe_get = _gpu_worker.Worker._maybe_get_memory_pool_context
-
-        def _kunlun_maybe_get_memory_pool_context(self, tag: str):
-            from vllm.platforms import current_platform
-            if type(current_platform).__name__ == "KunlunPlatform":
-                return _nullcontext()
-            return _orig_maybe_get(self, tag)
-
-        _gpu_worker.Worker._maybe_get_memory_pool_context = (
-            _kunlun_maybe_get_memory_pool_context
-        )
-        logger.info("[KunlunPlugin] patched Worker._maybe_get_memory_pool_context")
-    except Exception:
-        logger.exception("[KunlunPlugin] failed to patch _maybe_get_memory_pool_context")
-        raise
-
     # --- patch torch.accelerator.get_memory_info for Kunlun XPU ---
     # vllm 0.25.1 uses torch.accelerator.get_memory_info() which does not exist
     # in torch_xmlir 2.9. Patch it to use torch.cuda.mem_get_info which works on XPU.
@@ -350,7 +359,11 @@ def register():
             if device is None:
                 idx = _torch.cuda.current_device()
             elif isinstance(device, _torch.device):
-                idx = device.index if device.index is not None else _torch.cuda.current_device()
+                idx = (
+                    device.index
+                    if device.index is not None
+                    else _torch.cuda.current_device()
+                )
             elif isinstance(device, int):
                 idx = device
             else:
@@ -360,7 +373,9 @@ def register():
         _torch.accelerator.get_memory_info = _kunlun_get_memory_info
         logger.info("[KunlunPlugin] patched torch.accelerator.get_memory_info")
     except Exception:
-        logger.exception("[KunlunPlugin] failed to patch torch.accelerator.get_memory_info")
+        logger.exception(
+            "[KunlunPlugin] failed to patch torch.accelerator.get_memory_info"
+        )
         raise
 
     # --- register reasoning parser override (lazy, to avoid circular import) ---
