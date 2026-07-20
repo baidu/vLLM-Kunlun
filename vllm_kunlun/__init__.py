@@ -33,6 +33,7 @@ def _configure_kunlun_logger() -> logging.Logger:
 # run per real import event.
 _POST_IMPORT_DISPATCH_IN_PROGRESS = {"v": False}
 
+
 _MODULE_MAPPINGS = {
     "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
     "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
@@ -40,10 +41,10 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
     "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
-    # "vllm.model_executor.models.config": "vllm_kunlun.models.config",
-    # "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
 }
+
 
 # ---------------------------------------------------------------------------
 # Post-import hook registry
@@ -171,19 +172,67 @@ _register_post_import_hook(
 )
 
 
-# --- hook 5: SiluAndMul.forward_native ------------------------------
-# Replace SiluAndMul.forward_native with fused silu_and_mul kernel.
-def _activation_applied(mod):
-    cls = getattr(mod, "SiluAndMul", None)
-    return cls is None or getattr(cls, "_kunlun_silu_and_mul_patched", False)
+# --- hook 5: Worker._maybe_get_memory_pool_context -----------------------
+# vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
+# is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
+# fall through to get_mem_allocator_instance() which raises RuntimeError.
+# Patch the method to return nullcontext() for Kunlun.
+def _memory_pool_applied(mod):
+    cls = getattr(mod, "Worker", None)
+    return cls is None or getattr(cls, "_kunlun_memory_pool_patched", False)
 
 
-def _activation_apply(mod):
-    import vllm_kunlun.ops.activation  # noqa: F401  (self-applies on import)
+def _memory_pool_apply(mod):
+    from contextlib import nullcontext as _nullcontext
+
+    _orig = mod.Worker._maybe_get_memory_pool_context
+
+    def _patched(self, tag: str):
+        from vllm.platforms import current_platform
+
+        if type(current_platform).__name__ == "KunlunPlatform":
+            return _nullcontext()
+        return _orig(self, tag)
+
+    mod.Worker._maybe_get_memory_pool_context = _patched
+    mod.Worker._kunlun_memory_pool_patched = True
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched Worker._maybe_get_memory_pool_context"
+    )
 
 
 _register_post_import_hook(
-    "vllm.model_executor.layers.activation", _activation_applied, _activation_apply
+    "vllm.v1.worker.gpu_worker", _memory_pool_applied, _memory_pool_apply
+)
+
+
+# --- hook 6: skip qwen_triton_warmup on Kunlun XPU ---
+def _qwen_triton_warmup_applied(mod):
+    fn = getattr(mod, "qwen_triton_warmup", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _qwen_triton_warmup_apply(mod):
+    def _noop(*args, **kwargs):
+        import logging
+
+        logging.getLogger("vllm_kunlun").info(
+            "[KunlunPlugin] Skipping qwen_triton_warmup"
+        )
+
+    _noop._kunlun_patched = True
+    mod.qwen_triton_warmup = _noop
+    import logging
+
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched kernel_warmup.qwen_triton_warmup -> no-op"
+    )
+
+
+_register_post_import_hook(
+    "vllm.model_executor.warmup.kernel_warmup",
+    _qwen_triton_warmup_applied,
+    _qwen_triton_warmup_apply,
 )
 
 
@@ -313,6 +362,35 @@ def register():
         logger.info("[KunlunPlugin] import_hook() ok")
     except Exception:
         logger.exception("[KunlunPlugin] import_hook() failed")
+        raise
+
+    # --- patch torch.accelerator.get_memory_info for Kunlun XPU ---
+    # vllm 0.25.1 uses torch.accelerator.get_memory_info() which does not exist
+    # in torch_xmlir 2.9. Patch it to use torch.cuda.mem_get_info which works on XPU.
+    try:
+        import torch as _torch
+
+        def _kunlun_get_memory_info(device=None):
+            if device is None:
+                idx = _torch.cuda.current_device()
+            elif isinstance(device, _torch.device):
+                idx = (
+                    device.index
+                    if device.index is not None
+                    else _torch.cuda.current_device()
+                )
+            elif isinstance(device, int):
+                idx = device
+            else:
+                idx = _torch.cuda.current_device()
+            return _torch.cuda.mem_get_info(idx)
+
+        _torch.accelerator.get_memory_info = _kunlun_get_memory_info
+        logger.info("[KunlunPlugin] patched torch.accelerator.get_memory_info")
+    except Exception:
+        logger.exception(
+            "[KunlunPlugin] failed to patch torch.accelerator.get_memory_info"
+        )
         raise
 
     # --- register reasoning parser override (lazy, to avoid circular import) ---

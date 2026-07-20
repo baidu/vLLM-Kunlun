@@ -111,8 +111,18 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
     # lazy import to avoid triggering `torch.compile` too early
-    from vllm.model_executor.layers.quantization.awq import AWQConfig
-    from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig as AWQConfig,
+    )
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig as AWQMarlinConfig,
+    )
+
+    # gptq_bitblas, gptq_marlin, gptq_marlin_24 merged into auto_gptq in 0.25.x
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+    from vllm.model_executor.layers.quantization.auto_gptq import (
+        AutoGPTQConfig as GPTQConfig,
+    )
     from vllm.model_executor.layers.quantization.bitblas import BitBLASConfig
     from vllm.model_executor.layers.quantization.bitsandbytes import BitsAndBytesConfig
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -125,12 +135,10 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # from vllm.model_executor.layers.quantization.fp_quant import FPQuantConfig
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-    from vllm.model_executor.layers.quantization.gptq import GPTQConfig
-    from vllm.model_executor.layers.quantization.gptq_bitblas import GPTQBitBLASConfig
-    from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
-    from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
-        GPTQMarlin24Config,
-    )
+
+    GPTQBitBLASConfig = AutoGPTQConfig
+    GPTQMarlinConfig = AutoGPTQConfig
+    GPTQMarlin24Config = AutoGPTQConfig
     from vllm.model_executor.layers.quantization.inc import INCConfig
     from vllm.model_executor.layers.quantization.ipex_quant import IPEXConfig
     from vllm.model_executor.layers.quantization.modelopt import (

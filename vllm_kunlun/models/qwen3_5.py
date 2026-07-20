@@ -33,6 +33,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -353,6 +354,17 @@ class Qwen3_5Model(Qwen3NextModel):
 
         return loaded_local_expert
 
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return RoutedExperts.build_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=getattr(self.config, "num_experts", 0),
+            num_redundant_experts=self.num_redundant_experts,
+            routed_experts_prefix="routed_experts",
+            include_fused=True,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -373,14 +385,6 @@ class Qwen3_5Model(Qwen3NextModel):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        is_fused_expert = False
-        fused_expert_params_mapping = [
-            ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
-            ("experts.w2_weight", "experts.down_proj", 0, "w2"),
-        ]
-        num_experts = (
-            self.config.num_experts if hasattr(self.config, "num_experts") else 0
-        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -395,10 +399,6 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 if weight_name not in name:
                     continue
 
@@ -412,7 +412,6 @@ class Qwen3_5Model(Qwen3NextModel):
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
-                # name = apply_attn_prefix(name, params_dict)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -421,6 +420,34 @@ class Qwen3_5Model(Qwen3NextModel):
                 break
             else:
                 is_expert_weight = False
+                # gate_up_proj 是 gate+up 两部分合并存储的，需要先切成两半分别加载
+                if "experts.gate_up_proj" in name:
+                    # 找到对应的 w13_weight param 路径
+                    w13_name = name.replace(
+                        "experts.gate_up_proj", "experts.routed_experts.w13_weight"
+                    )
+                    if is_pp_missing_parameter(w13_name, self):
+                        continue
+                    if w13_name not in params_dict:
+                        logger.warning_once(
+                            f"Parameter {w13_name} not found in params_dict, skip loading"
+                        )
+                        continue
+                    # 沿 dim=-2 切成两半：w1=gate, w3=up
+                    w1_weight, w3_weight = loaded_weight.chunk(2, dim=-2)
+                    param = params_dict[w13_name]
+                    weight_loader = param.weight_loader
+                    # 加载 w1（gate）
+                    weight_loader(
+                        param, w1_weight, w13_name, shard_id="w1", expert_id=0
+                    )
+                    # 加载 w3（up）
+                    weight_loader(
+                        param, w3_weight, w13_name, shard_id="w3", expert_id=0
+                    )
+                    name = w13_name
+                    loaded_params.add(name)
+                    continue
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -430,63 +457,26 @@ class Qwen3_5Model(Qwen3NextModel):
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
-                    if is_fused_expert:
-                        # qwen3.5 no need to transpose
-                        # loaded_weight = loaded_weight.transpose(-1, -2)
-                        if "experts.gate_up_proj" in name:
-                            loaded_weight = loaded_weight.chunk(2, dim=-2)
-                            success_w1 = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight[0],
-                                "w1",
-                                num_experts,
-                            )
-                            success_w3 = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight[1],
-                                "w3",
-                                num_experts,
-                            )
-                            success = success_w1 and success_w3
-                        else:
-                            # down_proj
-                            success = self.load_fused_expert_weights(
-                                name_mapped,
-                                params_dict,
-                                loaded_weight,
-                                shard_id,
-                                num_experts,
-                            )
-                        if success:
-                            name = name_mapped
-                            break
-                    else:
-                        # Skip loading extra bias for GPTQ models.
-                        if (
-                            name_mapped.endswith(".bias")
-                            or name_mapped.endswith("_bias")
-                        ) and name_mapped not in params_dict:
-                            continue
-                        param = params_dict[name_mapped]
-                        weight_loader = param.weight_loader
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                    if success:
-                        name = name_mapped
-                        break
+                    # Skip loading extra bias for GPTQ models.
+                    if (
+                        name_mapped.endswith(".bias") or name_mapped.endswith("_bias")
+                    ) and name_mapped not in params_dict:
+                        continue
+                    if name_mapped not in params_dict:
+                        continue
+                    param = params_dict[name_mapped]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    name = name_mapped
+                    break
                 else:
                     if is_expert_weight:
-                        # We've checked that this is an expert weight
-                        # However it's not mapped locally to this rank
-                        # So we simply skip it
                         continue
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
@@ -607,7 +597,15 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         self.set_moe_parameters()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
+        return RoutedExperts.build_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=getattr(self.config, "num_experts", 0),
+            num_redundant_experts=0,
+            routed_experts_prefix="routed_experts",
+            include_fused=True,
+        )
 
 
 ########################################################

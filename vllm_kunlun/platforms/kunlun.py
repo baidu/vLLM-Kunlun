@@ -26,6 +26,7 @@ class KunlunPlatform(Platform):
     dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
     device_name: str = "cuda"
+    dispatch_key: str = "CUDA"
 
     @property
     def device_type(self):

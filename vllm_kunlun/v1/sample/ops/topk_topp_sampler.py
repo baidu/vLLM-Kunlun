@@ -12,6 +12,11 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def flashinfer_sampler_supported() -> bool:
+    """FlashInfer is not supported on Kunlun XPU, always return False."""
+    return False
+
+
 class TopKTopPSampler(nn.Module):
     """
     Module that performs optional top-k and top-p filtering followed by
@@ -20,9 +25,10 @@ class TopKTopPSampler(nn.Module):
     Implementations may update the logits tensor in-place.
     """
 
-    def __init__(self, logprobs_mode):
+    def __init__(self, logprobs_mode, use_fp64_gumbel: bool = False):
         super().__init__()
         self.logprobs_mode = logprobs_mode
+        self.use_fp64_gumbel = use_fp64_gumbel
         logger.info_once("Using FlashInfer for top-p & top-k sampling.")
         self.forward = self.forward_kunlun
         self.apply_top_k_top_p = apply_top_k_top_p
@@ -213,3 +219,35 @@ def flashinfer_sample(
         )
 
     return next_token_ids.view(-1)
+
+
+def empty_exponential_noise_like(
+    probs: torch.Tensor,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Return a tensor of exponential noise with the same shape as probs.
+
+    Used by vllm.v1.spec_decode.llm_base_proposer for speculative decoding.
+    """
+    if use_fp64_gumbel:
+        noise = torch.empty_like(probs, dtype=torch.float64)
+    else:
+        noise = torch.empty_like(probs)
+    noise.exponential_()
+    return noise
+
+
+def sample_with_exponential_noise(
+    probs: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Sample from probs using exponential noise q (Gumbel-max trick).
+
+    Used by vllm.v1.spec_decode.llm_base_proposer for speculative decoding.
+    """
+    if q.dtype == probs.dtype:
+        scores = probs.div_(q)
+    else:
+        scores = q.reciprocal_()
+        scores.mul_(probs)
+    return scores.argmax(dim=-1).view(-1)

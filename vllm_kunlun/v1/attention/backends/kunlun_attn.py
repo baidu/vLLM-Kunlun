@@ -32,6 +32,7 @@ import kunlun_ops
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -54,6 +55,8 @@ import inspect
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -689,6 +692,26 @@ class KunlunAttentionMetadataBuilder:
 class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
     """KunlunAttentionImpl"""
 
+    @staticmethod
+    def _get_block_table_scale(key_cache: torch.Tensor) -> int:
+        contiguous_block_stride = (
+            key_cache.shape[1] * key_cache.shape[2] * key_cache.shape[3]
+        )
+        actual_block_stride = key_cache.stride(0)
+        if actual_block_stride == contiguous_block_stride:
+            return 1
+        if actual_block_stride % contiguous_block_stride != 0:
+            logger.warning(
+                "[KunlunAttention] unexpected KV cache block stride: "
+                "actual=%s contiguous=%s shape=%s stride=%s",
+                actual_block_stride,
+                contiguous_block_stride,
+                tuple(key_cache.shape),
+                tuple(key_cache.stride()),
+            )
+            return 1
+        return actual_block_stride // contiguous_block_stride
+
     def __init__(
         self,
         num_heads: int,
@@ -794,7 +817,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     # and value tensors are not cached. This happens during
                     # the initial memory
                     value = value.contiguous()
-                    key = key.contiguous()
                     kunlun_ops.reshape_and_cache_flash(
                         key[: attn_metadata.num_actual_tokens],
                         value[: attn_metadata.num_actual_tokens],
@@ -822,23 +844,18 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             #   score = Q @ K^T * (1/sqrt(d)) * alpha
             # We want: score = Q @ K^T * self.scale
             # So: alpha = self.scale * sqrt(d) = self.scale / (1/sqrt(d))
-            import math
+            # import math
 
-            _prefill_alpha = self.scale * math.sqrt(self.head_size)
+            # _prefill_alpha = self.scale * math.sqrt(self.head_size)
 
-            # For hybrid Attention (Qwen3-Next.)
-            if key_cache.is_contiguous():
-                tmp_block_tables = prefill_meta.block_tables
-            else:
-                # For hybrid Attention (Qwen3-Next)
-                tmp_block_tables = prefill_meta.block_tables * 2
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = prefill_meta.block_tables * block_table_scale
 
             # Prefix cache or KV sharing layers (must read K/V from cache)
-            is_kv_sharing = self.kv_sharing_target_layer_name is not None
-            if (
-                is_kv_sharing
-                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
-            ):
+            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=key_cache,  # Key Cache [block_num, head, block_size, dim]
@@ -846,7 +863,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     is_prefix_cache=True,
-                    alpha=_prefill_alpha,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -869,7 +885,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
-                    alpha=_prefill_alpha,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -889,13 +904,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             ), "Encoder-only models should not have decode metadata."
             decode_query = query[:num_decode_tokens]
 
-            # For hybrid Attention (Qwen3-Next
-            if key_cache.is_contiguous():
-                tmp_block_tables = decode_meta.block_tables
-            else:
-                tmp_block_tables = (
-                    decode_meta.block_tables * 2
-                )  # only test in Qwen3-Next
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = decode_meta.block_tables * block_table_scale
 
             has_max_window_size = getattr(self, "_spec_attn_has_max_window_size", None)
             if has_max_window_size is None:
