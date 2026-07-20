@@ -47,7 +47,7 @@ class ExllamaState(enum.Enum):
     READY = 1
 
 
-# reove the original gptq quantization method
+# remove the original gptq quantization method
 _remove_quantization_method("gptq")
 
 
