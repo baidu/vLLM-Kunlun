@@ -10,6 +10,14 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 ROOT_DIR = os.path.dirname(__file__)
 
+
+def get_version():
+    version_file = os.path.join(ROOT_DIR, "vllm_kunlun", "platforms", "version.py")
+    ns = {}
+    with open(version_file) as f:
+        exec(f.read(), ns)
+    return ns["__version__"]
+
 ext_modules = [
     CppExtension(
         name="vllm_kunlun._kunlun",
@@ -42,7 +50,7 @@ if __name__ == "__main__":
 
     setup(
         name="vllm_kunlun",
-        version="0.21.0",
+        version=get_version(),
         author="vLLM-Kunlun team",
         license="Apache 2.0",
         description="vLLM Kunlun3 backend plugin",
