@@ -3,6 +3,7 @@
 #
 
 import os
+import re
 import shutil
 
 from setuptools import find_packages, setup
@@ -13,10 +14,16 @@ ROOT_DIR = os.path.dirname(__file__)
 
 def get_version():
     version_file = os.path.join(ROOT_DIR, "vllm_kunlun", "platforms", "version.py")
-    ns = {}
-    with open(version_file) as f:
-        exec(f.read(), ns)
-    return ns["__version__"]
+    with open(version_file, encoding="utf-8") as f:
+        content = f.read()
+    m = re.search(
+        r"^__version__\s*=\s*['\"]([^'\"]+)['\"]\s*$",
+        content,
+        flags=re.MULTILINE,
+    )
+    if not m:
+        raise RuntimeError(f"Unable to find __version__ in {version_file}")
+    return m.group(1)
 
 ext_modules = [
     CppExtension(
