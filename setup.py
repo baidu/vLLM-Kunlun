@@ -25,6 +25,7 @@ def get_version():
         raise RuntimeError(f"Unable to find __version__ in {version_file}")
     return m.group(1)
 
+
 ext_modules = [
     CppExtension(
         name="vllm_kunlun._kunlun",
