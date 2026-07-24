@@ -16,9 +16,11 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 
+import os
 from typing import Callable, Optional, Union
 
 import torch
+import xspeedgate_ops  # noqa: F401  (register torch.ops.xspeedgate_ops)
 from compressed_tensors import CompressionFormat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -35,10 +37,57 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
     WNA16_SUPPORTED_BITS,
 )
 
+import vllm_kunlun.platforms.envs as kunlun_envs
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
 logger = init_logger(__name__)
+
+_MOE_PRE_QUANT_MIN_TOKENS = 256
+
+
+def _use_xspeed_minimax_shared_gate(num_fused_shared_experts: int) -> bool:
+    """Use the graph-safe MiniMax top-k kernel for the fused shared slot."""
+    return (
+        num_fused_shared_experts == 1
+        and not kunlun_envs.VLLM_KUNLUN_DISABLE_XSPEED_SHARED_GATE
+    )
+
+
+def _xspeed_minimax_shared_gate(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    top_k: int,
+    num_fused_shared_experts: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return routed top-k plus the always-selected MiniMax shared expert.
+
+    FusedMoE applies ``routed_scaling_factor`` to the combined expert output
+    later.  Keeping ``apply_routed_scaling_factor_on_output=False`` makes the
+    routed weights sum to one and pre-divides the shared route by that factor,
+    preserving the original independent-shared-expert math.
+    """
+    return torch.ops.xspeedgate_ops.minimax_m3_moe_fused_gate(
+        router_logits.contiguous(),
+        correction_bias.contiguous(),
+        1,  # MiniMax-M3 uses ungrouped routing.
+        1,
+        top_k,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        False,
+    )
+
+
+def _should_pre_quantize_moe_input(num_tokens: int, top_k: int) -> bool:
+    if kunlun_envs.VLLM_KUNLUN_DISABLE_MOE_PRE_QUANT:
+        return False
+
+    # The extra scale-reorder kernel regresses the captured decode buckets.
+    # Keep the optimization for large prefill batches where reduced BF16
+    # traffic and quantization work amortize the additional launch.
+    return num_tokens >= _MOE_PRE_QUANT_MIN_TOKENS
 
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
@@ -111,6 +160,33 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe,
+    ):
+        # Skip select_int8_moe_backend() in parent - this is a monolithic
+        # implementation that uses torch.ops._C.moe_fc etc. directly.
+        # The parent's __init__ calls select_int8_moe_backend() which only
+        # supports Triton backend (not available on XPU for Int8).
+        # Set attributes directly without calling nn.Module.__init__ to
+        # avoid torch 2.9 call_super_init check.
+        self.moe = moe
+        self.moe_quant_config = None
+        self.moe_kernel = None
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.static_input_scales = False
+        self.int8_backend = None
+        self.experts_cls = None
+        self.moe_weight_scale_supported = set()
+        self._parameters = {}
+        self._modules = {}
+        self._buffers = {}
+        self._non_persistent_buffers_set = set()
+        self.training = True
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -135,23 +211,37 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         input_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
+        # Read routing params from layer attributes as source of truth,
+        # falling back to function defaults (used when caller doesn't pass them).
+        scoring_func = getattr(layer, 'scoring_func', scoring_func)
+        num_expert_group = getattr(layer, 'num_expert_group', num_expert_group)
+        topk_group = getattr(layer, 'topk_group', topk_group)
+        e_score_correction_bias = getattr(layer, 'e_score_correction_bias', e_score_correction_bias)
+        routed_scaling_factor = getattr(layer, 'routed_scaling_factor', routed_scaling_factor)
+        output_routed_scaling_factor = getattr(
+            layer, "kunlun_output_routed_scaling_factor",
+            getattr(getattr(layer, "runner", None), "routed_scaling_factor",
+                    routed_scaling_factor))
+        global_num_experts = getattr(layer, 'global_num_experts', global_num_experts)
+        # Read SwiGLU-OAI params from layer attributes (MiniMax-M3: alpha=1.702, beta=1.0, limit=7.0)
+        swiglu_alpha = getattr(layer, 'swiglu_alpha', 1.0)
+        swiglu_beta = getattr(layer, 'swiglu_beta', 1.0)
+        swiglu_limit = getattr(layer, 'swiglu_limit', None)
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
         M, N = hidden_states.shape
-        hidden_dim = layer.w2_weight.shape[1]
         top_k = self.moe.experts_per_token
+        num_fused_shared_experts = getattr(
+            layer, "num_kunlun_fused_shared_experts", 0)
         normed_score = torch.empty(
             M, top_k, dtype=torch.float32, device=hidden_states.device
         )
         topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=hidden_states.device)
-        num_blocks = 12
-        block_statistic = torch.zeros(
-            num_blocks,
-            global_num_experts,
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
 
         router_logits = router_logits.float()
+        # block_statistic produced by the fused gate (kunlun_ops.moe_fused_gate),
+        # reused by the moe_pre_sorted stage below to skip a redundant per-layer
+        # gen_block_statistic launch. Stays None on paths that don't produce it.
+        _gate_block_stat = None
         if scoring_func == "softmax":
             torch.ops._C.moe_softmax_topk_norm(
                 x=router_logits,
@@ -161,74 +251,240 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 stable=True,
             )
         elif scoring_func == "sigmoid":
-            torch.ops._C.moe_sigmoid_group_topk_norm(
-                x=router_logits,
-                norm_score=normed_score,
-                topk_index=topk_ids,
-                block_static=block_statistic,
-                bias=e_score_correction_bias,
-                n_group=num_expert_group,
-                topk_group=topk_group,
-                scale=routed_scaling_factor,
-            )
+            _M = router_logits.shape[0]
+            _E = router_logits.shape[1]
+            _is_group = (num_expert_group is not None and num_expert_group > 1
+                         and topk_group is not None and topk_group < num_expert_group)
+            # bias must be [E]/[1,E] fp32; tolerate None (no routing bias).
+            if e_score_correction_bias is not None:
+                _bias_1d = e_score_correction_bias.to(torch.float32).view(_E)
+            else:
+                _bias_1d = torch.zeros(_E, dtype=torch.float32,
+                                       device=router_logits.device)
 
-        if M * top_k > 768:
+            # === P1: fused MoE gate (sigmoid+bias+top-k) ===
+            # Use kunlun_ops.moe_fused_gate for the M3 n_group=1 path: it fuses
+            # sigmoid+bias+top-k+sum-norm AND emits block_statistic as a third
+            # output, letting moe_pre_sorted below skip a separate per-layer
+            # gen_block_statistic launch (57 launches/forward saved). Keep the
+            # group-limited PyTorch fallback for configs this kernel misses.
+            _use_fused_gate = (
+                os.environ.get("VLLM_KUNLUN_DISABLE_FUSED_MOE_GATE", "0") != "1"
+                and not _is_group
+                and top_k <= 16
+            )
+            if _use_fused_gate:
+                import kunlun_ops as _kops_gate
+                if num_fused_shared_experts > 0:
+                    routed_top_k = top_k - num_fused_shared_experts
+                    if _use_xspeed_minimax_shared_gate(
+                        num_fused_shared_experts
+                    ):
+                        # The dedicated op directly emits routed top-k plus the
+                        # fixed shared-expert slot.  Unlike the shared branch of
+                        # kunlun_ops.moe_fused_gate, it is stable for M=1/8 CUDA
+                        # Graph replay.  Build block statistics separately below.
+                        _score, _tid = _xspeed_minimax_shared_gate(
+                            router_logits,
+                            _bias_1d,
+                            top_k,
+                            num_fused_shared_experts,
+                            float(output_routed_scaling_factor),
+                        )
+                    else:
+                        # Strict A/B fallback: mature routed-only gate followed
+                        # by explicit construction of the shared route.
+                        _routed_score = torch.empty(
+                            _M,
+                            routed_top_k,
+                            dtype=torch.float32,
+                            device=router_logits.device,
+                        )
+                        _routed_tid = torch.empty(
+                            _M,
+                            routed_top_k,
+                            dtype=torch.int32,
+                            device=router_logits.device,
+                        )
+                        _routed_block_stat = torch.empty(
+                            12,
+                            _E,
+                            dtype=torch.int32,
+                            device=router_logits.device,
+                        )
+                        _kops_gate.moe_fused_gate(
+                            router_logits.contiguous(),
+                            _bias_1d.view(1, _E).contiguous(),
+                            1,       # num_expert_group (M3: 1)
+                            1,       # topk_group (M3: 1)
+                            routed_top_k,
+                            0,       # shared experts are appended below
+                            1.0,     # routed weights are normalized already
+                            _routed_score,  # output_score
+                            _routed_tid,    # topk_index
+                            _routed_block_stat,
+                        )
+                        _score = torch.empty(
+                            _M,
+                            top_k,
+                            dtype=torch.float32,
+                            device=router_logits.device,
+                        )
+                        _tid = torch.empty(
+                            _M,
+                            top_k,
+                            dtype=torch.int32,
+                            device=router_logits.device,
+                        )
+                        _score[:, :routed_top_k].copy_(_routed_score)
+                        _tid[:, :routed_top_k].copy_(_routed_tid)
+                        shared_weight = (
+                            1.0 / float(output_routed_scaling_factor)
+                        )
+                        for shared_idx in range(num_fused_shared_experts):
+                            col = routed_top_k + shared_idx
+                            _score.narrow(1, col, 1).fill_(shared_weight)
+                            _tid.narrow(1, col, 1).fill_(_E + shared_idx)
+                    _gate_block_stat = None
+                else:
+                    _score = torch.empty(_M, top_k, dtype=torch.float32,
+                                         device=router_logits.device)
+                    _tid = torch.empty(_M, top_k, dtype=torch.int32,
+                                       device=router_logits.device)
+                    _gate_block_stat = torch.empty(
+                        12, _E, dtype=torch.int32,
+                        device=router_logits.device)
+                    _kops_gate.moe_fused_gate(
+                        router_logits.contiguous(),
+                        _bias_1d.view(1, _E).contiguous(),
+                        1,       # num_expert_group (M3: 1)
+                        1,       # topk_group (M3: 1)
+                        top_k,
+                        0,       # n_share_experts_fusion
+                        1.0,     # routed weights are normalized already
+                        _score,  # output_score
+                        _tid,    # topk_index
+                        _gate_block_stat,  # block_statistic, reused below
+                    )
+                normed_score = _score
+                topk_ids = _tid
+            elif not _is_group:
+                _bias_2d = _bias_1d.view(1, _E).contiguous()
+                _block_stat = torch.empty(12, _E, dtype=torch.int32,
+                                          device=router_logits.device)
+                torch.ops._C.moe_sigmoid_group_topk_norm(
+                    router_logits,
+                    topk_ids,
+                    normed_score,
+                    _block_stat,
+                    _bias_2d,
+                    1.0,
+                    1,
+                    1,
+                )
+                _gate_block_stat = _block_stat
+            else:
+                # Group-limited routing fallback (pure PyTorch) for configs the
+                # fused kernels' n_group=1 path does not cover.
+                scores = torch.sigmoid(router_logits)  # [M, E]
+                scores_for_choice = (
+                    scores + _bias_1d
+                    if e_score_correction_bias is not None
+                    else scores
+                )
+                _gs = _E // num_expert_group
+                _gs_max = scores_for_choice.view(_M, num_expert_group, _gs).max(dim=-1).values
+                _, _selected_grp = torch.topk(_gs_max, topk_group, dim=-1)
+                _mask_3d = torch.zeros(_M, num_expert_group, _gs, dtype=torch.bool,
+                                       device=scores_for_choice.device)
+                _mask_3d.scatter_(dim=1, index=_selected_grp.unsqueeze(-1), value=True)
+                scores_for_choice = torch.where(_mask_3d.view(_M, _E), scores_for_choice,
+                                     torch.tensor(float("-inf"), device=scores_for_choice.device))
+                _, idx = torch.topk(scores_for_choice, top_k, dim=-1)
+                topk_weights = scores.gather(1, idx)
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+                topk_weights = topk_weights.to(torch.float32)
+                topk_ids.copy_(idx.to(torch.int32))
+                normed_score.copy_(topk_weights)
+
+        # === Item ④: fused Kunlun MoE dispatch / FC / activation / sum pipeline ===
+        # Replaces the handwritten torch path (argsort/unique/_q/index_add_) with the
+        # M2.7-validated _C op chain, swapping only the activation step to SwigluOAI
+        # (swiglu_bias) for M3. All these _C ops are registered in M3's _custom_ops.py.
+        import kunlun_ops as _kops  # noqa: F401  (kept for parity / debug use)
+        _dev = hidden_states.device
+        top_k = topk_ids.shape[1]
+        _hidden_dim = layer.w2_weight.shape[1]
+
+        # [CLAMP-FIX] dummy_run/cudagraph warmup synthetic routing can emit topk_ids
+        # past the physical expert count; clamp so block/sort kernels stay in range.
+        # Real decode ids are already valid -> no-op.
+        topk_ids = topk_ids.clamp_(0, global_num_experts - 1)
+
+        # This is a process-static fallback, so specializing it during the
+        # initial model trace is intentional. When disabled, preserve the
+        # original FX topology and allocation order for strict A/B comparison.
+        _disable_pre_quant = kunlun_envs.VLLM_KUNLUN_DISABLE_MOE_PRE_QUANT
+        if _disable_pre_quant:
             moe_expand = torch.empty(
-                (M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
-            )  # [M, top_k, N], float
-            expert_m = torch.zeros(
-                global_num_experts, dtype=torch.int32, device=hidden_states.device
-            )  # [E]
-            sorted_tokens_num_lod = torch.zeros(
-                global_num_experts + 1, dtype=torch.int32, device=hidden_states.device
-            )  # [E+1]
-            sorted_tokens_idx = torch.zeros(
-                M * top_k, dtype=torch.int32, device=hidden_states.device
-            )
+                (M * top_k, N), dtype=hidden_states.dtype, device=_dev)
+            expert_m = torch.empty(
+                global_num_experts, dtype=torch.int32, device=_dev)
+            sorted_tokens_num_lod = torch.empty(
+                global_num_experts + 1, dtype=torch.int32, device=_dev)
+            sorted_tokens_idx = torch.empty(
+                M * top_k, dtype=torch.int32, device=_dev)
 
-            torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+        # Reuse the block_statistic emitted by the fused gate when it is
+        # consistent with the (post-clamp) topk_ids, i.e. the fused-gate path
+        # ran AND the clamp above is a no-op. Gate ids are always in range for
+        # the gate's expert width, so reuse is valid exactly when that width
+        # matches global_num_experts. This static shape compare is graph-safe.
+        if (
+            _gate_block_stat is not None
+            and _gate_block_stat.shape[1] == global_num_experts
+        ):
+            _block_stat_mp = _gate_block_stat
+        else:
+            _block_stat_mp = torch.zeros(12, global_num_experts, dtype=torch.int32, device=_dev)
+            torch.ops._C.gen_block_statistic(topk_ids, _block_stat_mp)
 
+        if _disable_pre_quant:
             torch.ops._C.moe_pre_sorted(
                 x=hidden_states,
                 topk_index=topk_ids,
-                block_statistic=block_statistic,
+                block_statistic=_block_stat_mp,
                 moe_expand=moe_expand,
                 moe_index=sorted_tokens_idx,
                 expert_m=expert_m,
                 sorted_tokens_num_lod=sorted_tokens_num_lod,
             )
-            del expert_m
         else:
-            sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-                torch.ops.xspeedgate_ops.moe_pre_small(
-                    topk_ids,
-                    global_num_experts,
-                    index_have_neg=False,
-                    sort_mode=True,
+            # Keep only the shape-dependent choice inside an opaque op. vLLM
+            # traces first with max_num_batched_tokens and reuses that bytecode
+            # without guards, so a Python M-based branch here is not valid.
+            _xq, _xs, sorted_tokens_idx, _expert_m, sorted_tokens_num_lod = (
+                torch.ops._C.moe_pre_sorted_quant(
                     x=hidden_states,
-                )
-            )
+                    topk_index=topk_ids,
+                    block_statistic=_block_stat_mp,
+                    enable_pre_quant=True,
+                    min_pre_quant_tokens=_MOE_PRE_QUANT_MIN_TOKENS,
+                ))
 
-        y = torch.empty(
-            M,
-            top_k,
-            layer.w13_weight.shape[1],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        moe_expand = moe_expand.view(M * top_k, hidden_dim)
-
-        x_shape = moe_expand.shape
-        x_q = torch.empty(x_shape, dtype=torch.int8, device=moe_expand.device)
-        x_scale = torch.empty(
-            (x_shape[0], 1), dtype=torch.float32, device=moe_expand.device
-        )
-        torch.ops._C.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
-
+        _UG = layer.w13_weight.shape[1]
+        y = torch.empty(M, top_k, _UG, dtype=hidden_states.dtype, device=_dev)
+        if _disable_pre_quant:
+            moe_expand = moe_expand.view(M * top_k, _hidden_dim)
+            _xq = torch.empty(
+                moe_expand.shape, dtype=torch.int8, device=_dev)
+            _xs = torch.empty(
+                (moe_expand.shape[0], 1), dtype=torch.float32, device=_dev)
+            torch.ops._C.quant2d(
+                moe_expand, _xq, _xs, force_sdnn=True)
         torch.ops._C.moe_fc(
-            x=x_q,
-            x_perchannel_max=x_scale,
+            x=_xq,
+            x_perchannel_max=_xs,
             weight=layer.w13_weight,
             w_perchannel_max=layer.w13_weight_scale,
             sorted_tokens_num_lod=sorted_tokens_num_lod,
@@ -236,36 +492,50 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             moe_topk=top_k,
             y=y,
             topk_ids=topk_ids,
-            # sort_mode=False,
             act=None,
         )
 
-        d = y.shape[-1] // 2
-        output_shape = y.shape[:-1] + (d,)
-        out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-        torch.ops._C.silu_and_mul(out1, y)
-
+        # SwigluOAI activation followed by per-route dynamic INT8 quant.
+        # The default path fuses activation and quantization for every shape,
+        # including decode. The environment fallback preserves the old FX
+        # topology for strict A/B comparison.
+        _d = y.shape[-1] // 2
+        _y2d = y.reshape(-1, y.shape[-1])
+        _activation_beta = (
+            swiglu_beta if swiglu_limit is not None else 0.0)
+        _activation_limit = (
+            swiglu_limit if swiglu_limit is not None else 0.0)
+        if kunlun_envs.VLLM_KUNLUN_DISABLE_FUSED_SWIGLU_QUANT:
+            out1 = torch.empty(
+                y.shape[:-1] + (_d,), dtype=y.dtype, device=_dev)
+            _o2d = out1.reshape(-1, _d)
+            _kops.swiglu_bias(
+                _y2d, _o2d, recv_counts=None,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=_activation_beta,
+                swiglu_limit=_activation_limit)
+            out1 = out1.reshape(-1, out1.shape[-1])
+            _xq = torch.empty(out1.shape, dtype=torch.int8, device=_dev)
+            _xs = torch.empty(
+                (out1.shape[0], 1), dtype=torch.float32, device=_dev)
+            torch.ops._C.quant2d(out1, _xq, _xs, force_sdnn=True)
+            del out1
+        else:
+            _xq, _xs = torch.ops._C.moe_swiglu_quant(
+                x=_y2d,
+                alpha=swiglu_alpha,
+                beta=_activation_beta,
+                limit=_activation_limit,
+            )
         del y
 
-        out1 = out1.reshape(-1, out1.shape[-1])
-        x_shape = out1.shape
-        x_q = torch.empty(x_shape, dtype=torch.int8, device=moe_expand.device)
-        x_scale = torch.empty(
-            (x_shape[0], 1), dtype=torch.float32, device=moe_expand.device
-        )
-        torch.ops._C.quant2d(out1, x_q, x_scale, force_sdnn=True)
-        del out1, moe_expand
-        out = torch.empty(
-            M,
-            top_k,
-            layer.w2_weight.shape[1],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
+        if _disable_pre_quant:
+            del moe_expand
+        out = torch.empty(M, top_k, layer.w2_weight.shape[1],
+                          dtype=hidden_states.dtype, device=_dev)
         torch.ops._C.moe_fc(
-            x=x_q,
-            x_perchannel_max=x_scale,
+            x=_xq,
+            x_perchannel_max=_xs,
             weight=layer.w2_weight,
             w_perchannel_max=layer.w2_weight_scale,
             sorted_tokens_num_lod=sorted_tokens_num_lod,
@@ -273,22 +543,29 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             moe_topk=top_k,
             y=out,
             topk_ids=topk_ids,
-            # sort_mode=False,
             act=None,
         )
-        del x_q, x_scale, sorted_tokens_num_lod
 
-        dequant_scale = torch.ones([M, top_k], dtype=torch.float32, device=out.device)
-        output = torch.empty(
-            [M, N], dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        sorted_tokens_idx = sorted_tokens_idx.view(M, top_k)
-
+        # moe_post: reorder back to token order + weight by normed_score + sum.
+        # dequant_scale all-ones (already per-token dequantized inside moe_fc).
+        _dequant = getattr(layer, "_kunlun_moe_dequant_ones", None)
+        if (
+            _dequant is None
+            or _dequant.device != _dev
+            or _dequant.dtype != torch.float32
+            or _dequant.shape[0] < M
+            or _dequant.shape[1] != top_k
+        ):
+            _dequant = torch.ones([M, top_k], dtype=torch.float32, device=_dev)
+            layer._kunlun_moe_dequant_ones = _dequant
+        else:
+            _dequant = _dequant[:M, :top_k]
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=_dev)
         torch.ops._C.moe_post(
             x=out,
-            moe_index=sorted_tokens_idx,
+            moe_index=sorted_tokens_idx.view(M, top_k),
             normed_scale=normed_score,
-            dequant_scale=dequant_scale,
+            dequant_scale=_dequant,
             y=output,
         )
         return output

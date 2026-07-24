@@ -1,19 +1,21 @@
 Global:
-    version: "2.0"
-    group_email: hac@baidu.com
+  version: "2.0"
+  group_email: yuchengzhi02@baidu.com
+
 Default:
-    profile:
-        - build
+  profile: [build]
+
 Profiles:
-    - profile:
-      name: build
-      mode: AGENT
-      environment:
-        image: DECK_STD_CENTOS7
-        tools:
-            - python: 3.10.10
-      build:
-        command: sh build.sh
-      excludeTools: []
-      artifacts:
-        release: true
+  - profile:
+    name: build
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: MEDIUM
+      tools:
+        - python: 3.11.2
+    build:
+      command: python3 -m compileall -q vllm vllm_kunlun
+    check:
+      - reuse: TASK
+        enable: true

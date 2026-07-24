@@ -3,8 +3,9 @@
 Upstream's GPU branch calls ``xgr.apply_token_bitmask_inplace`` with
 ``backend="auto"`` (the default), which routes XPU tensors to the
 torch_compile path -- that path needs libcuda.so and raises
-``CUDA_ERROR_NOT_SUPPORTED`` on Kunlun XPU. Force ``backend="torch_native"``
-instead.
+``CUDA_ERROR_NOT_SUPPORTED`` on Kunlun XPU. Use Kunlun's native bitmask op by
+default, with xgrammar ``backend="torch_native"`` retained as an explicit
+fallback.
 
 The replacement also rebinds the symbol in any already-imported consumer
 (e.g. ``vllm.v1.worker.gpu_model_runner`` that does
@@ -19,11 +20,14 @@ import logging
 import sys
 from typing import TYPE_CHECKING
 
+import kunlun_ops
 import numpy as np
 import torch
 import vllm.v1.structured_output.utils as _upstream
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.platform_utils import is_pin_memory_available
+
+import vllm_kunlun.platforms.envs as kunlun_envs
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -42,7 +46,7 @@ def apply_grammar_bitmask(
     input_batch: InputBatch,
     logits: torch.Tensor,
 ) -> None:
-    """Same as upstream, but forces ``backend='torch_native'`` for XPU."""
+    """Apply grammar masks with Kunlun's native op on XPU by default."""
     grammar_bitmask = grammar_output.grammar_bitmask
 
     struct_out_req_batch_indices: dict[str, int] = {}
@@ -71,6 +75,31 @@ def apply_grammar_bitmask(
                 out_indices.append(bitmask_index)
         cumulative_index += 1 + num_spec_tokens
 
+    mask_capacity = grammar_bitmask.shape[-1] * 32
+    native_vocab_size = min(logits.shape[-1], mask_capacity)
+    real_vocab_size = min(
+        input_batch.vocab_size,
+        native_vocab_size,
+    )
+    valid_bits_in_last_word = real_vocab_size % 32
+    if valid_bits_in_last_word:
+        # Mark padding bits in the final real-vocab word as permitted.
+        padding_mask_u32 = (
+            ~((1 << valid_bits_in_last_word) - 1) & 0xFFFFFFFF
+        )
+        padding_mask = np.asarray(padding_mask_u32, dtype=np.uint32).view(
+            np.int32
+        )
+        last_word = real_vocab_size // 32
+        np.bitwise_or(
+            sorted_bitmask[:, last_word],
+            padding_mask,
+            out=sorted_bitmask[:, last_word],
+        )
+    first_padding_word = (real_vocab_size + 31) // 32
+    native_mask_words = (native_vocab_size + 31) // 32
+    sorted_bitmask[:, first_padding_word:native_mask_words] = -1
+
     grammar_bitmask = torch.from_numpy(sorted_bitmask).to(
         logits.device, non_blocking=True
     )
@@ -78,6 +107,23 @@ def apply_grammar_bitmask(
     skip_out_indices = len(out_indices) == logits.shape[0]
 
     if not logits.is_cpu:
+        # The wheel uses vocab_size as the physical row stride. Native masking
+        # is safe when it spans the complete logits row; otherwise retain the
+        # stride-aware xgrammar fallback.
+        native_shape_supported = (
+            native_vocab_size == logits.shape[-1] and logits.is_contiguous()
+        )
+        if (
+            not kunlun_envs.VLLM_KUNLUN_DISABLE_GRAMMAR_BITMASK
+            and native_shape_supported
+        ):
+            kunlun_ops.apply_token_bitmask_inplace(
+                logits, grammar_bitmask, vocab_size=native_vocab_size
+            )
+            return
+
+        # Strict A/B fallback to the previous XPU path. Unlike the native op,
+        # xgrammar needs explicit indices to skip unstructured request rows.
         index_tensor = None
         if not skip_out_indices:
             pin_memory = is_pin_memory_available()

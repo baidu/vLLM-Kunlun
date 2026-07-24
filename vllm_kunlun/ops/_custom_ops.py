@@ -249,6 +249,7 @@ def silu_and_mul_quant_xpu(
 
 import kunlun_ops  # noqa: E402
 import torch  # noqa: E402
+import xpu_flash_ops  # noqa: E402
 from torch.library import custom_op, impl  # noqa: E402
 
 
@@ -467,6 +468,68 @@ def _fake_gemma_add_rmsnorm(
 
 
 gemma_add_rmsnorm.register_fake(_fake_gemma_add_rmsnorm)
+
+
+def _minimax_m3_fused_norm_quant_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    norm_out = torch.empty_like(x)
+    residual_out = torch.empty_like(residual)
+    quant_out = torch.empty_like(x, dtype=torch.int8)
+    quant_max = torch.empty((x.shape[0],), device=x.device, dtype=torch.float32)
+    kunlun_ops.fused_quant_add_rmsnorm(
+        x,
+        weight,
+        quant_out,
+        quant_max,
+        residual_in=residual,
+        residual_out=residual_out,
+        norm_residual_out=norm_out,
+        eps=eps,
+    )
+    return norm_out, residual_out, quant_out, quant_max
+
+
+@custom_op("_C::minimax_m3_fused_norm_quant", mutates_args=())
+def minimax_m3_fused_norm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused residual add + RMSNorm + dynamic W8A8 quantization for MiniMax-M3."""
+    return _minimax_m3_fused_norm_quant_impl(x, residual, weight, eps)
+
+
+@impl("_C::minimax_m3_fused_norm_quant", "CUDA")
+def minimax_m3_fused_norm_quant_cuda(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """CUDA/XPU implementation of fused residual add + RMSNorm + quantization."""
+    return _minimax_m3_fused_norm_quant_impl(x, residual, weight, eps)
+
+
+def _fake_minimax_m3_fused_norm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(x),
+        torch.empty_like(residual),
+        torch.empty_like(x, dtype=torch.int8),
+        torch.empty((x.shape[0],), device=x.device, dtype=torch.float32),
+    )
+
+
+minimax_m3_fused_norm_quant.register_fake(_fake_minimax_m3_fused_norm_quant)
 
 
 @custom_op("_C::rms_norm_gated", mutates_args=())
@@ -734,8 +797,10 @@ def swigluoai_and_mul(
     turn: bool = True,
 ) -> torch.Tensor:
     """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
+    d = x.shape[-1] // 2
+    gate = x[..., :d]
+    up = x[..., d:]
+    gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
     glu = gate * torch.sigmoid(gate * alpha)
     gated_output = (up + 1) * glu
@@ -750,13 +815,28 @@ def swigluoai_and_mul_cuda(
     axis: int = -1,
     turn: bool = True,
 ) -> torch.Tensor:
-    """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    glu = gate * torch.sigmoid(gate * alpha)
-    gated_output = (up + 1) * glu
-    return gated_output
+    """Kunlun swiglu_bias kernel: out = (up+beta)*gate*sigmoid(alpha*gate).
+
+    SwigluOAI uses beta=1.0 (i.e. up+1). swiglu_bias clamps gate at
+    swiglu_limit (upper) and linear/up at +/-swiglu_limit, matching the
+    native SwigluOAIAndMul semantics (verified by ut_swiglu_bias.py).
+    """
+    if not x.is_contiguous():
+        x = x.contiguous()
+    d = x.shape[-1] // 2
+    out = torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+    # x shape (..., 2d) -> flatten leading dims to (N, 2d); y -> (N, d)
+    x2d = x.reshape(-1, x.shape[-1])
+    y2d = out.reshape(-1, d)
+    kunlun_ops.swiglu_bias(
+        x2d,
+        y2d,
+        recv_counts=None,
+        swiglu_alpha=alpha,
+        swiglu_beta=1.0,
+        swiglu_limit=limit,
+    )
+    return out
 
 
 def _fake_swigluoai_and_mul(
@@ -767,8 +847,10 @@ def _fake_swigluoai_and_mul(
     turn: bool = True,
 ) -> torch.Tensor:
     """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
+    d = x.shape[-1] // 2
+    gate = x[..., :d]
+    up = x[..., d:]
+    gate = gate.clamp(max=limit)
     up = up.clamp(min=-limit, max=limit)
     glu = gate * torch.sigmoid(gate * alpha)
     gated_output = (up + 1) * glu
@@ -776,6 +858,67 @@ def _fake_swigluoai_and_mul(
 
 
 swigluoai_and_mul.register_fake(_fake_swigluoai_and_mul)
+
+
+@custom_op("_C::swiglu_bias", mutates_args=("y",))
+def swiglu_bias(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    recv_counts: Optional[torch.Tensor] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
+    swiglu_limit: float = 0.0,
+    force_sdnn: bool = True,
+) -> None:
+    """Apply the Kunlun SwigluOAI fused activation into ``y``."""
+    # SwigluOAI fused activation: out = gate/(1+exp(-alpha*gate)) * (linear+beta),
+    # gate = x[:, :n/2], linear = x[:, n/2:]; limit clamps the gate (0 == no clamp).
+    kunlun_ops.swiglu_bias(
+        x,
+        y,
+        recv_counts,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        force_sdnn,
+    )
+
+
+@impl("_C::swiglu_bias", "CUDA")
+def swiglu_bias_cuda(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    recv_counts: Optional[torch.Tensor] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
+    swiglu_limit: float = 0.0,
+    force_sdnn: bool = True,
+) -> None:
+    """Dispatch SwigluOAI activation to the Kunlun CUDA-compatible op."""
+    kunlun_ops.swiglu_bias(
+        x,
+        y,
+        recv_counts,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        force_sdnn,
+    )
+
+
+def _fake_swiglu_bias(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    recv_counts: Optional[torch.Tensor] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
+    swiglu_limit: float = 0.0,
+    force_sdnn: bool = True,
+) -> None:
+    return None
+
+
+swiglu_bias.register_fake(_fake_swiglu_bias)
 
 
 @custom_op("_C::moe_softmax_topk", mutates_args=())
@@ -1141,6 +1284,46 @@ def fake_gen_block_statistic(
 gen_block_statistic.register_fake(fake_gen_block_statistic)
 
 
+@custom_op("_C::minimax_m3_moe_gate", mutates_args=("output",))
+def minimax_m3_moe_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    """BF16-input/FP32-weight MiniMax router projection.
+
+    The installed Kunlun kernel consumes ``weight`` in ``[N, K]`` layout,
+    matching vLLM's ``ReplicatedLinear.weight`` and the checkpoint despite the
+    public ``kunlun_ops.moe_gate`` docstring currently saying ``[K, N]``.
+    """
+    kunlun_ops.moe_gate(x, weight, bias, output)
+
+
+@impl("_C::minimax_m3_moe_gate", "CUDA")
+def minimax_m3_moe_gate_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    """CUDA/XPU implementation of MiniMax-M3 MoE router gate projection."""
+    kunlun_ops.moe_gate(x, weight, bias, output)
+
+
+def fake_minimax_m3_moe_gate(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    """Fake implementation for torch.compile tracing of minimax_m3_moe_gate."""
+    return None
+
+
+minimax_m3_moe_gate.register_fake(fake_minimax_m3_moe_gate)
+
+
 @custom_op("_C::moe_pre_sorted", mutates_args=())
 def moe_pre_sorted(
     x: torch.Tensor,
@@ -1199,6 +1382,206 @@ def fake_moe_pre_sorted(
 
 
 moe_pre_sorted.register_fake(fake_moe_pre_sorted)
+
+
+@custom_op("_C::moe_ffn_pre_sorted_scale", mutates_args=())
+def moe_ffn_pre_sorted_scale(
+    x: torch.Tensor,
+    moe_index: torch.Tensor,
+    y: torch.Tensor,
+) -> None:
+    """Apply pre-sorted MoE FFN scaling to the output tensor."""
+    kunlun_ops.moe_ffn_pre_sorted_scale(x, moe_index, y)
+
+
+@impl("_C::moe_ffn_pre_sorted_scale", "CUDA")
+def moe_ffn_pre_sorted_scale_cuda(
+    x: torch.Tensor,
+    moe_index: torch.Tensor,
+    y: torch.Tensor,
+) -> None:
+    """CUDA/XPU implementation of moe_ffn_pre_sorted_scale."""
+    kunlun_ops.moe_ffn_pre_sorted_scale(x, moe_index, y)
+
+
+def fake_moe_ffn_pre_sorted_scale(
+    x: torch.Tensor,
+    moe_index: torch.Tensor,
+    y: torch.Tensor,
+) -> None:
+    """Fake implementation for torch.compile tracing of moe_ffn_pre_sorted_scale."""
+    return None
+
+
+moe_ffn_pre_sorted_scale.register_fake(fake_moe_ffn_pre_sorted_scale)
+
+
+def _moe_pre_sorted_quant_impl(
+    x: torch.Tensor,
+    topk_index: torch.Tensor,
+    block_statistic: torch.Tensor,
+    enable_pre_quant: bool,
+    min_pre_quant_tokens: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    num_tokens, hidden_size = x.shape
+    top_k = topk_index.shape[1]
+    num_experts = block_statistic.shape[1]
+    num_expanded_tokens = num_tokens * top_k
+
+    x_q = torch.empty(
+        (num_expanded_tokens, hidden_size),
+        dtype=torch.int8,
+        device=x.device,
+    )
+    x_scale = torch.empty(
+        (num_expanded_tokens, 1),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    moe_index = torch.empty(
+        num_expanded_tokens, dtype=torch.int32, device=x.device)
+    expert_m = torch.empty(num_experts, dtype=torch.int32, device=x.device)
+    sorted_tokens_num_lod = torch.empty(
+        num_experts + 1, dtype=torch.int32, device=x.device)
+
+    if enable_pre_quant and num_tokens >= min_pre_quant_tokens:
+        token_x_q = torch.empty_like(x, dtype=torch.int8)
+        token_x_scale = torch.empty(
+            (num_tokens, 1), dtype=torch.float32, device=x.device)
+        kunlun_ops.quant2d(
+            x=x,
+            y=token_x_q,
+            max=token_x_scale,
+            force_sdnn=True,
+        )
+        kunlun_ops.moe_pre_sorted(
+            token_x_q,
+            topk_index,
+            block_statistic,
+            x_q,
+            moe_index,
+            expert_m,
+            sorted_tokens_num_lod,
+        )
+        kunlun_ops.moe_ffn_pre_sorted_scale(
+            token_x_scale.view(-1),
+            moe_index.view(num_tokens, top_k),
+            x_scale.view(-1),
+        )
+    else:
+        expanded_x = torch.empty(
+            (num_expanded_tokens, hidden_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        kunlun_ops.moe_pre_sorted(
+            x,
+            topk_index,
+            block_statistic,
+            expanded_x,
+            moe_index,
+            expert_m,
+            sorted_tokens_num_lod,
+        )
+        kunlun_ops.quant2d(
+            x=expanded_x,
+            y=x_q,
+            max=x_scale,
+            force_sdnn=True,
+        )
+
+    return x_q, x_scale, moe_index, expert_m, sorted_tokens_num_lod
+
+
+@custom_op("_C::moe_pre_sorted_quant", mutates_args=())
+def moe_pre_sorted_quant(
+    x: torch.Tensor,
+    topk_index: torch.Tensor,
+    block_statistic: torch.Tensor,
+    enable_pre_quant: bool,
+    min_pre_quant_tokens: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Pre-sort MoE tokens and optionally apply dynamic W8A8 quantization."""
+    return _moe_pre_sorted_quant_impl(
+        x,
+        topk_index,
+        block_statistic,
+        enable_pre_quant,
+        min_pre_quant_tokens,
+    )
+
+
+@impl("_C::moe_pre_sorted_quant", "CUDA")
+def moe_pre_sorted_quant_cuda(
+    x: torch.Tensor,
+    topk_index: torch.Tensor,
+    block_statistic: torch.Tensor,
+    enable_pre_quant: bool,
+    min_pre_quant_tokens: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """CUDA/XPU implementation of MoE pre-sort + optional quantization."""
+    return _moe_pre_sorted_quant_impl(
+        x,
+        topk_index,
+        block_statistic,
+        enable_pre_quant,
+        min_pre_quant_tokens,
+    )
+
+
+def fake_moe_pre_sorted_quant(
+    x: torch.Tensor,
+    topk_index: torch.Tensor,
+    block_statistic: torch.Tensor,
+    enable_pre_quant: bool,
+    min_pre_quant_tokens: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fake implementation for torch.compile tracing of moe_pre_sorted_quant."""
+    num_tokens, hidden_size = x.shape
+    num_expanded_tokens = num_tokens * topk_index.shape[1]
+    num_experts = block_statistic.shape[1]
+    return (
+        torch.empty(
+            (num_expanded_tokens, hidden_size),
+            dtype=torch.int8,
+            device=x.device,
+        ),
+        torch.empty(
+            (num_expanded_tokens, 1),
+            dtype=torch.float32,
+            device=x.device,
+        ),
+        torch.empty(num_expanded_tokens, dtype=torch.int32, device=x.device),
+        torch.empty(num_experts, dtype=torch.int32, device=x.device),
+        torch.empty(num_experts + 1, dtype=torch.int32, device=x.device),
+    )
+
+
+moe_pre_sorted_quant.register_fake(fake_moe_pre_sorted_quant)
 
 
 @custom_op("_C::moe_fc", mutates_args=())
@@ -1360,14 +1743,14 @@ def moe_sigmoid_group_topk_norm(
     topk_group: int,
 ) -> None:
     kunlun_ops.moe_sigmoid_group_topk_norm(
-        x=x,
-        norm_score=norm_score,
-        topk_index=topk_index,
-        block_static=block_static,
-        bias=bias,
-        n_group=n_group,
-        topk_group=topk_group,
-        scale=scale,
+        x,
+        topk_index,
+        norm_score,
+        block_static,
+        bias,
+        scale,
+        n_group,
+        topk_group,
     )
 
 
@@ -1383,14 +1766,14 @@ def moe_sigmoid_group_topk_norm_cuda(
     topk_group: int,
 ) -> None:
     kunlun_ops.moe_sigmoid_group_topk_norm(
-        x=x,
-        norm_score=norm_score,
-        topk_index=topk_index,
-        block_static=block_static,
-        bias=bias,
-        n_group=n_group,
-        topk_group=topk_group,
-        scale=scale,
+        x,
+        topk_index,
+        norm_score,
+        block_static,
+        bias,
+        scale,
+        n_group,
+        topk_group,
     )
 
 
@@ -1949,6 +2332,87 @@ def _fake_quant2d(
 
 
 quant2d.register_fake(_fake_quant2d)
+
+
+##################################################
+# ---------- fused SwigluOAI + INT8 quant --------
+##################################################
+def _moe_swiglu_quant_impl(
+    x: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_rows = x.shape[0]
+    output_size = x.shape[1] // 2
+    x_q = torch.empty(
+        (num_rows, output_size), dtype=torch.int8, device=x.device)
+    x_scale = torch.empty(
+        (num_rows, 1), dtype=torch.float32, device=x.device)
+
+    # The public kunlun_ops wrapper fixes alpha/beta to 1/0 and limit_mode
+    # to 0. MiniMax-M3 requires alpha=1.702, beta=1, and limit_mode=1
+    # (gate upper clamp plus bilateral up clamp), so use the raw contract.
+    # use_sdnn=False fails with ret=1 above roughly 32K rows and is slower
+    # for the M3 width. SDNN supports decode through the 163840-row service
+    # profile with the same contract.
+    xpu_flash_ops.silu_and_mul_quant_unt(
+        x,
+        x_q,
+        x_scale,
+        None,
+        True,
+        True,
+        limit,
+        1,
+        alpha,
+        beta,
+    )
+
+    return x_q, x_scale
+
+
+@custom_op("_C::moe_swiglu_quant", mutates_args=())
+def moe_swiglu_quant(
+    x: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SwigluOAI activation with dynamic W8A8 quantization for MoE FFN."""
+    return _moe_swiglu_quant_impl(x, alpha, beta, limit)
+
+
+@impl("_C::moe_swiglu_quant", "CUDA")
+def moe_swiglu_quant_cuda(
+    x: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """CUDA/XPU implementation of moe_swiglu_quant."""
+    return _moe_swiglu_quant_impl(x, alpha, beta, limit)
+
+
+def fake_moe_swiglu_quant(
+    x: torch.Tensor,
+    alpha: float,
+    beta: float,
+    limit: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile tracing of moe_swiglu_quant."""
+    return (
+        torch.empty(
+            (x.shape[0], x.shape[1] // 2),
+            dtype=torch.int8,
+            device=x.device,
+        ),
+        torch.empty(
+            (x.shape[0], 1), dtype=torch.float32, device=x.device),
+    )
+
+
+moe_swiglu_quant.register_fake(fake_moe_swiglu_quant)
 
 
 ##################################################

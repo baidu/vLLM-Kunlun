@@ -116,11 +116,63 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
     def __init__(self, *args, **kwargs):
         global _oot_gemma_rms_norm_init_logged
         super().__init__(*args, **kwargs)
+        self.register_buffer(
+            "_fused_weight",
+            None,
+            persistent=False,
+        )
+        self._fused_weight_ready = False
         if not _oot_gemma_rms_norm_init_logged:
             logger.info(
                 "[KunlunOOT] KunlunGemmaRMSNorm.__init__ called (OOT instantiation)"
             )
             _oot_gemma_rms_norm_init_logged = True
+
+    def refresh_fused_weight(self) -> None:
+        """Cache the plain-RMSNorm weight expected by the fused quant op."""
+        with torch.no_grad():
+            if (
+                self._fused_weight is None
+                or self._fused_weight.device != self.weight.device
+            ):
+                self._fused_weight = torch.empty_like(
+                    self.weight, dtype=torch.float32
+                )
+            self._fused_weight.copy_(self.weight.detach().float()).add_(1.0)
+        self._fused_weight_ready = True
+
+    def forward_quantized_oot(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused Gemma add-RMSNorm and dynamic symmetric INT8 quantization."""
+        if residual is None:
+            raise ValueError("fused norm quant requires a residual input")
+        if not self._fused_weight_ready or self._fused_weight is None:
+            raise RuntimeError(
+                "fused Gemma RMSNorm weight was not initialized after loading"
+            )
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if not residual.is_contiguous():
+            residual = residual.contiguous()
+
+        x_shape = x.shape
+        x_2d = x.view(-1, x_shape[-1])
+        residual_2d = residual.view(-1, x_shape[-1])
+        norm_out, residual_out, quant_out, quant_max = (
+            torch.ops._C.minimax_m3_fused_norm_quant(
+                x_2d,
+                residual_2d,
+                self._fused_weight,
+                self.variance_epsilon,
+            )
+        )
+        if len(x_shape) != 2:
+            norm_out = norm_out.view(x_shape)
+            residual_out = residual_out.view(x_shape)
+        return norm_out, residual_out, quant_out, quant_max
 
     @staticmethod
     def forward_xpu(

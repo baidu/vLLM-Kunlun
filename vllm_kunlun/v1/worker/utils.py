@@ -12,7 +12,15 @@ hook is installed, ensuring upstream is loaded first.
 """
 
 import logging
+import sys
+from collections import defaultdict
+from typing import Any
 
+import torch
+
+import vllm.v1.worker.utils as _upstream_utils
+from vllm.model_executor.models.utils import extract_layer_index
+from vllm.platforms import current_platform
 from vllm.v1.worker.utils import KVBlockZeroer as _upstream_cls
 
 logger = logging.getLogger("vllm_kunlun")
@@ -136,3 +144,75 @@ if not getattr(_upstream_cls, "_kunlun_patched", False):
     logger.info(
         "[KunlunPlugin] KVBlockZeroer patched in vllm_kunlun/v1/worker/utils.py"
     )
+
+
+def _kunlun_allows_multi_attention_layer_index() -> bool:
+    is_kunlun = getattr(current_platform, "is_kunlun", None)
+    if callable(is_kunlun) and is_kunlun():
+        return True
+    return (
+        current_platform.is_out_of_tree()
+        and getattr(current_platform, "device_name", None) == "cuda"
+        and getattr(current_platform, "device_type", None) == "cuda"
+    )
+
+
+def _kunlun_bind_kv_cache(
+    kv_caches: dict[str, torch.Tensor],
+    forward_context: dict[str, Any],
+    runner_kv_caches: list[torch.Tensor],
+    num_attn_module: int = 1,
+) -> None:
+    """Kunlun-compatible ``bind_kv_cache``.
+
+    Upstream already permits multiple attention cache names sharing one layer
+    index on CUDA/ROCm/XPU/CPU. Kunlun intentionally stays PlatformEnum.OOT
+    while exposing tensors as ``cuda`` devices, so MiniMax-M3's main cache plus
+    ``.index_cache`` side cache hit upstream's fallback NotImplementedError.
+    This keeps the upstream behavior and adds the narrow Kunlun OOT case only.
+    """
+
+    assert len(runner_kv_caches) == 0
+
+    index2name: dict[int, list[str]] = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        if len(layer_names) > 1:
+            if (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+                or _kunlun_allows_multi_attention_layer_index()
+            ):
+                pass
+            else:
+                raise NotImplementedError
+        for layer_name in layer_names:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
+
+
+def _patch_bind_kv_cache_aliases() -> None:
+    if getattr(_upstream_utils.bind_kv_cache, "_kunlun_patched", False):
+        return
+
+    _kunlun_bind_kv_cache._kunlun_patched = True
+    _upstream_utils.bind_kv_cache = _kunlun_bind_kv_cache
+
+    for module_name in (
+        "vllm.v1.worker.gpu_model_runner",
+        "vllm.v1.worker.gpu.attn_utils",
+    ):
+        mod = sys.modules.get(module_name)
+        if mod is not None and hasattr(mod, "bind_kv_cache"):
+            mod.bind_kv_cache = _kunlun_bind_kv_cache
+
+    logger.info("[KunlunPlugin] bind_kv_cache patched for Kunlun OOT side caches")
+
+
+_patch_bind_kv_cache_aliases()

@@ -9,6 +9,14 @@ if TYPE_CHECKING:
     ENABLE_VLLM_INFER_HOOK: bool = (False,)
     ENABLE_VLLM_OPS_HOOK: bool = (False,)
     ENABLE_VLLM_MODULE_HOOK: bool = False
+    VLLM_KUNLUN_DISABLE_MOE_PRE_QUANT: bool = False
+    VLLM_KUNLUN_DISABLE_ROUTER_MOE_GATE: bool = False
+    VLLM_KUNLUN_DISABLE_XSPEED_SHARED_GATE: bool = False
+    VLLM_KUNLUN_DISABLE_FUSED_SWIGLU_QUANT: bool = False
+    VLLM_KUNLUN_DISABLE_FUSED_DENSE_SWIGLU_QUANT: bool = False
+    VLLM_KUNLUN_DISABLE_FUSED_NORM_QUANT: bool = False
+    VLLM_KUNLUN_DISABLE_GRAMMAR_BITMASK: bool = False
+    VLLM_KUNLUN_DISABLE_MSA_SHORT_PREFILL_DENSE: bool = False
 
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
@@ -67,6 +75,60 @@ xvllm_environment_variables: dict[str, Callable[[], Any]] = {
     # use int8 bmm
     "VLLM_KUNLUN_ENABLE_INT8_BMM": lambda: (
         os.environ.get("VLLM_KUNLUN_ENABLE_INT8_BMM", "False").lower() in ("true", "1")
+    ),
+    # use the legacy BF16-dispatch-then-quantize MoE input path
+    "VLLM_KUNLUN_DISABLE_MOE_PRE_QUANT": lambda: (
+        os.environ.get("VLLM_KUNLUN_DISABLE_MOE_PRE_QUANT", "False").lower()
+        in ("true", "1")
+    ),
+    # use the original BF16->FP32 cast + ReplicatedLinear router path
+    "VLLM_KUNLUN_DISABLE_ROUTER_MOE_GATE": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_ROUTER_MOE_GATE", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # restore the legacy routed-topk + explicit shared-route assembly
+    "VLLM_KUNLUN_DISABLE_XSPEED_SHARED_GATE": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_XSPEED_SHARED_GATE", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # use the original BF16 SwigluOAI output followed by a separate quant2d
+    "VLLM_KUNLUN_DISABLE_FUSED_SWIGLU_QUANT": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_FUSED_SWIGLU_QUANT", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # use dense BF16 SwigluOAI followed by the linear kernel's quant2d
+    "VLLM_KUNLUN_DISABLE_FUSED_DENSE_SWIGLU_QUANT": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_FUSED_DENSE_SWIGLU_QUANT", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # use Gemma add-RMSNorm followed by a separate dynamic INT8 quantization
+    "VLLM_KUNLUN_DISABLE_FUSED_NORM_QUANT": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_FUSED_NORM_QUANT", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # restore xgrammar's torch-native structured-output bitmask path
+    "VLLM_KUNLUN_DISABLE_GRAMMAR_BITMASK": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_GRAMMAR_BITMASK", "False"
+        ).lower()
+        in ("true", "1")
+    ),
+    # keep all-block (<= sparse top-k width) prefill on the sparse pipeline
+    "VLLM_KUNLUN_DISABLE_MSA_SHORT_PREFILL_DENSE": lambda: (
+        os.environ.get(
+            "VLLM_KUNLUN_DISABLE_MSA_SHORT_PREFILL_DENSE", "False"
+        ).lower()
+        in ("true", "1")
     ),
 }
 
