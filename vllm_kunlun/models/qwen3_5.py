@@ -26,6 +26,7 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
@@ -52,6 +53,7 @@ from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -66,6 +68,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -87,9 +90,17 @@ from vllm_kunlun.transformers_utils.configs.qwen3_5 import (
     Qwen3_5TextConfig,
 )
 from vllm_kunlun.transformers_utils.configs.qwen3_5_moe import (
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeTextConfig,
+    Qwen3_5MoeConfig as KunlunQwen3_5MoeConfig,
 )
+from vllm_kunlun.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
+
+try:
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig as HFQwen3_5MoeConfig,
+    )
+except ImportError:
+    HFQwen3_5MoeConfig = None
+
 
 from .qwen3_next import (
     Qwen3NextAttention,
@@ -99,6 +110,9 @@ from .qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
 )
+
+if TYPE_CHECKING:
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 logger = init_logger(__name__)
 
@@ -110,10 +124,21 @@ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+        expected_types = (KunlunQwen3_5MoeConfig,)
+
+        if HFQwen3_5MoeConfig is not None:
+            expected_types += (HFQwen3_5MoeConfig,)
+        return self.ctx.get_hf_config(expected_types)
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+        )
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
@@ -517,6 +542,8 @@ class Qwen3_5ForCausalLMBase(
     HasInnerState,
     SupportsLoRA,
     SupportsPP,
+    IsHybrid,
+    SupportsMRoPE,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -529,6 +556,21 @@ class Qwen3_5ForCausalLMBase(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
+
+    # Checkpoints produced by transformers >= v4.52 for the Qwen3.5 family
+    # nest the text decoder under a "language_model" submodule even for the
+    # text-only (no vision tower) variant registered here, e.g.
+    # "model.language_model.layers.0..." / "model.language_model.embed_tokens.weight"
+    # while this standalone CausalLM's own module tree is flat:
+    # "model.layers.0..." / "model.embed_tokens.weight". Strip the extra
+    # "language_model." segment so AutoWeightsLoader can match parameters.
+    # "lm_head." is already top-level in both the checkpoint and this class,
+    # so it needs no remapping.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+        }
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -568,6 +610,43 @@ class Qwen3_5ForCausalLMBase(
             self.model.make_empty_intermediate_tensors
         )
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -596,7 +675,31 @@ class Qwen3_5ForCausalLMBase(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list["MultiModalFeatureSpec"],
+    ) -> tuple[torch.Tensor, int]:
+        """M-RoPE positions for the text-only Qwen3.5(-MoE) CausalLM.
+
+        This architecture is registered without a vision tower, so
+        ``mm_features`` is always empty here. The HF config still carries
+        ``mrope_section``/``mrope_interleaved`` in ``rope_parameters``
+        (inherited from the Qwen3-VL rope layout), which makes
+        ``ModelConfig.uses_mrope`` return True purely from the config —
+        the V1 GPU model runner then requires every model it runs to
+        implement ``SupportsMRoPE``, regardless of multimodal support.
+
+        For pure text, M-RoPE degenerates to plain 1D position ids
+        broadcast across the 3 (T/H/W) sections, matching the text-only
+        fallback used by Qwen2-VL/Qwen3-VL when no image/video is present.
+        """
+        text_len = len(input_tokens)
+        llm_positions = torch.arange(text_len).expand(3, -1)
+        mrope_position_delta = 0
+        return llm_positions, mrope_position_delta
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
@@ -841,7 +944,9 @@ class Qwen3_5MoeForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
+        config: KunlunQwen3_5MoeConfig | HFQwen3_5MoeConfig = (
+            vllm_config.model_config.hf_config
+        )
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
 

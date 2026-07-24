@@ -31,6 +31,8 @@ model_hosting_container_standards
 xgrammar
 lm-format-enforcer
 ijson
+py-cpuinfo
+model-hosting-container-standards
 
 # basic
 hatchling>=1.25

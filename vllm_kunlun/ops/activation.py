@@ -18,7 +18,7 @@
 
 import torch
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.activation import SiluAndMul, GeluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
 
 
 @CustomOp.register_oot(name="SiluAndMul")

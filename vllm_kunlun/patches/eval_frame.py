@@ -45,12 +45,7 @@ import torch.utils.checkpoint
 from torch import _guards
 
 # see discussion at https://github.com/pytorch/pytorch/issues/120699
-from torch._C._dynamo.eval_frame import (  # noqa: F401
-    reset_code,
-    set_guard_error_hook,
-    skip_code,
-    unsupported,
-)
+from torch._C._dynamo.eval_frame import reset_code  # noqa: F401
 from torch._dispatch.python import enable_python_dispatcher
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch._utils_internal import justknobs_check, log_export_usage
