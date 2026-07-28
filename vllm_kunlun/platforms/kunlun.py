@@ -26,6 +26,13 @@ class KunlunPlatform(Platform):
     dist_backend: str = "nccl"
     ray_device_key: str = "GPU"
     device_name: str = "cuda"
+    # Kunlun XPU is exposed to torch via the CUDA runtime (xpytorch hook), and
+    # all Kunlun tensors report device.type == "cuda". Custom ops registered
+    # via direct_register_custom_op(dispatch_key=current_platform.dispatch_key)
+    # must therefore be attached to the "CUDA" dispatch key, otherwise the
+    # torch dispatcher will silently move CUDA inputs to CPU before invoking
+    # the kernel (root cause of the MLA CPU/CUDA mixed-device crash).
+    dispatch_key: str = "CUDA"
 
     @property
     def device_type(self):
@@ -35,6 +42,29 @@ class KunlunPlatform(Platform):
         The device type is always ``"cuda"``.
         """
         return "cuda"
+
+    _dedicated_capture_stream = None
+
+    def current_stream(self):
+        """
+        Return the stream vLLM uses for CUDA graph capture / replay.
+
+        On Kunlun XPU ``torch.cuda.current_stream()`` returns the default
+        (null) stream. CUDA graphs captured on the default stream come out
+        empty ("captured on wrong device or stream"), so every capture was a
+        no-op. Mirror the CUDA branch in
+        ``vllm.utils.torch_utils.current_stream`` by returning a dedicated,
+        non-default stream (created once per process) and making it the
+        process-wide current stream so capture, replay and normal execution
+        all share one capturable stream.
+        """
+        import torch
+
+        cls = type(self)
+        if cls._dedicated_capture_stream is None:
+            cls._dedicated_capture_stream = torch.cuda.Stream()
+            torch.cuda.set_stream(cls._dedicated_capture_stream)
+        return cls._dedicated_capture_stream
 
     def is_kunlun(self) -> bool:
         """is_kunlun"""
@@ -180,6 +210,35 @@ class KunlunPlatform(Platform):
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
 
+        # ------------------------------------------------------------------
+        # Kunlun compat: force MLA for glm_moe_dsa (GLM-5.2 GlmMoeDsaForCausalLM).
+        # vllm 0.15.1's is_deepseek_mla() only whitelists a fixed set of
+        # model_types; glm_moe_dsa is not on it, so model_arch_config.is_deepseek_mla
+        # is False and DeepseekV2Attention (which asserts topk_indices_buffer is
+        # None) gets picked instead of DeepseekV2MLAAttention. Overwrite the flag
+        # here, before any downstream code (backend selection, decoder layer
+        # construction) reads model_config.use_mla.
+        # ------------------------------------------------------------------
+        try:
+            if (
+                model_config is not None
+                and getattr(model_config, "model_arch_config", None) is not None
+                and not model_config.model_arch_config.is_deepseek_mla
+                and getattr(model_config.hf_text_config, "model_type", None)
+                == "glm_moe_dsa"
+                and getattr(model_config.hf_text_config, "kv_lora_rank", None)
+                is not None
+            ):
+                model_config.model_arch_config.is_deepseek_mla = True
+                logger.info(
+                    "[KunlunPlugin] forcing is_deepseek_mla=True for model_type=glm_moe_dsa"
+                )
+        except Exception as _exc:
+            logger.warning(
+                "[KunlunPlugin] failed to force is_deepseek_mla for glm_moe_dsa: %s",
+                _exc,
+            )
+
         if parallel_config.worker_cls == "auto":
             # v0.15.1 do not support v0.15.1, remove the if condition
             if vllm_config.speculative_config:
@@ -199,11 +258,21 @@ class KunlunPlatform(Platform):
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
             use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+            # v0.15.1 compat: attention backend selection moved from env var
+            # (VLLM_ATTENTION_BACKEND) into vllm_config.attention_config.backend
+            # (an AttentionBackendEnum). "not set" is now `backend is None`.
+            _attn_backend = getattr(
+                getattr(vllm_config, "attention_config", None), "backend", None
             )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            _attn_backend_name = (
+                _attn_backend.name if _attn_backend is not None else None
+            )
+            use_flashmla = (
+                _attn_backend_name is None or _attn_backend_name == "FLASHMLA"
+            )
+            from vllm.v1.attention.ops.flashmla import (
+                is_flashmla_dense_supported as is_flashmla_supported,
+            )
 
             if (
                 use_flashmla

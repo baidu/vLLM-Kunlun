@@ -149,7 +149,7 @@ def kunlun_build(
     prefill_metadata = None
     if num_prefills > 0:
         chunk_seq_ids = split_prefill_chunks(
-            common_attn_metadata.seq_lens_cpu,
+            common_attn_metadata.seq_lens_cpu[num_decodes:],
             self.max_prefill_buffer_size,
             num_decodes,
         )
@@ -223,4 +223,4 @@ DeepseekV32IndexerMetadataBuilder.build = kunlun_build
 # Monkey patch: Upgrade cudagraph_support to UNIFORM_BATCH for spec-decode compatibility
 from vllm.v1.attention.backend import AttentionCGSupport  # noqa
 
-DeepseekV32IndexerMetadataBuilder.cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+DeepseekV32IndexerMetadataBuilder._cudagraph_support = AttentionCGSupport.UNIFORM_BATCH

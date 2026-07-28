@@ -19,7 +19,7 @@ jobs:
 
       - name: Install tools
         run: |
-          pip install black isort ruff
+          pip install black==26.1.0 isort==5.13.2 ruff==0.14.14
 
       - name: Get changed python files
         id: changed

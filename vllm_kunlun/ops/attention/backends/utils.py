@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Type, TypeVar, Union
 import numpy as np
 import torch
 from vllm.attention import AttentionMetadata, AttentionMetadataBuilder, AttentionState
-from vllm.attention.backends.abstract import AttentionType
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
+from vllm.v1.attention.backend import AttentionType  # v0.15.1 compat
 
 logger = init_logger(__name__)
 

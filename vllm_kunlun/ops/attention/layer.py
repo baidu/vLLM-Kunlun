@@ -5,9 +5,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch.library import custom_op
-from vllm.attention import Attention as VllmAttention
-from vllm.attention import AttentionType
-from vllm.attention.layer import MultiHeadAttention as VllmMultiHeadAttention
+from vllm.attention.layer import Attention as VllmAttention
 from vllm.config import CacheConfig
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
@@ -15,8 +13,12 @@ from vllm.distributed.kv_transfer import (
     is_v1_kv_transfer_group,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention as VllmMultiHeadAttention,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.platforms import _Backend
+from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum as _Backend
 
 
 class Attention(VllmAttention):
