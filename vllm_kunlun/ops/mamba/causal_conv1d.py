@@ -77,6 +77,8 @@ def torch_causal_conv1d_update_spec(
     conv_state_indices=None,
     num_accepted_tokens=None,
 ):
+    if bias is not None:
+        bias = bias.to(weight.dtype)
     out = torch.empty_like(hidden_states)
     _, seq_len, hidden_size = hidden_states.shape
     for i in range(hidden_states.shape[0]):
@@ -89,7 +91,41 @@ def torch_causal_conv1d_update_spec(
 
         hidden_states_new = hidden_states_new.unsqueeze(0)
 
-        conv_state[conv_state_indices[i]] = hidden_states_new[:, -state_len:, :]
+        width = weight.shape[-1]
+        # The convolution below needs at least ``width`` input rows to produce a
+        # non-negative output length (F.conv1d output len = in_len - width + 1).
+        # On the real spec-decode path the concatenated stream is always long
+        # enough. During the dummy/warmup run (e.g. cudagraph capture) the
+        # constructed ``num_accepted_tokens`` can make ``2 + accepted + seq_len``
+        # shorter than ``width``, which would crash F.conv1d with a negative
+        # dimension. Left-pad (on the oldest side) with zeros to the minimum
+        # required length; this mirrors the community Triton kernel, which reads
+        # conv history through a bounded mask and treats out-of-range history as
+        # zero. The real path never hits this branch, so its numerics are
+        # unchanged.
+        min_len = width - 1 + seq_len
+        if hidden_states_new.shape[1] < min_len:
+            hidden_states_new = F.pad(
+                hidden_states_new, (0, 0, min_len - hidden_states_new.shape[1], 0)
+            )
+
+        # Roll the conv_state in a sliding-window manner, matching the
+        # community Triton kernel (``_causal_conv1d_update_kernel``). That
+        # kernel writes ``new_conv_state`` back with a masked store bounded by
+        # ``idx_tokens < state_len``, i.e. it fills only the leading valid rows
+        # of the cache slot and leaves the rest untouched -- it never requires
+        # the written window to exactly equal the physical ``state_len``.
+        #
+        # Here ``hidden_states_new[:, -state_len:, :]`` is the sliding window
+        # (history tail + new tokens). On the real spec-decode path its length
+        # is exactly ``state_len``; during the dummy/warmup run (seq_len==1,
+        # dummy num_accepted_tokens) it can be shorter. Writing into the front
+        # slice ``[:n]`` reproduces the kernel's masked store for both cases
+        # without zero-padding the cache (left-padding would corrupt the state
+        # with spurious zeros).
+        new_conv_state = hidden_states_new[:, -state_len:, :]
+        n = new_conv_state.shape[1]
+        conv_state[conv_state_indices[i]][:n, :] = new_conv_state[0]
         for j in range(seq_len):
             if j == seq_len - 1:
                 hidden_states_new_j = hidden_states_new
@@ -119,6 +155,7 @@ def causal_conv1d_update(
     conv_state_indices: Optional[torch.Tensor] = None,
     conv_state_indices_cpu: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    num_accepted_tokens_cpu: Optional[torch.Tensor] = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
@@ -187,30 +224,53 @@ def causal_conv1d_update(
         x = x.squeeze(-1).unsqueeze(1)
     else:
         x = x.squeeze(-1).view(-1, max_query_len, dim)
+    # if num_accepted_tokens is None:
+    # New ``causal_conv1d_update`` writes its output in-place into x.
+    # Drop the legacy ``state_seq_stride`` / ``act="SWISH"`` / paired
+    # ``*_cpu`` + ``*_xpu`` arguments.
+    silu_activation = activation in ("silu", "swish")
+    kunlun_ops.causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias=bias,
+        silu_activation=silu_activation,
+        cache_seqlens=None,
+        conv_state_indices=conv_state_indices,
+        is_ncw=False,
+        pad_slot_id=pad_slot_id,
+        num_accepted_tokens=num_accepted_tokens,
+    )
+    # if (
+    #     num_accepted_tokens is not None
+    # ):
+    #     # Binary-search: route the spec conv through the pure-torch reference.
+    #     x = torch_causal_conv1d_update_spec(
+    #         hidden_states=x,
+    #         conv_state=conv_state,
+    #         weight=weight,
+    #         bias=bias,
+    #         activation="silu" if silu_activation else None,
+    #         conv_state_indices=conv_state_indices,
+    #         num_accepted_tokens=num_accepted_tokens,
+    #     )
+    # else:
+    #     kunlun_ops.causal_conv1d_update(
+    #         x,
+    #         conv_state,
+    #         weight,
+    #         bias=bias,
+    #         silu_activation=silu_activation,
+    #         cache_seqlens=None,
+    #         conv_state_indices=conv_state_indices,
+    #         is_ncw=False,
+    #         pad_slot_id=pad_slot_id,
+    #         num_accepted_tokens=num_accepted_tokens,
+    #     )
     if num_accepted_tokens is None:
-        # New ``causal_conv1d_update`` writes its output in-place into x.
-        # Drop the legacy ``state_seq_stride`` / ``act="SWISH"`` / paired
-        # ``*_cpu`` + ``*_xpu`` arguments.
-        silu_activation = activation in ("silu", "swish")
-        kunlun_ops.causal_conv1d_update(
-            x,
-            conv_state,
-            weight,
-            bias=bias,
-            silu_activation=silu_activation,
-            cache_seqlens=None,
-            conv_state_indices=conv_state_indices,
-            is_ncw=False,
-            pad_slot_id=pad_slot_id,
-        )
+        # non-spec decode: x is [batch, 1, dim] -> [batch, dim]
         return x.squeeze(1)
-    else:
-        return torch_causal_conv1d_update_spec(
-            x,
-            conv_state,
-            weight,
-            bias,
-            activation,
-            conv_state_indices=conv_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-        )
+    # spec (MTP) decode: x is [num_spec_decodes, max_query_len, dim];
+    # flatten back to [num_tokens, dim] to match the caller's layout
+    # (mixed_qkv_spec[:actual_num] = <return>).
+    return x.reshape(-1, dim)
