@@ -121,7 +121,7 @@ sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
 ## Applying PyTorch patches
 
 ```
-python vllm_kunlun/patches/patch_torch251.py
+python vllm_kunlun/patches/patch_vllm_compat.py
 ```
 
 ## Install Kunlun-related packages
