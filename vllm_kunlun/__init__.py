@@ -194,7 +194,7 @@ def _deepseek_v4_cache_apply(mod):
     # Kunlun Triton also cannot execute _compute_global_topk_indices_and_lens
     # and _combine_topk_swa_indices (CUDA_ERROR_NOT_SUPPORTED). Replace the
     # public helpers in this namespace with PyTorch equivalents.
-    from vllm_kunlun.ops.deepseek_v4_topk import (
+    from vllm_kunlun.ops.deepseek_v4_sparse_index import (
         compute_global_topk_indices_and_lens_pytorch as _kunlun_compute_global,
         combine_topk_swa_indices_pytorch as _kunlun_combine_topk_swa,
     )
@@ -922,7 +922,7 @@ def _mhc_tilelang_applied(mod):
 
 
 def _mhc_tilelang_apply(mod):
-    from vllm_kunlun.ops.mhc import (
+    from vllm_kunlun.ops.hyper_connection import (
         mhc_fused_post_pre_tilelang,
         mhc_post_tilelang,
         mhc_pre_tilelang,
@@ -947,7 +947,7 @@ _register_post_import_hook(
 def _v4_model_mhc_applied(mod):
     fn = getattr(mod, "mhc_pre_tilelang", None)
     mhc_applied = fn is not None and getattr(fn, "__module__", "") == (
-        "vllm_kunlun.ops.mhc"
+        "vllm_kunlun.ops.hyper_connection"
     )
     patched_classes = (
         getattr(mod, "DeepseekV4DecoderLayer", None),
@@ -968,7 +968,7 @@ def _v4_model_mhc_applied(mod):
     )
     head_fn = getattr(mod, "hc_head_fused_kernel_tilelang", None)
     head_patched = head_fn is not None and getattr(head_fn, "__module__", "") == (
-        "vllm_kunlun.ops.mhc"
+        "vllm_kunlun.ops.hyper_connection"
     )
     return (
         mhc_applied
@@ -981,7 +981,7 @@ def _v4_model_mhc_applied(mod):
 
 def _v4_model_mhc_apply(mod):
     _v4_attention_alias_apply(mod)
-    from vllm_kunlun.ops.mhc import (
+    from vllm_kunlun.ops.hyper_connection import (
         hc_head_fused_kernel_kunlun,
         mhc_fused_post_pre_tilelang,
         mhc_post_tilelang,
@@ -1431,7 +1431,7 @@ def _v4_o_proj_applied(mod):
 
 
 def _v4_o_proj_apply(mod):
-    from vllm_kunlun.ops.deep_gemm import deepseek_v4_bf16_o_proj
+    from vllm_kunlun.ops.deepseek_v4_o_proj import deepseek_v4_bf16_o_proj
 
     mod.deep_gemm_fp8_o_proj = deepseek_v4_bf16_o_proj
     logging.getLogger("vllm_kunlun").info(
