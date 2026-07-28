@@ -11,171 +11,9 @@ import warnings
 from typing import Optional
 
 import cocopod  # noqa
+import kunlun_ops
 import torch
-import xspeedgate_ops  # noqa
 from einops import rearrange
-
-from .index import prepare_chunk_indices, prepare_chunk_offsets
-from .l2norm import l2norm_fwd
-from .utils import SUPPRESS_LEVEL, input_guard
-
-
-def chunk_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-):
-    chunk_size = 64
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
-    )
-    chunk_offsets = (
-        prepare_chunk_offsets(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
-
-    g = torch.ops.xspeedgate_ops.chunk_local_cumsum(
-        g,
-        chunk_size=64,
-        reverse=False,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        head_first=False,
-    )
-
-    A = torch.ops.xspeedgate_ops.chunk_scaled_dot_kkt_fwd(
-        k, beta, g, cu_seqlens, chunk_indices, chunk_size
-    )
-
-    torch.ops.xspeedgate_ops.solve_tril_ns(A, cu_seqlens, chunk_indices, chunk_size)
-
-    """
-    B, T, Hg, K, V = *k.shape, v.shape[-1]
-    H = v.shape[-2]
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, H, K)
-    for i in range(len(cu_seqlens)-1):
-        k_i = k[:, cu_seqlens[i]:cu_seqlens[i+1], :, :]
-        v_i = v[:, cu_seqlens[i]:cu_seqlens[i+1], :, :]
-        beta_i = beta[:, cu_seqlens[i]:cu_seqlens[i+1], :]
-        A_i = A[:, cu_seqlens[i]:cu_seqlens[i+1], :, :]
-        g_i = g[:, cu_seqlens[i]:cu_seqlens[i+1], :]
-
-        w_i, u_i = recompute_w_u_fwd_torch(
-            k=k_i,
-            v=v_i,
-            beta=beta_i,
-            A=A_i,
-            g=g_i,
-        )
-        w[:, cu_seqlens[i]:cu_seqlens[i+1], :, :] = w_i
-        u[:, cu_seqlens[i]:cu_seqlens[i+1], :, :] = u_i
-    """
-    w, u = torch.ops.xspeedgate_ops.recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=64,
-    )
-    """
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
-    """
-    h, v_new, final_state = torch.ops.xspeedgate_ops.chunk_gated_delta_rule_fwd_h(
-        k,
-        u,
-        w,
-        g,
-        initial_state,
-        cu_seqlens,
-        chunk_indices,
-        chunk_offsets.to(torch.int32),
-        chunk_size,
-        output_final_state,
-        True,
-    )
-
-    o = torch.ops.xspeedgate_ops.chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=64,
-    )
-    """
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-    )
-    """
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
-
-
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-
-    @staticmethod
-    @input_guard
-    @torch.amp.custom_fwd(device_type="cuda")
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        scale: float,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: Optional[torch.LongTensor] = None,
-        use_qk_l2norm_in_kernel: bool = False,
-    ):
-        if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
-
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-        )
-        ctx.scale = scale
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        return o.to(q.dtype), final_state
 
 
 @torch.compiler.disable
@@ -257,9 +95,6 @@ def chunk_gated_delta_rule(
     """
     assert q.dtype == k.dtype == v.dtype
     assert (
-        q.dtype != torch.float32
-    ), "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert (
         len(beta.shape) == 3
     ), "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
 
@@ -294,47 +129,46 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if False:
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        g = g.contiguous()
-        beta = beta.contiguous()
-        initial_state = initial_state.contiguous()
-
-        o = torch.empty_like(v)
-        final_state = torch.empty_like(initial_state)
-        import kunlun_ops
-
-        kunlun_ops.gated_delta_rule(
-            q,
-            k,
-            v,
-            initial_state,
-            g,
-            beta,
-            final_state,
-            o,
-            scale,
-            cu_seqlens.cpu(),
-            cu_seqlens,
-            cu_seqlens.cpu(),
-            cu_seqlens,
-            use_qk_l2norm_in_kernel=True,
-        )
+    # Use fused single-operator kernel from kunlun_ops
+    # Kernel requires specific dtype combinations for g/beta/initial_state (aux_dtype):
+    #   bf16 qkv -> fp32,  fp16 qkv -> fp16,  fp32 qkv -> fp32
+    if q.dtype == torch.float16:
+        aux_dtype = torch.float16
     else:
-        o, final_state = ChunkGatedDeltaRuleFunction.apply(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            initial_state,
-            output_final_state,
-            cu_seqlens,
-            use_qk_l2norm_in_kernel,
-        )
+        aux_dtype = torch.float32
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.to(aux_dtype).contiguous()
+    beta = beta.to(aux_dtype).contiguous()
+    initial_state = initial_state.to(aux_dtype).contiguous()
+
+    o = torch.empty_like(v)
+    ht = torch.empty_like(initial_state)
+
+    if cu_seqlens is not None:
+        cu_seqlens_arg = cu_seqlens.to(torch.int32).cpu()
+    else:
+        cu_seqlens_arg = torch.tensor([0, q.shape[1]], dtype=torch.int32)
+
+    kunlun_ops.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        initial_state,
+        o,
+        ht,
+        cu_seqlens_arg,
+        False,  # head_first always False (handled above)
+        use_qk_l2norm_in_kernel,
+    )
+
+    final_state = ht if output_final_state else None
+
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, final_state

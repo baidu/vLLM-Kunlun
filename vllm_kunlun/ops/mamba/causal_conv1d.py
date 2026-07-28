@@ -31,47 +31,38 @@ def causal_conv1d_fn(
     if not x.is_contiguous():
         x = x.contiguous()
 
-    out = torch.empty_like(x)
-
-    x_shape = x.shape
-    dim = x_shape[-1]
-    cu_seqlen = x_shape[-2]
-    width = weight.shape[-1]
-
     assert (
         conv_states is not None
     ), "conv_states is required for kunlun causal_conv1d_fn"
-    num_cache_lines = conv_states.shape[0]
-    state_width = conv_states.shape[-2]
-    stride = conv_states.stride(0)
     assert (
         query_start_loc is not None
     ), "query_start_loc is required for kunlun causal_conv1d_fn"
-    batch_size = query_start_loc.shape[0] - 1
 
-    kunlun_ops.causal_conv1d_fn(
+    silu_activation = activation in ("silu", "swish")
+
+    # New _fusion.py API expects query_start_loc_cpu as a Python list of ints.
+    qsl_cpu = query_start_loc_cpu
+    if qsl_cpu is not None and isinstance(qsl_cpu, torch.Tensor):
+        qsl_cpu = qsl_cpu.tolist()
+
+    # causal_conv1d_fwd mutates x in-place (NWC, is_ncw=False) and returns a
+    # status int (0 = success; non-zero raises in the C++ binding).
+    # x is (cu_seqlen, dim); conv_states is (num_cache_lines, state_len, dim).
+    kunlun_ops.causal_conv1d_fwd(
         x,
-        out,
-        dim,
-        cu_seqlen,
         weight,
-        width,
-        conv_states,
-        num_cache_lines,
-        state_width,
-        query_start_loc_cpu,
-        query_start_loc,
-        batch_size,
-        bias,
-        cache_indices_cpu=cache_indices_cpu,
-        cache_indices_xpu=cache_indices,
-        has_initial_state_cpu=has_initial_state_cpu,
-        has_initial_state_xpu=has_initial_state,
-        act="SWISH",
-        state_seq_stride=stride,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        silu_activation=silu_activation,
+        is_ncw=False,
+        query_start_loc_cpu=qsl_cpu,
+        pad_slot_id=pad_slot_id,
     )
 
-    return out
+    return x
 
 
 def torch_causal_conv1d_update_spec(
@@ -194,25 +185,21 @@ def causal_conv1d_update(
     else:
         x = x.squeeze(-1).view(-1, max_query_len, dim)
     if num_accepted_tokens is None:
-        out = torch.empty_like(x)
-        import kunlun_ops
-
-        stride = conv_state.stride()[0]
+        # New _fusion.py API: mutates x in-place (NWC, is_ncw=False) and
+        # returns a status int (0 = success; non-zero raises in the C++ binding).
+        # x is (batch, 1, dim); conv_state is (num_cache_lines, state_len, dim).
         kunlun_ops.causal_conv1d_update(
             x,
-            weight,
-            out,
             conv_state,
-            None,
-            bias,
-            conv_state_indices_cpu=conv_state_indices_cpu,
-            conv_state_indices_xpu=conv_state_indices,
-            act="SWISH",
-            state_seq_stride=stride,
+            weight,
+            bias=bias,
+            silu_activation=activation in ("silu", "swish"),
+            conv_state_indices=conv_state_indices,
             is_ncw=False,
+            pad_slot_id=pad_slot_id,
         )
-        out = out.squeeze(1)
-        return out
+        x = x.squeeze(1)
+        return x
     else:
         return torch_causal_conv1d_update_spec(
             x,

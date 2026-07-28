@@ -80,3 +80,9 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         if isinstance(layer, FusedMoE):
             return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
+
+
+class KunlunCompressedTensorsKVCacheMethod(CompressedTensorsKVCacheMethod):
+    """
+    TODO(lzy): support per-channel scale.
+    """

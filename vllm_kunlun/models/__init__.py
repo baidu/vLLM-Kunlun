@@ -26,9 +26,10 @@ def register_model():
     #     "Qwen3ForCausalLM",
     #     "vllm_kunlun.models.qwen3:Qwen3ForCausalLM")
 
-    # ModelRegistry.register_model(
-    #     "Qwen3MoeForCausalLM",
-    #     "vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM")
+    ModelRegistry.register_model(
+        "Qwen3MoeForCausalLM",
+        "vllm_kunlun.models.qwen3_moe:Qwen3MoeForCausalLM",
+    )
 
     ModelRegistry.register_model(
         "Qwen3NextForCausalLM", "vllm_kunlun.models.qwen3_next:Qwen3NextForCausalLM"
@@ -96,6 +97,11 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3_5MoeForConditionalGeneration",
         "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MoeForCausalLM",
+        "vllm_kunlun.models.qwen3_5:Qwen3_5MoeForCausalLM",
     )
 
     ModelRegistry.register_model(
