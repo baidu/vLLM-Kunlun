@@ -416,7 +416,7 @@ class KunlunOps:
                 normed_score=normed_score,
                 topk_index=topk_ids,
                 block_statistic=None,
-                stable=False,
+                stable=True,
             )
         elif scoring_func == "sigmoid":
             torch.ops._C.moe_sigmoid_group_topk_norm(
@@ -578,6 +578,8 @@ class KunlunOps:
                 sorted_tokens_idx=sorted_tokens_idx,
                 moe_topk=moe_top_k,
                 y=y,
+                topk_ids=topk_ids,
+                act=None,
             )
             # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
             # needed.
@@ -599,6 +601,8 @@ class KunlunOps:
                 sorted_tokens_idx=sorted_tokens_idx,
                 moe_topk=moe_top_k,
                 y=out,
+                topk_ids=topk_ids,
+                act=None,
             )
 
             output = torch.empty(

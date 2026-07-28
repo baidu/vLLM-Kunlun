@@ -112,6 +112,16 @@ def register_model():
         "vllm_kunlun.models.gemma4_mm:Gemma4ForConditionalGeneration",
     )
 
+    ModelRegistry.register_model(
+        "Qwen3_5MTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MTP",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP",
+    )
+
 
 def register_quant_method():
     """to do"""
