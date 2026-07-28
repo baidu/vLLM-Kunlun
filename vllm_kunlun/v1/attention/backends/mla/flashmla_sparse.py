@@ -6,22 +6,28 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionLayer,
-    AttentionMetadata,
-)
-from vllm.attention.backends.utils import get_mla_dims
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonBaseImpl,
+    get_mla_dims,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.mla.common import MLACommonBaseImpl
-from vllm.v1.attention.backends.utils import (
+from vllm.utils.math_utils import cdiv  # v0.15.1 compat
+
+# v0.15.1 compat: vllm.attention.backends.abstract moved to vllm.v1.attention.backend;
+# get_mla_dims and MLACommonBaseImpl moved to vllm.model_executor.layers.attention.mla_attention;
+# AttentionCGSupport/AttentionMetadataBuilder/CommonAttentionMetadata now live in vllm.v1.attention.backend.
+from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
+    AttentionLayer,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
     split_decodes_and_prefills,
@@ -427,7 +433,7 @@ def kunlun_concat_and_cache_mla(
 
 @dataclass
 class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetadata]):
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
