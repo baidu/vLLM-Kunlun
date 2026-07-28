@@ -16,6 +16,7 @@
 #
 import copy
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,6 +33,7 @@ import kunlun_ops
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -54,6 +56,8 @@ import inspect
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -603,6 +607,13 @@ class KunlunAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
+        seq_start_loc = list(accumulate(seq_lens, initial=0))
+
+        seq_start_loc_tensor = torch.empty(
+            len(seq_start_loc), dtype=torch.int32, device=self.device
+        )
+        seq_start_loc_tensor.copy_(torch.as_tensor(seq_start_loc, dtype=torch.int32))
+
         kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
         kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
         kv_lod_xpu = kv_lod_cpu.to(self.device)
@@ -688,6 +699,26 @@ class KunlunAttentionMetadataBuilder:
 
 class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
     """KunlunAttentionImpl"""
+
+    @staticmethod
+    def _get_block_table_scale(key_cache: torch.Tensor) -> int:
+        contiguous_block_stride = (
+            key_cache.shape[1] * key_cache.shape[2] * key_cache.shape[3]
+        )
+        actual_block_stride = key_cache.stride(0)
+        if actual_block_stride == contiguous_block_stride:
+            return 1
+        if actual_block_stride % contiguous_block_stride != 0:
+            logger.warning(
+                "[KunlunAttention] unexpected KV cache block stride: "
+                "actual=%s contiguous=%s shape=%s stride=%s",
+                actual_block_stride,
+                contiguous_block_stride,
+                tuple(key_cache.shape),
+                tuple(key_cache.stride()),
+            )
+            return 1
+        return actual_block_stride // contiguous_block_stride
 
     def __init__(
         self,
@@ -794,7 +825,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     # and value tensors are not cached. This happens during
                     # the initial memory
                     value = value.contiguous()
-                    key = key.contiguous()
                     kunlun_ops.reshape_and_cache_flash(
                         key[: attn_metadata.num_actual_tokens],
                         value[: attn_metadata.num_actual_tokens],
@@ -822,23 +852,18 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             #   score = Q @ K^T * (1/sqrt(d)) * alpha
             # We want: score = Q @ K^T * self.scale
             # So: alpha = self.scale * sqrt(d) = self.scale / (1/sqrt(d))
-            import math
+            # import math
 
-            _prefill_alpha = self.scale * math.sqrt(self.head_size)
+            # _prefill_alpha = self.scale * math.sqrt(self.head_size)
 
-            # For hybrid Attention (Qwen3-Next.)
-            if key_cache.is_contiguous():
-                tmp_block_tables = prefill_meta.block_tables
-            else:
-                # For hybrid Attention (Qwen3-Next)
-                tmp_block_tables = prefill_meta.block_tables * 2
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = prefill_meta.block_tables * block_table_scale
 
             # Prefix cache or KV sharing layers (must read K/V from cache)
-            is_kv_sharing = self.kv_sharing_target_layer_name is not None
-            if (
-                is_kv_sharing
-                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
-            ):
+            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=key_cache,  # Key Cache [block_num, head, block_size, dim]
@@ -846,7 +871,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     is_prefix_cache=True,
-                    alpha=_prefill_alpha,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -869,7 +893,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
-                    alpha=_prefill_alpha,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -889,13 +912,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             ), "Encoder-only models should not have decode metadata."
             decode_query = query[:num_decode_tokens]
 
-            # For hybrid Attention (Qwen3-Next
-            if key_cache.is_contiguous():
-                tmp_block_tables = decode_meta.block_tables
-            else:
-                tmp_block_tables = (
-                    decode_meta.block_tables * 2
-                )  # only test in Qwen3-Next
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = decode_meta.block_tables * block_table_scale
 
             has_max_window_size = getattr(self, "_spec_attn_has_max_window_size", None)
             if has_max_window_size is None:
@@ -904,35 +925,76 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     in inspect.signature(kunlun_ops.speculative_attention).parameters
                 )
                 setattr(self, "_spec_attn_has_max_window_size", has_max_window_size)
-            if has_max_window_size:
-                # kunlun_ops.speculative_attention is not support max_window_size parameter in torch29
-                kunlun_ops.speculative_attention(
-                    out=output[:num_decode_tokens],
-                    # Only MLA support q len > 1 right now
-                    q=decode_query.unsqueeze(0),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                    context_lens_xpu=decode_meta.seq_lens_tensor,
-                    batch_num=decode_meta.block_tables.shape[0],
-                    # TODO (@xyDong23): Support MTP(q lens >1)
-                    qlen=1,
-                    # TODO (@xyDong23): Support max_context_len to (262144)
-                    max_context_len=decode_meta.max_model_len,
-                    head_num=self.num_heads,
-                    head_dim=self.head_size,
-                    scale=self.scale,
-                    kv_head_num=self.num_kv_heads,
-                    block_size=key_cache.shape[2],
-                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                    max_window_size=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    block_tables=tmp_block_tables,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
-                )
+
+            sig = inspect.signature(kunlun_ops.speculative_attention)
+            if "max_window_size" in sig.parameters:
+                batch_size = attn_metadata.num_decodes
+                query_seq_len, head_num, head_dim = decode_query.shape
+                if (
+                    not attn_metadata.is_speculative
+                    or batch_size == 0
+                    or query_seq_len == batch_size
+                ):
+                    kunlun_ops.speculative_attention(
+                        out=output[:num_decode_tokens],
+                        q=decode_query.unsqueeze(0),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        batch_num=decode_meta.block_tables.shape[0],
+                        qlen=1,
+                        max_context_len=decode_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=0.0,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                        max_window_size=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        block_tables=tmp_block_tables,
+                        sink=(
+                            self.sinks.to(torch.float32)
+                            if self.sinks is not None
+                            else None
+                        ),
+                    )
+                else:
+                    assert query_seq_len % batch_size == 0
+                    qlen = query_seq_len // batch_size
+                    out = output[:num_decode_tokens]
+                    kunlun_ops.speculative_attention(
+                        out=out.view(batch_size, qlen, head_num, self.head_size),
+                        q=decode_query.view(batch_size, qlen, head_num, head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        batch_num=batch_size,
+                        qlen=qlen,
+                        max_context_len=decode_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=0.0,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                        max_window_size=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        block_tables=tmp_block_tables,
+                        sink=(
+                            self.sinks.to(torch.float32)
+                            if self.sinks is not None
+                            else None
+                        ),
+                    )
             elif not attn_metadata.is_speculative:
                 kunlun_ops.paged_attention(
                     x=decode_query,
@@ -972,6 +1034,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
                     block_tables=tmp_block_tables,
                 )
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 

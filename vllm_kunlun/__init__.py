@@ -40,8 +40,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
     "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
-    # "vllm.model_executor.models.config": "vllm_kunlun.models.config",
-    # "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
 }
 
@@ -201,6 +200,26 @@ def _activation_apply(mod):
 _register_post_import_hook(
     "vllm.model_executor.layers.activation", _activation_applied, _activation_apply
 )
+
+
+# --- hook 6: EagleProposer padded-batch helpers ---------------------------
+# EagleProposer 的 prepare_next_token_ids_padded / prepare_inputs_padded /
+# _update_positions_dependent_metadata
+def _eagle_applied(mod):
+    cls = getattr(mod, "EagleProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "prepare_next_token_ids_padded", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _eagle_apply(mod):
+    if not hasattr(mod, "EagleProposer"):
+        return
+    import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401  (self-applies on import)
+
+
+_register_post_import_hook("vllm.v1.spec_decode.eagle", _eagle_applied, _eagle_apply)
 
 
 def _preload_mapped(full_name):
