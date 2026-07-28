@@ -17,8 +17,8 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention as VllmMultiHeadAttention,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.platforms import _Backend
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum as _Backend
 
 
 class Attention(VllmAttention):

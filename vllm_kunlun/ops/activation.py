@@ -37,3 +37,7 @@ if not getattr(_upstream_cls, "_kunlun_silu_and_mul_patched", False):
     _upstream_cls.forward_native = _forward_native
     _upstream_cls._kunlun_silu_and_mul_patched = True
     logger.info("[KunlunPlugin] SiluAndMul patched in vllm_kunlun/ops/activations.py")
+
+# Re-export so callers can `from vllm_kunlun.ops.activation import SiluAndMul`
+# and get the patched class.
+SiluAndMul = _upstream_cls

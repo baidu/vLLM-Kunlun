@@ -33,7 +33,6 @@ import torch
 from torch import nn
 from torch.library import custom_op
 from transformers import DeepseekV2Config, DeepseekV3Config
-from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
@@ -45,7 +44,10 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -53,7 +55,10 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttention
+from vllm.model_executor.layers.mla import MLAModules
+from vllm.model_executor.layers.mla import (
+    MultiHeadLatentAttentionWrapper as MultiHeadLatentAttention,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -72,6 +77,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -80,6 +86,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
 from vllm_kunlun.ops.activation import SiluAndMul
 from vllm_kunlun.ops.attention.layer import Attention
@@ -400,19 +407,21 @@ class DeepseekV2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        if rope_scaling:
+        if rope_scaling and "factor" in rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
+        # v0.15.1 compat: get_rope() now takes rope_parameters (a single dict)
+        # instead of separate rotary_dim/base/rope_scaling kwargs.
+        _rope_parameters = dict(rope_scaling) if rope_scaling else {}
+        _rope_parameters.setdefault("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=_rope_parameters,
             is_neox_style=False,
         )
 
-        if rope_scaling:
+        if rope_scaling and "factor" in rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
@@ -704,6 +713,10 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        # IndexCache skip flag; set from DeepseekV2MLAAttention after construction.
+        # When True, this layer reuses the topk indices computed by the previous
+        # non-skipped layer instead of running the sparse indexer kernel.
+        self._skip_topk = False
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -724,13 +737,18 @@ class Indexer(nn.Module):
                 - (self.max_model_len % cache_config.block_size)
             )
         self.prefix = prefix
-        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
+        from vllm_kunlun.v1.attention.backends.mla.indexer import (
+            get_max_prefill_buffer_size,
+        )
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
+        if self._skip_topk:
+            # Reuse topk indices from the previous non-skipped layer.
+            return self.topk_indices_buffer
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
@@ -883,17 +901,19 @@ class DeepseekV2MLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        if rope_scaling:
+        if rope_scaling and "factor" in rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
+        # v0.15.1 compat: get_rope() now takes rope_parameters (a single dict)
+        # instead of separate rotary_dim/base/rope_scaling kwargs.
+        _rope_parameters = dict(rope_scaling) if rope_scaling else {}
+        _rope_parameters.setdefault("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=_rope_parameters,
             is_neox_style=False,
         )
-        if rope_scaling:
+        if rope_scaling and "factor" in rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
@@ -902,6 +922,15 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            # Aligned with upstream vllm 0.23: sparse indexer rope layout follows config flag.
+            _indexer_rope_parameters = dict(rope_scaling) if rope_scaling else {}
+            _indexer_rope_parameters.setdefault("rope_theta", rope_theta)
+            self.indexer_rope_emb = get_rope(
+                qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters=_indexer_rope_parameters,
+                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+            )
             self.indexer = Indexer(
                 vllm_config,
                 config,
@@ -912,8 +941,39 @@ class DeepseekV2MLAAttention(nn.Module):
                 topk_indices_buffer,
                 f"{prefix}.indexer",
             )
+
+            # IndexCache config (aligned with upstream vllm 0.23).
+            # NOTE: v0.15.1 MultiHeadLatentAttentionWrapper does not accept
+            # `skip_topk`; the computed value is stored on self for parity
+            # and future wrapper support. The kunlun sparse indexer currently
+            # runs on every layer regardless.
+            _index_topk_freq = getattr(config, "index_topk_freq", 1)
+            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+            layer_id = extract_layer_index(prefix)
+
+            if _index_topk_pattern is None:
+                self._skip_topk = (
+                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
+                    != 0
+                )
+            elif 0 <= layer_id < len(_index_topk_pattern):
+                self._skip_topk = _index_topk_pattern[layer_id] == "S"
+            else:
+                self._skip_topk = False
+            # Forward the skip flag to the Indexer instance so its forward()
+            # can early-return without running the sparse indexer kernel.
+            self.indexer._skip_topk = self._skip_topk
+            logger.info(
+                "IndexCache topk %s: layer_id=%d prefix=%s.indexer",
+                "SKIP (reuse buffer)" if self._skip_topk else "COMPUTE (hot)",
+                layer_id,
+                prefix,
+            )
         else:
+            self.indexer_rope_emb = None
             self.indexer = None
+            self._skip_topk = False
 
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -930,6 +990,7 @@ class DeepseekV2MLAAttention(nn.Module):
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
             indexer=self.indexer,
+            indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
         )
@@ -1260,6 +1321,9 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    # Compat: vllm 0.15.1 VllmModel protocol renamed method to embed_input_ids
+    embed_input_ids = get_input_embeddings
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1290,7 +1354,8 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

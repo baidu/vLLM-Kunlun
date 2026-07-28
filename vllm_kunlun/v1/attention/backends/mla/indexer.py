@@ -4,18 +4,97 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
-    kv_spans_from_batches,
-    split_prefill_chunks,
-)
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     split_decodes_and_prefills,
 )
 
 logger = init_logger(__name__)
+
+
+def get_max_prefill_buffer_size(vllm_config: VllmConfig) -> int:
+    """Size of the flattened-KV workspace consumed by the Kunlun indexer op.
+
+    Upstream raised its own factor to 40 for the fp8 workspace layout; the
+    Kunlun kernel still sizes its buffer as 2 * max_model_len, and the same
+    value is handed to ``sparse_attn_indexer_vllm_kunlun``, so both sides must
+    agree here.
+    """
+    return vllm_config.model_config.max_model_len * 2
+
+
+def kv_spans_from_batches(
+    start_seq_loc: torch.Tensor,
+    seq_len_per_batch: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token [start, end) row bounds in the flattened KV cache.
+
+    Vendored: dropped from vllm upstream when the indexer moved to a triton
+    metadata kernel.
+    """
+    q = start_seq_loc.to(dtype=torch.long)
+    L = seq_len_per_batch.to(dtype=torch.long)
+    assert q.dim() == 1 and L.dim() == 1
+    assert q.numel() == L.numel() + 1, "start_seq_loc must have length B+1"
+
+    counts = q[1:] - q[:-1]
+    N = int(q[-1].item())
+    B = L.numel()
+
+    if N == 0:
+        return (
+            torch.empty(0, dtype=torch.long, device=device),
+            torch.empty(0, dtype=torch.long, device=device),
+        )
+
+    kv_starts_per_batch = torch.cumsum(L, dim=0) - L
+    batch_id = torch.repeat_interleave(torch.arange(B), counts)
+    start_tensor = kv_starts_per_batch[batch_id]
+
+    L_expand = torch.repeat_interleave(L, counts)
+    m_expand = torch.repeat_interleave(counts, counts)
+    pos_within = (
+        torch.arange(N, dtype=torch.long)
+        - torch.repeat_interleave(q[:-1], counts)
+        + 1
+    )
+
+    local_pos = L_expand - m_expand + pos_within
+    end_location = start_tensor + local_pos
+
+    return start_tensor.int().to(device), end_location.int().to(device)
+
+
+def split_prefill_chunks(
+    seq_lens_cpu: torch.Tensor,
+    max_prefill_buffer_size: int,
+    request_offset: int = 0,
+) -> list[tuple[int, int]]:
+    """Group prefill requests so each chunk fits the flattened-KV workspace.
+
+    Vendored: upstream replaced it with ``split_indexer_prefill_chunks``, which
+    also sub-chunks on the query dimension and returns slices.
+    """
+    chunk_seq_ids: list[tuple[int, int]] = []
+    total_seq_lens = 0
+    start = 0
+    for i in range(len(seq_lens_cpu)):
+        cur_seq_len = seq_lens_cpu[i].item()
+        assert cur_seq_len <= max_prefill_buffer_size
+        total_seq_lens += cur_seq_len
+        if total_seq_lens > max_prefill_buffer_size:
+            chunk_seq_ids.append((start + request_offset, i + request_offset))
+            start = i
+            total_seq_lens = cur_seq_len
+    if total_seq_lens > 0:
+        chunk_seq_ids.append(
+            (start + request_offset, len(seq_lens_cpu) + request_offset)
+        )
+    return chunk_seq_ids
 
 
 @dataclass
@@ -149,7 +228,7 @@ def kunlun_build(
     prefill_metadata = None
     if num_prefills > 0:
         chunk_seq_ids = split_prefill_chunks(
-            common_attn_metadata.seq_lens_cpu,
+            common_attn_metadata.seq_lens_cpu[num_decodes:],
             self.max_prefill_buffer_size,
             num_decodes,
         )
@@ -215,6 +294,15 @@ def kunlun_build(
     return attn_metadata
 
 
+_upstream_builder_init = DeepseekV32IndexerMetadataBuilder.__init__
+
+
+def kunlun_builder_init(self, *args, **kwargs):
+    _upstream_builder_init(self, *args, **kwargs)
+    self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
+
+
+DeepseekV32IndexerMetadataBuilder.__init__ = kunlun_builder_init
 DeepseekV32IndexerMetadataBuilder.build_one_prefill_chunk = (
     kunlun_build_one_prefill_chunk
 )
@@ -223,4 +311,4 @@ DeepseekV32IndexerMetadataBuilder.build = kunlun_build
 # Monkey patch: Upgrade cudagraph_support to UNIFORM_BATCH for spec-decode compatibility
 from vllm.v1.attention.backend import AttentionCGSupport  # noqa
 
-DeepseekV32IndexerMetadataBuilder.cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+DeepseekV32IndexerMetadataBuilder._cudagraph_support = AttentionCGSupport.UNIFORM_BATCH

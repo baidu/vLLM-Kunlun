@@ -33,3 +33,6 @@ include = ["vllm_kunlun/conf/*", "vllm_kunlun/data/*"]
 [tool.hatch.build.targets.wheel]
 packages = ["vllm_kunlun"]
 output-dir = "output/dist"
+
+[tool.black]
+target-version = ["py310"]

@@ -5,7 +5,6 @@ from itertools import islice
 
 import torch
 from torch import nn
-from vllm.attention.backends.abstract import AttentionType
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
@@ -42,6 +41,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType  # v0.15.1 compat
 
 from vllm_kunlun.ops.activation import SiluAndMul
 from vllm_kunlun.ops.attention.layer import Attention
