@@ -41,6 +41,11 @@ from vllm_kunlun.ops.attention.flashmla import (
     kunlun_flash_mla_with_kvcache,
 )
 
+# Registers the CUSTOM MLA prefill backend that KunlunPlatform selects. Imported
+# here so the registration also happens in worker processes, which resolve this
+# module before MLAAttention builds its prefill backend.
+from vllm_kunlun.v1.attention.backends.mla import prefill as _kunlun_mla_prefill  # noqa: F401
+
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 

@@ -313,6 +313,18 @@ class KunlunPlatform(Platform):
                 logger.info(
                     "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
                 )
+            if use_sparse:
+                # MLAAttention always constructs an MLA prefill backend, and
+                # every upstream candidate requires a CUDA-only kernel. Point it
+                # at the Kunlun placeholder, which the sparse impl never calls.
+                import vllm_kunlun.v1.attention.backends.mla.prefill  # noqa: F401
+                from vllm.v1.attention.backends.mla.prefill.registry import (
+                    MLAPrefillBackendEnum,
+                )
+
+                vllm_config.attention_config.mla_prefill_backend = (
+                    MLAPrefillBackendEnum.CUSTOM
+                )
 
         from vllm.config import CUDAGraphMode
 

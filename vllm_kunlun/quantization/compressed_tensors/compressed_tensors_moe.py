@@ -25,6 +25,9 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (  # noqa: E501
+    CompressedTensorsMoEMethod,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w8a8_int8 import (  # noqa: E501
     CompressedTensorsW8A8Int8MoEMethod,
 )
@@ -34,6 +37,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
+
+from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
@@ -99,15 +104,28 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        # TODO: @liwei support w4a8
-        # elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
-        #     return CompressedTensorsW4A8Int8MoEMethod(
-        #         weight_quant, input_quant, layer.moe_config
-        #     )
+        elif _is_packed_int4_weight(weight_quant, format):
+            # W4A8: packed int4 weights + dynamic per-token int8 activations.
+            logger.info_once("Using KunlunCompressedTensorsW4A8MoEMethod")
+            return KunlunCompressedTensorsW4A8MoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
+
+
+def _is_packed_int4_weight(weight_quant, format) -> bool:
+    return (
+        weight_quant is not None
+        and weight_quant.num_bits == 4
+        and weight_quant.type == "int"
+        and weight_quant.symmetric
+        and weight_quant.strategy in ("channel", "group")
+        and weight_quant.actorder != "group"
+        and format == CompressionFormat.pack_quantized.value
+    )
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
@@ -287,6 +305,268 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         torch.ops._C.moe_post(
             x=out,
             moe_index=sorted_tokens_idx,
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+        return output
+
+
+class KunlunCompressedTensorsW4A8MoEMethod(CompressedTensorsWNA16MoEMethod):
+    """Packed int4 expert weights with dynamic per-token int8 activations.
+
+    Weights come from compressed-tensors ``pack-quantized`` checkpoints; the
+    GEMMs run through the Kunlun ``moe_fc_v3`` int4 kernel instead of the
+    CUDA/Triton kernels.
+    """
+
+    def __init__(self, weight_quant, input_quant, moe, layer_name=None):
+        # Bypass the parent __init__, which rejects channel-wise weight scales.
+        CompressedTensorsMoEMethod.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // weight_quant.num_bits
+        self.strategy = weight_quant.strategy
+        self.group_size = weight_quant.group_size
+
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # pack-quantized packs nibbles along the input dim, i.e.
+        # [out, in // packed_factor]. The upstream loader only transposes
+        # loaded weights for a hardcoded list of upstream method classes, so
+        # register params in checkpoint layout and shard the packed dim for w2.
+        pf = self.packed_factor
+        if hidden_size % pf or intermediate_size_per_partition % pf:
+            raise ValueError(
+                f"Packed int4 MoE requires hidden_size ({hidden_size}) and "
+                f"intermediate size per partition "
+                f"({intermediate_size_per_partition}) divisible by {pf}."
+            )
+        extra_weight_attrs.update({"is_transposed": False, "quant_method": "channel"})
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        up_gate_size = w13_num_shards * intermediate_size_per_partition
+
+        def _param(*shape, dtype):
+            return torch.nn.Parameter(
+                torch.empty(*shape, dtype=dtype), requires_grad=False
+            )
+
+        params = {
+            "w13_weight_packed": _param(
+                num_experts, up_gate_size, hidden_size // pf, dtype=torch.int32
+            ),
+            "w2_weight_packed": _param(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // pf,
+                dtype=torch.int32,
+            ),
+            "w13_weight_scale": _param(
+                num_experts, up_gate_size, 1, dtype=params_dtype
+            ),
+            "w2_weight_scale": _param(num_experts, hidden_size, 1, dtype=params_dtype),
+            "w13_weight_shape": _param(num_experts, 2, dtype=torch.int64),
+            "w2_weight_shape": _param(num_experts, 2, dtype=torch.int64),
+        }
+        for name, param in params.items():
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+
+        layer.a13_scale = None
+        layer.a2_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for unused in ("w13_weight_shape", "w2_weight_shape"):
+            if hasattr(layer, unused):
+                delattr(layer, unused)
+
+        with torch.no_grad():
+            for weight_name, scale_name in (
+                ("w13_weight_packed", "w13_weight_scale"),
+                ("w2_weight_packed", "w2_weight_scale"),
+            ):
+                packed = getattr(layer, weight_name)
+                data = packed.data.view(torch.int8)
+                # pack-quantized stores nibbles offset by 8; the kernel wants
+                # two's-complement int4.
+                data.bitwise_xor_(0x88)
+                packed.data = data
+
+                scale = getattr(layer, scale_name)
+                scale_data = scale.data.float()
+                # kunlun kernels take the per-channel max, not the step size.
+                scale_data.mul_(7.0)
+                scale.data = scale_data
+
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "Expert parallelism is not supported for packed int4 MoE weights."
+            )
+
+        hidden_states = x
+        global_num_experts, up_gate_size, _ = layer.w13_weight_packed.shape
+        M, N = hidden_states.shape
+        hidden_dim = layer.w2_weight_packed.shape[1]
+        top_k = self.moe.experts_per_token
+
+        normed_score = torch.empty(
+            M, top_k, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=hidden_states.device)
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks,
+            global_num_experts,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+
+        router_logits = router_logits.float()
+        if layer.scoring_func == "softmax":
+            torch.ops._C.moe_softmax_topk_norm(
+                x=router_logits,
+                normed_score=normed_score,
+                topk_index=topk_ids,
+                block_statistic=None,
+                stable=True,
+            )
+        elif layer.scoring_func == "sigmoid":
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                norm_score=normed_score,
+                topk_index=topk_ids,
+                block_static=block_statistic,
+                bias=layer.e_score_correction_bias,
+                n_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                scale=getattr(layer, "routed_scaling_factor", 1.0),
+            )
+        else:
+            raise ValueError(f"Unsupported scoring_func: {layer.scoring_func}")
+
+        if M * top_k > 768:
+            moe_expand = torch.empty(
+                (M * top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            expert_m = torch.zeros(
+                global_num_experts, dtype=torch.int32, device=hidden_states.device
+            )
+            sorted_tokens_num_lod = torch.zeros(
+                global_num_experts + 1, dtype=torch.int32, device=hidden_states.device
+            )
+            sorted_tokens_idx = torch.zeros(
+                M * top_k, dtype=torch.int32, device=hidden_states.device
+            )
+
+            torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+            torch.ops._C.moe_pre_sorted(
+                x=hidden_states,
+                topk_index=topk_ids,
+                block_statistic=block_statistic,
+                moe_expand=moe_expand,
+                moe_index=sorted_tokens_idx,
+                expert_m=expert_m,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+            )
+            del expert_m
+        else:
+            sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
+                torch.ops.xspeedgate_ops.moe_pre_small(
+                    topk_ids,
+                    global_num_experts,
+                    index_have_neg=False,
+                    sort_mode=True,
+                    x=hidden_states,
+                )
+            )
+
+        moe_expand = moe_expand.view(M * top_k, hidden_dim)
+
+        def _quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            q = torch.empty(t.shape, dtype=torch.int8, device=t.device)
+            scale = torch.empty((t.shape[0], 1), dtype=torch.float32, device=t.device)
+            torch.ops._C.quant2d(t, q, scale, force_sdnn=True)
+            return q, scale
+
+        # The packed-int4 kernel requires int8 activations, a per-token
+        # activation scale column and a 2D output.
+        y = torch.empty(
+            M * top_k,
+            up_gate_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        x_q, x_scale = _quant(moe_expand)
+        del moe_expand
+        torch.ops._C.moe_fc_v3(
+            x=x_q,
+            x_perchannel_max=x_scale,
+            weight=layer.w13_weight_packed,
+            w_perchannel_max=layer.w13_weight_scale,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=top_k,
+            y=y,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+
+        d = up_gate_size // 2
+        out1 = torch.empty(M * top_k, d, dtype=y.dtype, device=y.device)
+        torch.ops._C.silu_and_mul(out1, y)
+        del y
+
+        out = torch.empty(
+            M * top_k,
+            hidden_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        x_q, x_scale = _quant(out1)
+        del out1
+        torch.ops._C.moe_fc_v3(
+            x=x_q,
+            x_perchannel_max=x_scale,
+            weight=layer.w2_weight_packed,
+            w_perchannel_max=layer.w2_weight_scale,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=top_k,
+            y=out,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del x_q, x_scale, sorted_tokens_num_lod
+
+        dequant_scale = torch.ones([M, top_k], dtype=torch.float32, device=out.device)
+        output = torch.empty(
+            [M, N], dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        torch.ops._C.moe_post(
+            x=out.view(M, top_k, hidden_dim),
+            moe_index=sorted_tokens_idx.view(M, top_k),
             normed_scale=normed_score,
             dequant_scale=dequant_scale,
             y=output,

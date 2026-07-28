@@ -19,7 +19,7 @@
 from typing import Optional
 
 import torch
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -79,6 +79,6 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
 
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None

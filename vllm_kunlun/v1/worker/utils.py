@@ -18,6 +18,29 @@ from vllm.v1.worker.utils import KVBlockZeroer as _upstream_cls
 logger = logging.getLogger("vllm_kunlun")
 
 
+def _bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module=1):
+    # Upstream only tolerates several cache-bearing layers sharing one layer
+    # index on cuda-alike/xpu/cpu platforms. GLM-5.x sparse attention has both
+    # ``self_attn.attn`` and ``self_attn.indexer`` per decoder block, so Kunlun
+    # needs the same tolerance.
+    from collections import defaultdict
+
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    assert len(runner_kv_caches) == 0
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
+
+
 def _init_meta(
     self,
     attn_groups_iter,
@@ -136,3 +159,13 @@ if not getattr(_upstream_cls, "_kunlun_patched", False):
     logger.info(
         "[KunlunPlugin] KVBlockZeroer patched in vllm_kunlun/v1/worker/utils.py"
     )
+
+if not getattr(_bind_kv_cache, "_kunlun_patched", False):
+    import sys
+
+    _bind_kv_cache._kunlun_patched = True
+    sys.modules["vllm.v1.worker.utils"].bind_kv_cache = _bind_kv_cache
+    _runner = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if _runner is not None:
+        _runner.bind_kv_cache = _bind_kv_cache
+    logger.info("[KunlunPlugin] bind_kv_cache patched for multi-cache layer indices")
