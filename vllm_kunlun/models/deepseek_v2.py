@@ -273,8 +273,8 @@ class DeepseekV2MoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        # The MoE runner already applies routed_scaling_factor, adds the shared
-        # expert output and reduces across TP.
+        # The MoE runner adds the shared expert output and reduces across TP;
+        # routed_scaling_factor is applied inside the topk kernel.
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )

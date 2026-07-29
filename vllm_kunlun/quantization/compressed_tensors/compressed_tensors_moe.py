@@ -129,9 +129,21 @@ def _is_packed_int4_weight(weight_quant, format) -> bool:
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    def __init__(self, weight_quant, input_quant, moe, layer_name=None):
+        # Bypass the parent __init__: it selects an upstream int8 MoE backend
+        # (cutlass/triton) that does not exist on Kunlun. The kunlun kernels are
+        # driven directly from apply_monolithic.
+        CompressedTensorsMoEMethod.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.static_input_scales = not input_quant.dynamic
+
     @property
     def is_monolithic(self) -> bool:
         return True
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        return None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # NOTE: kunlun_ops use max as scale
@@ -144,12 +156,6 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
@@ -157,6 +163,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         M, N = hidden_states.shape
         hidden_dim = layer.w2_weight.shape[1]
         top_k = self.moe.experts_per_token
+        scoring_func = layer.scoring_func
         normed_score = torch.empty(
             M, top_k, dtype=torch.float32, device=hidden_states.device
         )
@@ -184,11 +191,13 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 norm_score=normed_score,
                 topk_index=topk_ids,
                 block_static=block_statistic,
-                bias=e_score_correction_bias,
-                n_group=num_expert_group,
-                topk_group=topk_group,
-                scale=routed_scaling_factor,
+                bias=layer.e_score_correction_bias,
+                n_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                scale=getattr(layer, "routed_scaling_factor", 1.0),
             )
+        else:
+            raise ValueError(f"Unsupported scoring_func: {scoring_func}")
 
         if M * top_k > 768:
             moe_expand = torch.empty(
