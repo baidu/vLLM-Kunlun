@@ -53,18 +53,23 @@ def deepseek_v4_bf16_o_proj(
 
     # Cache dequantized weight on first call to avoid per-step CPU round-trip.
     # The FP8 weight never changes after loading, so this is safe.
+    # For unquantized (BF16) attention (e.g. INT8 MoE model), weight_scale_inv
+    # does not exist — use the weight as-is.
     if not hasattr(wo_a, '_bf16_weight_cache'):
         weight = wo_a.weight.data
-        weight_scale = wo_a.weight_scale_inv.data
         output_size_check = n_groups * o_lora_rank
         input_size_check = weight.shape[1]
         assert tuple(weight.shape) == (output_size_check, input_size_check), (
             f"weight shape {weight.shape} != ({output_size_check}, {input_size_check})"
         )
-        if weight_scale.ndim < 2:
-            weight_bf16 = weight.cpu().to(torch.bfloat16).to(weight.device) * weight_scale.float()
+        if hasattr(wo_a, 'weight_scale_inv'):
+            weight_scale = wo_a.weight_scale_inv.data
+            if weight_scale.ndim < 2:
+                weight_bf16 = weight.cpu().to(torch.bfloat16).to(weight.device) * weight_scale.float()
+            else:
+                weight_bf16 = dequantize_fp8_blocks(weight, weight_scale)
         else:
-            weight_bf16 = dequantize_fp8_blocks(weight, weight_scale)
+            weight_bf16 = weight.to(torch.bfloat16)
         wo_a._bf16_weight_cache = (
             weight_bf16
             .view(n_groups, o_lora_rank, input_size_check)
