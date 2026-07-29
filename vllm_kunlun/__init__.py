@@ -1478,6 +1478,18 @@ def _kunlun_sqrt_softplus_scores(gating_output):
     return torch.sqrt(F.softplus(x))
 
 
+_HAS_MOE_HASH_TOPK_FUSED = None  # lazy probe
+
+
+def _probe_moe_hash_topk_fused():
+    global _HAS_MOE_HASH_TOPK_FUSED
+    if _HAS_MOE_HASH_TOPK_FUSED is None:
+        import torch
+        _HAS_MOE_HASH_TOPK_FUSED = hasattr(torch.ops, "xspeedgate_ops") and \
+            hasattr(torch.ops.xspeedgate_ops, "moe_hash_topk_fused")
+    return _HAS_MOE_HASH_TOPK_FUSED
+
+
 def _kunlun_topk_softplus_sqrt_accel(
     topk_weights,
     topk_indices,
@@ -1491,10 +1503,34 @@ def _kunlun_topk_softplus_sqrt_accel(
 ):
     """Kunlun-accelerated drop-in for ``_topk_softplus_sqrt_torch``.
 
-    Same signature and semantics as the community router fallback; only the
-    sqrt(softplus) score computation is offloaded to ``act_sqrt_softplus``."""
+    For hash layers (hash_indices_table != None): uses the fused
+    ``xspeedgate_ops.moe_hash_topk_fused`` kernel that combines hash-lookup +
+    sqrtsoftplus activation + renormalization in a single kernel launch.
+
+    For non-hash layers: applies ``act_sqrt_softplus`` pointwise + torch.topk.
+    """
     import torch
 
+    # --- FUSED HASH PATH: single kernel for hash-lookup + activation + renorm ---
+    if hash_indices_table is not None and input_tokens is not None and _probe_moe_hash_topk_fused():
+        try:
+            topk_ids_out, topk_weights_out = torch.ops.xspeedgate_ops.moe_hash_topk_fused(
+                gating_output.float().contiguous(),     # [M, E] float32
+                input_tokens.to(torch.int64),           # [M] int64
+                hash_indices_table.to(torch.int32),     # [vocab, topk] int32
+                0,                                      # num_shared_experts=0 (caller appends)
+                1.0,                                    # scaling=1.0 (we scale below)
+            )
+            # Kernel returns renormalized weights; apply routed_scaling_factor
+            if routed_scaling_factor != 1.0:
+                topk_weights_out = topk_weights_out * routed_scaling_factor
+            topk_indices.copy_(topk_ids_out)
+            topk_weights.copy_(topk_weights_out.float())
+            return topk_weights, topk_indices
+        except Exception:
+            pass  # fall through to torch path
+
+    # --- TORCH PATH (non-hash layers or fallback) ---
     scores = _kunlun_sqrt_softplus_scores(gating_output)
     if e_score_correction_bias is not None:
         scores_for_choice = scores + e_score_correction_bias.float()
