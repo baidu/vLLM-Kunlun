@@ -1204,86 +1204,81 @@ def _sparse_indexer_oot_apply(mod):
 
             if has_decode and indexer_meta.decode is not None:
                 decode_meta = indexer_meta.decode
-                # decode_meta.seq_lens: [batch] or [batch, next_n] int32
-                # decode_meta.block_table: [batch, max_blocks] int32
                 seq_lens = decode_meta.seq_lens
                 block_table = decode_meta.block_table
 
                 if seq_lens.dim() == 2:
-                    # MTP: [B, next_n] -> use last column as effective seq_len
-                    effective_seq_lens = seq_lens[:, -1]
+                    effective_seq_lens = seq_lens[:, -1].contiguous()
                 else:
                     effective_seq_lens = seq_lens
 
                 batch_size = effective_seq_lens.shape[0]
+                max_model_len = self.max_model_len
 
-                # Q: dequantize fp8 to float for score computation
-                # q_quant is stored as int8 (Kunlun cannot cast fp8->bf16)
-                # Shape: [num_tokens, 64, 128]
-                q_decode = q_quant[:num_decode_tokens]
-                w_decode = weights[:num_decode_tokens]  # [num_decode_tokens, 64]
+                # Reshape Q: [num_decode_tokens, H=64, D=128] -> [B, next_n, H, D]
+                q_decode = q_quant[:num_decode_tokens].view(torch.int8)
+                next_n = num_decode_tokens // batch_size
+                q_4d = q_decode.reshape(batch_size, next_n, q_decode.shape[1], q_decode.shape[2])
 
-                # Dequant Q: treat as raw int8 values (scale already in weights)
-                q_float = q_decode.view(torch.int8).float()  # [T, 64, 128]
+                # Weights: [num_decode_tokens, H] -> [B, next_n, H]
+                w_decode = weights[:num_decode_tokens]
+                w_3d = w_decode.reshape(batch_size, next_n, -1)
 
-                # Compute weighted Q sum across heads:
-                # q_summed[t, d] = sum_h(q[t,h,d] * w[t,h])
-                # This reduces multi-head to single-head for MQA-style K cache
-                q_weighted = q_float * w_decode.unsqueeze(-1)  # [T, 64, 128]
-                q_summed = q_weighted.sum(dim=1)  # [T, 128]
+                # KV cache: [num_blocks, block_size, 132] -> paged layout for kernel
+                # Kernel expects: fused_kv_cache = [k_val, k_scale]
+                #   k_val: [num_blocks, block_size, 1, head_dim] int8
+                #   k_scale: [B, max_model_len] fp32 (gathered by block_table)
+                kv_flat = kv_cache.view(num_blocks_cache, -1)  # [blocks, block_size*132]
+                k_val = kv_flat[:, :block_size_cache * head_dim].view(torch.int8)
+                k_val = k_val.view(num_blocks_cache, block_size_cache, 1, head_dim)
 
-                # Per-token top-K selection against paged K cache
-                for t in range(num_decode_tokens):
-                    if t >= batch_size:
-                        break
-                    seq_len = int(effective_seq_lens[t].item())
-                    if seq_len <= 0:
-                        continue
+                # Gather scales per batch via block_table
+                block_indices = block_table.flatten().long()
+                # Each block has block_size scales at bytes [head_dim:head_dim+4] per slot
+                # But kernel expects [B, max_model_len] flat scale array
+                k_scale_all = kv_flat[block_indices, block_size_cache * head_dim:].view(-1, 4).view(torch.float32)
+                k_scale = k_scale_all.view(batch_size, -1)[:, :max_model_len]
 
-                    # Gather K from paged cache for this request
-                    num_blocks_needed = (seq_len + block_size_cache - 1) // block_size_cache
-                    bt = block_table[t, :num_blocks_needed].long()
+                # Context lens: kernel needs [cpu_tensor, xpu_tensor]
+                seq_lens_cpu = effective_seq_lens.cpu()
 
-                    # Collect all valid slots
-                    slots_per_block = min(block_size_cache, seq_len)
-                    all_k_int8 = []
-                    all_k_scale = []
-                    total_gathered = 0
+                # Allocate output logits
+                logits = torch.empty(
+                    (batch_size, next_n, max_model_len),
+                    dtype=torch.float32, device=device,
+                )
 
-                    for blk_idx in range(num_blocks_needed):
-                        blk_id = int(bt[blk_idx].item())
-                        remaining = seq_len - total_gathered
-                        n_slots = min(block_size_cache, remaining)
-                        if n_slots <= 0:
-                            break
-                        # kv_cache[blk_id, :n_slots, :] -> [n_slots, 132]
-                        blk_data = kv_cache[blk_id, :n_slots, :]
-                        k_data = blk_data[:, :head_dim]  # [n_slots, 128] uint8 = int8
-                        k_scale_raw = blk_data[:, head_dim:head_dim+4].contiguous()
-                        # Interpret 4 bytes as float32 scale
-                        k_scale_f32 = k_scale_raw.view(torch.float32)  # [n_slots, 1]
-                        all_k_int8.append(k_data)
-                        all_k_scale.append(k_scale_f32)
-                        total_gathered += n_slots
+                # Native paged MQA logits: single kernel, no Python loop
+                torch.ops._C.I8_paged_mqa_logits(
+                    q=q_4d,
+                    fused_kv_cache=[k_val, k_scale],
+                    weights=w_3d,
+                    context_lens=[seq_lens_cpu, effective_seq_lens],
+                    block_table=block_table,
+                    max_context_len=max_model_len,
+                    clean_logits=True,
+                    out=logits,
+                    use_xfa_boost=False,
+                )
 
-                    if not all_k_int8:
-                        continue
+                # Reshape logits for topk: [B * next_n, max_model_len]
+                logits = logits.view(-1, max_model_len)
+                num_padded_tokens = batch_size * next_n
 
-                    # Concatenate all gathered K: [seq_len_actual, 128]
-                    k_int8_cat = torch.cat(all_k_int8, dim=0)
-                    k_scale_cat = torch.cat(all_k_scale, dim=0)  # [seq_len_actual, 1]
-
-                    # Dequant K: k_float = k_int8 * scale
-                    k_float = k_int8_cat.view(torch.int8).float() * k_scale_cat  # [S, 128]
-
-                    # Score: q_summed[t] @ k_float^T -> [S]
-                    scores = torch.matmul(q_summed[t:t+1], k_float.T).squeeze(0)  # [S]
-
-                    # Top-K selection
-                    actual_topk = min(topk_tokens, scores.shape[0])
-                    if actual_topk > 0:
-                        _, top_idx = scores.topk(actual_topk, dim=0)
-                        self.topk_indices_buffer[t, :actual_topk] = top_idx.to(torch.int32)
+                # Native topk_per_row: single kernel
+                topk_indices = self.topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+                torch.ops.xspeedgate_ops.topk_per_row(
+                    logits=logits,
+                    srcIndices=topk_indices,
+                    numRows=num_padded_tokens,
+                    stride0=logits.stride(0),
+                    stride1=logits.stride(1),
+                    topK=topk_tokens,
+                    rowStarts=None,
+                    rowEnds=None,
+                    seqLens=effective_seq_lens,
+                    next_n=next_n,
+                )
 
             if has_prefill and indexer_meta.prefill is not None:
                 prefill_meta = indexer_meta.prefill
