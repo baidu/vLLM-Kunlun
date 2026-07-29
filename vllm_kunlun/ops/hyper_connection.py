@@ -18,7 +18,13 @@ _mhc_pre_warned = False
 def _rms_norm(x, weight, eps):
     if weight is None:
         return x
-    return x * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps).to(x.dtype) * weight
+    try:
+        out = torch.empty_like(x)
+        torch.ops._C.rmsnorm(x, weight, out, eps)
+        return out
+    except Exception:
+        # Fallback if native rmsnorm not available (e.g. pre-plugin-init)
+        return x * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps).to(x.dtype) * weight
 
 
 def _native_pre(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
