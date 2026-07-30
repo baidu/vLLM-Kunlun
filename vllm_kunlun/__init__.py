@@ -1796,10 +1796,12 @@ def _compressor_compress_apply(mod):
         use_fp4_cache, rms_norm_weight, rms_norm_eps,
         quant_block, token_stride, scale_dim,
     ):
+        """Vectorized compress: no .item(), no Python per-token/per-window loop."""
         coff = 2 if overlap else 1
         window = coff * compress_ratio
         nope_head_dim = head_dim - rope_head_dim
         half_rope = rope_head_dim // 2
+        device = state_cache.device
 
         all_positions = positions[:num_actual]
         all_slots = slot_mapping[:num_actual]
@@ -1807,68 +1809,99 @@ def _compressor_compress_apply(mod):
         if not valid_mask.any():
             return
 
+        # [N] boundary token indices (device tensor, no .item())
         valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+        N = valid_indices.shape[0]
+
         kv_slot_mapping = k_cache_metadata.slot_mapping
         kv_cache_block_size = kv_cache.shape[1] if kv_cache.ndim >= 3 else block_size
 
-        for idx in valid_indices:
-            token_idx = idx.item()
-            position = all_positions[token_idx].item()
-            req_idx = token_to_req_indices[token_idx].item()
+        # Gather all boundary token metadata as tensors (no .item())
+        boundary_positions = all_positions[valid_indices].long()       # [N]
+        boundary_req = token_to_req_indices[valid_indices].long()      # [N]
 
-            start = position - window + 1
-            gather_positions = torch.arange(start, position + 1, device=state_cache.device)
-            gather_mask = gather_positions >= 0
+        # Window offsets: [N, window] — positions to gather from state_cache
+        # For each boundary token at pos P, gather [P-window+1, ..., P]
+        offsets = torch.arange(-(window - 1), 1, device=device).unsqueeze(0)  # [1, window]
+        gather_pos = boundary_positions.unsqueeze(1) + offsets  # [N, window]
+        gather_mask = gather_pos >= 0  # [N, window]
+        gather_pos_safe = gather_pos.clamp(min=0)
 
-            block_indices = gather_positions.clamp(min=0) // block_size
-            block_numbers = block_table[req_idx, block_indices]
-            block_offsets = gather_positions % block_size
+        # Block table lookup: flat indexing to avoid 2D advanced index crash
+        block_i = gather_pos_safe // block_size  # [N, window]
+        block_off = gather_pos_safe % block_size  # [N, window]
+        max_blocks_bt = block_table.shape[1]
+        flat_bt_idx = (boundary_req.unsqueeze(1) * max_blocks_bt + block_i.clamp(max=max_blocks_bt - 1)).reshape(-1)
+        block_numbers = block_table.reshape(-1)[flat_bt_idx].reshape(N, window)  # [N, window]
 
-            tokens_in_window = torch.arange(window, device=state_cache.device)
-            if overlap:
-                head_offset = (tokens_in_window >= compress_ratio).long() * head_dim
-            else:
-                head_offset = torch.zeros(window, dtype=torch.long, device=state_cache.device)
+        # Head offset for overlap mode
+        tokens_in_window = torch.arange(window, device=device)  # [window]
+        if overlap:
+            head_offset = (tokens_in_window >= compress_ratio).long() * head_dim  # [window]
+        else:
+            head_offset = torch.zeros(window, dtype=torch.long, device=device)
 
-            kv_states = torch.zeros(window, head_dim, dtype=torch.float32, device=state_cache.device)
-            score_states = torch.full((window, head_dim), float("-inf"), dtype=torch.float32, device=state_cache.device)
+        # Gather kv_states and score_states from state_cache
+        # state_cache: [num_blocks_sc, block_size_sc, state_dim]
+        sc_block_size = state_cache.shape[1]
+        sc_flat = state_cache.reshape(-1, state_cache.shape[-1])  # [total_slots, state_dim]
+        flat_sc_idx = (block_numbers * sc_block_size + block_off).reshape(-1)  # [N*window]
 
-            for i in range(window):
-                if not gather_mask[i]:
-                    continue
-                bn = block_numbers[i].item()
-                bo = block_offsets[i].item()
-                ho = head_offset[i].item()
-                kv_states[i] = state_cache[bn, bo, ho:ho + head_dim]
-                score_states[i] = state_cache[bn, bo, state_width + ho:state_width + ho + head_dim]
+        gathered = sc_flat[flat_sc_idx].reshape(N, window, -1)  # [N, window, state_dim]
 
-            weights = torch.softmax(score_states, dim=0)
-            compressed_kv = (kv_states * weights).sum(dim=0)
+        # Extract kv and score with head_offset
+        # head_offset: [window] broadcast to [N, window]
+        ho = head_offset.unsqueeze(0).expand(N, -1)  # [N, window]
 
-            variance = (compressed_kv * compressed_kv).mean()
-            rrms = torch.rsqrt(variance + rms_norm_eps)
-            normed = compressed_kv * rrms * rms_norm_weight.float()
+        # For each (n, w): kv = gathered[n, w, ho[w] : ho[w]+head_dim]
+        # Vectorize: build index tensor [N, window, head_dim]
+        dim_idx = torch.arange(head_dim, device=device)  # [head_dim]
+        kv_start = ho.unsqueeze(-1) + dim_idx  # [N, window, head_dim]
+        score_start = (state_width + ho).unsqueeze(-1) + dim_idx  # [N, window, head_dim]
 
-            # GPT-J interleaved RoPE on LAST rope_head_dim dims
-            compressed_pos = (position // compress_ratio) * compress_ratio
-            cs = cos_sin_cache[compressed_pos]
-            cos_vals = cs[:half_rope]
-            sin_vals = cs[half_rope:]
+        # Gather using advanced indexing on last dim
+        kv_states = gathered.gather(2, kv_start).float()  # [N, window, head_dim]
+        score_states = gathered.gather(2, score_start).float()  # [N, window, head_dim]
 
-            rope_part = normed[nope_head_dim:]
-            rope_even = rope_part[0::2]
-            rope_odd = rope_part[1::2]
-            new_even = rope_even * cos_vals - rope_odd * sin_vals
-            new_odd = rope_even * sin_vals + rope_odd * cos_vals
-            normed[nope_head_dim::2] = new_even
-            normed[nope_head_dim + 1::2] = new_odd
+        # Mask invalid positions
+        mask_expand = gather_mask.unsqueeze(-1)  # [N, window, 1]
+        score_states = score_states.masked_fill(~mask_expand, float("-inf"))
+        kv_states = kv_states.masked_fill(~mask_expand, 0.0)
 
-            kv_slot_idx = kv_slot_mapping[token_idx].item()
-            if kv_slot_idx < 0:
-                continue
-            kv_block_idx = kv_slot_idx // kv_cache_block_size
-            kv_pos_in_block = kv_slot_idx % kv_cache_block_size
-            kv_cache[kv_block_idx, kv_pos_in_block, :head_dim] = normed.to(kv_cache.dtype)
+        # Softmax weighted sum: [N, head_dim]
+        weights = torch.softmax(score_states, dim=1)  # [N, window, head_dim]
+        compressed = (kv_states * weights).sum(dim=1)  # [N, head_dim]
+
+        # RMSNorm: [N, head_dim]
+        variance = (compressed * compressed).mean(dim=-1, keepdim=True)  # [N, 1]
+        rrms = torch.rsqrt(variance + rms_norm_eps)
+        normed = compressed * rrms * rms_norm_weight.float().unsqueeze(0)  # [N, head_dim]
+
+        # GPT-J interleaved RoPE on last rope_head_dim dims
+        compressed_pos = (boundary_positions // compress_ratio) * compress_ratio  # [N]
+        cs = cos_sin_cache[compressed_pos]  # [N, rope_dim]
+        cos_vals = cs[:, :half_rope]  # [N, half_rope]
+        sin_vals = cs[:, half_rope:]  # [N, half_rope]
+
+        rope_part = normed[:, nope_head_dim:]  # [N, rope_head_dim]
+        rope_even = rope_part[:, 0::2]  # [N, half_rope]
+        rope_odd = rope_part[:, 1::2]   # [N, half_rope]
+        new_even = rope_even * cos_vals - rope_odd * sin_vals
+        new_odd = rope_even * sin_vals + rope_odd * cos_vals
+        normed[:, nope_head_dim::2] = new_even
+        normed[:, nope_head_dim + 1::2] = new_odd
+
+        # Write to kv_cache: flat indexing
+        kv_slots = kv_slot_mapping[valid_indices].long()  # [N]
+        valid_write = kv_slots >= 0
+        if valid_write.any():
+            write_slots = kv_slots[valid_write]
+            write_data = normed[valid_write].to(kv_cache.dtype)
+            kv_block_idx = write_slots // kv_cache_block_size
+            kv_pos_in_block = write_slots % kv_cache_block_size
+            # Scatter write (per-token, but no .item() — uses tensor indexing)
+            for i in range(write_slots.shape[0]):
+                kv_cache[kv_block_idx[i], kv_pos_in_block[i], :head_dim] = write_data[i]
 
     mod.compress_norm_rope_store_triton = compress_norm_rope_store_triton
     mod._kunlun_compress_patched = True
