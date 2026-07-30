@@ -43,6 +43,26 @@ _MODULE_MAPPINGS = {
     "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
     "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
+    # --- Model Runner V2: torch-native / kunlun_ops replacements for the
+    # Triton kernels in the V2 sampling + input-preparation pipeline. See
+    # vllm_kunlun/v1/worker/gpu/. Spec-decode (rejection_sampler_utils) is a
+    # deferred milestone and intentionally not mapped here.
+    "vllm.v1.worker.gpu.buffer_utils": "vllm_kunlun.v1.worker.gpu.buffer_utils",
+    "vllm.v1.worker.gpu.block_table": "vllm_kunlun.v1.worker.gpu.block_table",
+    "vllm.v1.worker.gpu.input_batch": "vllm_kunlun.v1.worker.gpu.input_batch",
+    "vllm.v1.worker.gpu.structured_outputs": "vllm_kunlun.v1.worker.gpu.structured_outputs",
+    "vllm.v1.worker.gpu.sample.gumbel": "vllm_kunlun.v1.worker.gpu.sample.gumbel",
+    "vllm.v1.worker.gpu.sample.min_p": "vllm_kunlun.v1.worker.gpu.sample.min_p",
+    "vllm.v1.worker.gpu.sample.penalties": "vllm_kunlun.v1.worker.gpu.sample.penalties",
+    "vllm.v1.worker.gpu.sample.logit_bias": "vllm_kunlun.v1.worker.gpu.sample.logit_bias",
+    "vllm.v1.worker.gpu.sample.bad_words": "vllm_kunlun.v1.worker.gpu.sample.bad_words",
+    "vllm.v1.worker.gpu.sample.logprob": "vllm_kunlun.v1.worker.gpu.sample.logprob",
+    "vllm.v1.worker.gpu.sample.prompt_logprob": "vllm_kunlun.v1.worker.gpu.sample.prompt_logprob",
+    # Multimodal M-RoPE / XD-RoPE position preparation (every Qwen-VL model).
+    "vllm.v1.worker.gpu.mm.rope": "vllm_kunlun.v1.worker.gpu.mm.rope",
+    # Hybrid attention + mamba model state (Qwen3-Next, Qwen3.5, ...). Only
+    # reached when model_config.is_hybrid, via model_states/__init__.py:31.
+    "vllm.v1.worker.gpu.model_states.mamba_hybrid": "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
 }
 
 

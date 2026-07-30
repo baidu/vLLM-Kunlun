@@ -1,5 +1,6 @@
 """kunlun"""
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import psutil
@@ -213,6 +214,35 @@ class KunlunPlatform(Platform):
         parallel_config = vllm_config.parallel_config  # Not use scheduler_config
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
+
+        # --- Model Runner V2 Triton gate (Kunlun XPU has no Triton) ---
+        # Kunlun replaces the V2 Triton kernels with torch-native / kunlun_ops
+        # equivalents (see the ``vllm.v1.worker.gpu.*`` module swaps in
+        # vllm_kunlun/__init__.py), so upstream's Triton veto has to be lifted:
+        # ``vllm.config.vllm`` uses HAS_TRITON only for the two V2 checks
+        # (``use_v2_model_runner`` returns False when ``not HAS_TRITON``, and
+        # ``_validate_v2_model_runner`` hard raises "Model Runner V2 requires
+        # Triton."), so forcing it True here has no other side effects.
+        #
+        # NOTE: we deliberately do NOT set VLLM_USE_V2_MODEL_RUNNER. Upstream
+        # already routes only *some* models to V2, and its own selection logic
+        # (config/vllm.py::use_v2_model_runner) is more trustworthy than a table
+        # maintained here -- in particular ``_is_default_v2_model_runner_model``
+        # excludes hybrid models, which the V2 runner does not fully support on
+        # Kunlun yet. Defaulting the env var to "1" made the property
+        # early-return True and skipped all of those filters, which is how a
+        # hybrid model (Qwen3.5) reached V2 and died importing
+        # ``vllm.v1.worker.gpu.model_states.mamba_hybrid``. Users can still opt
+        # in explicitly with VLLM_USE_V2_MODEL_RUNNER=1 (or force V1 with "0").
+        import vllm.config.vllm as _vllm_cfg_mod
+
+        if not getattr(_vllm_cfg_mod, "_kunlun_v2_triton_gate_opened", False):
+            _vllm_cfg_mod.HAS_TRITON = True
+            _vllm_cfg_mod._kunlun_v2_triton_gate_opened = True
+            logger.info(
+                "[KunlunPlugin] Opened Model Runner V2 Triton gate "
+                "(upstream decides whether V2 is used)."
+            )
 
         if parallel_config.worker_cls == "auto":
             # v0.15.1 do not support v0.15.1, remove the if condition
