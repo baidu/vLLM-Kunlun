@@ -5725,7 +5725,8 @@ class GPUModelRunner(
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 
-        dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
+        def dummy_tensors(v):
+            return torch.full((num_reqs,), v, device=self.device)
 
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
@@ -6524,7 +6525,8 @@ class GPUModelRunner(
         just may have a performance penalty due to that backend treating decodes
         as prefills.
         """
-        min_none_high = lambda a, b: a if b is None else b if a is None else min(a, b)
+        def min_none_high(a, b):
+            return a if b is None else b if a is None else min(a, b)
 
         reorder_batch_thresholds: list[int | None] = [
             group.get_metadata_builder().reorder_batch_threshold

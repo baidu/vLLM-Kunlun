@@ -21,7 +21,6 @@
 # limitations under the License.
 """Inference-only MiniMax-M3 model (W8A8 compressed-tensors) with MSA sparse attention."""
 
-import math
 import os
 from collections.abc import Iterable
 from itertools import islice
@@ -68,7 +67,6 @@ from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.linear_attn import MiniMaxText01RMSNormTP
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -77,7 +75,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
-    maybe_remap_kv_scale_name,
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionBackend
@@ -401,7 +398,6 @@ class MiniMaxM3SharedExpertMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, _ = self.gate_proj(x)
         up, _ = self.up_proj(x)
-        d = gate.shape[-1]
         combined = torch.cat([gate, up], dim=-1)
         x = self.act(combined)
         x, _ = self.down_proj(x)

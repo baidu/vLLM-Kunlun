@@ -377,7 +377,9 @@ class MultiprocExecutor(Executor):
             )
         else:
             output_rank = unique_reply_rank
-            aggregate = lambda x: x
+
+            def aggregate(x):
+                return x
 
         if isinstance(method, str):
             send_method = method
@@ -433,7 +435,8 @@ class MultiprocExecutor(Executor):
                 time.sleep(0.1)
             return False
 
-        active_procs = lambda: [proc for proc in worker_procs if proc.is_alive()]
+        def active_procs():
+            return [proc for proc in worker_procs if proc.is_alive()]
         # Give processes time to clean themselves up properly first
         logger.debug("Worker Termination: allow workers to gracefully shutdown")
         if wait_for_termination(active_procs(), 4):
