@@ -12,6 +12,20 @@ except Exception:
 _FP8_BLOCK_SIZE = 128
 
 
+_HAS_FUSED_ROPE_INT8 = None
+
+
+def _probe_fused_rope_int8():
+    global _HAS_FUSED_ROPE_INT8
+    if _HAS_FUSED_ROPE_INT8 is None:
+        try:
+            import kunlun_ops
+            _HAS_FUSED_ROPE_INT8 = hasattr(kunlun_ops, "fused_rope_int8_quant")
+        except Exception:
+            _HAS_FUSED_ROPE_INT8 = False
+    return _HAS_FUSED_ROPE_INT8
+
+
 def fused_indexer_q_rope_quant_kunlun(
     positions,
     index_q,
@@ -21,8 +35,40 @@ def fused_indexer_q_rope_quant_kunlun(
     index_weights_head_scale,
     use_fp4=False,
 ):
-    """Correctness fallback for V4 Indexer Q RoPE and FP8 quantization."""
-    assert not use_fp4, "Kunlun correctness fallback only supports FP8 Indexer Q"
+    """V4 Indexer Q RoPE + INT8 quantization.
+
+    Native path: kunlun_ops.fused_rope_int8_quant (single kernel, no CPU round-trip).
+    Fallback: Python implementation with .cpu().to(fp8) (slow, PCIe bound).
+    """
+    assert not use_fp4, "Kunlun does not support FP4 Indexer Q"
+
+    # --- Native path: fused RoPE + INT8 quant in one kernel ---
+    if _probe_fused_rope_int8():
+        import kunlun_ops
+        # index_q: [T, n_heads=64, head_dim=128] bf16
+        # positions: [T] int64
+        # cos_sin_cache: [max_pos, rot_dim=64] fp32
+        # index_weights: [T, n_heads=64] fp32/bf16
+        T, n_heads, head_dim = index_q.shape
+        y = torch.empty_like(index_q, dtype=torch.int8)
+        scale = torch.empty(T, n_heads, dtype=torch.float32, device=index_q.device)
+
+        kunlun_ops.fused_rope_int8_quant(
+            index_q.contiguous(),               # x: [T, heads, head_dim] bf16
+            positions.long().contiguous(),       # positions: [T] int64
+            index_q_cos_sin_cache.contiguous(),  # cos_sin: [max_pos, 64] fp32
+            y,                                   # output: [T, heads, head_dim] int8
+            scale,                               # output: [T, heads] fp32
+            False,                               # inverse_rope=False (Q side)
+            -1,                                  # rot_offset=-1 (auto: head_dim - 64)
+            index_weights.float().contiguous(),  # index_weights: [T, heads] fp32
+            float(index_weights_softmax_scale),  # softmax_scale
+            float(index_weights_head_scale),     # head_scale
+        )
+        # Native kernel folds weights: scale already contains weight * q_scale * softmax_scale * head_scale
+        return y, scale
+
+    # --- Fallback: Python (correctness only, slow due to .cpu() round-trip) ---
     rope_dim = index_q_cos_sin_cache.shape[-1]
     half_rope_dim = rope_dim // 2
     nope_dim = index_q.shape[-1] - rope_dim

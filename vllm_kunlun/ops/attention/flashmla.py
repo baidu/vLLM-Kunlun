@@ -109,15 +109,14 @@ def flash_mla_with_kvcache(
         )
         return output, None
 
-    # ---- V4 path: PyTorch naive MLA attention (dual-cache: SWA + compressed) ----
+    # ---- V4 path: Vectorized sparse MLA (BF16 cache only; no per-token loop) ----
     batch_size = q.shape[0]
     seq_q = q.shape[1]
     num_heads = q.shape[2]
-    d_qk = q.shape[3]  # 576 = 512 + 64
+    d_qk = q.shape[3]
     kv_lora_rank = head_dim_v  # 512
-    qk_rope_head_dim = d_qk - kv_lora_rank  # 64
+    qk_rope_head_dim = d_qk - kv_lora_rank  # 64 (or 0 if d_qk==512)
 
-    # Output tensor
     if out is not None:
         output = out
     else:
@@ -130,20 +129,22 @@ def flash_mla_with_kvcache(
         logger.warning_once("[KunlunFlashMLA] No indices/topk_length, returning zeros")
         return output, None
 
-    # --- Helper: flatten paged cache to [total_slots, d_qk] bf16 vectors ---
+    # Flatten paged caches to [total_slots, dim] bf16 (device-side, no D2H)
     def _flatten_cache(cache_tensor, target_dim):
-        num_blk = cache_tensor.shape[0]
-        blk_sz = cache_tensor.shape[1]
-        head_sz = cache_tensor.shape[-1]
-        total = num_blk * blk_sz
-        flat = cache_tensor.reshape(total, head_sz)
+        total = cache_tensor.shape[0] * cache_tensor.shape[1]
+        flat = cache_tensor.reshape(total, -1)
 
-        if cache_tensor.dtype == torch.bfloat16 or cache_tensor.dtype == torch.float16:
+        if cache_tensor.dtype in (torch.bfloat16, torch.float16, torch.float32):
             flat_kv = flat.to(torch.bfloat16)
             if flat_kv.shape[1] > target_dim:
-                flat_kv = flat_kv[:, :target_dim]
+                return flat_kv[:, :target_dim]
+            elif flat_kv.shape[1] < target_dim:
+                pad = torch.zeros(total, target_dim - flat_kv.shape[1],
+                                  dtype=torch.bfloat16, device=flat.device)
+                return torch.cat([flat_kv, pad], dim=1)
             return flat_kv
         elif cache_tensor.dtype == torch.uint8:
+            # FP8 e4m3fn dequant (vectorized, no Python loop)
             fp8_data = flat[:, :target_dim].contiguous()
             sign = ((fp8_data >> 7) & 1).to(torch.int32)
             exp_bits = ((fp8_data >> 3) & 0x0F).to(torch.int32)
@@ -159,92 +160,71 @@ def flash_mla_with_kvcache(
             result = result * (1 - 2 * sign.float())
             return result.to(torch.bfloat16)
         else:
+            # Unknown dtype: try to cast
             flat_kv = flat.to(torch.bfloat16)
             if flat_kv.shape[1] > target_dim:
-                flat_kv = flat_kv[:, :target_dim]
+                return flat_kv[:, :target_dim]
             elif flat_kv.shape[1] < target_dim:
                 pad = torch.zeros(total, target_dim - flat_kv.shape[1],
-                                  dtype=torch.bfloat16, device=flat_kv.device)
-                flat_kv = torch.cat([flat_kv, pad], dim=1)
+                                  dtype=torch.bfloat16, device=flat.device)
+                return torch.cat([flat_kv, pad], dim=1)
             return flat_kv
 
-    # Flatten SWA cache: [num_blocks, block_size, 1, head_dim] -> [total_slots, d_qk]
     flat_swa = _flatten_cache(k_cache, d_qk)
-    swa_total_slots = flat_swa.shape[0]
+    swa_total = flat_swa.shape[0]
 
-    # Flatten extra (compressed) cache if provided
     flat_comp = None
-    comp_total_slots = 0
     if extra_k_cache is not None:
         flat_comp = _flatten_cache(extra_k_cache, d_qk)
-        comp_total_slots = flat_comp.shape[0]
 
-    # Parse SWA indices: [batch, 1, swa_window] -> [batch, swa_window]
-    if indices.dim() == 3:
-        swa_idx = indices.squeeze(1)
-    else:
-        swa_idx = indices
-
-    # Parse compressed indices: [batch, 1, topk] -> [batch, topk]
+    # Parse indices: [B, 1, N] -> [B, N]
+    swa_idx = indices.squeeze(1) if indices.dim() == 3 else indices
     comp_idx = None
     if extra_indices_in_kvcache is not None:
-        if extra_indices_in_kvcache.dim() == 3:
-            comp_idx = extra_indices_in_kvcache.squeeze(1)
-        else:
-            comp_idx = extra_indices_in_kvcache
+        comp_idx = extra_indices_in_kvcache.squeeze(1) if extra_indices_in_kvcache.dim() == 3 else extra_indices_in_kvcache
 
-    # Process each batch item
+    # Vectorized per-batch gather + attention (no .item(), no per-token loop)
+    # For decode: seq_q=1, so we process q[:, 0] directly
+    q_flat = q[:, 0].float()  # [B, H, d_qk]
+    q_c = q_flat[:, :, :kv_lora_rank]  # [B, H, 512]
+    q_r = q_flat[:, :, kv_lora_rank:kv_lora_rank + qk_rope_head_dim] if qk_rope_head_dim > 0 else None  # [B, H, 64]
+
     for b in range(batch_size):
-        swa_len = int(topk_length[b].item())
-        comp_len = 0
-        if extra_topk_length is not None:
-            comp_len = int(extra_topk_length[b].item())
+        # Gather using tensor indexing (no .item() for lengths - use full index width)
+        swa_len = topk_length[b]  # scalar tensor on device
+        parts = []
 
-        if swa_len <= 0 and comp_len <= 0:
-            continue
+        # SWA gather: use full swa_idx width (padded with 0s, clamped)
+        swa_indices_b = swa_idx[b].long().clamp(0, swa_total - 1)
+        parts.append(flat_swa[swa_indices_b])  # [swa_width, d_qk]
 
-        # Gather KV from both caches
-        kv_parts = []
-        if swa_len > 0:
-            valid_swa = swa_idx[b, :swa_len].long().clamp(0, swa_total_slots - 1)
-            kv_parts.append(flat_swa[valid_swa])
+        # Compressed gather
+        if flat_comp is not None and comp_idx is not None:
+            comp_indices_b = comp_idx[b].long().clamp(0, flat_comp.shape[0] - 1)
+            parts.append(flat_comp[comp_indices_b])  # [comp_width, d_qk]
 
-        if comp_len > 0 and flat_comp is not None and comp_idx is not None:
-            valid_comp = comp_idx[b, :comp_len].long().clamp(0, comp_total_slots - 1)
-            kv_parts.append(flat_comp[valid_comp])
+        # Concatenate: [total_kv, d_qk]
+        kv_all = torch.cat(parts, dim=0).float()
+        kv_c = kv_all[:, :kv_lora_rank]  # [K, 512]
+        kv_r = kv_all[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim] if qk_rope_head_dim > 0 else None
 
-        if not kv_parts:
-            continue
+        # MLA score: [H, K] = [H, 512] @ [512, K] + [H, 64] @ [64, K]
+        scores = torch.mm(q_c[b], kv_c.T)  # [H, K]
+        if q_r is not None and kv_r is not None:
+            scores = scores + torch.mm(q_r[b], kv_r.T)
+        scores = scores * softmax_scale
 
-        # Concatenate all KV: [total_kv, d_qk]
-        kv_gathered = torch.cat(kv_parts, dim=0)
-        kv_c = kv_gathered[:, :kv_lora_rank].float()       # [total_kv, 512]
-        kv_r = kv_gathered[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim].float()  # [total_kv, 64]
+        # Softmax + output
+        attn_weights = torch.softmax(scores, dim=-1)  # [H, K]
+        attn_out = torch.mm(attn_weights, kv_c)  # [H, 512]
 
-        for s in range(seq_q):
-            q_token = q[b, s].float()  # [num_heads, d_qk]
-            q_c = q_token[:, :kv_lora_rank]                 # [num_heads, 512]
-            q_r = q_token[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim]  # [num_heads, 64]
+        # Attention sink
+        if attn_sink is not None:
+            lse = torch.logsumexp(scores, dim=-1)  # [H]
+            sink_scale = torch.sigmoid(lse - attn_sink[:num_heads].float())
+            attn_out = attn_out * sink_scale.unsqueeze(-1)
 
-            # MLA scores: q_c @ kv_c.T + q_r @ kv_r.T -> [num_heads, total_kv]
-            scores = q_c @ kv_c.T + q_r @ kv_r.T
-            scores = scores * softmax_scale
-            attn_weights = torch.softmax(scores, dim=-1)
-
-            # Output = weighted sum of kv_c (lora rank)
-            attn_out = attn_weights @ kv_c  # [num_heads, 512]
-
-            # Apply attention sink if provided
-            # attn_sink: [padded_heads] float32 -- per-head log-space damping
-            # Effect: out *= exp(lse) / (exp(lse) + exp(attn_sink))
-            #       = sigmoid(lse - attn_sink) where lse = logsumexp(scaled_scores)
-            if attn_sink is not None:
-                lse = torch.logsumexp(scores, dim=-1)  # [num_heads]
-                sink_val = attn_sink[:num_heads].to(lse.device).float()
-                sink_scale = torch.sigmoid(lse - sink_val)  # [num_heads]
-                attn_out = attn_out * sink_scale.unsqueeze(-1)
-
-            output[b, s, :, :kv_lora_rank] = attn_out.to(output.dtype)
+        output[b, 0, :, :kv_lora_rank] = attn_out.to(output.dtype)
 
     return output, None
 

@@ -43,10 +43,11 @@ def compute_global_topk_indices_and_lens_pytorch(
 
     max_blocks = block_table.shape[1]
     block_i_safe = block_i.clamp(max=max_blocks - 1)
-    req_idx = token_to_req_indices.to(torch.int64).unsqueeze(1).expand(-1, topk)
+    req_idx = token_to_req_indices[:num_tokens].to(torch.int64).unsqueeze(1).expand(-1, topk)
 
-    # Advanced indexing: block_table[req_idx, block_i_safe] -> [num_tokens, topk]
-    block_numbers = block_table[req_idx, block_i_safe]
+    # Flat indexing (avoids 2D advanced indexing crash on Kunlun XPU)
+    flat_idx = (req_idx * max_blocks + block_i_safe).reshape(-1)
+    block_numbers = block_table.reshape(-1)[flat_idx].reshape(num_tokens, topk)
     slots = block_numbers * block_size + block_off
     slots_i32 = slots.to(torch.int32)
     neg_ones = torch.full_like(slots_i32, -1)
