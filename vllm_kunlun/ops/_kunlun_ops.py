@@ -703,7 +703,7 @@ class KunlunOps:
             raise ValueError(f"Unsupported scoring_func: {scoring_func}")
 
         # Generate block statistic
-        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+        # torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
         # Pre-sort tokens by expert
         moe_expand = torch.empty(

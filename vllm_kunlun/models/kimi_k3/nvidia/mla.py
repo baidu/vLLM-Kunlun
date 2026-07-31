@@ -104,6 +104,16 @@ def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
     return attn_out * gate.sigmoid()
 
 
+class _KunlunNoopPrefillBackend:
+    def clone(self):
+        return self
+    def prepare_metadata(self, *args, **kwargs):
+        return None
+    def supports_quant_output(self, *args, **kwargs):
+        return False
+    def supports_out(self, *args, **kwargs):
+        return False
+
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
 
@@ -326,7 +336,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         #     v_head_dim=self.v_head_dim,
         #     vllm_config=vllm_config,
         # )
-        self.prefill_backend = None
+        self.prefill_backend = _KunlunNoopPrefillBackend()
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
