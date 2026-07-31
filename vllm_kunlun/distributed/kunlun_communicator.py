@@ -1,18 +1,29 @@
 """kunlun_communicator"""
 
 from contextlib import contextmanager
-
+from torch.distributed import ProcessGroup
 import torch
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.utils import StatelessProcessGroup
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 
 
 class KunlunCommunicator(CudaCommunicator):
     """KunlunCommunicator"""
 
-    def __init__(self, device, device_group, cpu_group, unique_name):
+    def __init__(
+        self,
+        cpu_group: ProcessGroup,
+        device: torch.device | None = None,
+        device_group: ProcessGroup | None = None,
+        unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        tcp_store_group: StatelessProcessGroup | None = None,
+        use_all2all: bool = False,
+    ):
         """
             Initializes the CUDA Communicator.
 
@@ -26,7 +37,14 @@ class KunlunCommunicator(CudaCommunicator):
             ValueError: If both ``device`` and ``device_group`` are not specified.
         """
         DeviceCommunicatorBase.__init__(
-            self, cpu_group, device, device_group, unique_name
+            self,
+            cpu_group,
+            device,
+            device_group,
+            unique_name,
+            global_ranks,
+            global_world_size,
+            use_all2all=use_all2all,
         )
         self.ca_comm = None
         self.disabled = False

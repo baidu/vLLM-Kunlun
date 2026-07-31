@@ -36,7 +36,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
 logger = init_logger(__name__)
 
@@ -296,68 +295,118 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
-    def apply(
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe: "FusedMoEConfig",  # type: ignore # noqa: F821
+        layer_name: Optional[str] = None,
+    ):
+        # Skip parent __init__ which hard-asserts `strategy == "group"`.
+        # Call grandparent directly so both "group" and "channel" work on P800.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // weight_quant.num_bits
+        self.strategy = weight_quant.strategy
+        assert self.strategy in ("group", "channel"), (
+            f"Unsupported strategy: {self.strategy}, expected 'group' or 'channel'"
+        )
+        self.group_size = weight_quant.group_size if self.strategy == "group" else -1
+        assert weight_quant.actorder != "group", (
+            "grouped actorder isn't supported by this kernel"
+        )
+        assert weight_quant.symmetric, (
+            "Only symmetric quantization is supported for MoE"
+        )
+        assert self.num_bits in WNA16_SUPPORTED_BITS, (
+            f"Unsupported num_bits: {self.num_bits}, expected {WNA16_SUPPORTED_BITS}"
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Preprocess loaded weights for ``ops.fused_moe_ct_w4a16``.
+
+        1. Drop params created by the parent create_weights that Kunlun doesn't
+           use (shapes / g_idx / g_idx sort indices), to free memory.
+        2. Transpose packed weights, reinterpret as int8, in-place XOR 0x88 to
+           convert uint4-packed -> signed-int representation.
+        3. Transpose scales, cast to float32, multiply by 7.0.
+        Modify ``.data`` in place to avoid doubling memory.
+        """
+        del layer.w13_weight_shape
+        del layer.w2_weight_shape
+        del layer.w13_weight_g_idx
+        del layer.w2_weight_g_idx
+        del layer.w13_g_idx_sort_indices
+        del layer.w2_g_idx_sort_indices
+        with torch.no_grad():
+            w13_data = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
+            w13_data = w13_data.view(torch.int8)
+            w13_data.bitwise_xor_(0x88)
+            layer.w13_weight_packed.data = w13_data
+
+            w2_data = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
+            w2_data = w2_data.view(torch.int8)
+            w2_data.bitwise_xor_(0x88)
+            layer.w2_weight_packed.data = w2_data
+
+            w13_scale_data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
+            w13_scale_data = w13_scale_data.to(torch.float32)
+            w13_scale_data.mul_(7.0)
+            layer.w13_weight_scale.data = w13_scale_data
+
+            w2_scale_data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
+            w2_scale_data = w2_scale_data.to(torch.float32)
+            w2_scale_data.mul_(7.0)
+            layer.w2_weight_scale.data = w2_scale_data
+
+    @property
+    def is_monolithic(self) -> bool:
+        # Kunlun runs a single fused kernel (fused_moe_ct_w4a16) that does its
+        # own routing, so RoutedExperts must use forward_monolithic ->
+        # apply_monolithic rather than the modular (topk_weights/topk_ids) path.
+        return True
+
+    def apply_monolithic(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # dequant packed weights to float16
-        w13_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w13_weight_packed,
-            scale=self.moe_quant_config.w1_scale,
-        )
-        w2_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w2_weight_packed,
-            scale=self.moe_quant_config.w2_scale,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """W4A16 MoE via the Kunlun fused kernel (routing done inside).
+
+        Routing params are read from the RoutedExperts ``layer`` attributes.
+        Weights are already signed int8 (XOR 0x88) and scales float32*7.0 after
+        process_weights_after_loading.
+        """
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
+            )
+        return ops.fused_moe_ct_w4a16(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            router_logits=router_logits,
+            moe_top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
         )
 
-        if self.moe.use_ep:
-            return ops.fused_moe_ep(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
-        else:
-            return ops.fused_moe(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-                w1_bias=getattr(layer, "w13_bias", None),
-                w2_bias=getattr(layer, "w2_bias", None),
-            )
+
+# The RoutedExperts weight loader gates the compressed-tensors packed-weight
+# transpose (loaded_weight.t()) on an exact class-name allowlist
+# (routed_experts.py: "CompressedTensorsWNA16MoEMethod", etc.). Our subclass
+# name is not in that list, so the transpose would be skipped and the checkpoint
+# [N, K_packed] weights would be sharded on the wrong dim. Masquerade the class
+# name so the loader applies the transpose.
+KunlunCompressedTensorsWNA16MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
+KunlunCompressedTensorsWNA16MoEMethod.__qualname__ = "CompressedTensorsWNA16MoEMethod"
