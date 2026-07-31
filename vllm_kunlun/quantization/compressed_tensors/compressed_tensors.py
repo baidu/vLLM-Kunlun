@@ -19,7 +19,8 @@
 from typing import Optional
 
 import torch
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from compressed_tensors.quantization import QuantizationArgs, QuantizationType
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -33,6 +34,13 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsLinearMethod,
     CompressedTensorsLinearTransformMethod,
     get_linear_transform_schemes,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_embedding import (  # noqa: E501
+    CompressedTensorsEmbeddingWNA16Int,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
 
 from vllm_kunlun.quantization.utils import _remove_quantization_method
@@ -79,6 +87,34 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
 
         if isinstance(layer, Attention):
             return CompressedTensorsKVCacheMethod(self)
-        if isinstance(layer, FusedMoE):
+
+        if isinstance(layer, ParallelLMHead):
+            try:
+                quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            except ValueError:
+                quant_scheme = None
+            if quant_scheme is not None:
+                layer.scheme = quant_scheme
+                return CompressedTensorsLinearMethod(self)
+
+        # ParallelLMHead subclasses VocabParallelEmbedding but is handled above as
+        # a linear; only true embedding lookups land here.
+        if isinstance(layer, VocabParallelEmbedding):
+            scheme_dict = self.get_scheme_dict(layer, layer_name=prefix)
+            weight_quant = scheme_dict.get("weights") if scheme_dict else None
+            if weight_quant is None:
+                return None  # unquantized embedding
+            if not (
+                isinstance(weight_quant, QuantizationArgs)
+                and self._is_wNa16_group_channel(weight_quant, None)
+                and weight_quant.type == QuantizationType.INT
+            ):
+                raise ValueError(
+                    "compressed-tensors embeddings only support weight-only INT "
+                    f"group/channel (WNA16) quantization, got: {weight_quant}"
+                )
+            return CompressedTensorsEmbeddingWNA16Int(weight_quant)
+
+        if isinstance(layer, RoutedExperts):
             return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
