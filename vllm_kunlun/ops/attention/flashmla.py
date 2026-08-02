@@ -126,8 +126,13 @@ def flash_mla_with_kvcache(
         )
 
     if indices is None or topk_length is None:
-        logger.warning_once("[KunlunFlashMLA] No indices/topk_length, returning zeros")
-        return output, None
+        # Returning zeros here silently produces wrong attention output for the
+        # rest of the run (a single warning is easy to miss). Fail loudly.
+        raise RuntimeError(
+            "[KunlunFlashMLA] V4 sparse MLA needs both `indices` and "
+            f"`topk_length` (got indices={indices is not None}, "
+            f"topk_length={topk_length is not None}); refusing to return zeros."
+        )
 
     # Flatten paged caches to [total_slots, dim] bf16 (device-side, no D2H)
     def _flatten_cache(cache_tensor, target_dim):
