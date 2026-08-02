@@ -1,12 +1,34 @@
+import logging
+import os
+
 import torch
+
+logger = logging.getLogger("vllm_kunlun")
 
 try:
     import xspeedgate_ops  # noqa: F401  registers torch.ops.xspeedgate_ops
-    _HAS_XSG_DEQUANT_FP8_BLOCKS = hasattr(
-        torch.ops.xspeedgate_ops, "dequantize_fp8_blocks"
+    # Locally hand-written op (not present in any upstream branch).
+    # Gated off by default until validated; opt in with
+    # KUNLUN_XSG_DEQUANT_FP8_BLOCKS=1.
+    _HAS_XSG_DEQUANT_FP8_BLOCKS = (
+        os.getenv("KUNLUN_XSG_DEQUANT_FP8_BLOCKS", "0") == "1"
+        and hasattr(torch.ops.xspeedgate_ops, "dequantize_fp8_blocks")
     )
 except Exception:
     _HAS_XSG_DEQUANT_FP8_BLOCKS = False
+
+# Both fallbacks below cross PCIe on the decode hot path, which is a ~100x
+# slowdown rather than a mild regression, so say so once instead of silently
+# limping. `dequantize_fp8_blocks` in particular only exists in the source-tree
+# xspeedgate_ops build, so a PYTHONPATH mistake lands here.
+_warned_rope_fallback = [False]
+_warned_dequant_fallback = [False]
+
+
+def _warn_once(flag, msg):
+    if not flag[0]:
+        flag[0] = True
+        logger.warning(msg)
 
 
 _FP8_BLOCK_SIZE = 128
@@ -69,6 +91,12 @@ def fused_indexer_q_rope_quant_kunlun(
         return y, scale
 
     # --- Fallback: Python (correctness only, slow due to .cpu() round-trip) ---
+    _warn_once(
+        _warned_rope_fallback,
+        "kunlun_ops.fused_rope_int8_quant is unavailable; V4 indexer Q "
+        "RoPE+quant falls back to a host round-trip (.cpu() per decode step). "
+        "This is a large slowdown, not a cosmetic one.",
+    )
     rope_dim = index_q_cos_sin_cache.shape[-1]
     half_rope_dim = rope_dim // 2
     nope_dim = index_q.shape[-1] - rope_dim
@@ -130,6 +158,15 @@ def dequantize_fp8_blocks(weight, weight_scale):
         return torch.ops.xspeedgate_ops.dequantize_fp8_blocks(weight, weight_scale)
 
     # ---- fallback: CPU round-trip cast + on-device scale multiply ----
+    _warn_once(
+        _warned_dequant_fallback,
+        "xspeedgate_ops.dequantize_fp8_blocks unavailable or inputs "
+        f"unsuitable (has_op={_HAS_XSG_DEQUANT_FP8_BLOCKS}, "
+        f"contiguous={weight.is_contiguous()}, device={weight.device}, "
+        f"scale_dtype={weight_scale.dtype}); falling back to a host round-trip. "
+        "On the FP8 MoE decode path this runs per step and is catastrophic -- "
+        "check that PYTHONPATH points at the XSpeedGate source tree.",
+    )
     weight_scale = weight_scale[:n_blocks, :k_blocks]
     device = weight.device
     if weight.is_contiguous():

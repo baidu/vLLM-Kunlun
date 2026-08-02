@@ -1239,7 +1239,11 @@ def _sparse_indexer_oot_apply(mod):
                 k_scale_all = kv_flat[block_indices, block_size_cache * head_dim:].view(-1, 4).view(torch.float32)
                 k_scale = k_scale_all.view(batch_size, -1)[:, :max_model_len]
 
-                # Context lens: kernel needs [cpu_tensor, xpu_tensor]
+                # Context lens: kernel needs [cpu_tensor, xpu_tensor]. The host
+                # copy is vestigial -- verified that the kernel derives its
+                # masking from the xpu copy and its schedule from the static
+                # max_context_len, so a stale host copy (e.g. read during
+                # cuda-graph capture) does not affect the result.
                 seq_lens_cpu = effective_seq_lens.cpu()
 
                 # Allocate output logits
@@ -1419,9 +1423,14 @@ _register_post_import_hook(
 
 
 def _v4_o_proj_applied(mod):
+    # The installed name is `deep_gemm_fp8_o_proj` (that is what the community
+    # modules import), but the replacement comes from
+    # vllm_kunlun.ops.deepseek_v4_o_proj -- check against that module, otherwise
+    # the predicate never matches and the hook re-fires on every import
+    # statement executed in the process.
     fn = getattr(mod, "deep_gemm_fp8_o_proj", None)
     return fn is not None and getattr(fn, "__module__", "") == (
-        "vllm_kunlun.ops.deep_gemm"
+        "vllm_kunlun.ops.deepseek_v4_o_proj"
     )
 
 
@@ -1463,7 +1472,8 @@ def _kunlun_sqrt_softplus_scores(gating_output):
     raises (e.g. unexpected dtype/device)."""
     import torch
     x = gating_output.float()
-    op = getattr(torch.ops.xspeedgate_ops, "act_sqrt_softplus", None)
+    op = (getattr(torch.ops.xspeedgate_ops, "act_sqrt_softplus", None)
+          if os.getenv("KUNLUN_V4_ACT_SQRT_SOFTPLUS", "1") == "1" else None)
     if op is not None:
         try:
             return op(x)
@@ -1480,8 +1490,11 @@ def _probe_moe_hash_topk_fused():
     global _HAS_MOE_HASH_TOPK_FUSED
     if _HAS_MOE_HASH_TOPK_FUSED is None:
         import torch
-        _HAS_MOE_HASH_TOPK_FUSED = hasattr(torch.ops, "xspeedgate_ops") and \
-            hasattr(torch.ops.xspeedgate_ops, "moe_hash_topk_fused")
+        _HAS_MOE_HASH_TOPK_FUSED = (
+            os.getenv("KUNLUN_V4_HASH_TOPK_FUSED", "1") == "1"
+            and hasattr(torch.ops, "xspeedgate_ops")
+            and hasattr(torch.ops.xspeedgate_ops, "moe_hash_topk_fused")
+        )
     return _HAS_MOE_HASH_TOPK_FUSED
 
 
@@ -1709,6 +1722,40 @@ _register_post_import_hook(
 # These Triton kernels are not available on Kunlun; replace with PyTorch.
 # ---------------------------------------------------------------------------
 
+def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
+    """Scatter ``data`` into paged ``cache`` at flat slots ``dest``, skipping
+    rows where ``write_ok`` is False -- without any host-side read.
+
+    ``cache`` is [num_blocks, block_size, W]; ``dest`` [T] holds flat slot ids
+    (block * block_size + offset); ``data`` is [T, D] written to columns
+    ``col_start : col_start + D``.
+
+    A masked scatter normally wants a compacted index list, but compaction
+    (``nonzero`` / boolean masking) has a data-dependent output shape and needs
+    a host-side count, which is unavailable during CUDA-graph capture. So every
+    row is written unconditionally and the skipped rows are redirected onto
+    block 0 with a zero payload: vLLM's BlockPool reserves block 0 as the
+    ``null_block``, never hands it to a request, and keeps it all-zero, so
+    those stores are no-ops and can never collide with a real destination.
+
+    The mask is applied in fp32 and only then cast to the cache dtype, because
+    xdnn's capture-mode kernels (``aten_capture/eager_customized``) do not
+    implement ``where`` or ``index_select`` for uint8 -- and the DSv4 indexer's
+    compressed cache is uint8. ``index_put_`` and dtype casts are implemented.
+    """
+    import torch
+
+    D = data.shape[1]
+    block_size = cache.shape[1]
+    data = data.float()
+    dest_f = torch.where(write_ok, dest, torch.zeros_like(dest))
+    data_f = torch.where(
+        write_ok.unsqueeze(-1), data, torch.zeros_like(data)
+    ).to(cache.dtype)
+    cache[:, :, col_start:col_start + D].index_put_(
+        (dest_f // block_size, dest_f % block_size), data_f, accumulate=False
+    )
+
 def _compressor_save_applied(mod):
     return getattr(mod, "_kunlun_compressor_ops_patched", False)
 
@@ -1726,19 +1773,30 @@ def _compressor_save_apply(mod):
 
     def _torch_save(kv, score, ape, positions, state_cache, slot_mapping,
                     block_size, state_width, compress_ratio):
-        head_size = kv.shape[-1]
         valid_mask = slot_mapping >= 0
-        if not valid_mask.any():
-            return
-        valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-        valid_slots = slot_mapping[valid_indices]
-        block_idx = valid_slots // block_size
-        pos_in_block = valid_slots % block_size
-        state_cache[block_idx, pos_in_block, :head_size] = kv[valid_indices]
-        valid_positions = positions[valid_indices]
-        ape_rows = valid_positions % compress_ratio
-        score_with_ape = score[valid_indices] + ape[ape_rows]
-        state_cache[block_idx, pos_in_block, state_width:state_width + head_size] = score_with_ape
+        if torch.cuda.is_current_stream_capturing():
+            # ``nonzero``/boolean-mask compaction needs a host-side count that
+            # is unavailable mid-capture; keep every row and mask the stores.
+            sel = torch.arange(slot_mapping.shape[0], device=kv.device)
+            wv = valid_mask
+        else:
+            if not valid_mask.any():
+                return
+            sel = valid_mask.nonzero(as_tuple=True)[0]
+            wv = torch.ones_like(sel, dtype=torch.bool)
+
+        slots = slot_mapping.index_select(0, sel).long()
+        write_ok = wv & (slots >= 0)
+        _masked_paged_write(
+            state_cache, dest=slots, write_ok=write_ok,
+            data=kv.index_select(0, sel), col_start=0,
+        )
+        ape_rows = positions.index_select(0, sel) % compress_ratio
+        _masked_paged_write(
+            state_cache, dest=slots, write_ok=write_ok,
+            data=score.index_select(0, sel) + ape.index_select(0, ape_rows),
+            col_start=state_width,
+        )
 
     def save_partial_states(
         kv, score, ape, positions, state_cache, slot_mapping,
@@ -1788,6 +1846,106 @@ def _compressor_compress_applied(mod):
 def _compressor_compress_apply(mod):
     import torch
 
+    def _compress_core(
+        sel, wv, state_cache, token_to_req_indices, all_positions,
+        block_table, block_size, state_width, cos_sin_cache, kv_cache,
+        kv_slot_mapping, head_dim, rope_head_dim,
+        compress_ratio, overlap, rms_norm_weight, rms_norm_eps,
+    ):
+        """Compress+norm+RoPE+store for the token rows listed in ``sel``.
+
+        ``sel`` [T] are token indices to process and ``wv`` [T] says whether
+        each row is a real compression boundary. Everything here is shaped by
+        ``T = sel.shape[0]`` only, so as long as the caller passes a
+        statically-shaped ``sel`` the whole body is CUDA-graph capturable.
+        """
+        coff = 2 if overlap else 1
+        window = coff * compress_ratio
+        nope_head_dim = head_dim - rope_head_dim
+        half_rope = rope_head_dim // 2
+        device = state_cache.device
+        T = sel.shape[0]
+
+        boundary_positions = all_positions.index_select(0, sel).long()      # [T]
+        boundary_req = token_to_req_indices.index_select(0, sel).long()     # [T]
+
+        # Window offsets: [T, window] — positions to gather from state_cache.
+        # For each boundary token at pos P, gather [P-window+1, ..., P].
+        offsets = torch.arange(-(window - 1), 1, device=device).unsqueeze(0)
+        gather_pos = boundary_positions.unsqueeze(1) + offsets  # [T, window]
+        gather_mask = gather_pos >= 0  # [T, window]
+        gather_pos_safe = gather_pos.clamp(min=0)
+
+        # Block table lookup: flat indexing to avoid 2D advanced index crash
+        block_i = gather_pos_safe // block_size  # [T, window]
+        block_off = gather_pos_safe % block_size  # [T, window]
+        max_blocks_bt = block_table.shape[1]
+        flat_bt_idx = (
+            boundary_req.unsqueeze(1) * max_blocks_bt
+            + block_i.clamp(max=max_blocks_bt - 1)
+        ).reshape(-1)
+        block_numbers = block_table.reshape(-1)[flat_bt_idx].reshape(T, window)
+
+        # Head offset for overlap mode
+        tokens_in_window = torch.arange(window, device=device)  # [window]
+        if overlap:
+            head_offset = (tokens_in_window >= compress_ratio).long() * head_dim
+        else:
+            head_offset = torch.zeros(window, dtype=torch.long, device=device)
+
+        # Gather kv_states and score_states from state_cache
+        # state_cache: [num_blocks_sc, block_size_sc, state_dim]
+        sc_block_size = state_cache.shape[1]
+        sc_flat = state_cache.reshape(-1, state_cache.shape[-1])
+        flat_sc_idx = (block_numbers * sc_block_size + block_off).reshape(-1)
+        gathered = sc_flat[flat_sc_idx].reshape(T, window, -1)
+
+        # For each (t, w): kv = gathered[t, w, ho[w] : ho[w]+head_dim]
+        ho = head_offset.unsqueeze(0).expand(T, -1)  # [T, window]
+        dim_idx = torch.arange(head_dim, device=device)  # [head_dim]
+        kv_start = ho.unsqueeze(-1) + dim_idx  # [T, window, head_dim]
+        score_start = (state_width + ho).unsqueeze(-1) + dim_idx
+
+        kv_states = gathered.gather(2, kv_start).float()
+        score_states = gathered.gather(2, score_start).float()
+
+        # Mask out-of-range window slots. Offset 0 is always in range (token
+        # positions are >= 0), so no row can be fully masked and softmax
+        # cannot produce NaN even for the padding rows kept by the static path.
+        mask_expand = gather_mask.unsqueeze(-1)  # [T, window, 1]
+        score_states = score_states.masked_fill(~mask_expand, float("-inf"))
+        kv_states = kv_states.masked_fill(~mask_expand, 0.0)
+
+        weights = torch.softmax(score_states, dim=1)  # [T, window, head_dim]
+        compressed = (kv_states * weights).sum(dim=1)  # [T, head_dim]
+
+        variance = (compressed * compressed).mean(dim=-1, keepdim=True)
+        rrms = torch.rsqrt(variance + rms_norm_eps)
+        normed = compressed * rrms * rms_norm_weight.float().unsqueeze(0)
+
+        # GPT-J interleaved RoPE on last rope_head_dim dims
+        compressed_pos = (boundary_positions // compress_ratio) * compress_ratio
+        cs = cos_sin_cache[compressed_pos]  # [T, rope_dim]
+        cos_vals = cs[:, :half_rope]
+        sin_vals = cs[:, half_rope:]
+
+        rope_part = normed[:, nope_head_dim:]
+        rope_even = rope_part[:, 0::2]
+        rope_odd = rope_part[:, 1::2]
+        new_even = rope_even * cos_vals - rope_odd * sin_vals
+        new_odd = rope_even * sin_vals + rope_odd * cos_vals
+        normed[:, nope_head_dim::2] = new_even
+        normed[:, nope_head_dim + 1::2] = new_odd
+
+        # ---- graph-safe masked scatter into the paged cache --------------
+        kv_slots = kv_slot_mapping.index_select(0, sel).long()  # [T]
+        _masked_paged_write(
+            kv_cache,
+            dest=kv_slots,
+            write_ok=wv & (kv_slots >= 0),
+            data=normed,
+        )
+
     def compress_norm_rope_store_triton(
         state_cache, num_actual, token_to_req_indices, positions,
         slot_mapping, block_table, block_size, state_width,
@@ -1796,117 +1954,59 @@ def _compressor_compress_apply(mod):
         use_fp4_cache, rms_norm_weight, rms_norm_eps,
         quant_block, token_stride, scale_dim,
     ):
-        """Vectorized compress: no .item(), no Python per-token/per-window loop."""
-        coff = 2 if overlap else 1
-        window = coff * compress_ratio
-        nope_head_dim = head_dim - rope_head_dim
-        half_rope = rope_head_dim // 2
-        device = state_cache.device
+        """Vectorized compress: no .item(), no Python per-token/per-window loop.
 
+        Two selection strategies over the same core:
+
+        * eager -- compact to just the boundary tokens via ``nonzero``. Cheap
+          for prefill, where ``num_actual`` can be 8k but only
+          ``num_actual / compress_ratio`` tokens are boundaries.
+        * CUDA-graph capture -- ``nonzero`` has a data-dependent output shape,
+          which needs a host-side count that is unavailable mid-capture (it
+          reads uninitialized memory and blows up with a garbage dimension).
+          So process *all* ``num_actual`` rows and mask the store instead.
+          This mirrors what the upstream Triton kernel does: it launches
+          ``grid=(num_actual,)`` and each program early-exits on the GPU.
+        """
         all_positions = positions[:num_actual]
         all_slots = slot_mapping[:num_actual]
         valid_mask = (all_slots >= 0) & ((all_positions + 1) % compress_ratio == 0)
-        if not valid_mask.any():
-            return
 
-        # [N] boundary token indices (device tensor, no .item())
-        valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-        N = valid_indices.shape[0]
-
-        kv_slot_mapping = k_cache_metadata.slot_mapping
-        kv_cache_block_size = kv_cache.shape[1] if kv_cache.ndim >= 3 else block_size
-
-        # Gather all boundary token metadata as tensors (no .item())
-        boundary_positions = all_positions[valid_indices].long()       # [N]
-        boundary_req = token_to_req_indices[valid_indices].long()      # [N]
-
-        # Window offsets: [N, window] — positions to gather from state_cache
-        # For each boundary token at pos P, gather [P-window+1, ..., P]
-        offsets = torch.arange(-(window - 1), 1, device=device).unsqueeze(0)  # [1, window]
-        gather_pos = boundary_positions.unsqueeze(1) + offsets  # [N, window]
-        gather_mask = gather_pos >= 0  # [N, window]
-        gather_pos_safe = gather_pos.clamp(min=0)
-
-        # Block table lookup: flat indexing to avoid 2D advanced index crash
-        block_i = gather_pos_safe // block_size  # [N, window]
-        block_off = gather_pos_safe % block_size  # [N, window]
-        max_blocks_bt = block_table.shape[1]
-        flat_bt_idx = (boundary_req.unsqueeze(1) * max_blocks_bt + block_i.clamp(max=max_blocks_bt - 1)).reshape(-1)
-        block_numbers = block_table.reshape(-1)[flat_bt_idx].reshape(N, window)  # [N, window]
-
-        # Head offset for overlap mode
-        tokens_in_window = torch.arange(window, device=device)  # [window]
-        if overlap:
-            head_offset = (tokens_in_window >= compress_ratio).long() * head_dim  # [window]
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            sel = torch.arange(num_actual, device=state_cache.device)
+            wv = valid_mask
         else:
-            head_offset = torch.zeros(window, dtype=torch.long, device=device)
+            if not valid_mask.any():
+                return
+            sel = valid_mask.nonzero(as_tuple=True)[0]
+            wv = torch.ones_like(sel, dtype=torch.bool)
 
-        # Gather kv_states and score_states from state_cache
-        # state_cache: [num_blocks_sc, block_size_sc, state_dim]
-        sc_block_size = state_cache.shape[1]
-        sc_flat = state_cache.reshape(-1, state_cache.shape[-1])  # [total_slots, state_dim]
-        flat_sc_idx = (block_numbers * sc_block_size + block_off).reshape(-1)  # [N*window]
-
-        gathered = sc_flat[flat_sc_idx].reshape(N, window, -1)  # [N, window, state_dim]
-
-        # Extract kv and score with head_offset
-        # head_offset: [window] broadcast to [N, window]
-        ho = head_offset.unsqueeze(0).expand(N, -1)  # [N, window]
-
-        # For each (n, w): kv = gathered[n, w, ho[w] : ho[w]+head_dim]
-        # Vectorize: build index tensor [N, window, head_dim]
-        dim_idx = torch.arange(head_dim, device=device)  # [head_dim]
-        kv_start = ho.unsqueeze(-1) + dim_idx  # [N, window, head_dim]
-        score_start = (state_width + ho).unsqueeze(-1) + dim_idx  # [N, window, head_dim]
-
-        # Gather using advanced indexing on last dim
-        kv_states = gathered.gather(2, kv_start).float()  # [N, window, head_dim]
-        score_states = gathered.gather(2, score_start).float()  # [N, window, head_dim]
-
-        # Mask invalid positions
-        mask_expand = gather_mask.unsqueeze(-1)  # [N, window, 1]
-        score_states = score_states.masked_fill(~mask_expand, float("-inf"))
-        kv_states = kv_states.masked_fill(~mask_expand, 0.0)
-
-        # Softmax weighted sum: [N, head_dim]
-        weights = torch.softmax(score_states, dim=1)  # [N, window, head_dim]
-        compressed = (kv_states * weights).sum(dim=1)  # [N, head_dim]
-
-        # RMSNorm: [N, head_dim]
-        variance = (compressed * compressed).mean(dim=-1, keepdim=True)  # [N, 1]
-        rrms = torch.rsqrt(variance + rms_norm_eps)
-        normed = compressed * rrms * rms_norm_weight.float().unsqueeze(0)  # [N, head_dim]
-
-        # GPT-J interleaved RoPE on last rope_head_dim dims
-        compressed_pos = (boundary_positions // compress_ratio) * compress_ratio  # [N]
-        cs = cos_sin_cache[compressed_pos]  # [N, rope_dim]
-        cos_vals = cs[:, :half_rope]  # [N, half_rope]
-        sin_vals = cs[:, half_rope:]  # [N, half_rope]
-
-        rope_part = normed[:, nope_head_dim:]  # [N, rope_head_dim]
-        rope_even = rope_part[:, 0::2]  # [N, half_rope]
-        rope_odd = rope_part[:, 1::2]   # [N, half_rope]
-        new_even = rope_even * cos_vals - rope_odd * sin_vals
-        new_odd = rope_even * sin_vals + rope_odd * cos_vals
-        normed[:, nope_head_dim::2] = new_even
-        normed[:, nope_head_dim + 1::2] = new_odd
-
-        # Write to kv_cache: flat indexing
-        kv_slots = kv_slot_mapping[valid_indices].long()  # [N]
-        valid_write = kv_slots >= 0
-        if valid_write.any():
-            write_slots = kv_slots[valid_write]
-            write_data = normed[valid_write].to(kv_cache.dtype)
-            kv_block_idx = write_slots // kv_cache_block_size
-            kv_pos_in_block = write_slots % kv_cache_block_size
-            # Scatter write (per-token, but no .item() — uses tensor indexing)
-            for i in range(write_slots.shape[0]):
-                kv_cache[kv_block_idx[i], kv_pos_in_block[i], :head_dim] = write_data[i]
+        _compress_core(
+            sel=sel,
+            wv=wv,
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            all_positions=all_positions,
+            block_table=block_table,
+            block_size=block_size,
+            state_width=state_width,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            kv_slot_mapping=k_cache_metadata.slot_mapping,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+        )
 
     mod.compress_norm_rope_store_triton = compress_norm_rope_store_triton
     mod._kunlun_compress_patched = True
     logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched V4 compress_norm_rope_store_triton (PyTorch fallback)"
+        "[KunlunPlugin] patched V4 compress_norm_rope_store_triton "
+        "(PyTorch fallback, cudagraph-safe static path)"
     )
 
 
@@ -2048,6 +2148,7 @@ def register():
         logger.exception("[KunlunPlugin] Qwen3ReasoningParser registration failed")
         # Non-fatal: continue without the override
 
+    _log_op_inventory(logger)
     logger.info("[KunlunPlugin] register() done")
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
 
@@ -2104,4 +2205,63 @@ _register_post_import_hook(
     "vllm.models.deepseek_v4.nvidia.flashmla",
     _flashmla_padded_heads_applied,
     _flashmla_padded_heads_apply,
+)
+
+
+def _log_op_inventory(logger, tag="early"):
+    """Log the in-process op inventory.
+
+    Called twice on purpose. ~20 xspeedgate ops register LAZILY, only once
+    the quant modules are imported, so the register()-time snapshot ("early")
+    under-reports and e.g. shows sparse_attn_fwd absent when it is in fact
+    callable later. Trust the "final" line.
+
+    A stale source tree on PYTHONPATH can also shadow the installed package
+    while its .so still gets dlopened, so print which .so files are mapped.
+    """
+    try:
+        import torch
+
+        def names(ns):
+            return {n.split("::", 1)[1]
+                    for n in torch._C._dispatch_get_all_op_names()
+                    if n.startswith(ns + "::")}
+
+        xsg, kl = names("xspeedgate_ops"), names("_C")
+        try:
+            import xspeedgate_ops
+            where = xspeedgate_ops.__file__
+        except Exception:  # noqa: BLE001
+            where = "(not importable)"
+        logger.info("[KunlunPlugin] op inventory (%s): xspeedgate_ops=%d _C=%d from %s",
+                    tag, len(xsg), len(kl), where)
+        watch = ("sparse_attn_fwd", "act_sqrt_softplus", "dequantize_fp8_blocks",
+                 "moe_pre_small", "compressed_attention", "mqa_logits_paged",
+                 "moe_hash_topk_fused", "topk_per_row")
+        logger.info("[KunlunPlugin] key ops (%s): %s", tag,
+                    " ".join("%s=%s" % (w, "Y" if w in xsg else "n") for w in watch))
+        with open("/proc/self/maps") as f:
+            libs = sorted({ln.split()[-1] for ln in f
+                           if "xspeedgate" in ln or "kunlun_ops" in ln})
+        for lib in libs:
+            logger.info("[KunlunPlugin] mapped %s", lib)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[KunlunPlugin] op inventory probe failed: %r", e)
+
+
+def _op_inventory_final_applied(mod):
+    return getattr(mod, "_kunlun_op_inventory_logged", False)
+
+
+def _op_inventory_final_apply(mod):
+    mod._kunlun_op_inventory_logged = True
+    _log_op_inventory(logging.getLogger("vllm_kunlun"), tag="final")
+
+
+# gpu_model_runner is imported during engine init, i.e. after the quantization
+# modules that trigger the lazy op registration.
+_register_post_import_hook(
+    "vllm.v1.worker.gpu_model_runner",
+    _op_inventory_final_applied,
+    _op_inventory_final_apply,
 )
