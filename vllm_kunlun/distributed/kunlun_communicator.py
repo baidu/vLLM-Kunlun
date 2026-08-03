@@ -36,6 +36,9 @@ class KunlunCommunicator(CudaCommunicator):
         Raises:
             ValueError: If both ``device`` and ``device_group`` are not specified.
         """
+        # NOTE: `use_all2all` is accepted for callers that still pass it, but
+        # this vllm's DeviceCommunicatorBase derives `use_all2all` itself and
+        # rejects the kwarg.
         DeviceCommunicatorBase.__init__(
             self,
             cpu_group,
@@ -44,7 +47,6 @@ class KunlunCommunicator(CudaCommunicator):
             unique_name,
             global_ranks,
             global_world_size,
-            use_all2all=use_all2all,
         )
         self.ca_comm = None
         self.disabled = False
