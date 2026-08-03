@@ -198,18 +198,32 @@ def flash_mla_with_kvcache(
         # Gather using tensor indexing (no .item() for lengths - use full index width)
         swa_len = topk_length[b]  # scalar tensor on device
         parts = []
+        valid_parts = []
 
-        # SWA gather: use full swa_idx width (padded with 0s, clamped)
+        # SWA gather: padded indices are clamped for safe memory access, then
+        # excluded from attention by the per-request valid-length mask.
         swa_indices_b = swa_idx[b].long().clamp(0, swa_total - 1)
         parts.append(flat_swa[swa_indices_b])  # [swa_width, d_qk]
+        valid_parts.append(
+            torch.arange(swa_indices_b.shape[0], device=q.device) < swa_len
+        )
 
         # Compressed gather
         if flat_comp is not None and comp_idx is not None:
+            if extra_topk_length is None:
+                raise RuntimeError(
+                    "extra_topk_length is required with compressed sparse indices"
+                )
             comp_indices_b = comp_idx[b].long().clamp(0, flat_comp.shape[0] - 1)
             parts.append(flat_comp[comp_indices_b])  # [comp_width, d_qk]
+            valid_parts.append(
+                torch.arange(comp_indices_b.shape[0], device=q.device)
+                < extra_topk_length[b]
+            )
 
         # Concatenate: [total_kv, d_qk]
         kv_all = torch.cat(parts, dim=0).float()
+        valid_mask = torch.cat(valid_parts)
         kv_c = kv_all[:, :kv_lora_rank]  # [K, 512]
         kv_r = kv_all[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim] if qk_rope_head_dim > 0 else None
 
@@ -219,9 +233,20 @@ def flash_mla_with_kvcache(
             scores = scores + torch.mm(q_r[b], kv_r.T)
         scores = scores * softmax_scale
 
+        # Keep one safe slot for all-padding rows so softmax stays finite, then
+        # explicitly zero the output. For non-empty rows, only valid slots
+        # participate in softmax.
+        has_valid = valid_mask.any()
+        safe_valid_mask = valid_mask | (
+            (~has_valid)
+            & (torch.arange(valid_mask.shape[0], device=q.device) == 0)
+        )
+        scores = scores.masked_fill(~safe_valid_mask.unsqueeze(0), float("-inf"))
+
         # Softmax + output
         attn_weights = torch.softmax(scores, dim=-1)  # [H, K]
         attn_out = torch.mm(attn_weights, kv_c)  # [H, 512]
+        attn_out = attn_out * has_valid.to(attn_out.dtype)
 
         # Attention sink
         if attn_sink is not None:

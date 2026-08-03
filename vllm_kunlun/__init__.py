@@ -1846,8 +1846,93 @@ def _compressor_compress_applied(mod):
 def _compressor_compress_apply(mod):
     import torch
 
+    try:
+        import kunlun_ops as _compress_ops
+
+        _HAS_NATIVE_COMPRESS = (
+            os.getenv("KUNLUN_V4_COMPRESS_NATIVE", "1") != "0"
+            and all(
+                hasattr(_compress_ops, name)
+                for name in (
+                    "fused_kv_compress_gather",
+                    "dpsk_v4_norm_rope_gptj",
+                )
+            )
+        )
+    except Exception:
+        _compress_ops = None
+        _HAS_NATIVE_COMPRESS = False
+    _native_compress_warned = [False]
+
+    def _native_compress(
+        sel, state_cache, token_to_req_indices, all_positions, all_slots,
+        block_table, block_size, state_width, cos_sin_cache, head_dim,
+        rope_head_dim, compress_ratio, overlap, rms_norm_weight,
+        rms_norm_eps,
+    ):
+        if not _HAS_NATIVE_COMPRESS:
+            return None
+        try:
+            selected_positions = all_positions.index_select(0, sel)
+            selected_slots = all_slots.index_select(0, sel)
+            selected_reqs = token_to_req_indices.index_select(0, sel)
+            num_selected = sel.shape[0]
+            compressed = torch.zeros(
+                (num_selected, head_dim),
+                dtype=torch.float32,
+                device=state_cache.device,
+            )
+            _compress_ops.fused_kv_compress_gather(
+                state_cache,
+                selected_reqs,
+                selected_positions,
+                selected_slots,
+                block_table,
+                compressed,
+                block_size,
+                head_dim,
+                state_width,
+                compress_ratio,
+                int(overlap),
+            )
+
+            compressed_positions = (
+                selected_positions.long() // compress_ratio * compress_ratio
+            )
+            cos_sin = cos_sin_cache.index_select(0, compressed_positions)
+            half_rope = rope_head_dim // 2
+            interleaved_freqs = torch.stack(
+                (cos_sin[:, :half_rope], cos_sin[:, half_rope:]), dim=-1
+            ).reshape(num_selected, rope_head_dim).float().contiguous()
+            local_positions = torch.arange(
+                num_selected, dtype=torch.int64, device=state_cache.device
+            )
+            status = _compress_ops.dpsk_v4_norm_rope_gptj(
+                compressed,
+                rms_norm_weight.float().contiguous(),
+                local_positions,
+                interleaved_freqs,
+                mode=2,
+                compress_ratio=0,
+                eps=rms_norm_eps,
+            )
+            if status != 0:
+                raise RuntimeError(
+                    f"dpsk_v4_norm_rope_gptj returned {status}"
+                )
+            return compressed
+        except Exception as exc:
+            if not _native_compress_warned[0]:
+                logging.getLogger("vllm_kunlun").warning(
+                    "[KunlunPlugin] native V4 compressor failed; using torch "
+                    "fallback: %s",
+                    exc,
+                )
+                _native_compress_warned[0] = True
+            return None
+
     def _compress_core(
-        sel, wv, state_cache, token_to_req_indices, all_positions,
+        sel, wv, state_cache, token_to_req_indices, all_positions, all_slots,
         block_table, block_size, state_width, cos_sin_cache, kv_cache,
         kv_slot_mapping, head_dim, rope_head_dim,
         compress_ratio, overlap, rms_norm_weight, rms_norm_eps,
@@ -1859,6 +1944,33 @@ def _compressor_compress_apply(mod):
         ``T = sel.shape[0]`` only, so as long as the caller passes a
         statically-shaped ``sel`` the whole body is CUDA-graph capturable.
         """
+        normed = _native_compress(
+            sel=sel,
+            state_cache=state_cache,
+            token_to_req_indices=token_to_req_indices,
+            all_positions=all_positions,
+            all_slots=all_slots,
+            block_table=block_table,
+            block_size=block_size,
+            state_width=state_width,
+            cos_sin_cache=cos_sin_cache,
+            head_dim=head_dim,
+            rope_head_dim=rope_head_dim,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+        )
+        if normed is not None:
+            kv_slots = kv_slot_mapping.index_select(0, sel).long()
+            _masked_paged_write(
+                kv_cache,
+                dest=kv_slots,
+                write_ok=wv & (kv_slots >= 0),
+                data=normed,
+            )
+            return
+
         coff = 2 if overlap else 1
         window = coff * compress_ratio
         nope_head_dim = head_dim - rope_head_dim
@@ -1988,6 +2100,7 @@ def _compressor_compress_apply(mod):
             state_cache=state_cache,
             token_to_req_indices=token_to_req_indices,
             all_positions=all_positions,
+            all_slots=all_slots,
             block_table=block_table,
             block_size=block_size,
             state_width=state_width,
@@ -2006,7 +2119,8 @@ def _compressor_compress_apply(mod):
     mod._kunlun_compress_patched = True
     logging.getLogger("vllm_kunlun").info(
         "[KunlunPlugin] patched V4 compress_norm_rope_store_triton "
-        "(PyTorch fallback, cudagraph-safe static path)"
+        "(native=%s; torch fallback armed, cudagraph-safe static path)",
+        _HAS_NATIVE_COMPRESS,
     )
 
 
