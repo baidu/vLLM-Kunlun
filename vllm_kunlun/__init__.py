@@ -175,6 +175,47 @@ _register_post_import_hook(
 )
 
 
+# --- hook 4b: Kimi-K3 KDA torch fallbacks ---------------------------------
+# Every KDA kernel (causal_conv1d_*, chunk_kda_*, fused_recurrent_kda*,
+# gather_initial_states, rms_norm_gated) is triton-only and triton cannot load
+# binaries on P800. One torch implementation replaces one kernel; see
+# vllm_kunlun/ops/kda.py for why the kunlun gated-delta-rule kernel cannot be
+# used instead. Each module gets its own hook: importing an upstream module from
+# inside a hook would run that package's relative imports before _MODULE_MAPPINGS
+# can redirect them.
+def _kda_applied(mod):
+    return getattr(mod, "_kunlun_kda_patched", False)
+
+
+def _kda_model_apply(mod):
+    from vllm_kunlun.ops.kda import patch_kda_model
+
+    patch_kda_model(mod)
+
+
+def _kda_ops_apply(mod):
+    from vllm_kunlun.ops.kda import patch_kda_ops
+
+    patch_kda_ops(mod)
+
+
+def _kda_norm_apply(mod):
+    from vllm_kunlun.ops.kda import patch_rms_norm_gated
+
+    patch_rms_norm_gated(mod)
+
+
+_register_post_import_hook(
+    "vllm.models.kimi_k3.nvidia.kda", _kda_applied, _kda_model_apply
+)
+_register_post_import_hook(
+    "vllm.models.kimi_k3.nvidia.ops.third_party.kda", _kda_applied, _kda_ops_apply
+)
+_register_post_import_hook(
+    "vllm.third_party.flash_linear_attention.ops.kda", _kda_applied, _kda_norm_apply
+)
+
+
 # --- hook 5: Worker._maybe_get_memory_pool_context -----------------------
 # vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
 # is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
