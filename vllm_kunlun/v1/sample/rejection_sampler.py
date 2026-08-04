@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
@@ -674,12 +675,22 @@ def sample_recovered_tokens(
         dtype=torch.float32,
         device=device,
     )
-    q.exponential_()
-    for i, generator in sampling_metadata.generators.items():
-        # Do not generate random numbers for requests with no draft tokens.
-        # This can be important for reproducibility.
-        if num_draft_tokens[i] > 0:
-            q[i].exponential_(generator=generator)
+    if os.getenv("FAST_RANDOM_SAMPLE") == "1":
+        q.uniform_()
+        for i, generator in sampling_metadata.generators.items():
+            # Do not generate random numbers for requests with no draft tokens.
+            # This can be important for reproducibility.
+            if num_draft_tokens[i] > 0:
+                q[i].uniform_(generator=generator)
+        q = -torch.log(q)
+        q = q.clamp(min=1e-12)
+    else:
+        q.exponential_()
+        for i, generator in sampling_metadata.generators.items():
+            # Do not generate random numbers for requests with no draft tokens.
+            # This can be important for reproducibility.
+            if num_draft_tokens[i] > 0:
+                q[i].exponential_(generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
     sample_recovered_tokens_pytorch(
