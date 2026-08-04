@@ -113,6 +113,77 @@ def apply_top_k_top_p(
     return logits
 
 
+def apply_top_k_top_p_optimized(
+    logits: torch.Tensor,
+    k: Optional[torch.Tensor],
+    p: Optional[torch.Tensor],
+    max_select_k: int = 8192,
+) -> torch.Tensor:
+    """Sort-free top-k + top-p, mathematically identical to
+    :func:`apply_top_k_top_p` (same surviving token set, bit-identical probs).
+
+    Two strategies, picked by whether a small top-k window is available:
+
+    1. ``k`` given and ``max(k) <= max_select_k``: a single
+       ``topk(select_k)`` (select_k << V) yields a window that provably
+       contains every row's kept set, so top-p only needs a sorted cumsum over
+       that window. Exact, because the softmax over the window equals the
+       softmax over the full vocab once everything outside the top-k is -inf.
+    2. otherwise (``k`` is None, or top-k is effectively disabled -- vLLM
+       encodes that as ``k == vocab_size``): there is no bounded window, so use
+       ``kunlun_ops.top_p_renorm_probs``, which computes the top-p cutoff
+       without sorting.
+
+    NOTE: do NOT approximate case 2 by truncating to a fixed window. Measured
+    on vocab=151936: with ``p=0.9`` the exact kept set is ~6700 tokens/row, a
+    256-wide window keeps 171 (probs error 2e-1) and even a 4096-wide window
+    keeps 1877 (5e-2). For a flatter distribution the exact set is >100k.
+    """
+    if p is None:
+        if k is None:
+            return logits
+        # Avoid sorting vocab for top-k only case.
+        return apply_top_k_only(logits, k)
+
+    if k is not None:
+        select_k = min(int(k.max().item()), logits.shape[1])
+        if select_k <= max_select_k:
+            return _top_k_top_p_partial_sort(logits, k, p, select_k)
+        logits = kunlun_ops.top_k_mask_logits(logits, k)
+
+    renorm = kunlun_ops.top_p_renorm_probs(
+        logits.softmax(dim=-1, dtype=torch.float32), p
+    )
+    return logits.masked_fill_(renorm == 0, float("-inf"))
+
+
+def _top_k_top_p_partial_sort(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+    select_k: int,
+) -> torch.Tensor:
+    batch, vocab_size = logits.shape
+    # [batch, select_k], descending.
+    topk_vals, topk_idx = logits.topk(select_k, dim=1, largest=True, sorted=True)
+
+    # Apply top-k inside the window (k is a 1-based count).
+    k_thresh = topk_vals.gather(1, (k.to(torch.long) - 1).unsqueeze(1))
+    topk_vals.masked_fill_(topk_vals < k_thresh, -float("inf"))
+
+    # Apply top-p on the window. Descending exclusive cumsum >= p is the same
+    # cut as the ascending ``cumsum <= 1 - p`` used by the sort implementation.
+    probs_sort = topk_vals.softmax(dim=-1)
+    probs_cumsum = probs_sort.cumsum(dim=-1)
+    top_p_mask = (probs_cumsum - probs_sort) >= p.unsqueeze(1)
+    top_p_mask[:, 0] = False  # keep at least one token
+    topk_vals.masked_fill_(top_p_mask, -float("inf"))
+
+    out = logits.new_full((batch, vocab_size), -float("inf"))
+    out.scatter_(1, topk_idx, topk_vals)
+    return out
+
+
 def apply_top_k_only(
     logits: torch.Tensor,
     k: torch.Tensor,

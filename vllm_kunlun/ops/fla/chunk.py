@@ -296,6 +296,7 @@ def chunk_gated_delta_rule(
         scale = k.shape[-1] ** -0.5
 
     if cu_seqlens is not None and initial_state is not None:
+        # out_dtype = v.dtype
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
@@ -325,6 +326,7 @@ def chunk_gated_delta_rule(
             cu_seqlens,
             use_qk_l2norm_in_kernel=True,
         )
+        # o = o.to(out_dtype)
     else:
         o, final_state = ChunkGatedDeltaRuleFunction.apply(
             q,

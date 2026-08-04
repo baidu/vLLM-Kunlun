@@ -77,72 +77,64 @@ def torch_causal_conv1d_update_spec(
     conv_state_indices=None,
     num_accepted_tokens=None,
 ):
-    if bias is not None:
-        bias = bias.to(weight.dtype)
-    out = torch.empty_like(hidden_states)
-    _, seq_len, hidden_size = hidden_states.shape
-    for i in range(hidden_states.shape[0]):
-        tmp_conv_state = conv_state[conv_state_indices[i]]
-        state_len = tmp_conv_state.shape[-2]
-        hidden_states_i = hidden_states[i]
-        hidden_states_new = torch.cat(
-            [tmp_conv_state[: (2 + num_accepted_tokens[i]), :], hidden_states_i], dim=0
-        ).to(weight.dtype)
+    """CUDA/XPU-graph-safe pure-torch reference for the spec (MTP) conv update.
 
-        hidden_states_new = hidden_states_new.unsqueeze(0)
+    hidden_states: (batch, seq_len, dim)
+    conv_state:    (num_cache_lines, state_len, dim)  [is_ncw=False layout]
+    weight:        (dim, width), bias: (dim,)
 
-        width = weight.shape[-1]
-        # The convolution below needs at least ``width`` input rows to produce a
-        # non-negative output length (F.conv1d output len = in_len - width + 1).
-        # On the real spec-decode path the concatenated stream is always long
-        # enough. During the dummy/warmup run (e.g. cudagraph capture) the
-        # constructed ``num_accepted_tokens`` can make ``2 + accepted + seq_len``
-        # shorter than ``width``, which would crash F.conv1d with a negative
-        # dimension. Left-pad (on the oldest side) with zeros to the minimum
-        # required length; this mirrors the community Triton kernel, which reads
-        # conv history through a bounded mask and treats out-of-range history as
-        # zero. The real path never hits this branch, so its numerics are
-        # unchanged.
-        min_len = width - 1 + seq_len
-        if hidden_states_new.shape[1] < min_len:
-            hidden_states_new = F.pad(
-                hidden_states_new, (0, 0, min_len - hidden_states_new.shape[1], 0)
-            )
+    ``num_accepted_tokens`` is only ever used to build *gather indices* and a
+    *mask* -- never a Python slice bound, an ``if`` condition or a tensor
+    shape. Every shape below is a function of (batch, seq_len, dim, width)
+    only, so the traced graph stays valid for any accepted-token count and
+    there is no device->host sync.
+    """
+    batch, seq_len, dim = hidden_states.shape
+    state_len = conv_state.shape[-2]
+    width = weight.shape[-1]
+    # The caller guarantees a sliding window that exactly fits the cache slot
+    # (state_len == conv_kernel_size - 1 + num_spec, seq_len == num_spec + 1).
+    assert state_len == width - 2 + seq_len, (
+        f"spec conv expects state_len == width - 2 + seq_len, got "
+        f"state_len={state_len}, width={width}, seq_len={seq_len}"
+    )
 
-        # Roll the conv_state in a sliding-window manner, matching the
-        # community Triton kernel (``_causal_conv1d_update_kernel``). That
-        # kernel writes ``new_conv_state`` back with a masked store bounded by
-        # ``idx_tokens < state_len``, i.e. it fills only the leading valid rows
-        # of the cache slot and leaves the rest untouched -- it never requires
-        # the written window to exactly equal the physical ``state_len``.
-        #
-        # Here ``hidden_states_new[:, -state_len:, :]`` is the sliding window
-        # (history tail + new tokens). On the real spec-decode path its length
-        # is exactly ``state_len``; during the dummy/warmup run (seq_len==1,
-        # dummy num_accepted_tokens) it can be shorter. Writing into the front
-        # slice ``[:n]`` reproduces the kernel's masked store for both cases
-        # without zero-padding the cache (left-padding would corrupt the state
-        # with spurious zeros).
-        new_conv_state = hidden_states_new[:, -state_len:, :]
-        n = new_conv_state.shape[1]
-        conv_state[conv_state_indices[i]][:n, :] = new_conv_state[0]
-        for j in range(seq_len):
-            if j == seq_len - 1:
-                hidden_states_new_j = hidden_states_new
-            else:
-                hidden_states_new_j = hidden_states_new[:, : (1 - seq_len + j)]
-            hidden_states_new_j = hidden_states_new_j.transpose(-1, -2).contiguous()
-            out_i = F.conv1d(
-                hidden_states_new_j,
-                weight.unsqueeze(1),
-                bias,
-                padding=0,
-                groups=hidden_size,
-            )
-            out_i = F.silu(out_i[:, :, -1:])
-            out_i = out_i.to(hidden_states.dtype).squeeze(-1).unsqueeze(0)
-            out[i, j] = out_i
-    return out.view(-1, hidden_size)
+    idx = conv_state_indices.long()
+    # Read the selected cache lines *before* the write-back below.
+    hist = conv_state.index_select(0, idx)  # (batch, state_len, dim)
+
+    # Request i has ``2 + accepted_i`` valid history rows, so the ``width - 1``
+    # rows the convolution needs start at ``2 + accepted_i - (width - 1)``.
+    # Negative rows lie outside the history -- only reachable on the
+    # dummy/warmup run where accepted can be 0. They are clamped for the gather
+    # and then zeroed by ``row_ok``, which reproduces the zero-padded history of
+    # the community Triton kernel (it reads history through a bounded mask).
+    rows = num_accepted_tokens.long().view(batch, 1) + (3 - width)
+    rows = rows + torch.arange(width - 1, device=hidden_states.device).view(1, -1)
+    row_ok = (rows >= 0) & (rows < state_len)
+    rows = rows.clamp_(0, state_len - 1)
+    hist_tail = hist.gather(1, rows.unsqueeze(-1).expand(batch, width - 1, dim))
+    hist_tail = hist_tail * row_ok.unsqueeze(-1).to(hist_tail.dtype)
+
+    # (batch, width - 1 + seq_len, dim): history tail followed by the new
+    # tokens. Output token j is the conv over the fixed window [j, j + width).
+    stream = torch.cat([hist_tail, hidden_states], dim=1).to(weight.dtype)
+
+    out = F.conv1d(
+        stream.transpose(1, 2).contiguous(),
+        weight.unsqueeze(1),
+        bias.to(weight.dtype) if bias is not None else None,
+        padding=0,
+        groups=dim,
+    )  # (batch, dim, seq_len)
+    # Unconditional silu, matching the previous reference and the GDN caller,
+    # which always requests silu.
+    out = F.silu(out).transpose(1, 2).to(hidden_states.dtype)
+
+    # Slide the cache window: drop the oldest row of the stream, keeping the
+    # newest ``state_len`` rows.
+    conv_state.index_copy_(0, idx, stream[:, 1:, :].to(conv_state.dtype).contiguous())
+    return out.reshape(-1, dim)
 
 
 def causal_conv1d_update(
@@ -229,9 +221,13 @@ def causal_conv1d_update(
     # Drop the legacy ``state_seq_stride`` / ``act="SWISH"`` / paired
     # ``*_cpu`` + ``*_xpu`` arguments.
     silu_activation = activation in ("silu", "swish")
+    if num_accepted_tokens is not None:
+        state_len = width - 1 + (max_query_len - 1)  # spec
+    else:
+        state_len = width - 1
     kunlun_ops.causal_conv1d_update(
         x,
-        conv_state,
+        conv_state[:, :state_len, :],
         weight,
         bias=bias,
         silu_activation=silu_activation,
@@ -241,32 +237,6 @@ def causal_conv1d_update(
         pad_slot_id=pad_slot_id,
         num_accepted_tokens=num_accepted_tokens,
     )
-    # if (
-    #     num_accepted_tokens is not None
-    # ):
-    #     # Binary-search: route the spec conv through the pure-torch reference.
-    #     x = torch_causal_conv1d_update_spec(
-    #         hidden_states=x,
-    #         conv_state=conv_state,
-    #         weight=weight,
-    #         bias=bias,
-    #         activation="silu" if silu_activation else None,
-    #         conv_state_indices=conv_state_indices,
-    #         num_accepted_tokens=num_accepted_tokens,
-    #     )
-    # else:
-    #     kunlun_ops.causal_conv1d_update(
-    #         x,
-    #         conv_state,
-    #         weight,
-    #         bias=bias,
-    #         silu_activation=silu_activation,
-    #         cache_seqlens=None,
-    #         conv_state_indices=conv_state_indices,
-    #         is_ncw=False,
-    #         pad_slot_id=pad_slot_id,
-    #         num_accepted_tokens=num_accepted_tokens,
-    #     )
     if num_accepted_tokens is None:
         # non-spec decode: x is [batch, 1, dim] -> [batch, dim]
         return x.squeeze(1)
