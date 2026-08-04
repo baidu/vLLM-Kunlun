@@ -1,0 +1,128 @@
+"""Central registration of DSV4 adapter hooks.
+
+This module bridges between ``vllm_kunlun.__init__.py``'s existing
+post-import machinery and individual functional adapters kept under this
+package.
+"""
+import logging
+from typing import Callable, List, Tuple
+
+LOGGER = logging.getLogger("vllm_kunlun.adapters")
+HookSpec = Tuple[str, str, Callable[[object], bool], Callable[[object], None]]
+# Targets that will be patched lazily through the plugin dispatcher once their host modules are loaded.
+_LAZY_HOOKS: List[Tuple[str, str, Callable[[object], bool], Callable[[object], None]]] = []
+
+_LAZY_DESCRIPTOR = "__dsv4_lazy_applied_sentinel__"
+
+
+def _register_lazy(
+    target_module_path: str,
+    applied_test: Callable[[object], bool],
+    applier: Callable[[object], None],
+    *,
+    label: str | None = None,
+) -> None:
+    """Record a hook that should fire when *target_module_path* appears in sys.modules."""
+    effective_label = label or target_module_path
+    _LAZY_HOOKS.append((effective_label, target_module_path, applied_test, applier))
+
+
+def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
+    """Register every DSV4 hook known so far and eagerly install cheap ones.
+
+    Args:
+        register_post_import_hook: callback provided by root package used to queue
+            patches against imported community modules.
+    Returns:
+        Labels of adapters successfully registered on this invocation.
+    """
+    labels_installed: List[str] = []
+
+    # --- lightweight paths installed immediately ---
+    # NOTE: platform_policy is NOT installed eagerly because it imports
+    # KunlunPlatform which triggers vllm.__init__ -> torch_utils -> 
+    # is_pin_memory_available() -> from vllm.platforms import current_platform
+    # This chain fails during plugin registration when current_platform
+    # is not yet resolved. Instead, we defer to a lazy hook that fires
+    # when the platform is first used for model config checking.
+    _register_lazy(
+        "vllm.v1.worker.gpu_worker",
+        lambda m: True,  # fire once, platform_policy.apply() is idempotent
+        lambda m: __import__("vllm_kunlun.adapters.dsv4.platform_policy", fromlist=["apply"]).apply(),
+        label="dsv4.platform_policy",
+    )
+
+    try:
+        from .norms import apply as _norms_apply
+        _norms_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 RMSNorm-shortcut installation failed (%s)", exc)
+
+    try:
+        from .qkv_cache_insert import apply as _qkv_insert_apply
+        _qkv_insert_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 QKV-cache-insert installation failed (%s)", exc)
+
+    try:
+        from .o_proj_alias import apply as _o_proj_apply
+        _o_proj_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 O-projection alias installation failed (%s)", exc)
+
+    try:
+        from .mhc_hyperconnection import apply as _mhc_apply
+        _mhc_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 MHC hyperconnection installation failed (%s)", exc)
+
+    try:
+        from .flashmla_bridge import apply as _flashmla_bridge_apply
+        _flashmla_bridge_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 FlashMLA metadata bridge registration failed (%s)", exc)
+
+    try:
+        from .indexer_decode import apply as _indexer_decode_apply
+        _indexer_decode_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 sparse-indexer decode registration failed (%s)", exc)
+
+    try:
+        from .compressor import apply as _compressor_apply
+        _compressor_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 compressor adapter registration failed (%s)", exc)
+
+    try:
+        from .moe_hash_router import apply as _moe_hash_apply
+        _moe_hash_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 MoE hash/softplus router registration failed (%s)", exc)
+
+    try:
+        from .moe_int8_factory import apply as _moe_int8_apply
+        _moe_int8_apply()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 INT8-W8A8-MoE bridge registration failed (%s)", exc)
+
+    # Note for future extraction work:
+    # Other functional adapters should append entries to _LAZY_HOOKS inside their own apply().
+
+    # --- heavier paths flushed only when their owning modules actually load ---
+    def _make_predicate(pred):
+        return pred
+
+    for descriptor_label, target, pred_fn, applier_fn in list(_LAZY_HOOKS):
+
+        def _applier(mod, inner_app=applier_fn, marker=descriptor_label):
+            try:
+                inner_app(mod)
+                setattr(mod, _LAZY_DESCRIPTOR, marker)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Lazy DSV4 adapter failed for %r", marker)
+
+        register_post_import_hook(target, lambda mod, p=pred_fn: p(mod), _applier)
+        labels_installed.append(f"lazy:{target}")
+
+    return labels_installed

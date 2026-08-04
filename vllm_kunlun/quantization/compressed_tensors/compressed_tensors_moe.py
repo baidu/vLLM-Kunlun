@@ -18,7 +18,6 @@
 
 from typing import Callable, Optional, Union
 
-import os as _os
 import torch
 import torch.nn.functional as F
 from compressed_tensors import CompressionFormat
@@ -42,13 +41,12 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
-logger = init_logger(__name__)
+from vllm_kunlun.adapters.dsv4.moe_int8_factory import (
+    create_modular_v4_method as _dsv4_create_v4_i8_method,
+    int8_w8a8_route_native_enabled as _dsv4_i8_native_enabled,
+)
 
-# V4 INT8 MoE forward backend. Default ON: use the native grouped-GEMM
-# pipeline (moe_pre_sorted -> quant2d -> INT8 moe_fc -> silu_and_mul ->
-# quant2d -> INT8 moe_fc -> moe_post). Set KUNLUN_INT8_MOE_NATIVE=0 to
-# force the torch per-expert loop (correctness fallback).
-_INT8_MOE_V4_NATIVE = _os.environ.get("KUNLUN_INT8_MOE_NATIVE", "1") == "1"
+logger = init_logger(__name__)
 
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
@@ -112,18 +110,14 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant, input_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
-            # DeepSeek-V4 uses sqrtsoftplus + hash routing, which the community
-            # router computes (modular path). The monolithic INT8 kernel only
-            # supports softmax/sigmoid scoring, so route V4 to a dedicated
-            # modular method that accepts pre-computed topk_weights/topk_ids.
             scoring_func = getattr(layer, "scoring_func", "softmax")
             if scoring_func == "sqrtsoftplus":
                 logger.info_once(
                     "Using KunlunCompressedTensorsW8A8Int8MoEMethodV4 "
                     "(modular, scoring_func=sqrtsoftplus)"
                 )
-                return KunlunCompressedTensorsW8A8Int8MoEMethodV4(
-                    weight_quant, input_quant, layer.moe_config
+                return _dsv4_create_v4_i8_method(
+                    weight_quant, input_quant, layer
                 )
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
@@ -405,7 +399,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethodV4(CompressedTensorsW8A8Int8MoEMet
         # ``mul_`` is safe; do NOT call it twice or scales become 127^2 x.
         # Torch fallback path (KUNLUN_INT8_MOE_NATIVE=0): keep weights as
         # loaded so ``_dequant_expert`` produces the correct bf16 tensor.
-        if _INT8_MOE_V4_NATIVE:
+        if _dsv4_i8_native_enabled():
             with torch.no_grad():
                 layer.w13_weight_scale.mul_(127.0)
                 layer.w2_weight_scale.mul_(127.0)
@@ -626,7 +620,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethodV4(CompressedTensorsW8A8Int8MoEMet
         # Shared experts are executed separately by FusedMoERunner for this
         # non-modular method (mirrors the FP8 path).
         del shared_experts, shared_experts_input
-        if _INT8_MOE_V4_NATIVE:
+        if _dsv4_i8_native_enabled():
             try:
                 return self._apply_native_int8_grouped(
                     layer, x, topk_weights, topk_ids
