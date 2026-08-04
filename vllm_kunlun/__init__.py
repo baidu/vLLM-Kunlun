@@ -45,6 +45,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.attention.backends.mla.flashattn_mla": "vllm_kunlun.v1.attention.backends.mla.flashattn_mla",
     "vllm.models.kimi_k3.nvidia.mla": "vllm_kunlun.models.kimi_k3.nvidia.mla",
     "vllm.models.kimi_k3.nvidia.ops.attn_res": "vllm_kunlun.models.kimi_k3.nvidia.ops.attn_res",
+    "vllm.models.kimi_k3.nvidia.kda": "vllm_kunlun.models.kimi_k3.nvidia.kda",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
 }
 
