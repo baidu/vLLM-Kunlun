@@ -37,82 +37,6 @@ except ImportError as e:
 
 _per_token_smooth_quant = True
 
-# `moe_sigmoid_group_topk_norm` and `moe_pre_sorted` only support
-# expert_num <= 512 on P800. Above that, `moe_sigmoid_group_topk_norm`
-# returns ret=1 and leaves its outputs untouched (the wrapper ignores the
-# return code, so the garbage topk ids then make the pre-sort kernels read
-# out of bounds), and `moe_pre_sorted` fails with ret=2. Kimi-K3 has 896
-# experts, so those shapes take the torch path below.
-_MOE_KERNEL_MAX_EXPERTS = 512
-
-
-def _sigmoid_group_topk_norm_torch(
-    x: torch.Tensor,
-    topk_index: torch.Tensor,
-    norm_score: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    scale: float,
-    n_group: Optional[int],
-    topk_group: Optional[int],
-) -> None:
-    """torch equivalent of ``torch.ops._C.moe_sigmoid_group_topk_norm``.
-
-    Experts are picked on ``sigmoid(x) + bias``, while the returned weights
-    are the (bias-free) sigmoid scores of the picked experts, normalized to
-    sum to 1 and scaled by ``scale``.
-    """
-    scores = torch.sigmoid(x.float())
-    routing = scores if bias is None else scores + bias.reshape(1, -1).float()
-
-    if n_group is not None and n_group > 1:
-        m, e = routing.shape
-        grouped = routing.view(m, n_group, e // n_group)
-        group_score = grouped.topk(2, dim=-1).values.sum(dim=-1)
-        kept = group_score.topk(topk_group, dim=-1).indices
-        group_mask = torch.zeros_like(group_score, dtype=torch.bool)
-        group_mask.scatter_(1, kept, True)
-        routing = routing.masked_fill(
-            ~group_mask.unsqueeze(-1).expand_as(grouped).reshape(m, e),
-            float("-inf"),
-        )
-
-    ids = routing.topk(topk_index.shape[-1], dim=-1).indices
-    weights = scores.gather(1, ids)
-    weights = weights / weights.sum(dim=-1, keepdim=True) * scale
-
-    topk_index.copy_(ids.to(topk_index.dtype))
-    norm_score.copy_(weights.to(norm_score.dtype))
-
-
-def _moe_pre_sorted_torch(
-    x: torch.Tensor,
-    topk_index: torch.Tensor,
-    moe_expand: torch.Tensor,
-    moe_index: torch.Tensor,
-    expert_m: torch.Tensor,
-    sorted_tokens_num_lod: torch.Tensor,
-) -> None:
-    """torch equivalent of ``torch.ops._C.moe_pre_sorted``.
-
-    Sorts the ``[m * topk]`` (token, expert) slots by expert id, writes the
-    gathered rows into ``moe_expand`` and the slot -> sorted position map
-    into ``moe_index``, matching the kernel's output layout.
-    """
-    num_experts = expert_m.numel()
-    flat_ids = topk_index.reshape(-1).long()
-    order = torch.argsort(flat_ids, stable=True)
-    slot_token = torch.arange(x.shape[0], device=x.device).repeat_interleave(
-        topk_index.shape[-1]
-    )
-
-    moe_expand.copy_(x[slot_token[order]])
-    moe_index.copy_(torch.argsort(order).to(moe_index.dtype))
-
-    counts = torch.bincount(flat_ids, minlength=num_experts)
-    expert_m.copy_(counts.to(expert_m.dtype))
-    sorted_tokens_num_lod[0] = 0
-    sorted_tokens_num_lod[1:].copy_(counts.cumsum(0).to(sorted_tokens_num_lod.dtype))
-
 
 def is_per_token_smooth_quant():
     """is per token smooth quant"""
@@ -765,29 +689,21 @@ class KunlunOps:
                 stable=True,
             )
         elif scoring_func == "sigmoid":
-            if global_num_experts > _MOE_KERNEL_MAX_EXPERTS:
-                _sigmoid_group_topk_norm_torch(
-                    router_logits,
-                    topk_ids,
-                    normed_score,
-                    e_score_correction_bias,
-                    1.0,
-                    num_expert_group,
-                    topk_group,
-                )
-            else:
-                torch.ops._C.moe_sigmoid_group_topk_norm(
-                    x=router_logits,
-                    topk_index=topk_ids,
-                    norm_score=normed_score,
-                    block_static=block_statistic,
-                    bias=e_score_correction_bias,
-                    scale=1.0,
-                    n_group=num_expert_group,
-                    topk_group=topk_group,
-                )
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                topk_index=topk_ids,
+                norm_score=normed_score,
+                block_static=block_statistic,
+                bias=e_score_correction_bias,
+                scale=1.0,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+            )
         else:
             raise ValueError(f"Unsupported scoring_func: {scoring_func}")
+
+        # Generate block statistic
+        # torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
         # Pre-sort tokens by expert
         moe_expand = torch.empty(
@@ -803,26 +719,15 @@ class KunlunOps:
             M * moe_top_k, dtype=torch.int32, device=hidden_states.device
         )
 
-        if global_num_experts > _MOE_KERNEL_MAX_EXPERTS:
-            _moe_pre_sorted_torch(
-                x=hidden_states,
-                topk_index=topk_ids,
-                moe_expand=moe_expand,
-                moe_index=sorted_tokens_idx,
-                expert_m=expert_m,
-                sorted_tokens_num_lod=sorted_tokens_num_lod,
-            )
-        else:
-            torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
-            torch.ops._C.moe_pre_sorted(
-                x=hidden_states,
-                topk_index=topk_ids,
-                block_statistic=block_statistic,
-                moe_expand=moe_expand,
-                moe_index=sorted_tokens_idx,
-                expert_m=expert_m,
-                sorted_tokens_num_lod=sorted_tokens_num_lod,
-            )
+        # torch.ops._C.moe_pre_sorted(
+        #     x=hidden_states,
+        #     topk_index=topk_ids,
+        #     block_statistic=block_statistic,
+        #     moe_expand=moe_expand,
+        #     moe_index=sorted_tokens_idx,
+        #     expert_m=expert_m,
+        #     sorted_tokens_num_lod=sorted_tokens_num_lod,
+        # )
         del expert_m, block_statistic  # Release after moe_pre_sorted
 
         # First FC layer (w13) - use preprocessed weights directly

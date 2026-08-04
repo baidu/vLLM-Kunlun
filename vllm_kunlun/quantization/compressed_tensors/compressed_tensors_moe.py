@@ -50,30 +50,14 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        # Checkpoints name the expert projections after their own convention
-        # (Kimi-K3 uses w1/w3/w2) and the compressed-tensors targets are
-        # regexes over those names, while the RoutedExperts layer itself is
-        # built with the canonical names. Probe the canonical names first and
-        # fall back to the checkpoint conventions.
-        ckpt_names = (
-            getattr(layer, "ckpt_gate_proj_name", "gate_proj"),
-            getattr(layer, "ckpt_up_proj_name", "up_proj"),
-            getattr(layer, "ckpt_down_proj_name", "down_proj"),
-        )
-        name_candidates = [ckpt_names]
-        for candidate in [("gate_proj", "up_proj", "down_proj"), ("w1", "w3", "w2")]:
-            if candidate != ckpt_names:
-                name_candidates.append(candidate)
-
-        all_scheme_dicts: list = []
-        for candidate in name_candidates:
-            unfused_names = [f"{layer_name}.0.{proj_name}" for proj_name in candidate]
-            # TODO: refactor this to use expert_mapping and check all layer numbers
-            all_scheme_dicts = [
-                quant_config.get_scheme_dict(layer, name) for name in unfused_names
-            ]
-            if any(cur_dict is not None for cur_dict in all_scheme_dicts):
-                break
+        unfused_names = [
+            layer_name + proj_name
+            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        ]
+        # TODO: refactor this to use expert_mapping and check all layer numbers
+        all_scheme_dicts = [
+            quant_config.get_scheme_dict(layer, name) for name in unfused_names
+        ]
         scheme_dict = all_scheme_dicts.pop()
 
         # multiple schemes found
