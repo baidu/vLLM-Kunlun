@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
+import kunlun_ops
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -693,7 +694,7 @@ def sample_recovered_tokens(
                 q[i].exponential_(generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    sample_recovered_tokens_pytorch(
+    kunlun_ops.sample_recovered_tokens(
         recovered_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -701,7 +702,7 @@ def sample_recovered_tokens(
         target_probs,
         q,
         vocab_size,
-        IS_NGRAM=draft_probs is None,
+        draft_probs is None,
     )
     return recovered_token_ids
 
