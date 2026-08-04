@@ -25,6 +25,18 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 logger = init_logger(__name__)
 
 
+def _to_cpu(t: torch.Tensor | None) -> torch.Tensor | None:
+    """Force a metadata mirror onto the host, no-op if it is already there.
+
+    Several ``*_cpu`` locals in ``build()`` are produced by indexing the *device*
+    block table, so they are not actually on the host despite the name. Their
+    consumers pass them to kunlun ops as host pointers.
+    """
+    if t is None or t.device.type == "cpu":
+        return t
+    return t.to("cpu")
+
+
 class GDNAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -210,6 +222,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_conv_state_indices_tensor: torch.Tensor | None = None
         spec_conv_state_indices_tensor_cpu: torch.Tensor | None = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        # [Kunlun] These CPU mirrors are only produced on some branches below but
+        # are always read when the metadata is built, so default them here.
+        spec_state_indices_tensor_cpu: torch.Tensor | None = None
+        non_spec_state_indices_tensor_cpu: torch.Tensor | None = None
         if (
             not self.use_spec_decode
             or num_decode_draft_tokens_cpu is None
@@ -544,27 +560,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc=non_spec_query_start_loc,
             non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             spec_state_indices_tensor=spec_state_indices_tensor,
-            spec_state_indices_tensor_cpu=(
-                spec_state_indices_tensor.cpu()
-                if spec_state_indices_tensor is not None
-                else None
-            ),
+            # [Kunlun] These locals are named ``*_cpu`` but are produced by
+            # indexing the *device* ``block_table_tensor`` (see the branches
+            # above), so they can still live on the device. The consumers hand
+            # them to kunlun ops as host pointers, so they must be forced to CPU
+            # -- passing a device tensor there faults with
+            # "an illegal memory access was encountered".
+            spec_state_indices_tensor_cpu=_to_cpu(spec_state_indices_tensor_cpu),
             spec_conv_state_indices_tensor=spec_conv_state_indices_tensor,
-            spec_conv_state_indices_tensor_cpu=spec_conv_state_indices_tensor_cpu,
+            spec_conv_state_indices_tensor_cpu=_to_cpu(
+                spec_conv_state_indices_tensor_cpu
+            ),
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
-            non_spec_state_indices_tensor_cpu=(
-                non_spec_state_indices_tensor.to("cpu", non_blocking=True)
-                if non_spec_state_indices_tensor is not None
-                else None
+            non_spec_state_indices_tensor_cpu=_to_cpu(
+                non_spec_state_indices_tensor_cpu
             ),
             spec_sequence_masks=spec_sequence_masks,
             spec_token_masks=spec_token_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
-            num_accepted_tokens_cpu=(
-                num_accepted_tokens.cpu() if num_accepted_tokens is not None else None
-            ),
+            # [Kunlun] No consumer reads this: ``causal_conv1d_update`` accepts a
+            # ``num_accepted_tokens_cpu`` argument but never forwards it to the
+            # kernel. Dropping the blocking ``.cpu()`` removes one device sync
+            # per spec-decode step per attention group.
+            num_accepted_tokens_cpu=None,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,

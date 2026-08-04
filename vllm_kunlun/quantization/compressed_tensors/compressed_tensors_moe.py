@@ -20,6 +20,7 @@ from typing import Callable, Optional, Union
 
 import torch
 from compressed_tensors import CompressionFormat
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -111,6 +112,49 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+        moe,
+        layer_name: Optional[str] = None,
+    ):
+        # Deliberately skip CompressedTensorsW8A8Int8MoEMethod.__init__: it ends
+        # with ``select_int8_moe_backend()``, whose only registered backend is
+        # TRITON (see vllm .../fused_moe/oracle/int8.py: Int8MoeBackend has a
+        # single member). Triton is unsupported on Kunlun XPU, so the oracle
+        # raises "No Int8 MoE backend supports the deployment configuration."
+        #
+        # This class does not need the oracle: ``is_monolithic`` is True and
+        # ``apply_monolithic`` / ``process_weights_after_loading`` below run the
+        # kunlun int8 MoE ops directly, so ``experts_cls`` / ``moe_kernel`` are
+        # never used. The validation the upstream __init__ performs is kept.
+        super(CompressedTensorsW8A8Int8MoEMethod, self).__init__(moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found "
+                f"{self.weight_quant}, {self.input_quant}"
+            )
+
+        self.static_input_scales = not self.input_quant.dynamic
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found static input scales."
+            )
+
+        # Consumed only by the upstream (unused here) modular-kernel path.
+        self.int8_backend = None
+        self.experts_cls = None
+
     @property
     def is_monolithic(self) -> bool:
         return True

@@ -136,9 +136,12 @@ def torch_fused_recurrent_gated_delta_rule(
         S     += outer(k, u)                  # rank-1 update
         o      = q @ S                        # readout
 
-    Rolling-buffer writeback (matches the fwdv2 kernel exactly):
-        column t  <- S_t         for t >= 1   (per draft-token states)
-        column 0  <- S_{acc-1}                (the accepted / base state)
+    Rolling-buffer writeback (matches the community Triton kernel):
+        column t  <- S_t         for every t, including t == 0
+    The next forward reads column ``num_accepted - 1``, so all L candidate
+    states must be published. NOTE: the kunlun fwdv2 kernel instead writes
+    ``column 0 <- S_{num_accepted-1}``, which is stale by one step and corrupts
+    the state (see the comment at the writeback below).
 
     CUDA-graph-friendly form: this is a fully vectorized rewrite of the earlier
     per-sequence Python loop. It contains no host synchronization (no ``.item()``
@@ -221,16 +224,6 @@ def torch_fused_recurrent_gated_delta_rule(
     g2 = g.reshape(N, L, HV)
     beta2 = beta.reshape(N, L, HV, V) if beta_headwise else beta.reshape(N, L, HV)
 
-    # Writeback rolling-buffer source (column 0 <- state after step
-    # ``num_accepted - 1``; column t <- state after step t for t >= 1). Committed
-    # in-place per step (below) to keep peak memory at ~one step's state instead
-    # of stacking all L states, which OOMs for large concurrency.
-    if inplace_final_state:
-        if is_spec:
-            base = (num_accepted_tokens.long() - 1).clamp_(0, L - 1)  # (N,)
-        else:
-            base = torch.zeros(N, dtype=torch.long, device=device)
-
     def _commit(state_kv, dest_blocks, wmask):
         """Scatter state (N, HV, K, V) -> physical [V, K] into ``initial_state``
         at ``dest_blocks`` for rows where ``wmask`` & block id > 0. Skipped rows
@@ -254,9 +247,17 @@ def torch_fused_recurrent_gated_delta_rule(
         S = S + k_t[:, :, :, None] * u[:, :, None, :]  # (N, HV, K, V)
         o[:, t] = (S * q2[:, t][:, :, :, None]).sum(2)  # (N, HV, V)
         if inplace_final_state:
-            if t >= 1:
-                _commit(S, idx[:, t], valid_read)  # column t
-            _commit(S, idx[:, 0], valid_read & (base == t))  # column 0 when base==t
+            # Rolling buffer: column t <- state after step t, for EVERY t
+            # (including t == 0). The next forward reads column
+            # ``num_accepted - 1``, i.e. the state after its last accepted
+            # token, so all L candidate states must be published. Writing
+            # column 0 with ``S_{num_accepted-1}`` of *this* call instead (what
+            # the kunlun fwdv2 kernel does) uses the previous step's acceptance
+            # count and leaves column 0 holding a state that is too far ahead
+            # whenever this call was entered with ``num_accepted >= 2``; the
+            # following step then reads it if it accepts exactly 1 token and the
+            # sequence state is corrupted from there on.
+            _commit(S, idx[:, t], valid_read)
     # Zero the output of skipped (NULL read) sequences, then flatten back.
     o = (o * valid_read.view(N, 1, 1, 1)).reshape(T, HV, V).to(out_dtype)
 

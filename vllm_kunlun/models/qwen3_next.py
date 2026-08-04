@@ -269,7 +269,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
-            # self.cache_config.mamba_ssm_cache_dtype
+            self.cache_config.mamba_ssm_cache_dtype
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -575,9 +575,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
-        spec_state_indices_tensor_cpu = attn_metadata.spec_state_indices_tensor_cpu
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
+        spec_conv_state_indices_tensor = attn_metadata.spec_conv_state_indices_tensor
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor_cpu = (
             attn_metadata.non_spec_state_indices_tensor_cpu
@@ -587,7 +587,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
-        num_accepted_tokens_cpu = attn_metadata.num_accepted_tokens_cpu
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
@@ -620,12 +619,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0]
-                [:attn_metadata.num_spec_decodes],
-                conv_state_indices_cpu=spec_state_indices_tensor_cpu[:, 0]
+                conv_state_indices=spec_conv_state_indices_tensor
                 [:attn_metadata.num_spec_decodes],
                 num_accepted_tokens=num_accepted_tokens[:attn_metadata.num_spec_decodes],
-                num_accepted_tokens_cpu=num_accepted_tokens_cpu[:attn_metadata.num_spec_decodes],
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
@@ -1432,7 +1428,7 @@ class Qwen3NextForCausalLM(
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
-            # vllm_config.cache_config.mamba_ssm_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod
