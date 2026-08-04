@@ -689,21 +689,64 @@ class KunlunOps:
                 stable=True,
             )
         elif scoring_func == "sigmoid":
-            torch.ops._C.moe_sigmoid_group_topk_norm(
-                x=router_logits,
-                topk_index=topk_ids,
-                norm_score=normed_score,
-                block_static=block_statistic,
-                bias=e_score_correction_bias,
-                scale=1.0,
-                n_group=num_expert_group,
-                topk_group=topk_group,
-            )
+            # The fused XPU kernel `moe_sigmoid_group_topk_norm` only supports
+            # up to 512 experts; for larger expert counts it silently fails
+            # (returns non-zero and leaves topk_index uninitialized), so fall
+            # back to a pure-torch implementation of sigmoid + group-topk + norm.
+            if global_num_experts <= 512:
+                torch.ops._C.moe_sigmoid_group_topk_norm(
+                    x=router_logits,
+                    topk_index=topk_ids,
+                    norm_score=normed_score,
+                    block_static=block_statistic,
+                    bias=e_score_correction_bias,
+                    scale=1.0,
+                    n_group=num_expert_group,
+                    topk_group=topk_group,
+                )
+            else:
+                _top_k = topk_ids.shape[1]
+                # sigmoid scores; add correction bias only for group/expert selection
+                _scores = torch.sigmoid(router_logits.to(torch.float32))
+                if e_score_correction_bias is not None:
+                    _choice = _scores + e_score_correction_bias.to(
+                        torch.float32
+                    ).view(1, -1)
+                else:
+                    _choice = _scores
+                _ng = num_expert_group if num_expert_group else 1
+                _tg = topk_group if topk_group else _ng
+                if _ng > 1:
+                    _epg = global_num_experts // _ng
+                    _group_scores = (
+                        _choice.view(-1, _ng, _epg)
+                        .topk(min(2, _epg), dim=-1)
+                        .values.sum(dim=-1)
+                    )
+                    _group_idx = torch.topk(
+                        _group_scores, k=_tg, dim=-1, sorted=False
+                    ).indices
+                    _group_mask = torch.zeros(
+                        _choice.shape[0], _ng, dtype=torch.bool, device=_choice.device
+                    )
+                    _group_mask.scatter_(1, _group_idx, True)
+                    _expert_mask = (
+                        _group_mask.unsqueeze(-1)
+                        .expand(-1, _ng, _epg)
+                        .reshape(-1, global_num_experts)
+                    )
+                    _choice = _choice.masked_fill(~_expert_mask, float("-inf"))
+                _topk_idx = torch.topk(_choice, k=_top_k, dim=-1, sorted=False).indices
+                # weights come from the original (unbiased) sigmoid scores
+                _weights = _scores.gather(1, _topk_idx)
+                _weights = _weights / _weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+                topk_ids.copy_(_topk_idx.to(topk_ids.dtype))
+                normed_score.copy_(_weights.to(normed_score.dtype))
         else:
             raise ValueError(f"Unsupported scoring_func: {scoring_func}")
 
         # Generate block statistic
-        # torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
 
         # Pre-sort tokens by expert
         moe_expand = torch.empty(
@@ -719,15 +762,41 @@ class KunlunOps:
             M * moe_top_k, dtype=torch.int32, device=hidden_states.device
         )
 
-        # torch.ops._C.moe_pre_sorted(
-        #     x=hidden_states,
-        #     topk_index=topk_ids,
-        #     block_statistic=block_statistic,
-        #     moe_expand=moe_expand,
-        #     moe_index=sorted_tokens_idx,
-        #     expert_m=expert_m,
-        #     sorted_tokens_num_lod=sorted_tokens_num_lod,
-        # )
+        if global_num_experts <= 512:
+            torch.ops._C.moe_pre_sorted(
+                x=hidden_states,
+                topk_index=topk_ids,
+                block_statistic=block_statistic,
+                moe_expand=moe_expand,
+                moe_index=sorted_tokens_idx,
+                expert_m=expert_m,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+            )
+        else:
+            # The `moe_pre_sorted` (moe_ffn_pre_sorted) XPU kernel also only
+            # supports up to 512 experts (fails with ret=2 otherwise). Replicate
+            # its "sort token-expert assignments by expert id" behavior in torch.
+            # Verified bit-exact against the kernel for E<=512.
+            _flat_expert = topk_ids.reshape(-1).to(torch.int64)  # [M*moe_top_k]
+            _order = torch.argsort(_flat_expert, stable=True)    # sorted pos -> flat id
+            _tok = _order // moe_top_k
+            moe_expand.copy_(hidden_states.index_select(0, _tok))
+            # moe_index is the inverse permutation: flat id -> sorted position
+            _inv = torch.empty_like(_order)
+            _inv[_order] = torch.arange(_order.numel(), device=_order.device)
+            sorted_tokens_idx.copy_(_inv.to(sorted_tokens_idx.dtype))
+            _cnt = torch.bincount(
+                _flat_expert, minlength=global_num_experts
+            ).to(torch.int32)
+            expert_m.copy_(_cnt)
+            sorted_tokens_num_lod.copy_(
+                torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32, device=_cnt.device),
+                        torch.cumsum(_cnt, 0, dtype=torch.int32),
+                    ]
+                )
+            )
         del expert_m, block_statistic  # Release after moe_pre_sorted
 
         # First FC layer (w13) - use preprocessed weights directly
@@ -739,18 +808,18 @@ class KunlunOps:
         )
 
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
-        # torch.ops._C.moe_fc_v3(
-        #     x=moe_expand,
-        #     weight=w13_weight_packed_signed,
-        #     sorted_tokens_num_lod=sorted_tokens_num_lod,
-        #     sorted_tokens_idx=sorted_tokens_idx,
-        #     moe_topk=moe_top_k,
-        #     y=y,
-        #     x_perchannel_max=None,
-        #     w_perchannel_max=w13_scale,
-        #     use_pack_int4=True,
-        #     sort_mode=True,
-        # )
+        torch.ops._C.moe_fc_v3(
+            x=moe_expand,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=None,
+            w_perchannel_max=w13_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
         del moe_expand  # Release after first FC
 
         # Activation: silu_and_mul
@@ -771,18 +840,18 @@ class KunlunOps:
         out1 = out1.reshape(-1, out1.shape[-1])
 
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
-        # torch.ops._C.moe_fc_v3(
-        #     x=out1,
-        #     weight=w2_weight_packed_signed,
-        #     sorted_tokens_num_lod=sorted_tokens_num_lod,
-        #     sorted_tokens_idx=sorted_tokens_idx,
-        #     moe_topk=moe_top_k,
-        #     y=out,
-        #     x_perchannel_max=None,
-        #     w_perchannel_max=w2_scale,
-        #     use_pack_int4=True,
-        #     sort_mode=True,
-        # )
+        torch.ops._C.moe_fc_v3(
+            x=out1,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=None,
+            w_perchannel_max=w2_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
 
         del out1
 
@@ -798,13 +867,13 @@ class KunlunOps:
         # Reshape out to 3D for moe_post
         out = out.view(M, moe_top_k, hidden_dim)
 
-        # torch.ops._C.moe_post(
-        #     x=out,
-        #     moe_index=sorted_tokens_idx,
-        #     normed_scale=normed_score,
-        #     dequant_scale=dequant_scale,
-        #     y=output,
-        # )
+        torch.ops._C.moe_post(
+            x=out,
+            moe_index=sorted_tokens_idx,
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
 
         return output
 
