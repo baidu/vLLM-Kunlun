@@ -2,8 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kunlun overrides for the EAGLE / MTP speculative-decode proposer."""
 
+import os
+from dataclasses import replace
+
 import numpy as np
 import torch
+from vllm.compilation import monitor
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.config import CUDAGraphMode
+from vllm.distributed.parallel_state import graph_capture
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -20,6 +28,27 @@ _orig_update_positions_dependent_metadata = (
     EagleProposer._update_positions_dependent_metadata
 )
 _orig_eagle_init = EagleProposer.__init__
+_orig_load_model = EagleProposer.load_model
+
+# NOTE: the drafter is still restricted to PIECEWISE cudagraphs upstream
+# (llm_base_proposer.py::initialize_cudagraph_keys). That was originally a
+# *correctness* requirement: ``CUDAGraphWrapper`` never copies runtime inputs
+# into persistent buffers, and the drafter rebuilt its attention metadata from
+# freshly allocated tensors on every step
+# (``build_per_group_and_layer_attn_metadata``), so a FULL graph baked in those
+# pointers and replays read stale slot mappings / state indices. Measured effect
+# when this was attempted: acceptance rate collapsed from ~60% to 2.95%
+# (acceptance length 1.06) while the step got slower.
+#
+# The metadata addresses are stable now (``KunlunAttentionMetadataBuilder.build``
+# stages every lod / seq-len field, host *and* device, into persistent buffers),
+# and the kernels were measured to be graph-safe: under capture/replay
+# ``speculative_attention`` follows the *device* ``context_lens`` (changing only
+# the host mirror has no effect, and replay is bit-exact across block-count
+# changes in both directions), and ``reshape_and_cache_flash`` follows the
+# runtime slot mapping including the -1 padding. So the opt-in path below exists;
+# it is still off by default and must be validated with the per-position
+# acceptance rate, not just address stability.
 
 
 def _is_qwen35_mtp(self) -> bool:
@@ -184,32 +213,41 @@ def _update_positions_dependent_metadata(
     cad = common_attn_metadata
     positions_1d = positions[0] if self.uses_mrope else positions
 
-    new_position = positions_1d + 1
-    exceeds_max = new_position >= self.max_model_len
-    clamped_position = torch.where(
-        exceeds_max, torch.zeros_like(new_position), new_position
-    )
-
-    n_blocks_per_req = cad.block_table_tensor.shape[1]
-    block_number = (clamped_position // block_size).clamp(max=n_blocks_per_req - 1)
-    block_id = cad.block_table_tensor.gather(
-        dim=1, index=block_number.view(-1, 1)
-    ).view(-1)
-    slot = block_id * block_size + (clamped_position % block_size)
-    slot = torch.where(exceeds_max, torch.full_like(slot, PADDING_SLOT_ID), slot)
-
-    new_seq_lens = torch.where(
-        exceeds_max, torch.ones_like(cad.seq_lens), cad.seq_lens + 1
-    ).clamp(max=self.max_model_len)
-    cad.seq_lens.copy_(new_seq_lens)
-
+    # Pick the destination buffer up front so ``positions + 1`` can be written
+    # straight into it.
+    #
+    # PERF: every op here is a separate dispatch, and the drafter runs this once
+    # per draft step at batch 1, where the tensors are a handful of elements --
+    # so the cost is pure dispatch overhead, not compute. Profiling showed this
+    # function alone issuing 167 of the ~1140 eager ops in one ``propose`` (the
+    # single largest contributor). The in-place / ``out=`` forms below avoid the
+    # ``zeros_like`` / ``full_like`` / ``ones_like`` temporaries and the extra
+    # ``copy_`` that the straightforward version needs.
     if self.uses_mrope:
         out_pos = self.mrope_positions[0, :batch_size]
     elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
         out_pos = self.xdrope_positions[0, :batch_size]
     else:
         out_pos = self.positions[:batch_size]
-    out_pos.copy_(clamped_position)
+
+    # positions + 1, with out-of-range entries folded to 0; their slot is set to
+    # PADDING_SLOT_ID below, so the value itself does not matter.
+    torch.add(positions_1d, 1, out=out_pos)
+    exceeds_max = out_pos >= self.max_model_len
+    out_pos.masked_fill_(exceeds_max, 0)
+    clamped_position = out_pos
+
+    n_blocks_per_req = cad.block_table_tensor.shape[1]
+    block_number = clamped_position.div(block_size, rounding_mode="floor")
+    block_number.clamp_(max=n_blocks_per_req - 1)
+    # gather() returns a fresh tensor, so the slot arithmetic can run in place.
+    slot = cad.block_table_tensor.gather(dim=1, index=block_number.view(-1, 1)).view(-1)
+    slot = slot.mul_(block_size).add_(clamped_position.remainder(block_size))
+    slot.masked_fill_(exceeds_max, PADDING_SLOT_ID)
+
+    # seq_lens += 1, reset to 1 where out of range, then clamp -- in place on
+    # cad.seq_lens instead of building a new tensor and copying it back.
+    cad.seq_lens.add_(1).masked_fill_(exceeds_max, 1).clamp_(max=self.max_model_len)
 
     self._slot_mapping_buffer[:batch_size].copy_(slot)
     if input_batch_size > batch_size:
@@ -217,13 +255,13 @@ def _update_positions_dependent_metadata(
     cad.slot_mapping = self._slot_mapping_buffer[:batch_size]
 
     if self.uses_mrope:
-        self.mrope_positions[1:, :batch_size] = self.mrope_positions[0, :batch_size]
+        self.mrope_positions[1:, :batch_size] = out_pos
         positions = self.mrope_positions[:, :batch_size]
     elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-        self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[0, :batch_size]
+        self.xdrope_positions[1:, :batch_size] = out_pos
         positions = self.xdrope_positions[0, :batch_size]
     else:
-        positions = self.positions[:batch_size]
+        positions = out_pos
 
     cad.max_seq_len = min(cad.max_seq_len + 1, self.max_model_len)
 
@@ -253,3 +291,152 @@ EagleProposer._update_positions_dependent_metadata = (
     _update_positions_dependent_metadata
 )
 EagleProposer.__init__ = _patched_eagle_init
+
+
+# --------------------------------------------------------------------------
+# Experimental: FULL cudagraphs for the drafter. Off unless
+# ``VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH=1``.
+#
+# Upstream gives the drafter no FULL path at all: ``initialize_cudagraph_keys``
+# hardcodes PIECEWISE, and ``CUDAGraphWrapper`` is only ever wrapped around the
+# *target* model (gpu_model_runner.py). Capture also cannot go through the
+# drafter's ``dummy_run``: it calls ``set_forward_context(None, ...)``, so the
+# attention layers take the ``attn_metadata is None`` profiling shortcut and a
+# graph captured there would contain no attention at all. The proposer holds no
+# reference to the runner either, so it cannot synthesize capture-time metadata
+# pointing at the runner's persistent ``seq_lens`` / block table -- and those are
+# handed to the kernels unstaged, so their addresses must match capture time.
+# Hence: capture lazily, on a real drafting step, where the real metadata is.
+# --------------------------------------------------------------------------
+
+
+def _drafter_full_cudagraph_enabled() -> bool:
+    return os.getenv("VLLM_KUNLUN_DRAFTER_FULL_CUDAGRAPH", "0") == "1"
+
+
+def _uniform_decode_num_reqs(attn_metadata) -> int | None:
+    """Request count if every attention group is a query-len-1 decode batch.
+
+    ``None`` means "do not use a graph for this call". The first drafter forward
+    in ``propose`` is a mixed prefill/decode batch, and ``KunlunImpl.forward``
+    picks between the prefill and decode kernels on the host from
+    ``num_prefills`` / ``num_decodes``; baking that choice into a graph would
+    silently attend over the wrong rows on a later step with a different split.
+    """
+    if not attn_metadata:
+        return None
+    groups = (
+        attn_metadata.values() if isinstance(attn_metadata, dict) else [attn_metadata]
+    )
+    num_reqs = None
+    for md in groups:
+        if getattr(md, "num_prefills", 1) != 0:
+            return None
+        if getattr(md, "max_decode_seq_len", 0) != 1:
+            return None
+        block_tables = getattr(md, "block_tables", None)
+        if block_tables is None:
+            return None
+        if num_reqs is not None and block_tables.shape[0] != num_reqs:
+            return None
+        num_reqs = block_tables.shape[0]
+    return num_reqs
+
+
+class _DrafterCUDAGraphWrapper(CUDAGraphWrapper):
+    """FULL cudagraphs for the drafter, captured on the first real step.
+
+    Deliberately does *not* touch the cudagraph dispatcher. The dispatcher only
+    sees a token count and always dispatches with ``uniform_decode=False``
+    (llm_base_proposer::_determine_batch_execution_and_padding), so it cannot
+    tell a draft step from the mixed prefill/decode first pass -- and switching
+    its mode to FULL would strip the drafter's PIECEWISE keys, leaving the first
+    pass eager. Instead this wrapper triggers on the PIECEWISE mode the
+    dispatcher already emits and decides per call:
+
+    * mixed batch -> pass through, so the inner piecewise graphs run as before.
+      ``KunlunImpl.forward`` picks between the prefill and decode kernels on the
+      host from ``num_prefills``/``num_decodes``, so baking that choice into a
+      graph would silently attend over the wrong rows on a later step.
+    * uniform query-len-1 decode -> run the whole drafter forward from one FULL
+      graph. The runtime mode is flipped to FULL for the duration so the inner
+      piecewise wrappers see a mode that is not theirs and pass through, rather
+      than trying to capture inside our capture.
+
+    Two more deviations from the base wrapper:
+
+    * The unpadded request count is folded into the cache key. The dispatcher's
+      descriptor only carries the *padded* token count, while what the graph
+      bakes follows the unpadded count (``block_tables.shape[0]`` becomes the
+      kernel's ``batch_num``), so two batch sizes that pad to the same size must
+      not share a graph.
+    * Capture runs inside ``graph_capture()`` (a non-default stream is required)
+      and is followed by an explicit replay: capture executes nothing, so the
+      base wrapper's post-capture return value is uninitialized memory. During
+      warmup that is harmless, but here the caller is a real drafting step.
+    """
+
+    def __init__(self, runnable, vllm_config, device):
+        super().__init__(runnable, vllm_config, CUDAGraphMode.FULL)
+        self._device = device
+
+    def __call__(self, *args, **kwargs):
+        if not is_forward_context_available():
+            return self.runnable(*args, **kwargs)
+
+        ctx = get_forward_context()
+        if (
+            ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+            or ctx.batch_descriptor is None
+        ):
+            return self.runnable(*args, **kwargs)
+
+        num_reqs = _uniform_decode_num_reqs(ctx.attn_metadata)
+        if num_reqs is None:
+            return self.runnable(*args, **kwargs)
+
+        prev_desc = ctx.batch_descriptor
+        desc = replace(prev_desc, num_reqs=num_reqs, uniform=True)
+        entry = self.concrete_cudagraph_entries.get(desc)
+        prev_mode = ctx.cudagraph_runtime_mode
+        prev_enabled = monitor.cudagraph_capturing_enabled
+        ctx.batch_descriptor = desc
+        ctx.cudagraph_runtime_mode = CUDAGraphMode.FULL
+        try:
+            if entry is not None and entry.cudagraph is not None:
+                return super().__call__(*args, **kwargs)
+            monitor.set_cudagraph_capturing_enabled(True)
+            # ``torch.cuda.graph.__enter__`` calls ``torch.cuda.empty_cache()``
+            # (torch/cuda/graphs.py). During warmup that is free; in a live
+            # process it drops the allocator cache and every following
+            # allocation goes back to cudaMalloc. Measured ~40% of the capture
+            # cost, plus the aftermath. vLLM's own ``CUDAGraphOptions.gc_disable``
+            # does not cover this: it patches ``torch.accelerator.empty_cache``,
+            # a different function from the one graphs.py calls. ``gc.collect()``
+            # is already gated off by ``torch.compiler.config.force_cudagraph_gc``.
+            orig_empty_cache = torch.cuda.empty_cache
+            torch.cuda.empty_cache = lambda *a, **kw: None
+            try:
+                with graph_capture(self._device):
+                    super().__call__(*args, **kwargs)
+            finally:
+                torch.cuda.empty_cache = orig_empty_cache
+            entry = self.concrete_cudagraph_entries[desc]
+            entry.cudagraph.replay()
+            logger.info("[KunlunPlugin] drafter captured a FULL cudagraph %s", desc)
+            return entry.output
+        finally:
+            monitor.set_cudagraph_capturing_enabled(prev_enabled)
+            ctx.batch_descriptor = prev_desc
+            ctx.cudagraph_runtime_mode = prev_mode
+
+
+def _patched_load_model(self, target_model) -> None:
+    _orig_load_model(self, target_model)
+    if not _drafter_full_cudagraph_enabled():
+        return
+    self.model = _DrafterCUDAGraphWrapper(self.model, self.vllm_config, self.device)
+    logger.info("[KunlunPlugin] drafter model wrapped for FULL cudagraphs")
+
+
+EagleProposer.load_model = _patched_load_model
