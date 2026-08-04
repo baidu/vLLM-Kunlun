@@ -1,0 +1,407 @@
+"""Torch replacements for the triton-only KDA kernels on Kunlun XPU.
+
+Triton cannot load its binaries on P800 (``Triton Error [CUDA]:
+CUDA_ERROR_NOT_SUPPORTED`` from ``load_binary``), and every KDA kernel
+(``causal_conv1d_*``, ``chunk_kda_*``, ``fused_recurrent_kda*``,
+``gather_initial_states``, ``rms_norm_gated``) is triton-only.
+
+The kunlun gated-delta-rule kernels are not a usable substitute:
+``fused_recurrent_gated_delta_rule_fwd`` and ``...fwdv2`` both reject a
+per-channel gate (``RuntimeError: g size must equal to B * T * HV``), i.e. they
+only support one scalar decay per head, while KDA decays the recurrent state per
+channel (``g`` is ``[B, T, H, head_dim]``).
+
+Each function below replaces exactly one kernel entry point and keeps its
+signature, so ``KimiK3DeltaAttention._forward`` and its prefill/decode split,
+cache bookkeeping and spec-decode handling all run unchanged.
+
+Recurrence ported from
+``vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py``:
+
+    gate  = lower_bound * sigmoid(exp(A_log) * (raw_g + dt_bias))   if lower_bound
+            -exp(A_log) * softplus(raw_g + dt_bias)                 otherwise
+    q, k  = l2norm(q), l2norm(k);  q *= head_dim ** -0.5
+    S     = S * exp(gate)                     # decay along the K axis
+    v     = (v - S @ k) * sigmoid(raw_beta)
+    S     = S + v (x) k
+    out   = S @ q
+"""
+
+import torch
+import torch.nn.functional as F
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_SOFTPLUS_THRESHOLD = 20.0
+
+
+def kda_gate(
+    raw_g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """Per-channel decay gate in negative log space, shape ``[B, T, H, D]``."""
+    num_heads, head_dim = raw_g.shape[-2:]
+    g = raw_g.float()
+    if dt_bias is not None:
+        g = g + dt_bias.float().view(1, 1, num_heads, head_dim)
+    a = A_log.float().exp().view(1, 1, num_heads, 1)
+    if lower_bound is not None:
+        return lower_bound * torch.sigmoid(a * g)
+    softplus = torch.where(g > _SOFTPLUS_THRESHOLD, g, torch.log1p(g.exp()))
+    return -a * softplus
+
+
+def _l2norm_scaled(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    x = x.float()
+    return x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + 1e-6) * scale
+
+
+def _delta_rule_scan(
+    qf: torch.Tensor,
+    kf: torch.Tensor,
+    vf: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+    begin: int,
+    end: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Run the gated delta rule over ``[begin, end)``, batched over heads.
+
+    ``qf``/``kf``/``vf``/``decay`` are ``[T, H, D]`` fp32, ``beta`` is ``[T, H]``
+    fp32 (already sigmoid-ed), ``state`` is ``[H, V, K]`` fp32. Writes ``out[t]``
+    and returns the updated state.
+    """
+    for t in range(begin, end):
+        state = state * decay[t].unsqueeze(-2)
+        kt = kf[t]
+        delta = (vf[t] - (state @ kt.unsqueeze(-1)).squeeze(-1)) * beta[t].unsqueeze(-1)
+        state = state + delta.unsqueeze(-1) * kt.unsqueeze(-2)
+        out[t] = (state @ qf[t].unsqueeze(-1)).squeeze(-1)
+    return state
+
+
+def causal_conv1d_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    **kwargs,
+) -> torch.Tensor:
+    """Varlen causal depthwise conv, ``x`` is ``[dim, num_tokens]``.
+
+    ``conv_states`` (``[num_slots, dim, state_len]``) is updated in place with
+    the trailing ``state_len`` inputs of every sequence.
+    """
+    assert activation in ("silu", "swish", None)
+    dim = x.shape[0]
+    state_len = conv_states.shape[-1]
+    starts = query_start_loc.tolist()
+    num_seqs = len(starts) - 1
+    slots = (
+        list(range(num_seqs)) if cache_indices is None else cache_indices.tolist()
+    )
+    init_flags = (
+        [False] * num_seqs if has_initial_state is None else has_initial_state.tolist()
+    )
+
+    out = torch.empty_like(x)
+    w = weight.float().unsqueeze(1)
+    b = None if bias is None else bias.float()
+    for i in range(num_seqs):
+        begin, end = starts[i], starts[i + 1]
+        slot = slots[i]
+        if begin == end or slot < 0:
+            continue
+        seq = x[:, begin:end].float()
+        if init_flags[i]:
+            seq = torch.cat([conv_states[slot].float(), seq], dim=-1)
+        else:
+            seq = F.pad(seq, (state_len, 0))
+        y = F.conv1d(seq.unsqueeze(0), w, b, groups=dim)[0]
+        if activation is not None:
+            y = F.silu(y)
+        out[:, begin:end] = y.to(out.dtype)
+        conv_states[slot].copy_(seq[:, -state_len:])
+    return out
+
+
+def causal_conv1d_update(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int = -1,
+    out: torch.Tensor | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """Single-token causal conv, ``x`` is ``[num_tokens, dim]``.
+
+    ``conv_state`` is ``[num_slots, dim, state_len]`` and is updated in place.
+    """
+    if num_accepted_tokens is not None:
+        raise NotImplementedError(
+            "KDA speculative decode conv update is not supported on Kunlun XPU"
+        )
+    if x.dim() != 2:
+        raise NotImplementedError(f"expected x of shape [tokens, dim], got {x.shape}")
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+
+    # Per-slot basic indexing: advanced indexing on the paged conv cache copies
+    # the whole cache on XPU (see fused_recurrent_kda_packed_decode).
+    slots = conv_state_indices[: x.shape[0]].tolist()
+    w = weight.float()
+    b = None if bias is None else bias.float()
+    y = torch.empty_like(x, dtype=torch.float32)
+    for i, slot in enumerate(slots):
+        if slot < 0:
+            continue
+        window = torch.cat(
+            [conv_state[slot].float(), x[i].unsqueeze(-1).float()], dim=-1
+        )  # [dim, width]
+        row = (window * w).sum(-1)
+        if b is not None:
+            row = row + b
+        y[i] = row
+        conv_state[slot] = window[:, 1:].to(conv_state.dtype)
+    if activation is not None:
+        y = F.silu(y)
+
+    y = y.to(x.dtype)
+    if out is not None:
+        out.copy_(y)
+        return out
+    return y
+
+
+def gather_initial_states(
+    state: torch.Tensor,
+    indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> torch.Tensor:
+    """Gather dense state rows, zeroing rows without an initial state.
+
+    Per-slot basic indexing: ``state.index_select`` copies the whole paged cache
+    on XPU (see fused_recurrent_kda_packed_decode).
+    """
+    slots = indices.tolist()
+    flags = has_initial_state.tolist()
+    out = state.new_zeros((len(slots), *state.shape[1:]))
+    for i, slot in enumerate(slots):
+        if flags[i] and slot >= 0:
+            out[i] = state[slot]
+    return out
+
+
+def chunk_kda_with_fused_gate(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """KDA prefill: sequential scan instead of the chunked triton kernels.
+
+    ``initial_state`` is the dense per-request state ``[N, H, V, K]`` produced by
+    ``gather_initial_states``; the per-request final states are returned rather
+    than written into the paged cache (the caller does that).
+    """
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    if use_qk_l2norm_in_kernel:
+        qf = _l2norm_scaled(q[0], scale)
+        kf = _l2norm_scaled(k[0])
+    else:
+        qf = q[0].float() * scale
+        kf = k[0].float()
+    vf = v[0].float()
+    decay = kda_gate(raw_g, A_log, g_bias, lower_bound)[0].exp()
+    beta = torch.sigmoid(raw_beta[0].float())
+
+    out = torch.empty_like(vf)
+    starts = cu_seqlens.tolist()
+    if initial_state is None:
+        states = torch.zeros(
+            len(starts) - 1,
+            vf.shape[1],
+            vf.shape[2],
+            kf.shape[2],
+            dtype=torch.float32,
+            device=vf.device,
+        )
+        state_dtype = v.dtype
+    else:
+        states = initial_state.float().clone()
+        state_dtype = initial_state.dtype
+    for i in range(len(starts) - 1):
+        states[i] = _delta_rule_scan(
+            qf, kf, vf, decay, beta, states[i], starts[i], starts[i + 1], out
+        )
+    final_state = states.to(state_dtype) if output_final_state else None
+    return out.unsqueeze(0).to(v.dtype), final_state
+
+
+def fused_recurrent_kda_packed_decode(
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    initial_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KDA single-token decode from packed post-conv QKV.
+
+    ``mixed_qkv`` is ``[B, 2 * H * K + H * V]``, ``initial_state`` is the paged
+    ``[num_slots, H, V, K]`` cache and is updated in place at ``state_indices``.
+    """
+    num_heads, head_dim = raw_g.shape[-2:]
+    batch = mixed_qkv.shape[0]
+    if scale is None:
+        scale = head_dim**-0.5
+
+    q, k, v = mixed_qkv.split([num_heads * head_dim] * 3, dim=-1)
+    qf = _l2norm_scaled(q.view(batch, num_heads, head_dim), scale)
+    kf = _l2norm_scaled(k.view(batch, num_heads, head_dim))
+    vf = v.view(batch, num_heads, head_dim).float()
+    decay = kda_gate(raw_g, A_log, dt_bias, lower_bound)[0].exp()
+    beta = torch.sigmoid(raw_beta[0].float())
+
+    slots = state_indices[:batch].tolist()
+    out = torch.empty_like(vf)
+    # Per-slot basic indexing on purpose: advanced indexing / index_select on the
+    # paged state cache copies the *whole* cache on XPU (a single row out of
+    # [85585, 12, 128, 128] fp32 tried to allocate 62.69 GiB), while
+    # `state[int]` is a view.
+    for i in range(batch):
+        slot = slots[i]
+        if slot < 0:
+            continue
+        state = initial_state[slot].float()  # [H, V, K]
+        state = state * decay[i].unsqueeze(-2)
+        kt = kf[i]
+        delta = (vf[i] - (state @ kt.unsqueeze(-1)).squeeze(-1)) * beta[i].unsqueeze(-1)
+        state = state + delta.unsqueeze(-1) * kt.unsqueeze(-2)
+        out[i] = (state @ qf[i].unsqueeze(-1)).squeeze(-1)
+        initial_state[slot] = state.to(initial_state.dtype)
+    return out.unsqueeze(0).to(mixed_qkv.dtype), initial_state
+
+
+def fused_recurrent_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    fuse_gate: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """KDA multi-query (spec decode) recurrence over the paged state cache."""
+    scale = k.shape[-1] ** -0.5
+    qf = _l2norm_scaled(q[0], scale)
+    kf = _l2norm_scaled(k[0])
+    vf = v[0].float()
+    decay = kda_gate(raw_g, A_log, dt_bias, lower_bound)[0].exp()
+    beta = torch.sigmoid(raw_beta[0].float())
+
+    result = torch.empty_like(vf)
+    starts = cu_seqlens.tolist()
+    indices = ssm_state_indices
+    if indices.dim() == 1:
+        indices = indices.unsqueeze(-1)
+    index_rows = indices.tolist()
+    accepted = None if num_accepted_tokens is None else num_accepted_tokens.tolist()
+
+    for i in range(len(starts) - 1):
+        begin, end = starts[i], starts[i + 1]
+        first = 0 if accepted is None else accepted[i] - 1
+        state = initial_state[index_rows[i][first]].float()
+        for t in range(begin, end):
+            state = _delta_rule_scan(
+                qf, kf, vf, decay, beta, state, t, t + 1, result
+            )
+            slot = index_rows[i][t - begin]
+            if slot > 0:
+                initial_state[slot] = state.to(initial_state.dtype)
+    if out is not None:
+        out[0] = result.to(out.dtype)
+        return out, initial_state
+    return result.unsqueeze(0).to(v.dtype), initial_state
+
+
+def patch_kda_model(mod) -> None:
+    """Swap the conv / state-gather kernels used by ``KimiK3DeltaAttention``.
+
+    NOTE: no imports here. Importing ``vllm.models.kimi_k3.nvidia.ops.*`` from a
+    post-import hook makes that package's *relative* ``from .attn_res import ...``
+    run before the plugin's module mapping can redirect it, which silently pulls
+    in the upstream triton ``attn_res``.
+    """
+    if not hasattr(mod, "KimiK3DeltaAttention"):
+        # Module body still executing: its own `from ... import causal_conv1d_*`
+        # would overwrite the patch. Retry on a later import event.
+        return
+    mod.causal_conv1d_fn = causal_conv1d_fn
+    mod.causal_conv1d_update = causal_conv1d_update
+    mod.gather_initial_states = gather_initial_states
+    mod._kunlun_kda_patched = True
+    logger.info("[KunlunPlugin] KDA conv / gather kernels -> torch")
+
+
+def patch_kda_ops(mod) -> None:
+    """Swap the KDA delta-rule kernels (prefill chunk + recurrent decode)."""
+    if not all(
+        hasattr(mod, name)
+        for name in (
+            "chunk_kda_with_fused_gate",
+            "fused_recurrent_kda",
+            "fused_recurrent_kda_packed_decode",
+        )
+    ):
+        return
+    mod.chunk_kda_with_fused_gate = chunk_kda_with_fused_gate
+    mod.fused_recurrent_kda = fused_recurrent_kda
+    mod.fused_recurrent_kda_packed_decode = fused_recurrent_kda_packed_decode
+    mod._kunlun_kda_patched = True
+    logger.info("[KunlunPlugin] KDA delta-rule kernels -> torch")
+
+
+def patch_rms_norm_gated(mod) -> None:
+    """``o_norm``'s forward_cuda is the triton rms_norm_gated kernel."""
+    cls = getattr(mod, "FusedRMSNormGated", None)
+    if cls is None:
+        return
+    cls.forward_cuda = cls.forward_native
+    mod._kunlun_kda_patched = True
+    logger.info("[KunlunPlugin] FusedRMSNormGated.forward_cuda -> forward_native")
