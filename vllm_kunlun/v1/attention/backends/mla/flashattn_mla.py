@@ -123,7 +123,12 @@ class FlashAttnMLAMetadata(MLACommonMetadata[FlashAttnMLADecodeMetadata]):
 class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
-    reorder_batch_threshold: int = 512  # process small prefills with decode pathway
+    # Upstream routes query_len <= 512 through the decode (MQA) pathway. Kunlun's
+    # `paged_attention` only computes the *first* query token of each request
+    # (verified standalone: it either returns ret != 0, or leaves rows 1..n-1 of
+    # the output at zero), so anything longer than one token must go through the
+    # varlen prefill path instead.
+    reorder_batch_threshold: int = 1
 
     def __init__(
         self,
