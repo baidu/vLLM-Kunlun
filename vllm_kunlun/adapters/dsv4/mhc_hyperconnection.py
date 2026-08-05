@@ -91,7 +91,7 @@ def _tilelang_applier(tile_mod) -> List[str]:
     tile_mod.mhc_fused_post_pre_tilelang = mhc_fused_post_pre_tilelang
     setattr(tile_mod, _TILELANG_SENTINEL, True)
     LOGGER.info("Wired DSV4 TileLang-mHC aliases into %s", tile_mod.__name__)
-    return [_TARGET]
+    return [_TILE_TARGET]
 
 
 def _model_applied(mod) -> bool:
