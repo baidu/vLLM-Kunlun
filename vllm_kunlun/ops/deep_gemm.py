@@ -1,6 +1,8 @@
 import torch
 import xspeedgate_ops  # noqa
 
+from vllm_kunlun.ops.fp8 import dequantize_fp8_blocks
+
 
 def int8_mqa_logits(
     q: torch.Tensor,

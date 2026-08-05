@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING, Optional
 
+import os
 import psutil
 import torch
 import vllm.envs as envs
@@ -232,24 +233,34 @@ class KunlunPlatform(Platform):
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
-            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+            attention_backend = os.getenv("VLLM_ATTENTION_BACKEND")
+            # DSV4-specific: DeepseekV4 uses a 256 MLA block size.
+            hf_config = vllm_config.model_config.hf_config
+            use_sparse = hasattr(hf_config, "index_topk")
+            architectures = getattr(hf_config, "architectures", ()) or ()
+            is_deepseek_v4 = "DeepseekV4ForCausalLM" in architectures
+            mla_block_size = 256 if is_deepseek_v4 else 64
             use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+                attention_backend is None
+                or attention_backend == "FLASHMLA"
             )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            from vllm_kunlun.ops.attention.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
                 and is_flashmla_supported()[0]
-                and cache_config.block_size != 64
+                and cache_config.block_size != mla_block_size
             ):
-                cache_config.block_size = 64
-                logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
-            if use_sparse and cache_config.block_size != 64:
-                cache_config.block_size = 64
+                cache_config.block_size = mla_block_size
                 logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
+                    "Forcing kv cache block size to %d for FlashMLA backend.",
+                    mla_block_size,
+                )
+            if use_sparse and cache_config.block_size != mla_block_size:
+                cache_config.block_size = mla_block_size
+                logger.info(
+                    "Forcing kv cache block size to %d for FlashMLASparse backend.",
+                    mla_block_size,
                 )
 
         from vllm.config import CUDAGraphMode

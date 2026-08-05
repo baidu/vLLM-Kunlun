@@ -61,71 +61,192 @@ def get_mla_metadata(
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    head_dim_v: int,
-    tile_scheduler_metadata: torch.Tensor,
-    num_splits: torch.Tensor,
+    block_table: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    head_dim_v: int = 512,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     is_fp8_kvcache: bool = False,
     indices: Optional[torch.Tensor] = None,
+    # V4 kwargs
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink=None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Arguments:
-        q: (batch_size, seq_len_q, num_heads_q, head_dim).
-        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
-        block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
-        cache_seqlens: (batch_size), torch.int32.
-        head_dim_v: Head dimension of v.
-        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
-        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
-        softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
-        causal: bool. Whether to apply causal attention mask.
-
-    Returns:
-        out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
-        softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
+    Kunlun flash_mla_with_kvcache for DeepSeek-V4.
+    Two paths:
+    - Legacy V3: block_table provided -> kunlun_ops.paged_attention
+    - V4: indices provided -> PyTorch naive MLA attention
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    softmax_lse = None
-    out = torch.ones(
-        q.size(0), q.size(1), q.size(2), head_dim_v, dtype=q.dtype, device=q.device
-    )
-    kv_lora_rank = head_dim_v
-    qk_rope_head_dim = q.size(3) - head_dim_v
-    head_dim = k_cache.shape[3]
-    page_block_size = k_cache.shape[1]
-    k_cache = k_cache.view(-1, 1, page_block_size, head_dim)
+    # ---- Legacy V3 path ----
+    if block_table is not None and indices is None:
+        output = torch.ones(
+            q.size(0), q.size(1), q.size(2), head_dim_v, dtype=q.dtype, device=q.device
+        )
+        kv_lora_rank = head_dim_v
+        qk_rope_head_dim = q.size(3) - head_dim_v
+        head_dim = k_cache.shape[3]
+        page_block_size = k_cache.shape[1]
+        k_cache_view = k_cache.view(-1, 1, page_block_size, head_dim)
 
-    # todo: optimize memcp
-    # q_c = q[..., : kv_lora_rank].contiguous()
-    # q_r = q[..., kv_lora_rank :].contiguous()
+        kunlun_ops.paged_attention(
+            output, q, k_cache_view, None, block_table,
+            tile_scheduler_metadata, num_splits,
+            False, causal, -1,
+            kv_lora_rank, qk_rope_head_dim, softmax_scale, q_r=q,
+        )
+        return output, None
 
-    is_context = False
-    vo_head_dim = -1
+    # ---- V4 path: PyTorch naive MLA attention (dual-cache: SWA + compressed) ----
+    batch_size = q.shape[0]
+    seq_q = q.shape[1]
+    num_heads = q.shape[2]
+    d_qk = q.shape[3]  # 576 = 512 + 64
+    kv_lora_rank = head_dim_v  # 512
+    qk_rope_head_dim = d_qk - kv_lora_rank  # 64
 
-    kunlun_ops.paged_attention(
-        out,
-        q,
-        k_cache,
-        None,
-        block_table,
-        tile_scheduler_metadata,  # context_lens_cpu
-        num_splits,  # context_lens_xpu
-        is_context,
-        causal,
-        vo_head_dim,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        softmax_scale,
-        q_r=q,
-    )
-    return out, softmax_lse
+    # Output tensor
+    if out is not None:
+        output = out
+    else:
+        output = torch.zeros(
+            batch_size, seq_q, num_heads, head_dim_v,
+            dtype=q.dtype, device=q.device,
+        )
+
+    if indices is None or topk_length is None:
+        logger.warning_once("[KunlunFlashMLA] No indices/topk_length, returning zeros")
+        return output, None
+
+    # --- Helper: flatten paged cache to [total_slots, d_qk] bf16 vectors ---
+    def _flatten_cache(cache_tensor, target_dim):
+        num_blk = cache_tensor.shape[0]
+        blk_sz = cache_tensor.shape[1]
+        head_sz = cache_tensor.shape[-1]
+        total = num_blk * blk_sz
+        flat = cache_tensor.reshape(total, head_sz)
+
+        if cache_tensor.dtype == torch.bfloat16 or cache_tensor.dtype == torch.float16:
+            flat_kv = flat.to(torch.bfloat16)
+            if flat_kv.shape[1] > target_dim:
+                flat_kv = flat_kv[:, :target_dim]
+            return flat_kv
+        elif cache_tensor.dtype == torch.uint8:
+            fp8_data = flat[:, :target_dim].contiguous()
+            sign = ((fp8_data >> 7) & 1).to(torch.int32)
+            exp_bits = ((fp8_data >> 3) & 0x0F).to(torch.int32)
+            mant_bits = (fp8_data & 0x07).to(torch.int32)
+            is_normal = (exp_bits > 0)
+            is_zero = (fp8_data == 0) | (fp8_data == 0x80)
+            mantissa_n = (8 + mant_bits).float() / 8.0
+            exponent_n = (exp_bits - 7).float()
+            val_normal = mantissa_n * torch.pow(2.0, exponent_n)
+            val_subnormal = mant_bits.float() / 8.0 * (2.0 ** -6.0)
+            result = torch.where(is_normal, val_normal, val_subnormal)
+            result = torch.where(is_zero, torch.zeros_like(result), result)
+            result = result * (1 - 2 * sign.float())
+            return result.to(torch.bfloat16)
+        else:
+            flat_kv = flat.to(torch.bfloat16)
+            if flat_kv.shape[1] > target_dim:
+                flat_kv = flat_kv[:, :target_dim]
+            elif flat_kv.shape[1] < target_dim:
+                pad = torch.zeros(total, target_dim - flat_kv.shape[1],
+                                  dtype=torch.bfloat16, device=flat_kv.device)
+                flat_kv = torch.cat([flat_kv, pad], dim=1)
+            return flat_kv
+
+    # Flatten SWA cache: [num_blocks, block_size, 1, head_dim] -> [total_slots, d_qk]
+    flat_swa = _flatten_cache(k_cache, d_qk)
+    swa_total_slots = flat_swa.shape[0]
+
+    # Flatten extra (compressed) cache if provided
+    flat_comp = None
+    comp_total_slots = 0
+    if extra_k_cache is not None:
+        flat_comp = _flatten_cache(extra_k_cache, d_qk)
+        comp_total_slots = flat_comp.shape[0]
+
+    # Parse SWA indices: [batch, 1, swa_window] -> [batch, swa_window]
+    if indices.dim() == 3:
+        swa_idx = indices.squeeze(1)
+    else:
+        swa_idx = indices
+
+    # Parse compressed indices: [batch, 1, topk] -> [batch, topk]
+    comp_idx = None
+    if extra_indices_in_kvcache is not None:
+        if extra_indices_in_kvcache.dim() == 3:
+            comp_idx = extra_indices_in_kvcache.squeeze(1)
+        else:
+            comp_idx = extra_indices_in_kvcache
+
+    # Process each batch item
+    for b in range(batch_size):
+        swa_len = int(topk_length[b].item())
+        comp_len = 0
+        if extra_topk_length is not None:
+            comp_len = int(extra_topk_length[b].item())
+
+        if swa_len <= 0 and comp_len <= 0:
+            continue
+
+        # Gather KV from both caches
+        kv_parts = []
+        if swa_len > 0:
+            valid_swa = swa_idx[b, :swa_len].long().clamp(0, swa_total_slots - 1)
+            kv_parts.append(flat_swa[valid_swa])
+
+        if comp_len > 0 and flat_comp is not None and comp_idx is not None:
+            valid_comp = comp_idx[b, :comp_len].long().clamp(0, comp_total_slots - 1)
+            kv_parts.append(flat_comp[valid_comp])
+
+        if not kv_parts:
+            continue
+
+        # Concatenate all KV: [total_kv, d_qk]
+        kv_gathered = torch.cat(kv_parts, dim=0)
+        kv_c = kv_gathered[:, :kv_lora_rank].float()       # [total_kv, 512]
+        kv_r = kv_gathered[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim].float()  # [total_kv, 64]
+
+        for s in range(seq_q):
+            q_token = q[b, s].float()  # [num_heads, d_qk]
+            q_c = q_token[:, :kv_lora_rank]                 # [num_heads, 512]
+            q_r = q_token[:, kv_lora_rank:kv_lora_rank + qk_rope_head_dim]  # [num_heads, 64]
+
+            # MLA scores: q_c @ kv_c.T + q_r @ kv_r.T -> [num_heads, total_kv]
+            scores = q_c @ kv_c.T + q_r @ kv_r.T
+            scores = scores * softmax_scale
+            attn_weights = torch.softmax(scores, dim=-1)
+
+            # Output = weighted sum of kv_c (lora rank)
+            attn_out = attn_weights @ kv_c  # [num_heads, 512]
+
+            # Apply attention sink if provided
+            # attn_sink: [padded_heads] float32 -- per-head log-space damping
+            # Effect: out *= exp(lse) / (exp(lse) + exp(attn_sink))
+            #       = sigmoid(lse - attn_sink) where lse = logsumexp(scaled_scores)
+            if attn_sink is not None:
+                lse = torch.logsumexp(scores, dim=-1)  # [num_heads]
+                sink_val = attn_sink[:num_heads].to(lse.device).float()
+                sink_scale = torch.sigmoid(lse - sink_val)  # [num_heads]
+                attn_out = attn_out * sink_scale.unsqueeze(-1)
+
+            output[b, s, :, :kv_lora_rank] = attn_out.to(output.dtype)
+
+    return output, None
 
 
 def kunlun_flash_mla_with_kvcache(
@@ -207,9 +328,14 @@ def flash_mla_sparse_prefill(
     kv: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
-    q_lod_xpu: torch.Tensor,
-    q_lod_cpu: torch.Tensor,
+    q_lod_xpu: Optional[torch.Tensor] = None,
+    q_lod_cpu: Optional[torch.Tensor] = None,
     d_v: int = 512,
+    # V4 new kwargs
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
@@ -233,9 +359,65 @@ def flash_mla_sparse_prefill(
     """
     s_q, h_q, d_qk = q.shape
 
-    out = torch.zeros([s_q, h_q, d_v], dtype=q.dtype, device=q.device)
+    # [kunlun-patch] 3D-kv naive PyTorch MLA fallback
+    #
+    # DSv4 nvidia._forward_prefill calls this wrapper with
+    #   kv     = kv_workspace.view(-1, 1, d_qk)   # 3-D
+    #   indices= combined_indices.unsqueeze(1)    # [s_q, 1, topk]
+    #   topk_length = combined_lens
+    # The kunlun sparse_prefill_fwd_opt kernel asserts kv.dim() == 2 and
+    # historically rejected this V4 layout on Kunlun, so we fall back to a
+    # naive PyTorch MLA attention over the gathered bf16 workspace. This
+    # matches the source-patched implementation that produced tokens on the
+    # old pod. The 2-D fast path (V3.2 indexer sparse prefill) is unchanged.
+    if kv.dim() == 3:
+        import torch as _torch
+        d_qk_v = q.shape[-1]
+        s_q_v = q.shape[0]
+        h_q_v = q.shape[1]
+        if out is None:
+            out = _torch.zeros(
+                [s_q_v, h_q_v, d_v], dtype=q.dtype, device=q.device
+            )
+        kv_flat = kv.reshape(-1, d_qk_v)
+        idx2d = indices.reshape(s_q_v, -1)
+        kv_lora_rank = d_v
+        rope_dim = d_qk_v - kv_lora_rank
+        lens = topk_length
+        for _t in range(s_q_v):
+            valid = int(lens[_t].item()) if lens is not None else idx2d.shape[1]
+            if valid <= 0:
+                continue
+            vi = idx2d[_t, :valid].long().clamp(0, kv_flat.shape[0] - 1)
+            kvg = kv_flat[vi].float()
+            kv_c = kvg[:, :kv_lora_rank]
+            kv_r = kvg[:, kv_lora_rank:kv_lora_rank + rope_dim]
+            q_tok = q[_t].float()
+            q_c = q_tok[:, :kv_lora_rank]
+            q_r = q_tok[:, kv_lora_rank:kv_lora_rank + rope_dim]
+            scores = (q_c @ kv_c.T + q_r @ kv_r.T) * sm_scale
+            w = _torch.softmax(scores, dim=-1)
+            ao = w @ kv_c
+            out[_t, :, :kv_lora_rank] = ao.to(out.dtype)
+        max_logits = _torch.zeros(
+            [s_q_v, h_q_v], dtype=_torch.float32, device=q.device
+        )
+        lse = _torch.zeros(
+            [s_q_v, h_q_v], dtype=_torch.float32, device=q.device
+        )
+        return out, max_logits, lse
+
+    if out is None:
+        out = torch.zeros([s_q, h_q, d_v], dtype=q.dtype, device=q.device)
     max_logits = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
     lse = torch.zeros([s_q, h_q], dtype=torch.float32, device=q.device)
+
+    # If q_lod not provided (V4 path), create a simple [0, s_q] lod
+    if q_lod_xpu is None:
+        q_lod_cpu = torch.tensor([0, s_q], dtype=torch.int32)
+        q_lod_xpu = q_lod_cpu.to(q.device)
+    if q_lod_cpu is None:
+        q_lod_cpu = q_lod_xpu.cpu()
 
     torch.ops._C.sparse_prefill_fwd_opt(
         q=q,
@@ -257,7 +439,12 @@ def flash_mla_sparse_prefill(
     # out_scale = 1 / math.log2(math.e)
     # gpu_max_logits * out_scale = kunlun_lse
     # gpu_lse * out_scale = kunlun_lse
-    return out, max_logits, lse
+    lse = lse.float()
+    if isinstance(attn_sink, torch.Tensor):
+        sink = attn_sink[:h_q].to(device=lse.device, dtype=torch.float32)
+        sink_scale = torch.sigmoid(lse - sink.unsqueeze(0))
+        out.mul_(sink_scale.unsqueeze(-1).to(out.dtype))
+    return out, max_logits.float(), lse
 
 
 #

@@ -38,9 +38,46 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 logger = logging.getLogger("vllm_kunlun.ops.layernorm")
 
-# Track if OOT classes have logged (for logging once per type)
-_oot_rms_norm_init_logged = False
-_oot_gemma_rms_norm_init_logged = False
+
+def rms_norm_kunlun(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    torch.ops._C.rmsnorm(x, weight, out, eps)
+    return out
+
+
+def fused_q_kv_rmsnorm_kunlun(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert q.shape[:-1] == kv.shape[:-1]
+    assert q.shape[-1] == q_weight.shape[0]
+    assert kv.shape[-1] == kv_weight.shape[0]
+    return (
+        rms_norm_kunlun(q, q_weight, eps),
+        rms_norm_kunlun(kv, kv_weight, eps),
+    )
+
+
+def fused_add_rms_norm_kunlun(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.ops._C.add_rmsnorm(
+        x,
+        residual,
+        residual_output=residual,
+        weight=weight,
+        eps=eps,
+        output=x,
+    )
+    return x, residual
 
 
 # =============================================================================
@@ -62,11 +99,7 @@ class KunlunRMSNorm(RMSNorm):
     """
 
     def __init__(self, *args, **kwargs):
-        global _oot_rms_norm_init_logged
         super().__init__(*args, **kwargs)
-        if not _oot_rms_norm_init_logged:
-            logger.info("[KunlunOOT] KunlunRMSNorm.__init__ called (OOT instantiation)")
-            _oot_rms_norm_init_logged = True
 
     def forward_oot(
         self,
@@ -114,13 +147,7 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
     """
 
     def __init__(self, *args, **kwargs):
-        global _oot_gemma_rms_norm_init_logged
         super().__init__(*args, **kwargs)
-        if not _oot_gemma_rms_norm_init_logged:
-            logger.info(
-                "[KunlunOOT] KunlunGemmaRMSNorm.__init__ called (OOT instantiation)"
-            )
-            _oot_gemma_rms_norm_init_logged = True
 
     @staticmethod
     def forward_xpu(
@@ -175,9 +202,4 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
         return self.forward_xpu(self.weight.data, self.variance_epsilon, x, residual)
 
 
-# Log that OOT registration is complete
-# NOTE: OOT mechanism uses cls.__name__ (e.g. "RMSNorm") not the op's logical name
-# Use print to stderr to ensure visibility in logs
-logger.info(
-    "[KunlunOOT] Registered KunlunRMSNorm and KunlunGemmaRMSNorm via CustomOp.register_oot"
-)
+logger.info("[KunlunOOT] Loaded Kunlun RMSNorm implementations")
