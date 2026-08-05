@@ -14,6 +14,7 @@ OLD_IMPORT_HOOK = builtins.__import__
 _MODULE_MAPPINGS = {
     "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
     "vllm.v1.worker.utils": "vllm_kunlun.v1.worker.utils",
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
     "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
