@@ -50,24 +50,34 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        # The fused RoutedExperts layer is resolved by looking up its
+        # per-expert projection names. Different checkpoints / vllm builds
+        # name these either gate/up/down_proj (HF-canonical) or w1/w3/w2
+        # (Mixtral-style: w1=gate, w3=up, w2=down). Some vllm builds do not
+        # remap w1/w2/w3 -> gate/up/down in the compressed-tensors target
+        # map, so try both conventions and use the first that resolves.
+        name_variant_suffixes = [
+            [".0.gate_proj", ".0.up_proj", ".0.down_proj"],
+            [".0.w1", ".0.w3", ".0.w2"],
         ]
-        # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [
-            quant_config.get_scheme_dict(layer, name) for name in unfused_names
-        ]
-        scheme_dict = all_scheme_dicts.pop()
+        scheme_dict = None
+        for proj_suffixes in name_variant_suffixes:
+            dicts = [
+                quant_config.get_scheme_dict(layer, layer_name + p)
+                for p in proj_suffixes
+            ]
+            if any(d is None for d in dicts):
+                continue
+            # multiple schemes found
+            if not all(cur_dict == dicts[0] for cur_dict in dicts):
+                raise ValueError(
+                    "All MoE projections need to have same "
+                    "quantization scheme but found multiple"
+                )
+            scheme_dict = dicts[0]
+            break
 
-        # multiple schemes found
-        if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
-            raise ValueError(
-                "All MoE projections need to have same "
-                "quantization scheme but found multiple"
-            )
-
-        if scheme_dict is None:  # ignored layer
+        if scheme_dict is None:  # ignored / unquantized layer
             return UnquantizedFusedMoEMethod(layer.moe_config)
 
         weight_quant = scheme_dict.get("weights")
@@ -323,6 +333,16 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         assert self.num_bits in WNA16_SUPPORTED_BITS, (
             f"Unsupported num_bits: {self.num_bits}, expected {WNA16_SUPPORTED_BITS}"
         )
+        # We skip the parent __init__ (it selects a GPU marlin/flashinfer
+        # backend via an oracle and asserts group-only). Newer vllm's inherited
+        # create_weights / get_weight_shape need these attributes explicitly.
+        # is_transposed=True -> "Marlin" (transposed) weight layout, which is
+        # identical to the layout this plugin's process_weights_after_loading
+        # (transpose(1,2)+XOR 0x88) and fused_moe_ct_w4a16 expect.
+        self.symmetric = weight_quant.symmetric
+        self.actorder = weight_quant.actorder
+        self.is_transposed = True
+
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Preprocess loaded weights for ``ops.fused_moe_ct_w4a16``.

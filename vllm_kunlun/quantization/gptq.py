@@ -23,7 +23,7 @@ from typing import Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.auto_gptq import (
     AutoGPTQConfig as GPTQConfig,
@@ -57,7 +57,7 @@ class KunlunGPTQConfig(GPTQConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Union["GPTQLinearMethod", "QuantizeMethodBase"] | None:
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, FusedMoEFactory):
             from .moe_wna16 import MoeWNA16Config
 
             config = {

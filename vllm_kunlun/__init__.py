@@ -281,6 +281,53 @@ _register_post_import_hook(
 )
 
 
+# --- hook: MessageQueue remote-bind port-conflict retry (P800) ------------
+# On P800 the single get_open_port()+zmq bind in MessageQueue.__init__ can hit
+# an already-in-use port. Wrap __init__ to retry (re-rolls the port each time),
+# instead of intrusively editing vllm's shm_broadcast.py.
+def _shm_mq_applied(mod):
+    cls = getattr(mod, "MessageQueue", None)
+    return cls is None or getattr(cls, "_kunlun_bind_retry", False)
+
+
+def _shm_mq_apply(mod):
+    import zmq
+
+    cls = getattr(mod, "MessageQueue", None)
+    if cls is None:
+        return
+    _orig_init = cls.__init__
+    _MAX = 30
+
+    def _init_with_retry(self, *args, **kwargs):
+        for attempt in range(_MAX):
+            try:
+                return _orig_init(self, *args, **kwargs)
+            except zmq.error.ZMQError as e:
+                if attempt == _MAX - 1:
+                    raise
+                logging.getLogger("vllm_kunlun").warning(
+                    "[KunlunPlugin] MessageQueue bind port conflict, "
+                    "retry %d/%d: %s",
+                    attempt + 1,
+                    _MAX,
+                    e,
+                )
+
+    cls.__init__ = _init_with_retry
+    cls._kunlun_bind_retry = True
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched MessageQueue.__init__ with bind-retry"
+    )
+
+
+_register_post_import_hook(
+    "vllm.distributed.device_communicators.shm_broadcast",
+    _shm_mq_applied,
+    _shm_mq_apply,
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
