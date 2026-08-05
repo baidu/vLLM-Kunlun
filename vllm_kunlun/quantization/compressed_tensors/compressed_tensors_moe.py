@@ -22,6 +22,7 @@ import torch
 from compressed_tensors import CompressionFormat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
     FusedMoEMethodBase,
     UnquantizedFusedMoEMethod,
 )
@@ -51,9 +52,16 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
+
+        # Determine projection names from the layer's checkpoint naming
+        # (e.g., MiniMax M2 uses "w1", "w2", "w3" instead of "gate_proj", etc.)
+        ckpt_gate = getattr(layer, "ckpt_gate_proj_name", "gate_proj")
+        ckpt_down = getattr(layer, "ckpt_down_proj_name", "down_proj")
+        ckpt_up = getattr(layer, "ckpt_up_proj_name", "up_proj")
+
         unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+            layer_name + f".0.{proj_name}"
+            for proj_name in [ckpt_gate, ckpt_up, ckpt_down]
         ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
         all_scheme_dicts = [
@@ -76,7 +84,6 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         format = scheme_dict.get("format")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
-
             valid_format_and_bits = (
                 weight_quant.num_bits in WNA16_SUPPORTED_BITS
                 and format == CompressionFormat.pack_quantized.value
@@ -111,6 +118,24 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe: "FusedMoEConfig",
+        layer_name: str | None = None,
+    ):
+        # Skip the parent __init__ which calls select_int8_moe_backend
+        # (not applicable on Kunlun XPU). Instead, directly init FusedMoEMethodBase.
+        from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
+
+        FusedMoEMethodBase.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.static_input_scales = not self.input_quant.dynamic
+        self.int8_backend = None
+        self.experts_cls = None
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -199,14 +224,16 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             )
             del expert_m
         else:
-            sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-                torch.ops.xspeedgate_ops.moe_pre_small(
-                    topk_ids,
-                    global_num_experts,
-                    index_have_neg=False,
-                    sort_mode=True,
-                    x=hidden_states,
-                )
+            (
+                sorted_tokens_idx,
+                sorted_tokens_num_lod,
+                moe_expand,
+            ) = torch.ops.xspeedgate_ops.moe_pre_small(
+                topk_ids,
+                global_num_experts,
+                index_have_neg=False,
+                sort_mode=True,
+                x=hidden_states,
             )
 
         y = torch.empty(
@@ -295,7 +322,6 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
-
     def apply(
         self,
         layer: torch.nn.Module,
