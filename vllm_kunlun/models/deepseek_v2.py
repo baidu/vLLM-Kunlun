@@ -454,6 +454,31 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+# Persistent scratch for the indexer prefill path. `cp_gather_indexer_k_quant_cache`
+# gathers the quantized indexer keys of a chunk into a [total_seq_lens, head_dim]
+# int8 buffer plus its scales. Those are dead as soon as the chunk's logits are
+# computed, so a single grow-on-demand buffer is shared by every layer instead of
+# allocating a fresh pair per chunk per layer.
+_INDEXER_PREFILL_SCRATCH: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _indexer_prefill_scratch(
+    num_rows: int, head_dim: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = _INDEXER_PREFILL_SCRATCH.get(device)
+    if (
+        cached is None
+        or cached[0].shape[0] < num_rows
+        or cached[0].shape[1] != head_dim
+    ):
+        cached = (
+            torch.empty([num_rows, head_dim], device=device, dtype=torch.int8),
+            torch.empty([num_rows, 4], device=device, dtype=torch.uint8),
+        )
+        _INDEXER_PREFILL_SCRATCH[device] = cached
+    return cached[0][:num_rows], cached[1][:num_rows]
+
+
 @custom_op("vllm::sparse_attn_indexer_vllm_kunlun", mutates_args=())
 def sparse_attn_indexer_vllm_kunlun(
     hidden_states: torch.Tensor,
@@ -505,15 +530,15 @@ def sparse_attn_indexer_vllm_kunlun(
         quant_block_size,
         scale_fmt,
     )
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # NOTE: topk_indices_buffer is reset to -1 once per forward pass by the
+    # caller that owns it (DeepseekV2Model / the MTP layer). Every indexer layer
+    # writes the same rows with the same per-row valid lengths, so re-filling it
+    # here per layer only rewrote the same padding 78 times.
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
         for chunk in prefill_metadata.chunks:
-            k_fp8 = torch.empty(
-                [chunk.total_seq_lens, head_dim], device=k.device, dtype=torch.int8
-            )
-            k_scale = torch.empty(
-                [chunk.total_seq_lens, 4], device=k.device, dtype=torch.uint8
+            k_fp8, k_scale = _indexer_prefill_scratch(
+                int(chunk.total_seq_lens), head_dim, k.device
             )
             torch.ops.xspeedgate_ops.cp_gather_indexer_k_quant_cache(
                 kv_cache=kv_cache,
@@ -686,6 +711,10 @@ class Indexer(nn.Module):
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
+        # `weights` is scaled by n_head**-0.5, by softmax_scale and by the
+        # per-token q scale (which quant2d reports as a max, so it needs /127).
+        # All but the q scale are compile-time constants, so fold them into one.
+        self.weights_scale = self.n_head**-0.5 * self.softmax_scale / 127.0
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
@@ -713,9 +742,7 @@ class Indexer(nn.Module):
                 - (self.max_model_len % cache_config.block_size)
             )
         self.prefix = prefix
-        from vllm_kunlun.v1.attention.backends.mla.indexer import (
-            get_max_prefill_buffer_size,
-        )
+        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
 
@@ -738,11 +765,16 @@ class Indexer(nn.Module):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
+        # rotary_emb is in-place on CUDA/XPU, in which case q/k already hold the
+        # rotated halves in exactly the [pe, nope] layout the cat would rebuild.
+        # Fall back to the cat when the backend returns fresh tensors.
+        if q_pe.data_ptr() != q.data_ptr():
+            q = torch.cat([q_pe, q_nope], dim=-1)
+        if k_pe.data_ptr() != k.data_ptr():
+            k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
+        q = q.reshape(-1, self.head_dim)
         q_fp8 = torch.empty(
             q.shape,
             device=q.device,
@@ -754,12 +786,10 @@ class Indexer(nn.Module):
             dtype=torch.float32,
         )
         torch.ops._C.quant2d(q, q_fp8, q_scale, force_sdnn=True)
-        q_scale /= 127
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head)
         weights, _ = self.weights_proj(hidden_states)
-        weights = weights * self.n_head**-0.5
-        weights = weights * q_scale * self.softmax_scale
+        weights = weights * q_scale * self.weights_scale
 
         torch.ops.vllm.sparse_attn_indexer_vllm_kunlun(
             hidden_states,
@@ -1132,6 +1162,9 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             topk_indices_buffer = None
+        # Owned here so forward() can reset it once per pass instead of every
+        # indexer layer re-writing the same -1 padding.
+        self.topk_indices_buffer = topk_indices_buffer
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1179,6 +1212,13 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        if self.topk_indices_buffer is not None:
+            # Reset the shared top-k buffer once per forward pass. Rows shorter
+            # than topk_tokens keep -1 padding, and every indexer layer writes
+            # the same rows with the same valid lengths, so one reset covers all
+            # of them.
+            self.topk_indices_buffer[: hidden_states.shape[0]] = -1
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)

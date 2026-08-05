@@ -63,6 +63,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             )
         else:
             topk_indices_buffer = None
+        # The indexer no longer resets this per layer, so the owner does it once
+        # per forward pass (see DeepseekV2Model.forward).
+        self.topk_indices_buffer = topk_indices_buffer
         self.shared_head = SharedHead(config=config, quant_config=quant_config)
         self.mtp_block = DeepseekV2DecoderLayer(
             vllm_config, prefix, topk_indices_buffer
@@ -85,6 +88,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states = self.eh_proj(
             torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
         )
+
+        if self.topk_indices_buffer is not None:
+            self.topk_indices_buffer[: hidden_states.shape[0]] = -1
 
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
