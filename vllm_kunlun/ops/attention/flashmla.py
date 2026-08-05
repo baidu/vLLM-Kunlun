@@ -394,6 +394,9 @@ def flash_mla_sparse_prefill(
         kv_lora_rank = d_v
         rope_dim = d_qk_v - kv_lora_rank
         lens = topk_length
+        lse_for_sink = _torch.zeros(
+            [s_q_v, h_q_v], dtype=_torch.float32, device=q.device
+        )
         for _t in range(s_q_v):
             valid = int(lens[_t].item()) if lens is not None else idx2d.shape[1]
             if valid <= 0:
@@ -407,14 +410,19 @@ def flash_mla_sparse_prefill(
             q_r = q_tok[:, kv_lora_rank:kv_lora_rank + rope_dim]
             scores = (q_c @ kv_c.T + q_r @ kv_r.T) * sm_scale
             w = _torch.softmax(scores, dim=-1)
+            lse_for_sink[_t] = _torch.logsumexp(scores, dim=-1)
             ao = w @ kv_c
             out[_t, :, :kv_lora_rank] = ao.to(out.dtype)
+        if isinstance(attn_sink, _torch.Tensor):
+            sink = attn_sink[:h_q_v].to(
+                device=out.device, dtype=_torch.float32
+            )
+            sink_scale = _torch.sigmoid(lse_for_sink - sink.unsqueeze(0))
+            out.mul_(sink_scale.unsqueeze(-1).to(out.dtype))
         max_logits = _torch.zeros(
             [s_q_v, h_q_v], dtype=_torch.float32, device=q.device
         )
-        lse = _torch.zeros(
-            [s_q_v, h_q_v], dtype=_torch.float32, device=q.device
-        )
+        lse = lse_for_sink
         return out, max_logits, lse
 
     if out is None:
