@@ -333,7 +333,9 @@ def _compute_slot_mappings_native(self, idx_mapping, query_start_loc, positions,
         bt = self.block_tables[g].gpu
         slot = self.slot_mappings[g]
         for b in range(num_reqs):
-            rsi = int(idxl[b]); s = int(qsl[b]); e = int(qsl[b + 1])
+            rsi = int(idxl[b])
+            s = int(qsl[b])
+            e = int(qsl[b + 1])
             if e > s:
                 pos = positions[s:e].to(torch.long)
                 bidx = pos // bs
@@ -348,7 +350,8 @@ def _compute_slot_mappings_native(self, idx_mapping, query_start_loc, positions,
 BlockTables.gather_block_tables = _gather_block_tables_native
 BlockTables.compute_slot_mappings = _compute_slot_mappings_native
 # === KUNLUN_V2_HOSTVEC_PATCH ===
-import os as _hv_os, torch as _hv_t
+import os as _hv_os  # noqa: E402
+import torch as _hv_t  # noqa: E402
 def _gather_block_tables_vec(self, idx_mapping, num_reqs_padded):
     num_reqs = idx_mapping.shape[0]
     idxl = idx_mapping.to(_hv_t.long)

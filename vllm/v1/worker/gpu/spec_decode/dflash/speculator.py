@@ -664,7 +664,8 @@ def prepare_dflash_inputs_native(
 
     for req_idx in range(num_reqs):
         req_state_idx = int(idx_l[req_idx])
-        ctx_start = int(tqsl_l[req_idx]); ctx_end = int(tqsl_l[req_idx + 1])
+        ctx_start = int(tqsl_l[req_idx])
+        ctx_end = int(tqsl_l[req_idx + 1])
         num_ctx = ctx_end - ctx_start
         num_rej = int(nrej_l[req_idx])
         valid_ctx_end = ctx_end - num_rej
@@ -721,7 +722,7 @@ def prepare_dflash_inputs_native(
         query_slot_mapping[q_pad_start:max_num_tokens] = PAD_SLOT_ID
 
 
-prepare_dflash_inputs = prepare_dflash_inputs_native
+prepare_dflash_inputs = prepare_dflash_inputs_native  # noqa: F811
 
 
 # === KUNLUN_DFLASH_VEC_PATCH ===
@@ -817,7 +818,7 @@ def prepare_dflash_inputs_vec(
         query_slot_mapping[q_pad_start:max_num_tokens] = PAD_SLOT_ID
 
 
-import os as _dfv_os
+import os as _dfv_os  # noqa: E402
 if _dfv_os.environ.get("KUNLUN_DFLASH_VEC", "0") == "1":
     prepare_dflash_inputs = prepare_dflash_inputs_vec
     try:

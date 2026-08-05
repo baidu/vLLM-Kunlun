@@ -251,8 +251,8 @@ class Sampler:
 
 
 # === KUNLUN_GUMBEL_GREEDY_PATCH ===
-import os as _kg_os
-import numpy as _kg_np
+import os as _kg_os  # noqa: E402
+import numpy as _kg_np  # noqa: E402
 
 
 def _kg_greedy_fastpath(sampling_states, idx_mapping_np):

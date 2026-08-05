@@ -646,7 +646,7 @@ def _get_num_sampled_and_rejected_native(
     return num_sampled, num_rejected
 
 
-get_num_sampled_and_rejected = _get_num_sampled_and_rejected_native
+get_num_sampled_and_rejected = _get_num_sampled_and_rejected_native  # noqa: F811
 
 
 # === KUNLUN_NATIVE_INPUTBATCH_PATCH2 ===
@@ -658,10 +658,13 @@ def _prepare_prefill_inputs_native(
     qsl = query_start_loc
     for b in range(num_reqs):
         rsi = int(idx_mapping[b])
-        pfl = int(prefill_len[rsi]); nc = int(num_computed_tokens[rsi])
+        pfl = int(prefill_len[rsi])
+        nc = int(num_computed_tokens[rsi])
         if nc >= pfl:
             continue
-        qs = int(qsl[b]); qe = int(qsl[b + 1]); ql = qe - qs
+        qs = int(qsl[b])
+        qe = int(qsl[b + 1])
+        ql = qe - qs
         if ql > 0:
             input_ids[qs:qe] = all_token_ids[rsi, nc:nc + ql]
         next_pos = nc + ql
@@ -675,8 +678,11 @@ def _prepare_pos_seq_lens_native(
     num_reqs = idx_mapping.shape[0]
     qsl = query_start_loc
     for b in range(num_reqs):
-        rsi = int(idx_mapping[b]); nc = int(num_computed_tokens[rsi])
-        start = int(qsl[b]); end = int(qsl[b + 1]); ql = end - start
+        rsi = int(idx_mapping[b])
+        nc = int(num_computed_tokens[rsi])
+        start = int(qsl[b])
+        end = int(qsl[b + 1])
+        ql = end - start
         seq_lens[b] = nc + ql
         if ql > 0:
             pos[start:end] = nc + torch.arange(ql, device=pos.device, dtype=pos.dtype)
@@ -695,11 +701,15 @@ def _combine_sampled_and_draft_tokens_native(
     qsl = query_start_loc
     for b in range(num_reqs):
         rsi = int(idx_mapping[b])
-        cs = int(cu_num_logits[b]); ce = int(cu_num_logits[b + 1]); nl = ce - cs
+        cs = int(cu_num_logits[b])
+        ce = int(cu_num_logits[b + 1])
+        nl = ce - cs
         nd = nl - num_new_sampled_tokens
-        qe = int(qsl[b + 1]); ls = qe - nl
+        qe = int(qsl[b + 1])
+        ls = qe - nl
         logits_indices[cs:ce] = ls + torch.arange(nl, device=dev, dtype=torch.int64)
-        sl = int(seq_lens[b]); pl = int(prefill_len[rsi])
+        sl = int(seq_lens[b])
+        pl = int(prefill_len[rsi])
         if sl <= pl:                                 # prefill: no sampled/draft
             continue
         first = sl - nl
@@ -723,7 +733,8 @@ def _post_update_native(
         rsi = int(idx_mapping[b])
         if rsi < 0:
             continue
-        base = int(total_len[rsi]); n = int(num_sampled[b])
+        base = int(total_len[rsi])
+        n = int(num_sampled[b])
         if n > 0:
             last_sampled_tokens[rsi] = sampled_tokens[b, n - 1]
             total_len[rsi] = base + n
@@ -750,14 +761,16 @@ def _expand_idx_mapping_native(idx_mapping, total_num_logits, cu_num_logits, max
     expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
     expanded_local_pos = torch.empty(total_num_logits, dtype=torch.int32, device=dev)
     for b in range(num_reqs):
-        s = int(cu_num_logits[b]); e = int(cu_num_logits[b + 1]); n = e - s
+        s = int(cu_num_logits[b])
+        e = int(cu_num_logits[b + 1])
+        n = e - s
         if n > 0:
             expanded_idx_mapping[s:e] = int(idx_mapping[b])
             expanded_local_pos[s:e] = torch.arange(n, device=dev, dtype=torch.int32)
     return expanded_idx_mapping, expanded_local_pos
 
 
-prepare_prefill_inputs = _prepare_prefill_inputs_native
+prepare_prefill_inputs = _prepare_prefill_inputs_native  # noqa: F811
 # === ABTEST_VEC_INPUTPREP ===
 def _prepare_pos_seq_lens_vec(idx_mapping, query_start_loc, num_computed_tokens, pos, seq_lens):
     import torch as _t
@@ -780,9 +793,9 @@ def _prepare_pos_seq_lens_vec(idx_mapping, query_start_loc, num_computed_tokens,
             pos[:total] = (rep_base + (tok - rep_start)).to(pos.dtype)
 
 
-prepare_pos_seq_lens = _prepare_pos_seq_lens_vec
+prepare_pos_seq_lens = _prepare_pos_seq_lens_vec  # noqa: F811
 # === ABTEST_XPU_COMBINE ===
-import kunlun_ops as _abtest_kops
+import kunlun_ops as _abtest_kops  # noqa: E402
 def _combine_sampled_and_draft_tokens_xpu(
     input_ids, idx_mapping, last_sampled_tokens, query_start_loc, seq_lens,
     prefill_len, draft_tokens, cu_num_logits, num_logits, num_new_sampled_tokens=1,
@@ -804,9 +817,9 @@ def _combine_sampled_and_draft_tokens_xpu(
         cu_num_logits.to(_i32),
         num_logits,
     )
-combine_sampled_and_draft_tokens = _combine_sampled_and_draft_tokens_xpu
-post_update = _post_update_native
-post_update_num_computed_tokens = _post_update_num_computed_tokens_native
+combine_sampled_and_draft_tokens = _combine_sampled_and_draft_tokens_xpu  # noqa: F811
+post_update = _post_update_native  # noqa: F811
+post_update_num_computed_tokens = _post_update_num_computed_tokens_native  # noqa: F811
 def _expand_idx_mapping_vec(idx_mapping, total_num_logits, cu_num_logits, max_expand_len):
     import torch as _t
     num_reqs = idx_mapping.shape[0]
@@ -821,7 +834,7 @@ def _expand_idx_mapping_vec(idx_mapping, total_num_logits, cu_num_logits, max_ex
     return expanded_idx_mapping, expanded_local_pos
 
 
-expand_idx_mapping = _expand_idx_mapping_vec
+expand_idx_mapping = _expand_idx_mapping_vec  # noqa: F811
 
 
 # === KUNLUN_POSTUPDATE_VEC_PATCH (whk) ===
@@ -838,7 +851,9 @@ def _post_update_vec(
     if num_reqs == 0:
         return
     dev = all_token_ids.device
-    idx = idx_mapping.to(_t.long); valid = idx >= 0; n = num_sampled.to(_t.long)
+    idx = idx_mapping.to(_t.long)
+    valid = idx >= 0
+    n = num_sampled.to(_t.long)
     if query_start_loc is not None:
         qlens = (query_start_loc[1:num_reqs + 1] - query_start_loc[:num_reqs]).to(_t.long)
     else:
@@ -851,7 +866,8 @@ def _post_update_vec(
     if not bool(prod.any()):
         return
     b_idx = _t.nonzero(prod, as_tuple=True)[0]
-    rsi_p = idx[b_idx]; n_p = n[b_idx]
+    rsi_p = idx[b_idx]
+    n_p = n[b_idx]
     base_p = total_len.to(_t.long)[rsi_p]
     last_sampled_tokens[rsi_p] = sampled_tokens[b_idx, n_p - 1].to(last_sampled_tokens.dtype)
     total_len[rsi_p] = (base_p + n_p).to(total_len.dtype)
@@ -861,13 +877,15 @@ def _post_update_vec(
         seg = _t.repeat_interleave(_t.arange(P, device=dev), n_p)
         starts_cum = _t.cumsum(n_p, 0) - n_p
         j = _t.arange(total_writes, device=dev) - _t.repeat_interleave(starts_cum, n_p)
-        dst_rsi = rsi_p[seg]; dst_col = base_p[seg] + j
+        dst_rsi = rsi_p[seg]
+        dst_col = base_p[seg] + j
         src_val = sampled_tokens[b_idx[seg], j]
         all_token_ids[dst_rsi, dst_col] = src_val.to(all_token_ids.dtype)
 
 post_update = _post_update_vec
 # === KUNLUN_V2_HOSTVEC_PATCH ===
-import os as _hv_os, torch as _hv_t
+import os as _hv_os  # noqa: E402
+import torch as _hv_t  # noqa: E402
 def _prepare_pos_seq_lens_vec(idx_mapping, query_start_loc, num_computed_tokens, pos, seq_lens):
     num_reqs = idx_mapping.shape[0]
     qsl = query_start_loc
@@ -895,7 +913,9 @@ def _post_update_vec2(
     if num_reqs == 0:
         return
     dev = all_token_ids.device
-    idx = idx_mapping.to(_hv_t.long); valid = idx >= 0; n = num_sampled.to(_hv_t.long)
+    idx = idx_mapping.to(_hv_t.long)
+    valid = idx >= 0
+    n = num_sampled.to(_hv_t.long)
     if query_start_loc is not None:
         qlens = (query_start_loc[1:num_reqs + 1] - query_start_loc[:num_reqs]).to(_hv_t.long)
     else:
@@ -908,7 +928,8 @@ def _post_update_vec2(
     if not bool(prod.any()):
         return
     b_idx = _hv_t.nonzero(prod, as_tuple=True)[0]
-    rsi_p = idx[b_idx]; n_p = n[b_idx]
+    rsi_p = idx[b_idx]
+    n_p = n[b_idx]
     base_p = total_len.to(_hv_t.long)[rsi_p]
     S = sampled_tokens.shape[1]
     last_vals = sampled_tokens.reshape(-1).index_select(0, b_idx * S + (n_p - 1))
@@ -920,7 +941,8 @@ def _post_update_vec2(
         seg = _hv_t.repeat_interleave(_hv_t.arange(P, device=dev), n_p)
         starts_cum = _hv_t.cumsum(n_p, 0) - n_p
         j = _hv_t.arange(total_writes, device=dev) - _hv_t.repeat_interleave(starts_cum, n_p)
-        dst_rsi = rsi_p[seg]; dst_col = base_p[seg] + j
+        dst_rsi = rsi_p[seg]
+        dst_col = base_p[seg] + j
         src_val = sampled_tokens.reshape(-1).index_select(0, b_idx[seg] * S + j)
         W = all_token_ids.shape[1]
         all_token_ids.reshape(-1).index_copy_(0, dst_rsi * W + dst_col, src_val.to(all_token_ids.dtype))
@@ -960,7 +982,9 @@ def _combine_sampled_and_draft_tokens_vec(
     draft_rows = _hv_t.nonzero(decode & (nd > 0), as_tuple=True)[0]
     if draft_rows.numel() > 0:
         for b in draft_rows.tolist():
-            ndb = int(nd[b]); qeb = int(qe[b]); rsi = int(idxl[b])
+            ndb = int(nd[b])
+            qeb = int(qe[b])
+            rsi = int(idxl[b])
             input_ids[qeb - ndb:qeb] = draft_tokens[rsi, :ndb]
     return logits_indices
 
