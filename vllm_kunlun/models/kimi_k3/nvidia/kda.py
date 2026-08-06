@@ -728,9 +728,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                     )
                 # recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
-                for i, slot in enumerate(non_spec_state_indices_tensor.tolist()):
-                    if slot >= 0:
-                        recurrent_state[slot] = last_recurrent_state[i]
+                slots = non_spec_state_indices_tensor.tolist()
+                for i in range(min(len(slots), last_recurrent_state.shape[0])):
+                    if slots[i] >= 0:
+                        recurrent_state[slots[i]] = last_recurrent_state[i]
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
