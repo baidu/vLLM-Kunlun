@@ -437,6 +437,65 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             return cache.view(current_platform.fp8_dtype())
         return cache
 
+    def _apply_pe_rope(
+        self,
+        positions: torch.Tensor | None,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """[KUNLUN] torch replacement for the RoPE that NV folds into the fused
+        MLA prefill/decode epilogues.
+
+        ``q_pe`` is ``[tokens, num_local_heads, qk_rope_head_dim]`` and ``k_pe``
+        is ``[tokens, 1, qk_rope_head_dim]``; ``rotary_emb`` expects flattened
+        ``[tokens, heads * head_size]`` and rotates in place-safe fashion.
+        """
+        if self.rotary_emb is None or positions is None:
+            return q_pe, k_pe
+        num_tokens = q_pe.shape[0]
+        q_rot, k_rot = self.rotary_emb.forward_native(
+            positions,
+            q_pe.reshape(num_tokens, -1),
+            k_pe.reshape(num_tokens, -1),
+        )
+        return q_rot.view(q_pe.shape), k_rot.view(k_pe.shape)
+
+    def _write_latent_cache(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """[KUNLUN] torch replacement for the paged cache-insert folded into the
+        fused epilogues: write ``[kv_c_normed | k_pe]`` at ``slot_mapping``.
+
+        The MLA cache is one latent "head" of ``kv_lora_rank +
+        qk_rope_head_dim`` per slot, so flattening block/slot dims gives a
+        ``[num_slots, head_size]`` view that ``index_copy_`` can scatter into
+        (in-place -- advanced indexing would copy the whole cache on XPU).
+        """
+        cache = self.kv_cache
+        if cache.numel() == 0:
+            return
+        num_tokens = kv_c_normed.shape[0]
+        latent = torch.cat(
+            [
+                kv_c_normed.reshape(num_tokens, -1),
+                k_pe.reshape(num_tokens, -1),
+            ],
+            dim=-1,
+        ).to(cache.dtype)
+        flat_cache = cache.reshape(-1, latent.shape[-1])
+        slots = slot_mapping[:num_tokens].to(torch.long)
+        # Padded / profile-run tokens carry slot -1; drop them before scatter.
+        if bool((slots < 0).any()):
+            keep = slots >= 0
+            slots = slots[keep]
+            latent = latent[keep]
+        if slots.numel() == 0:
+            return
+        flat_cache.index_copy_(0, slots, latent)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -670,12 +729,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         #     cos_sin_cache=cos_sin_cache,
         # )
         # --- naive begin (bf16 only) ---
-        # [KUNLUN][VERIFY] RoPE: the fused kernel applies rope to q_pe and k_pe
-        # using (positions, cos_sin_cache). Apply the model's rotary_emb here if
-        # required before concatenation / cache insert.
+        # (1) RoPE on q_pe / k_pe, (2) build mqa_q = [ql_nope | q_pe],
+        # (3) insert the decode-token latent into the paged cache.
+        del cos_sin_cache  # rotary_emb owns the table in the torch path
+        q_pe, k_pe = self._apply_pe_rope(positions, q_pe, k_pe)
         mqa_q = torch.cat([ql_nope, q_pe], dim=-1)
-        # [KUNLUN][TODO] Insert latent [kv_c_normed | k_pe] into self.kv_cache at
-        # slot_mapping for this decode token (needs KLX paged cache-write op).
+        self._write_latent_cache(kv_c_normed, k_pe, slot_mapping)
         return mqa_q
         # --- naive end ---
 
@@ -779,14 +838,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             #     cos_sin_cache,
             # )
             # --- naive begin ---
-            # [KUNLUN][VERIFY] RoPE: the fused kernel applies rope to q[..., nope:]
-            # and to k_pe using (positions, cos_sin_cache). Apply the model's
-            # rotary_emb here if the split query/key rope is required.
+            # (1) RoPE on q's rope part and on k_pe, (2) K = [k_nope | k_pe
+            # broadcast to heads], (3) write the latent into the paged cache.
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            q_pe, k_pe = self._apply_pe_rope(positions, q_pe, k_pe)
+            q = torch.cat([q_nope, q_pe], dim=-1)
             k_pe_heads = k_pe.expand(-1, self.num_local_heads, -1)
             k = torch.cat([k_nope, k_pe_heads], dim=-1)
-            # [KUNLUN][TODO] Write latent [kv_c_normed | k_pe] into self.kv_cache
-            # at slot_mapping for subsequent decode steps. Needs the KLX paged
-            # cache-write op / exact cache layout; left as TODO for now.
+            self._write_latent_cache(kv_c_normed, k_pe, slot_mapping)
             # --- naive end ---
 
         # [KUNLUN] prefill new-token attention. NV used
