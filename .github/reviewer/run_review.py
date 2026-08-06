@@ -8,7 +8,6 @@ import sys
 import urllib.error
 import urllib.request
 
-
 # The workflow includes complete changed files plus bounded related files. Keep
 # one request below the model context limit; very large PRs should be split.
 MAX_PROMPT_CHARS = 450_000
@@ -95,15 +94,17 @@ def validate_result(result):
         line = finding.get("line")
         if line is not None and (not isinstance(line, int) or line < 1):
             line = None
-        normalized.append({
-            "severity": severity,
-            "title_zh": finding["title_zh"],
-            "title_en": finding["title_en"],
-            "file": finding.get("file") or "unknown",
-            "line": line,
-            "body_zh": finding["body_zh"],
-            "body_en": finding["body_en"],
-        })
+        normalized.append(
+            {
+                "severity": severity,
+                "title_zh": finding["title_zh"],
+                "title_en": finding["title_en"],
+                "file": finding.get("file") or "unknown",
+                "line": line,
+                "body_zh": finding["body_zh"],
+                "body_en": finding["body_en"],
+            }
+        )
     return {
         "summary_zh": result["summary_zh"],
         "summary_en": result["summary_en"],
@@ -176,4 +177,3 @@ if __name__ == "__main__":
     except (OSError, KeyError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"Review failed: {exc}", file=sys.stderr)
         sys.exit(1)
-
