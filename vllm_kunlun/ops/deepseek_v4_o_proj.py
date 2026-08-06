@@ -2,6 +2,11 @@ import torch
 
 from vllm_kunlun.ops.fp8 import dequantize_fp8_blocks
 
+try:
+    import kunlun_ops
+except Exception:
+    kunlun_ops = None
+
 def deepseek_v4_bf16_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -30,26 +35,110 @@ def deepseek_v4_bf16_o_proj(
     ).permute(1, 0, 2, 3)
 
     half_rope = rope_dim // 2
-    cos_sin = torch.index_select(cos_sin_cache, 0, positions)
-    cos = cos_sin[:, :half_rope].view(1, num_tokens, 1, half_rope)
-    sin = cos_sin[:, half_rope:rope_dim].view(
-        1, num_tokens, 1, half_rope
+
+    # ------------------------------------------------------------------
+    # Native V4 inv-GPTJ RoPE via kunlun_ops.
+    # The kernel performs the standard GPT-J forward rotation; by passing a
+    # cos_sin table whose sine half has been negated we obtain the inverse
+    # rotation required for DeepSeek-V4's output projection. If the kernel is
+    # unavailable or raises (e.g., dtype/layout mismatch), fall back to the
+    # original PyTorch formula exactly once per process and keep going.
+    # ------------------------------------------------------------------
+    _warned_inv_rope_fallback = getattr(deepseek_v4_bf16_o_proj,
+                                        "_warned_inv_rope_fallback", False)
+    use_native_rotary = (
+        kunlun_ops is not None
+        and hasattr(kunlun_ops, "dpsk_decode_rotary_embedding_v3")
+        and head_dim >= nope_dim + rope_dim
+        
     )
-    rope = grouped[..., nope_dim : nope_dim + rope_dim]
-    rope_even = rope[..., 0::2]   # interleaved even indices
-    rope_odd = rope[..., 1::2]    # interleaved odd indices
-    inv_even = rope_even * cos + rope_odd * sin
-    inv_odd = -rope_even * sin + rope_odd * cos
-    inverse_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-    grouped = torch.cat(
-        (
-            grouped[..., :nope_dim],
-            inverse_rope,
-            grouped[..., nope_dim + rope_dim :],
-        ),
-        dim=-1,
-    )
-    grouped = grouped.contiguous().view(n_groups, num_tokens, -1)
+    if use_native_rotary:
+        try:
+            # Process-wide inverse-RoPE lookup table, keyed by the identity of
+            # the source table. DeepSeek-V4 builds two distinct rotary tables of
+            # identical shape and dtype -- `rope_theta` for compress_ratio <= 1
+            # layers and `compress_rope_theta` for the rest (see
+            # `vllm/models/deepseek_v4/common/rope.py`) -- so a (shape, dtype)
+            # key makes every layer reuse whichever table was seen first and
+            # rotate by the wrong angle.
+            caches = getattr(deepseek_v4_bf16_o_proj, "_global_inv_rope_caches", None)
+            if caches is None:
+                caches = {}
+                deepseek_v4_bf16_o_proj._global_inv_rope_caches = caches
+            cache_id = (
+                cos_sin_cache.data_ptr(),
+                tuple(cos_sin_cache.shape),
+                str(cos_sin_cache.dtype),
+            )
+            inv_cache = caches.get(cache_id)
+            if inv_cache is None or inv_cache.device != o.device:
+                inv_cos_sin = cos_sin_cache.float().detach().clone()
+                if inv_cos_sin.shape[-1] < half_rope * 2:
+                    raise RuntimeError(f"rotary cache last dim {inv_cos_sin.shape[-1]} too small for rope dim {rope_dim}")
+                neg_region_end = min(half_rope * 2, inv_cos_sin.shape[-1])
+                inv_cos_sin[:, half_rope:neg_region_end].neg_()
+                inv_cache = inv_cos_sin.contiguous().to(o.device)
+                caches[cache_id] = inv_cache
+
+            all_heads_3d = o.view(
+                num_tokens, n_groups, heads_per_group, head_dim
+            ).reshape(num_tokens, num_heads, head_dim)
+            positions_xpu = (
+                positions.to(o.device)
+                if positions.device != o.device else positions
+            )
+            # dpsk_decode_rotary_embedding_v3 takes one position per token and broadcasts across q/k heads.
+            rotated_out = all_heads_3d.clone().contiguous()
+            status_obj = kunlun_ops.dpsk_decode_rotary_embedding_v3(
+                positions=positions_xpu.long(),
+                cos_sin_cache=inv_cache,
+                in_query=all_heads_3d.contiguous(),
+                in_key=all_heads_3d.detach(),             # key side content unused by caller
+                out_query=rotated_out,
+                in_query_offset=nope_dim,
+                in_key_offset=0,
+                out_query_offset=nope_dim,
+            )
+            status_int = int(status_obj) if status_obj is not None else 0
+            assert status_int == 0, f"dpsk_decode_rotary_embedding_v3 failed status={status_int}"
+            grouped = (
+    rotated_out.view_as(o)
+        .to(torch.bfloat16)
+        .view(num_tokens, n_groups, heads_per_group, head_dim)
+        .permute(1, 0, 2, 3)
+        .contiguous().view(n_groups, num_tokens, -1)
+)
+        except Exception as e:  # noqa: BLE001
+            use_native_rotary = False
+            if not _warned_inv_rope_fallback:
+                import logging
+                logging.getLogger("vllm_kunlum.ops.deepseek_v4_o_proj").warning(
+                    "native dpsk_decode_rotary_embedding_v3 O-proj inverse-RoPE "
+                    "failed (%s), falling back to torch formula", str(e)
+                )
+                deepseek_v4_bf16_o_proj._warned_inv_rope_fallback = True
+
+    if not use_native_rotary:
+        # Original elementwise fallback using selected rows from cos_sin_cache.
+        cos_sin = torch.index_select(cos_sin_cache, 0, positions)
+        cos = cos_sin[:, :half_rope].view(1, num_tokens, 1, half_rope)
+        sin = cos_sin[:, half_rope:rope_dim].view(
+            1, num_tokens, 1, half_rope
+        )
+        rope = grouped[..., nope_dim : nope_dim + rope_dim]
+        rope_even = rope[..., 0::2]
+        rope_odd = rope[..., 1::2]
+        inv_even = rope_even * cos + rope_odd * sin
+        inv_odd = -rope_even * sin + rope_odd * cos
+        inverse_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+        grouped = torch.cat(
+            (
+                grouped[..., :nope_dim],
+                inverse_rope,
+                grouped[..., nope_dim + rope_dim :],
+            ),
+            dim=-1,
+        ).contiguous().view(n_groups, num_tokens, -1)
 
     # Cache dequantized weight on first call to avoid per-step CPU round-trip.
     # The FP8 weight never changes after loading, so this is safe.
