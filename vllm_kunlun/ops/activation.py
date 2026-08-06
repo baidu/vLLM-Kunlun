@@ -36,4 +36,11 @@ def _forward_native(self, x: torch.Tensor) -> torch.Tensor:
 if not getattr(_upstream_cls, "_kunlun_silu_and_mul_patched", False):
     _upstream_cls.forward_native = _forward_native
     _upstream_cls._kunlun_silu_and_mul_patched = True
-    logger.info("[KunlunPlugin] SiluAndMul patched in vllm_kunlun/ops/activations.py")
+    logger.info("[KunlunPlugin] SiluAndMul patched in vllm_kunlun/ops/activation.py")
+
+
+# Re-export so that ``from vllm_kunlun.ops.activation import SiluAndMul`` keeps
+# working for model files written against the pre-patch layout (deepseek_v2,
+# seed_oss, mimo_v2_flash). It is the upstream class itself -- patched above --
+# not a separate implementation.
+SiluAndMul = _upstream_cls
