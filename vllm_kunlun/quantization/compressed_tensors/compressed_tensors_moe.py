@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+from vllm_kunlun.ops.activation import swiglu
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
 from vllm_kunlun.adapters.dsv4.moe_int8_factory import (
@@ -449,6 +450,10 @@ class KunlunCompressedTensorsW8A8Int8MoEMethodV4(CompressedTensorsW8A8Int8MoEMet
             expert_x = x_flat[token_rows].to(torch.bfloat16)
             w13, w2 = self._dequant_expert(layer, expert_id)
             gate, up = F.linear(expert_x, w13).chunk(2, dim=-1)
+            limit = getattr(layer, "swiglu_limit", None)
+            if limit is not None:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(-limit, limit)
             expert_y = F.linear(F.silu(gate) * up, w2)
             expert_weights = (
                 weights_cpu[token_rows_cpu, choices_cpu]
@@ -550,12 +555,12 @@ class KunlunCompressedTensorsW8A8Int8MoEMethodV4(CompressedTensorsW8A8Int8MoEMet
         )
         del x_q, x_scale
 
-        # SwiGLU activation.
+        # SwiGLU activation. `swiglu_limit` (10.0 for DeepSeek-V4) must be
+        # honoured here: without it the position-0 sink token's intermediates
+        # saturate and the layer output is inflated (rel_l2 0.6 on L26 against
+        # an fp64 golden).
         d = y.shape[-1] // 2
-        out1 = torch.empty(
-            (*y.shape[:-1], d), dtype=y.dtype, device=dev
-        )
-        torch.ops._C.silu_and_mul(out1, y)
+        out1 = swiglu(y, getattr(layer, "swiglu_limit", None))
         del y
         out1 = out1.reshape(-1, d)
 

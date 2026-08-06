@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
+from vllm_kunlun.ops.activation import swiglu
 from vllm_kunlun.ops.fp8 import dequantize_fp8_blocks
 
 import os as _os
@@ -294,9 +295,12 @@ class KunlunFp8MoEMethod(Fp8MoEMethod):
         )
         del moe_expand
 
-        # SwiGLU activation.
-        out1 = torch.empty(M * TOPK, I, dtype=torch.bfloat16, device=dev)
-        torch.ops._C.silu_and_mul(out1, y1.reshape(-1, N_2I))
+        # SwiGLU activation. Honour `swiglu_limit` (10.0 for DeepSeek-V4);
+        # dropping it inflates the sink token's output, see
+        # `vllm_kunlun/ops/activation.py::swiglu`.
+        out1 = swiglu(
+            y1.reshape(-1, N_2I), getattr(layer, "swiglu_limit", None)
+        )
         del y1
 
         # Grouped GEMM 2: down projection.
