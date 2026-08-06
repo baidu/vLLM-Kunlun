@@ -74,6 +74,9 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 #        dst = _make_uint8_view_from_ptr(dst_ptr, size, device)
 #        dst.copy_(src, non_blocking=True)
 
+@dataclasses.dataclass
+class MambaSpecDecodeGPUContext:
+    pass
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
@@ -180,6 +183,7 @@ def preprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
+    align_ctx: MambaSpecDecodeGPUContext | None = None,
 ):
     """
     Copy the mamba state of previous step to the last

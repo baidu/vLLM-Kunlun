@@ -328,6 +328,48 @@ _register_post_import_hook(
 )
 
 
+# --- hook: kda_metadata mamba state-indices Triton -> torch (P800) --------
+# _mamba_get_block_table_tensor uses the Triton kernel
+# _get_aligned_state_indices_kernel, which does not run on P800. Replace it
+# with a torch-native gather: for each request take num_state_slots block ids
+# from block_table starting at the block holding the current mamba state
+# (col = max((seq_len - 1)//block_size, 0)).
+def _kda_state_indices_applied(mod):
+    fn = getattr(mod, "_mamba_get_block_table_tensor", None)
+    return fn is None or getattr(fn, "_kunlun_torch_native", False)
+
+
+def _kda_state_indices_apply(mod):
+    import torch
+
+    def _mamba_get_block_table_tensor(
+        block_table, seq_lens, kv_cache_spec, mamba_cache_mode
+    ):
+        if mamba_cache_mode in ("all", "none"):
+            return block_table
+        num_state_slots = 1 + kv_cache_spec.num_speculative_blocks
+        block_size = kv_cache_spec.block_size
+        first = torch.clamp((seq_lens.long() - 1) // block_size, min=0)
+        slots = torch.arange(num_state_slots, device=block_table.device)
+        cols = (first[:, None] + slots[None, :]).clamp_(
+            max=block_table.shape[1] - 1
+        )
+        return torch.gather(block_table, 1, cols.long())
+
+    _mamba_get_block_table_tensor._kunlun_torch_native = True
+    mod._mamba_get_block_table_tensor = _mamba_get_block_table_tensor
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched kda_metadata._mamba_get_block_table_tensor -> torch"
+    )
+
+
+_register_post_import_hook(
+    "vllm.models.kimi_k3.nvidia.kda_metadata",
+    _kda_state_indices_applied,
+    _kda_state_indices_apply,
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
