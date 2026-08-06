@@ -109,7 +109,6 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
-
 @torch.compile(dynamic=True, backend="aot_eager")
 def get_masked_input_and_mask_kunlun(
     input_: torch.Tensor,
@@ -587,6 +586,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        spec_pad_gather_idx = attn_metadata.spec_pad_gather_idx
+        spec_unpad_idx = attn_metadata.spec_unpad_idx
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
@@ -613,19 +614,24 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if spec_sequence_masks is not None:
             assert spec_state_indices_tensor is not None
             actual_num = attn_metadata.num_spec_decodes * spec_state_indices_tensor.size(-1)
+            if spec_pad_gather_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_pad_gather_idx)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec[:actual_num],
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_conv_state_indices_tensor
-                [:attn_metadata.num_spec_decodes],
+                conv_state_indices=spec_conv_state_indices_tensor[
+                    :attn_metadata.num_spec_decodes
+                ],
                 num_accepted_tokens=num_accepted_tokens[:attn_metadata.num_spec_decodes],
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+            if spec_unpad_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_unpad_idx)
         if attn_metadata.num_prefills > 0:
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec,
@@ -694,13 +700,18 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            spec_len = (
+                attn_metadata.num_spec_decode_tokens
+                if spec_unpad_idx is not None
+                else actual_num
+            )
             core_attn_out_spec, last_recurrent_state = (
                 fused_recurrent_gated_delta_rule(
-                    q=query_spec[:, :actual_num],
-                    k=key_spec[:, :actual_num],
-                    v=value_spec[:, :actual_num],
-                    g=g_spec[:, :actual_num],
-                    beta=beta_spec[:, :actual_num],
+                    q=query_spec[:, :spec_len],
+                    k=key_spec[:, :spec_len],
+                    v=value_spec[:, :spec_len],
+                    g=g_spec[:, :spec_len],
+                    beta=beta_spec[:, :spec_len],
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=spec_query_start_loc[  # type: ignore[index]
@@ -808,7 +819,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            spec_out = core_attn_out_spec.squeeze(0)
+            core_attn_out[: spec_out.shape[0]] = spec_out
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 

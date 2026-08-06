@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import logging
 from collections.abc import Callable
 from math import prod
 from typing import Any
@@ -138,6 +139,113 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
         copy_bufs.src_ptrs.copy_to_gpu(n),
         copy_bufs.dst_ptrs.copy_to_gpu(n),
         copy_bufs.sizes.copy_to_gpu(n),
+    )
+
+
+def reanchor_spec_to_non_spec_states(
+    runner: Any,
+    scheduler_output: SchedulerOutput,
+) -> int:
+    """Move accepted speculative candidates to canonical non-spec state slots.
+
+    In Mamba cache mode ``none``, each request owns one canonical block followed
+    by speculative candidate blocks. A speculative GDN step writes conv history
+    candidate ``a`` at row offset ``a - 1`` of the canonical block and writes the
+    temporal candidate to block ``a - 1``. If the next suffix step has no draft,
+    the request switches to non-spec kernels, which read only canonical offset 0.
+    Re-anchor only those transitions before attention metadata is built.
+    """
+    if (
+        runner.cache_config.mamba_cache_mode != "none"
+        or not runner.speculative_config
+        or not runner.model_config.is_hybrid
+    ):
+        return 0
+
+    scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+    transitions: list[tuple[int, str, int]] = []
+    for row, req_id in enumerate(runner.input_batch.req_ids):
+        accepted = int(runner.num_accepted_tokens.np[row])
+        draft_len = len(scheduled_spec.get(req_id, ()))
+        is_decode = (
+            runner.input_batch.num_computed_tokens_cpu[row]
+            >= runner.input_batch.num_prompt_tokens[row]
+        )
+        current_is_spec = draft_len > 0 and is_decode
+        if accepted > 1 and not current_is_spec:
+            transitions.append((row, req_id, accepted))
+
+    if not transitions:
+        return 0
+
+    copy_funcs = runner.model.get_mamba_state_copy_func()
+    mamba_group_ids, mamba_spec = get_mamba_groups(runner.kv_cache_config)
+    num_spec = mamba_spec.num_speculative_blocks
+    assert len(copy_funcs) == 2, "GDN re-anchor expects conv and temporal states"
+
+    for group_id in mamba_group_ids:
+        layer_names = runner.kv_cache_config.kv_cache_groups[group_id].layer_names
+        dest_block_ids: list[int] = []
+        source_block_ids: list[int] = []
+        offsets: list[int] = []
+        for _, req_id, accepted in transitions:
+            block_ids = runner.requests[req_id].block_ids[group_id]
+            assert (
+                1 <= accepted <= len(block_ids)
+            ), f"accepted count {accepted} exceeds block table for {req_id}"
+            dest_block_ids.append(block_ids[0])
+            source_block_ids.append(block_ids[accepted - 1])
+            offsets.append(accepted - 1)
+
+        first_attention = runner.compilation_config.static_forward_context[
+            layer_names[0]
+        ]
+        first_conv_state = first_attention.kv_cache[0]
+        history_len = first_conv_state.shape[1] - num_spec
+        assert history_len > 0
+
+        device = first_conv_state.device
+        dest = torch.tensor(dest_block_ids, dtype=torch.long, device=device)
+        source = torch.tensor(source_block_ids, dtype=torch.long, device=device)
+        offset = torch.tensor(offsets, dtype=torch.long, device=device)
+        history_rows = torch.arange(history_len, device=device)
+        source_rows = offset[:, None] + history_rows[None, :]
+
+        for layer_name in layer_names:
+            attention = runner.compilation_config.static_forward_context[layer_name]
+            conv_state, temporal_state = attention.kv_cache
+            assert conv_state.shape[1] - num_spec == history_len
+
+            conv_history = conv_state[dest[:, None], source_rows].clone()
+            conv_state[dest[:, None], history_rows[None, :]] = conv_history
+
+            temporal_candidates = temporal_state.index_select(0, source)
+            temporal_state.index_copy_(0, dest, temporal_candidates)
+
+    rows = [row for row, _, _ in transitions]
+    runner.input_batch.num_accepted_tokens_cpu[rows] = 1
+    runner.num_accepted_tokens.np[rows] = 1
+    row_tensor = torch.tensor(rows, dtype=torch.long, device=runner.device)
+    runner.num_accepted_tokens.gpu.index_fill_(0, row_tensor, 1)
+    return len(transitions)
+
+
+def patch_gpu_model_runner(module: Any) -> None:
+    """Patch the upstream runner at the post-input-preparation boundary."""
+    cls = module.GPUModelRunner
+    original = cls._prepare_inputs
+    if getattr(original, "_kunlun_spec_reanchor_patched", False):
+        return
+
+    def _prepare_inputs_with_reanchor(self, scheduler_output, num_scheduled_tokens):
+        result = original(self, scheduler_output, num_scheduled_tokens)
+        reanchor_spec_to_non_spec_states(self, scheduler_output)
+        return result
+
+    _prepare_inputs_with_reanchor._kunlun_spec_reanchor_patched = True
+    cls._prepare_inputs = _prepare_inputs_with_reanchor
+    logging.getLogger(__name__).info(
+        "[KunlunPlugin] GPUModelRunner speculative state re-anchor patched"
     )
 
 

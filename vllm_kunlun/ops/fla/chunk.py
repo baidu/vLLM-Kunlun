@@ -296,12 +296,13 @@ def chunk_gated_delta_rule(
         scale = k.shape[-1] ** -0.5
 
     if cu_seqlens is not None and initial_state is not None:
-        # out_dtype = v.dtype
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        g = g.contiguous()
-        beta = beta.contiguous()
+        out_dtype = v.dtype
+        state_dtype = initial_state.dtype
+        q = q.to(state_dtype).contiguous()
+        k = k.to(state_dtype).contiguous()
+        v = v.to(state_dtype).contiguous()
+        g = g.to(state_dtype).contiguous()
+        beta = beta.to(state_dtype).contiguous()
         initial_state = initial_state.contiguous()
 
         o = torch.empty_like(v)
@@ -326,7 +327,7 @@ def chunk_gated_delta_rule(
             cu_seqlens,
             use_qk_l2norm_in_kernel=True,
         )
-        # o = o.to(out_dtype)
+        o = o.to(out_dtype)
     else:
         o, final_state = ChunkGatedDeltaRuleFunction.apply(
             q,

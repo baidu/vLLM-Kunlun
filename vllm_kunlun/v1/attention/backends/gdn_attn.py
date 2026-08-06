@@ -94,6 +94,12 @@ class GDNAttentionMetadata:
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     num_accepted_tokens_cpu: torch.Tensor | None = None  # shape: [batch,]
 
+    # Variable-length speculative decode uses a padded layout only for the
+    # fixed-width Kunlun conv kernel, then restores the real token layout before
+    # the recurrent kernel. Both are None for uniform MTP batches.
+    spec_pad_gather_idx: torch.Tensor | None = None
+    spec_unpad_idx: torch.Tensor | None = None
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -102,6 +108,33 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+
+
+def build_spec_pad_indices(
+    spec_query_lens_cpu: torch.Tensor,
+    spec_width: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Map variable-length spec tokens to fixed-width rows and back."""
+    num_spec_decodes = spec_query_lens_cpu.size(0)
+    lens = spec_query_lens_cpu.to(torch.int64)
+    if int(lens.sum().item()) == num_spec_decodes * spec_width:
+        return None
+
+    cu = torch.zeros(num_spec_decodes + 1, dtype=torch.int64)
+    torch.cumsum(lens, dim=0, out=cu[1:])
+    starts = cu[:-1].unsqueeze(1)
+    pos = torch.arange(spec_width, dtype=torch.int64).unsqueeze(0)
+    last_real = (lens - 1).clamp_(min=0).unsqueeze(1)
+
+    # Replicate the final real token so the conv input stays finite. These tail
+    # outputs are removed before the recurrent kernel and cannot be accepted.
+    pad_gather_idx = (starts + torch.minimum(pos, last_real)).reshape(-1)
+    real_mask = pos < lens.unsqueeze(1)
+    unpad_idx = (
+        torch.arange(num_spec_decodes, dtype=torch.int64).unsqueeze(1) * spec_width
+        + pos
+    )[real_mask]
+    return pad_gather_idx.to(torch.int32), unpad_idx.to(torch.int32)
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -222,6 +255,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_conv_state_indices_tensor: torch.Tensor | None = None
         spec_conv_state_indices_tensor_cpu: torch.Tensor | None = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_pad_gather_idx: torch.Tensor | None = None
+        spec_unpad_idx: torch.Tensor | None = None
         # [Kunlun] These CPU mirrors are only produced on some branches below but
         # are always read when the metadata is built, so default them here.
         spec_state_indices_tensor_cpu: torch.Tensor | None = None
@@ -393,6 +428,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
+            pad_indices = build_spec_pad_indices(
+                query_lens_cpu[spec_sequence_masks_cpu], self.num_spec + 1
+            )
+            if pad_indices is not None:
+                logger.warning_once(
+                    "[KunlunPlugin] GDN spec decode hit non-uniform query "
+                    "lengths; using the padded-conv fallback"
+                )
+                spec_pad_gather_idx = pad_indices[0].to(
+                    query_start_loc.device, non_blocking=True
+                )
+                spec_unpad_idx = pad_indices[1].to(
+                    query_start_loc.device, non_blocking=True
+                )
+
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
         if num_prefills > 0:
@@ -441,6 +491,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         if (
             self.use_full_cuda_graph
+            and spec_pad_gather_idx is None
             and num_prefills == 0
             and num_decodes == 0
             and num_spec_decodes <= self.decode_cudagraph_max_bs
@@ -585,6 +636,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # kernel. Dropping the blocking ``.cpu()`` removes one device sync
             # per spec-decode step per attention group.
             num_accepted_tokens_cpu=None,
+            spec_pad_gather_idx=spec_pad_gather_idx,
+            spec_unpad_idx=spec_unpad_idx,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -716,8 +769,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         This method builds the metadata for full cudagraph capture.
         Currently, only decode is supported for full cudagraphs with Mamba.
         """
-        # # [Kunlun] Warm the spec fused_recurrent kernel in eager BEFORE the
-        # # capture region records it (see _maybe_warmup_spec_kernel).
+        # Warm the spec fused_recurrent kernel before graph capture.
         self._maybe_warmup_spec_kernel(common_attn_metadata)
 
         m = common_attn_metadata
@@ -732,10 +784,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             f"and number of tokens ({m.num_actual_tokens}) <= "
             f"cudagraph capture sizes ({self.decode_cudagraph_max_bs})."
         )
-        # if m.query_start_loc.shape[0] > 2 and m.query_start_loc[-1] - m.query_start_loc[-2] < m.query_start_loc[-2] - m.query_start_loc[-3]:
-        #     m.query_start_loc = m.query_start_loc[:-1]
-        #     m.seq_lens_cpu = m.seq_lens_cpu[:-1]
-
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
