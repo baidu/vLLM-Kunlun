@@ -3,12 +3,28 @@
 #
 
 import os
+import re
 import shutil
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 ROOT_DIR = os.path.dirname(__file__)
+
+
+def get_version():
+    version_file = os.path.join(ROOT_DIR, "vllm_kunlun", "platforms", "version.py")
+    with open(version_file, encoding="utf-8") as f:
+        content = f.read()
+    m = re.search(
+        r"^__version__\s*=\s*['\"]([^'\"]+)['\"]\s*$",
+        content,
+        flags=re.MULTILINE,
+    )
+    if not m:
+        raise RuntimeError(f"Unable to find __version__ in {version_file}")
+    return m.group(1)
+
 
 ext_modules = [
     CppExtension(
@@ -42,7 +58,7 @@ if __name__ == "__main__":
 
     setup(
         name="vllm_kunlun",
-        version="0.21.0",
+        version=get_version(),
         author="vLLM-Kunlun team",
         license="Apache 2.0",
         description="vLLM Kunlun3 backend plugin",

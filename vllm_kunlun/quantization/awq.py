@@ -23,7 +23,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.awq import AWQConfig, AWQLinearMethod
+from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig as AWQConfig
+from vllm.model_executor.layers.quantization.auto_awq import (
+    AutoAWQLinearMethod as AWQLinearMethod,
+)
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 

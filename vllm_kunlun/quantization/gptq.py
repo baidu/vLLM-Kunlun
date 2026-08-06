@@ -17,6 +17,7 @@
 # This file is a part of the vllm-kunlun project.
 
 
+import enum
 from typing import Optional, Union
 
 import torch
@@ -24,12 +25,13 @@ from torch.nn.parameter import Parameter
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.gptq import (
-    ExllamaState,
-    GPTQConfig,
-    GPTQLinearMethod,
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQConfig as GPTQConfig,
 )
+from vllm.model_executor.layers.quantization.auto_gptq import (
+    AutoGPTQLinearMethod as GPTQLinearMethod,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (
     get_linear_quant_method,
 )
@@ -39,7 +41,13 @@ from vllm_kunlun.quantization.utils import _remove_quantization_method
 logger = init_logger(__name__)
 
 
-# reove the original gptq quantization method
+# ExllamaState was removed in vllm 0.25.x, define a compat stub
+class ExllamaState(enum.Enum):
+    UNINITIALIZED = 0
+    READY = 1
+
+
+# remove the original gptq quantization method
 _remove_quantization_method("gptq")
 
 
