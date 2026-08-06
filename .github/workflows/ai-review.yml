@@ -1,0 +1,135 @@
+name: AI PR Review
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - ai-review
+    timeout-minutes: 30
+
+    steps:
+      # pull_request_target 中只能检出默认分支的可信代码。
+      - name: Checkout trusted reviewer code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Collect PR diff
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const pr = context.payload.pull_request;
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                per_page: 100
+              }
+            );
+
+            fs.writeFileSync(
+              "review-input.json",
+              JSON.stringify({
+                repository: context.repo.full_name,
+                pull_request: pr.number,
+                title: pr.title,
+                description: pr.body || "",
+                base_sha: pr.base.sha,
+                head_sha: pr.head.sha,
+                files: files.map(file => ({
+                  filename: file.filename,
+                  status: file.status,
+                  additions: file.additions,
+                  deletions: file.deletions,
+                  patch: file.patch || null
+                }))
+              }, null, 2)
+            );
+
+      - name: Run internal AI review
+        env:
+          MODEL_API_URL: ${{ secrets.INTERNAL_MODEL_API_URL }}
+          MODEL_API_TOKEN: ${{ secrets.INTERNAL_MODEL_API_TOKEN }}
+          MODEL_NAME: DeepSeek-V4-Pro
+        run: |
+          python3 .github/reviewer/run_review.py \
+            --input review-input.json \
+            --output review-result.json
+
+      - name: Publish or update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- baidu-vllm-kunlun-ai-review -->";
+            const result = JSON.parse(
+              fs.readFileSync("review-result.json", "utf8")
+            );
+
+            const findings = (result.findings || []).map((item, index) => {
+              return [
+                `### ${index + 1}. ${item.severity}: ${item.title}`,
+                `**File:** \`${item.file}:${item.line || ""}\``,
+                item.body
+              ].join("\n\n");
+            }).join("\n\n");
+
+            const body = [
+              marker,
+              "## AI Review",
+              result.summary,
+              findings || "No actionable findings."
+            ].join("\n\n");
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100
+              }
+            );
+
+            const old = comments.find(comment =>
+              comment.body && comment.body.includes(marker)
+            );
+
+            if (old) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: old.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
