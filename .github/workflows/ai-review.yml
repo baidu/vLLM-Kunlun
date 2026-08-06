@@ -21,7 +21,8 @@ jobs:
       - self-hosted
       - Linux
       - X64
-      - ai-review
+      # 如果 runner 有自定义 ai-review 标签，取消下一行注释
+      # - ai-review
     timeout-minutes: 30
 
     steps:
@@ -37,7 +38,29 @@ jobs:
         with:
           script: |
             const fs = require("fs");
+            const { execFileSync } = require("child_process");
             const pr = context.payload.pull_request;
+            const contextFiles = [];
+            const changedPaths = new Set();
+            const relatedPaths = new Set();
+            let relatedBudget = 120000;
+
+            async function readText(owner, repo, path, ref) {
+              try {
+                const response = await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path,
+                  ref
+                });
+                const data = response.data;
+                if (Array.isArray(data) || data.encoding !== "base64") return null;
+                return Buffer.from(data.content.replace(/\n/g, ""), "base64")
+                  .toString("utf8");
+              } catch (error) {
+                return null;
+              }
+            }
 
             const files = await github.paginate(
               github.rest.pulls.listFiles,
@@ -49,6 +72,132 @@ jobs:
               }
             );
 
+            const headRepo = pr.head.repo || pr.base.repo;
+            for (const file of files) {
+              changedPaths.add(file.filename);
+              const baseContent = await readText(
+                pr.base.repo.owner.login,
+                pr.base.repo.name,
+                file.filename,
+                pr.base.sha
+              );
+              const headContent = await readText(
+                headRepo.owner.login,
+                headRepo.name,
+                file.filename,
+                pr.head.sha
+              );
+              contextFiles.push({
+                filename: file.filename,
+                kind: "changed",
+                base_content: baseContent || "",
+                head_content: headContent || ""
+              });
+            }
+
+            // Extract likely local symbols and module names from changed files.
+            // Search is read-only and the PR branch is never executed.
+            const searchTerms = new Set();
+            const addSearchTerm = term => {
+              if (term && term.length >= 5 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(term)) {
+                searchTerms.add(term);
+              }
+            };
+            for (const file of contextFiles) {
+              const source = `${file.head_content}\n${files.find(item => item.filename === file.filename)?.patch || ""}`;
+              for (const match of source.matchAll(/\b(?:def|class)\s+([A-Za-z_]\w*)/g)) {
+                addSearchTerm(match[1]);
+              }
+              for (const match of source.matchAll(/\b([A-Za-z_]\w{4,})\s*\(/g)) {
+                addSearchTerm(match[1]);
+              }
+              for (const match of source.matchAll(/\b(?:from|import)\s+([A-Za-z_][\w.]*)/g)) {
+                addSearchTerm(match[1].split(".").pop());
+              }
+              addSearchTerm(file.filename.split("/").pop().replace(/\.[^.]+$/, ""));
+            }
+
+            let trackedPaths = [];
+            try {
+              trackedPaths = execFileSync("git", ["ls-files"], {
+                encoding: "utf8"
+              }).split(/\r?\n/).filter(Boolean);
+            } catch (error) {
+              trackedPaths = [];
+            }
+
+            // Scan the trusted base checkout first. This finds callers and tests
+            // even when GitHub code search has not indexed the repository.
+            const escapedTerms = Array.from(searchTerms).slice(0, 24).map(term =>
+              new RegExp(`\\b${term}\\b`)
+            );
+            for (const path of trackedPaths) {
+              if (relatedPaths.size >= 30 || changedPaths.has(path)) break;
+              if (!/\.(py|pyi|c|cc|cpp|h|hh|hpp|cu|cuh|sh|yaml|yml|toml)$/.test(path)) continue;
+              let content;
+              try {
+                content = fs.readFileSync(path, "utf8");
+              } catch (error) {
+                continue;
+              }
+              if (escapedTerms.some(pattern => pattern.test(content))) {
+                relatedPaths.add(path);
+              }
+            }
+
+            // Use GitHub code search as a supplementary source of references.
+            for (const term of Array.from(searchTerms).slice(0, 12)) {
+              if (relatedPaths.size >= 30) break;
+              try {
+                const response = await github.rest.search.code({
+                  q: `${term} repo:${context.repo.owner}/${context.repo.repo}`,
+                  per_page: 10
+                });
+                for (const result of response.data.items || []) {
+                  if (!changedPaths.has(result.path)) relatedPaths.add(result.path);
+                }
+              } catch (error) {
+                // Code search may be unavailable under repository policy; the
+                // changed-file context remains sufficient for a partial review.
+              }
+              if (relatedPaths.size >= 30) break;
+            }
+
+            // Always include small, high-signal project metadata when present.
+            for (const path of [
+              "pyproject.toml",
+              "setup.py",
+              "setup.cfg",
+              "requirements.txt",
+              "CONTRIBUTING.md"
+            ]) {
+              if (!changedPaths.has(path)) relatedPaths.add(path);
+            }
+
+            for (const path of Array.from(relatedPaths)) {
+              if (relatedBudget <= 0) break;
+              let content = null;
+              try {
+                content = fs.readFileSync(path, "utf8");
+              } catch (error) {
+                content = await readText(
+                  pr.base.repo.owner.login,
+                  pr.base.repo.name,
+                  path,
+                  pr.base.sha
+                );
+              }
+              if (!content) continue;
+              const available = Math.min(12000, relatedBudget);
+              contextFiles.push({
+                filename: path,
+                kind: "related",
+                base_content: content.slice(0, available),
+                head_content: content.slice(0, available)
+              });
+              relatedBudget -= available;
+            }
+
             fs.writeFileSync(
               "review-input.json",
               JSON.stringify({
@@ -58,6 +207,7 @@ jobs:
                 description: pr.body || "",
                 base_sha: pr.base.sha,
                 head_sha: pr.head.sha,
+                context_files: contextFiles,
                 files: files.map(file => ({
                   filename: file.filename,
                   status: file.status,
@@ -72,7 +222,7 @@ jobs:
         env:
           MODEL_API_URL: ${{ secrets.INTERNAL_MODEL_API_URL }}
           MODEL_API_TOKEN: ${{ secrets.INTERNAL_MODEL_API_TOKEN }}
-          MODEL_NAME: DeepSeek-V4-Pro
+          MODEL_NAME: gpt-5.6-sol
         run: |
           python3 .github/reviewer/run_review.py \
             --input review-input.json \
@@ -90,16 +240,18 @@ jobs:
 
             const findings = (result.findings || []).map((item, index) => {
               return [
-                `### ${index + 1}. ${item.severity}: ${item.title}`,
+                `### ${index + 1}. ${item.severity}: ${item.title_zh}`,
+                `**English:** ${item.title_en}`,
                 `**File:** \`${item.file}:${item.line || ""}\``,
-                item.body
+                item.body_zh,
+                `**English:** ${item.body_en}`
               ].join("\n\n");
             }).join("\n\n");
 
             const body = [
               marker,
               "## AI Review",
-              result.summary,
+              `### 中文 / Chinese\n${result.summary_zh}\n\n### English / 英文\n${result.summary_en}`,
               findings || "No actionable findings."
             ].join("\n\n");
 
@@ -132,4 +284,3 @@ jobs:
                 body
               });
             }
-
