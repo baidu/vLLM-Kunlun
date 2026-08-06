@@ -171,7 +171,17 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                     if total_seq_len_chunk == 0 or local_cu is None:
                         continue
 
+                    # `cu_seqlen_ks` / `cu_seqlen_ke` are per *query token*: row t of
+                    # the logits matrix is valid on the half-open column range
+                    # [ks[t], ke[t]) of the chunk's concatenated compressed K, and
+                    # ke[t] - ks[t] == (position + 1) // compress_ratio, which is
+                    # exactly the entry count `combine_topk_swa_indices` will read
+                    # back. Treating them as per-sequence query bounds leaves the
+                    # first request's slots at the -1 sentinel and every later
+                    # request's shifted into the previous request's KV workspace.
                     num_seqs = local_cu.shape[0] - 1
+                    gathered_values: list[torch.Tensor] = []
+                    gathered_scales: list[torch.Tensor] = []
                     for seq_idx in range(num_seqs):
                         seq_k_s = int(local_cu[seq_idx].item())
                         seq_k_e = int(local_cu[seq_idx + 1].item())
@@ -181,8 +191,6 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
 
                         blocks_needed = (seq_k_len + block_size_cache - 1) // block_size_cache
                         bt_row = chunk_bt[seq_idx, :blocks_needed].long()
-                        gathered_values: list[torch.Tensor] = []
-                        gathered_scales: list[torch.Tensor] = []
                         collected_slots = 0
                         for blk_ref in bt_row.unbind(0):
                             blk_id = int(blk_ref.item())
@@ -200,29 +208,41 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                             gathered_scales.append(raw_scale[:take])
                             collected_slots += take
 
-                        k_int8_cat = torch.cat(gathered_values, dim=0).view(torch.int8)
-                        k_f32_scale = torch.cat(gathered_scales, dim=0)
-                        k_float_chunk = k_int8_cat.float() * k_f32_scale
+                    if not gathered_values:
+                        continue
 
-                        q_s = int(cu_seqlen_ks[seq_idx].item())
-                        q_e = int(cu_seqlen_ke[seq_idx].item())
-                        for qt_pos_offset in range(q_e - q_s):
-                            qt_global = token_start_local + q_s + qt_pos_offset
-                            if qt_global < 0 or qt_global >= q_summed_p.shape[0]:
-                                continue
-                            causal_len = seq_k_len
-                            if causal_len <= 0:
-                                continue
-                            scores = (
-                                q_summed_p[qt_global:qt_global + 1]
-                                @ k_float_chunk[:causal_len].T
-                            ).squeeze(0)
-                            actual_topk = min(topk_tokens, scores.shape[0])
-                            if actual_topk <= 0:
-                                continue
-                            _, chosen_idx = scores.topk(actual_topk, dim=0, sorted=False)
-                            buf_row = num_decode_tokens + qt_global
-                            self.topk_indices_buffer[buf_row, :actual_topk] = chosen_idx.to(torch.int32)
+                    k_int8_cat = torch.cat(gathered_values, dim=0).view(torch.int8)
+                    k_f32_scale = torch.cat(gathered_scales, dim=0)
+                    k_float_chunk = k_int8_cat.float() * k_f32_scale
+                    total_k = k_float_chunk.shape[0]
+
+                    q_chunk = q_summed_p[token_start_local:token_end_local]
+                    num_q = q_chunk.shape[0]
+                    if num_q == 0 or total_k == 0:
+                        continue
+                    ks = cu_seqlen_ks[:num_q].long()
+                    ke = cu_seqlen_ke[:num_q].long()
+
+                    scores = q_chunk @ k_float_chunk.T
+                    columns = torch.arange(total_k, device=device).unsqueeze(0)
+                    scores = scores.masked_fill(
+                        (columns < ks.unsqueeze(1)) | (columns >= ke.unsqueeze(1)),
+                        float("-inf"),
+                    )
+
+                    width = min(topk_tokens, total_k)
+                    _, chosen = scores.topk(width, dim=1, sorted=True)
+                    # Indices are handed back request-local: the sparse-attention
+                    # consumer adds the request's own workspace offset, and ks[t] is
+                    # that request's first compressed column.
+                    local_idx = (chosen - ks.unsqueeze(1)).to(torch.int32)
+                    counts = (ke - ks).clamp(min=0, max=width).unsqueeze(1)
+                    keep = torch.arange(width, device=device).unsqueeze(0) < counts
+                    self.topk_indices_buffer[
+                        num_decode_tokens + token_start_local:
+                        num_decode_tokens + token_end_local,
+                        :width,
+                    ] = torch.where(keep, local_idx, torch.full_like(local_idx, -1))
 
             return self.topk_indices_buffer
 
