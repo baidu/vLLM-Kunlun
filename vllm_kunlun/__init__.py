@@ -206,6 +206,66 @@ def _eagle_apply(mod):
 _register_post_import_hook("vllm.v1.spec_decode.eagle", _eagle_applied, _eagle_apply)
 
 
+# --- hook 7: SuffixDecodingProposer draft padding -------------------------
+# Suffix decoding proposes a dynamic number of draft tokens, which keeps the
+# verify batch non-uniform and therefore off the FULL cudagraph path. The
+# patch pads each draft to the speculation budget (enabled by default; disable
+# via VLLM_KUNLUN_SUFFIX_PAD_DRAFT=0). See
+# ``vllm_kunlun/v1/sample/spec_decode/suffix_decoding.py``.
+def _suffix_decoding_applied(mod):
+    cls = getattr(mod, "SuffixDecodingProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "propose", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _suffix_decoding_apply(mod):
+    if not hasattr(mod, "SuffixDecodingProposer"):
+        return
+    import vllm_kunlun.v1.sample.spec_decode.suffix_decoding  # noqa: F401
+
+
+_register_post_import_hook(
+    "vllm.v1.spec_decode.suffix_decoding",
+    _suffix_decoding_applied,
+    _suffix_decoding_apply,
+)
+
+
+# --- hook 8: speculative Mamba state re-anchor ----------------------------
+# Use worker consumers as triggers instead of gpu_model_runner itself. A hook
+# targeting gpu_model_runner can run while that module is still being defined,
+# allowing its later class body to overwrite the patched method.
+def _gpu_model_runner_applied(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    cls = getattr(runner_mod, "GPUModelRunner", None)
+    if cls is None:
+        return False
+    fn = getattr(cls, "_prepare_inputs", None)
+    return fn is not None and getattr(fn, "_kunlun_spec_reanchor_patched", False)
+
+
+def _gpu_model_runner_apply(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if runner_mod is None or not hasattr(runner_mod, "GPUModelRunner"):
+        return
+    from vllm_kunlun.v1.worker.mamba_utils import patch_gpu_model_runner
+
+    patch_gpu_model_runner(runner_mod)
+
+
+for _runner_consumer in (
+    "vllm.v1.worker.gpu_worker",
+    "vllm.v1.worker.xpu_model_runner",
+):
+    _register_post_import_hook(
+        _runner_consumer,
+        _gpu_model_runner_applied,
+        _gpu_model_runner_apply,
+    )
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
