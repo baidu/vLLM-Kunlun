@@ -235,6 +235,7 @@ _register_post_import_hook(
     _qwen_triton_warmup_apply,
 )
 
+
 # --- hook 6: select_int8_moe_backend in w8a8_int8 module ---------------
 # CompressedTensorsW8A8Int8MoEMethod.__init__ calls select_int8_moe_backend()
 # which only supports Triton/CUDA backends. On Kunlun XPU is_cuda()==False so
@@ -258,9 +259,7 @@ def _w8a8_int8_moe_apply(mod):
     if not hasattr(mod, "select_int8_moe_backend"):
         return
 
-    def _kunlun_select_int8_moe_backend(
-        config, weight_key=None, activation_key=None
-    ):
+    def _kunlun_select_int8_moe_backend(config, weight_key=None, activation_key=None):
         return None, None
 
     mod.select_int8_moe_backend = _kunlun_select_int8_moe_backend
