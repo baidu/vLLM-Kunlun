@@ -180,6 +180,39 @@ class KunlunPlatform(Platform):
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
+    def _default_collective_algo(cls) -> None:
+        """Prefer BKCL's mesh all-reduce over its ring all-reduce.
+
+        The ring implementation chunks the flat buffer and rotates which rank
+        starts each chunk's accumulation, so its result depends on where a
+        value sits in the buffer rather than only on the value. Two rows of a
+        batch holding bit-identical activations then come back one bf16 ULP
+        apart, and because every decoder layer's o-proj and MoE end in an
+        all-reduce that asymmetry compounds: measured over 43 layers of
+        DeepSeek-V4-Flash, 171 of the captured tensors had unequal row blocks
+        for a batch of identical prompts, and a request's own logits moved
+        0.4-0.8 nats between runs because the scheduler varied the batch width.
+
+        The mesh algorithm sums every element in the same rank order, which
+        makes the result blind both to a row's position and to the batch
+        width; the same measurement then reports zero unequal tensors and
+        bit-identical logits across repeats. It costs roughly 3% decode
+        throughput, and it only applies below BKCL's own size threshold --
+        buffers of about 512x4096 bf16 and above fall back to ring, so long
+        prefill chunks are still position-dependent.
+
+        Set ``XCCL_MESH_ALGO=0`` to keep the ring algorithm.
+        """
+        if "XCCL_MESH_ALGO" in os.environ:
+            return
+        os.environ["XCCL_MESH_ALGO"] = "1"
+        logger.info(
+            "Defaulting XCCL_MESH_ALGO=1 so BKCL all-reduce results do not "
+            "depend on a row's offset in the buffer; set XCCL_MESH_ALGO=0 to "
+            "restore the ring algorithm."
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """
         TODO Update here for v0.15.1
@@ -211,6 +244,8 @@ class KunlunPlatform(Platform):
         Returns:
             None.
         """
+        cls._default_collective_algo()
+
         parallel_config = vllm_config.parallel_config  # Not use scheduler_config
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
