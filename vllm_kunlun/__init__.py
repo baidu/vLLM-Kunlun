@@ -6,13 +6,13 @@ import logging
 import os
 import sys
 
-from vllm.logger import init_logger as init_vllm_logger
-
 OLD_IMPORT_HOOK = builtins.__import__
 
 
 def _configure_kunlun_logger() -> logging.Logger:
     """Reuse vLLM's handler for the vllm_kunlun logger tree."""
+    from vllm.logger import init_logger as init_vllm_logger
+
     vllm_logger = init_vllm_logger("vllm")
     kunlun_logger = logging.getLogger("vllm_kunlun")
 
