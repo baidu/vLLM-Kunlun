@@ -1,0 +1,25 @@
+name: Runner Smoke Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on:
+      - self-hosted
+      - linux
+      - ai-review
+
+    steps:
+      - name: Show runner information
+        run: |
+          echo "runner is working"
+          hostname
+          whoami
+          uname -a
+
+      - name: Test GitHub API
+        run: |
+          curl --fail --silent --show-error \
+            https://api.github.com/meta >/dev/null
+          echo "GitHub API reachable"

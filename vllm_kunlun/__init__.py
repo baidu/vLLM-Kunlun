@@ -6,13 +6,13 @@ import logging
 import os
 import sys
 
-from vllm.logger import init_logger as init_vllm_logger
-
 OLD_IMPORT_HOOK = builtins.__import__
 
 
 def _configure_kunlun_logger() -> logging.Logger:
     """Reuse vLLM's handler for the vllm_kunlun logger tree."""
+    from vllm.logger import init_logger as init_vllm_logger
+
     vllm_logger = init_vllm_logger("vllm")
     kunlun_logger = logging.getLogger("vllm_kunlun")
 
@@ -233,6 +233,44 @@ _register_post_import_hook(
     "vllm.model_executor.warmup.kernel_warmup",
     _qwen_triton_warmup_applied,
     _qwen_triton_warmup_apply,
+)
+
+
+# --- hook 6: select_int8_moe_backend in w8a8_int8 module ---------------
+# CompressedTensorsW8A8Int8MoEMethod.__init__ calls select_int8_moe_backend()
+# which only supports Triton/CUDA backends. On Kunlun XPU is_cuda()==False so
+# all backends get skipped, raising NotImplementedError.
+# The Kunlun class uses is_monolithic=True + apply_monolithic() with
+# torch.ops._C.moe_* custom ops — it never uses int8_backend or experts_cls.
+# We patch the LOCAL reference (from X import Y) in the caller module so that
+# super().__init__() falls through gracefully.  See hook comment block above
+# for the post-import hook contract.
+def _w8a8_int8_moe_applied(mod):
+    # Module may be partially initialized during circular imports
+    if not hasattr(mod, "select_int8_moe_backend"):
+        return False
+    return getattr(mod, "_kunlun_select_int8_patched", False)
+
+
+def _w8a8_int8_moe_apply(mod):
+    # Guard against partially initialized module during circular imports.
+    # When oracle.int8 triggers import of this module, select_int8_moe_backend
+    # may not be bound yet (the "from oracle.int8 import ..." is still in flight).
+    if not hasattr(mod, "select_int8_moe_backend"):
+        return
+
+    def _kunlun_select_int8_moe_backend(config, weight_key=None, activation_key=None):
+        return None, None
+
+    mod.select_int8_moe_backend = _kunlun_select_int8_moe_backend
+    mod._kunlun_select_int8_patched = True
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.quantization.compressed_tensors."
+    "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8",
+    _w8a8_int8_moe_applied,
+    _w8a8_int8_moe_apply,
 )
 
 
