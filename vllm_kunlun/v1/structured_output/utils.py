@@ -109,7 +109,15 @@ if not getattr(_ORIGINAL, "_kunlun_patched", False):
     for module in list(sys.modules.values()):
         if module is None or module is _upstream:
             continue
-        if getattr(module, "apply_grammar_bitmask", None) is _ORIGINAL:
+        # ``__dict__.get`` rather than ``getattr``: a real ``from ... import``
+        # binding always lands in the module's own ``__dict__``, while
+        # ``getattr`` would fall through to module-level ``__getattr__``
+        # hooks. transformers registers ~192 backward-compat alias modules
+        # (``models.*.image_processing_*``) whose catch-all
+        # ``__getattr__`` logs a warning and eagerly imports the real
+        # module for *any* attribute name -- probing them costs ~0.75s and
+        # ~38MB per process and floods the log.
+        if module.__dict__.get("apply_grammar_bitmask") is _ORIGINAL:
             try:
                 setattr(module, "apply_grammar_bitmask", apply_grammar_bitmask)
                 rebind_count += 1
