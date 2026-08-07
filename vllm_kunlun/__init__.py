@@ -282,6 +282,33 @@ for _runner_consumer in (
     )
 
 
+# --- hook 9: keep mamba groups out of EAGLE's extend-and-pop ----------------
+# The coordinator hands every "eagle group" one extra block of hit-search budget
+# expecting the manager to pop it; mamba groups cannot pop (popping removes the
+# GDN state block), and cancelling the extension inside the manager over-corrects
+# whenever the extension was clipped -- which is why a fixed correction helps one
+# model and breaks another. See vllm_kunlun/v1/core/mamba_prefix_hit.py.
+def _mamba_prefix_hit_applied(mod):
+    cls = getattr(mod, "KVCacheCoordinator", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "__init__", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _mamba_prefix_hit_apply(mod):
+    if not hasattr(mod, "KVCacheCoordinator"):
+        return
+    import vllm_kunlun.v1.core.mamba_prefix_hit  # noqa: F401  (self-applies)
+
+
+_register_post_import_hook(
+    "vllm.v1.core.kv_cache_coordinator",
+    _mamba_prefix_hit_applied,
+    _mamba_prefix_hit_apply,
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
