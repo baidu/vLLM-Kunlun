@@ -58,43 +58,15 @@ def attn_res(
              mixed   = softmax_i(logit) @ source_i
       4. If ``output_norm_weight`` is given: RMSNorm(mixed) * output_norm_weight.
     """
-    num_tokens, hidden_size = prefix.shape
-    orig_dtype = prefix.dtype
-
-    updated_prefix = prefix.float()
-    if delta is not None:
-        updated_prefix = updated_prefix + delta.float()
-        # Match the BF16 prefix-add result before using it as a residual source.
-        updated_prefix = updated_prefix.to(orig_dtype).float()
-        prefix.copy_(updated_prefix.to(orig_dtype))
-
-    if block_write_idx >= 0:
-        blocks[:, block_write_idx, :] = updated_prefix.to(blocks.dtype)
-
-    if num_blocks == 0:
-        mixed = updated_prefix
-    else:
-        # Fold the residual-norm weight into the qk direction (matches kernel).
-        input_qk_weight = norm_weight.float() * qk_weight.float()  # [H]
-
-        # Sources: the first num_blocks blocks plus the (updated) prefix.
-        block_vals = blocks[:, :num_blocks, :].float()  # [T, num_blocks, H]
-        sources = torch.cat(
-            [block_vals, updated_prefix.unsqueeze(1)], dim=1
-        )  # [T, num_blocks + 1, H]
-
-        reciprocal_std = torch.rsqrt(
-            sources.pow(2).mean(dim=-1) + eps
-        )  # [T, S]
-        logits = (sources * input_qk_weight).sum(dim=-1) * reciprocal_std  # [T, S]
-        weights = torch.softmax(logits, dim=1)  # [T, S]
-        mixed = (weights.unsqueeze(-1) * sources).sum(dim=1)  # [T, H]
-
-    output = mixed
-    if output_norm_weight is not None:
-        output_reciprocal_std = torch.rsqrt(
-            mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps
-        )
-        output = mixed * output_reciprocal_std * output_norm_weight.float()
-
-    return output.to(orig_dtype)
+    return torch.ops.xspeedgate_ops.attn_res(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        num_blocks,
+        block_write_idx,
+        eps,
+        output_norm_eps,
+    )
