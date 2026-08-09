@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
+import os
 from typing import Optional, Tuple
 
 import kunlun_ops
@@ -58,6 +59,9 @@ def get_mla_metadata(
     return cache_seqlens_cpu, cache_seqlens
 
 
+_SHAPE_SENTINEL_DONE = {}
+
+
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -79,6 +83,10 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    # V4 per-layer config (needed by native hybrid_attention)
+    compress_ratio: int = 4,
+    max_window_size: int = 128,
+    com_topk: int = 512,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -109,6 +117,224 @@ def flash_mla_with_kvcache(
         )
         return output, None
 
+    # ---- one-shot shape sentinel (env-gated, default OFF) ----
+    _sentinel_kind = "swa_only" if extra_k_cache is None else "dual"
+    if (os.environ.get("KUNLUN_DSV4_SHAPE_SENTINEL", "0") == "1"
+            and _sentinel_kind not in _SHAPE_SENTINEL_DONE):
+        _SHAPE_SENTINEL_DONE[_sentinel_kind] = True
+
+        def _d(name, t):
+            if t is None:
+                return f"    {name}: None"
+            if isinstance(t, torch.Tensor):
+                extra = ""
+                try:
+                    _st = t.untyped_storage()
+                    _elems = _st.size() // t.element_size()
+                    _base = t._base
+                    extra = (f" storage_elems={_elems}"
+                             f" numel={t.numel()}"
+                             f" base_shape="
+                             f"{tuple(_base.shape) if _base is not None else None}")
+                except Exception as _e:
+                    extra = f" (storage probe failed: {_e})"
+                return (f"    {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+                        f"stride={t.stride()} contig={t.is_contiguous()}"
+                        + extra)
+            return f"    {name}: {type(t).__name__}={t!r}"
+
+        lines = ["[DSv4-SHAPE-SENTINEL] flash_mla_with_kvcache route=" + _sentinel_kind + ":"]
+        for _n, _t in (
+                ("q", q), ("k_cache", k_cache), ("block_table", block_table),
+                ("cache_seqlens", cache_seqlens),
+                ("indices", indices), ("topk_length", topk_length),
+                ("attn_sink", attn_sink),
+                ("extra_k_cache", extra_k_cache),
+                ("extra_indices_in_kvcache", extra_indices_in_kvcache),
+                ("extra_topk_length", extra_topk_length),
+                ("out", out),
+                ("head_dim_v", head_dim_v),
+                ("softmax_scale", softmax_scale),
+                ("is_fp8_kvcache", is_fp8_kvcache),
+        ):
+            lines.append(_d(_n, _t))
+        # Value summaries for the length/index tensors decide whether the
+        # native op's kvseqlen-derived masking can reproduce these.
+        for _n, _t in (("topk_length", topk_length),
+                       ("extra_topk_length", extra_topk_length)):
+            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
+                lines.append(f"    {_n} values: {_t.flatten()[:16].tolist()}")
+        for _n, _t in (("indices", indices),
+                       ("extra_indices_in_kvcache", extra_indices_in_kvcache)):
+            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
+                _f = _t.flatten()
+                lines.append(
+                    f"    {_n}: min={int(_f.min())} max={int(_f.max())} "
+                    f"n_neg={int((_f < 0).sum())} head={_f[:12].tolist()}")
+        # Row 0 of each index tensor, so the padding convention (-1 vs
+        # clamped vs repeated) is unambiguous.
+        for _n, _t in (("indices", indices),
+                       ("extra_indices_in_kvcache", extra_indices_in_kvcache)):
+            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
+                _r = _t.reshape(_t.shape[0], -1)[0]
+                lines.append(f"    {_n} row0[:32]: {_r[:32].tolist()}")
+                lines.append(f"    {_n} row0[-8:]: {_r[-8:].tolist()}")
+        try:
+            import time as _time
+
+            _nb, _bs = k_cache.shape[0], k_cache.shape[1]
+
+            def _timeit(fn, reps=5):
+                fn()
+                torch.cuda.synchronize()
+                _t0 = _time.perf_counter()
+                for _ in range(reps):
+                    fn()
+                torch.cuda.synchronize()
+                return (_time.perf_counter() - _t0) * 1e3 / reps
+
+            # (a) current: full flatten (materializes a copy), then gather.
+            _slots = indices.reshape(-1).long().clamp(0, _nb * _bs - 1)
+
+            def _cur():
+                _flat = k_cache.reshape(_nb * _bs, -1)
+                return _flat[_slots]
+
+            # (b) proposed: decompose slot -> (block, offset), gather in place.
+            def _new():
+                _blk = torch.div(_slots, _bs, rounding_mode="floor")
+                _off = _slots - _blk * _bs
+                return k_cache[_blk, _off, 0, :]
+
+            _ms_cur = _timeit(_cur)
+            _ms_new = _timeit(_new)
+            _same = torch.equal(_cur().to(torch.float32),
+                                _new().to(torch.float32))
+            lines.append(
+                f"    GATHER BENCH  flatten+gather={_ms_cur:.3f} ms  "
+                f"strided_gather={_ms_new:.3f} ms  "
+                f"speedup={_ms_cur / max(_ms_new, 1e-9):.1f}x  "
+                f"results_identical={_same}  "
+                f"n_slots={_slots.numel()}")
+        except Exception as _e:
+            lines.append(f"    gather bench failed: {type(_e).__name__}: {_e}")
+        logger.info("\n".join(lines))
+
+    # ---- Allocate output buffer (used by both native and torch paths) ----
+    if out is not None:
+        output = out
+    else:
+        output = torch.zeros(
+            q.shape[0], q.shape[1], q.shape[2], head_dim_v,
+            dtype=q.dtype, device=q.device,
+        )
+
+    # ---- Native hybrid_attention short-circuit (env-gated, default OFF,
+    #        DUAL path only). For SWA-only layers the torch path is fast
+    #        enough and the native op's host-side dim check rejects the
+    #        1D empty tensors we'd have to pass. ----
+    _native_ok = (
+        os.environ.get("KUNLUN_DSV4_HYBRID_NATIVE", "0") == "1"
+        and hasattr(kunlun_ops, "hybrid_attention")
+        and extra_k_cache is not None
+        and extra_indices_in_kvcache is not None
+        and extra_topk_length is not None
+    )
+    if _native_ok:
+        try:
+            _B, _S, _H, _D = q.shape
+            assert _S == 1, (
+                f"native hybrid_attention decode-only path; got seq_q={_S}"
+            )
+            # ---- 2D view of caches: (NB, BS, 1, D) -> (NB*BS, D) ----
+            _win_kv = k_cache.reshape(-1, k_cache.shape[-1])
+            _com_kv = (
+                extra_k_cache.reshape(-1, extra_k_cache.shape[-1])
+                if extra_k_cache is not None
+                else torch.empty(0, dtype=k_cache.dtype, device=q.device)
+            )
+            # ---- 2D view of indices: (B, 1, N) -> (B, N) ----
+            _win_idx = (
+                indices.squeeze(1) if indices.dim() == 3 else indices
+            ).contiguous()
+            _com_idx = (
+                extra_indices_in_kvcache.squeeze(1)
+                if (extra_indices_in_kvcache is not None
+                    and extra_indices_in_kvcache.dim() == 3)
+                else extra_indices_in_kvcache
+            )
+            if _com_idx is not None:
+                _com_idx = _com_idx.contiguous()
+            # ---- 2D view of out: (B, 1, H, head_dim_v) -> (B, H, head_dim_v) ----
+            _out2d = output[:, 0, :, :]
+            # ---- qlod: cumulative q-token count, length B+1 ----
+            # seq_q=1 for decode, so qlod = [0, 1, 2, ..., B]
+            _qlod_xpu = torch.arange(
+                _B + 1, dtype=torch.int32, device=q.device
+            )
+            # ---- kvseqlen: per-seq kv length ----
+            # Caller passes cache_seqlens=None on the sparse decode path.
+            # Use topk_length[:B] as an upper bound (gathered tokens < total seq).
+            _kvseqlen_xpu = (
+                topk_length[:_B].to(torch.int32).contiguous()
+                if topk_length is not None
+                else torch.full(
+                    (_B,), max_window_size + com_topk,
+                    dtype=torch.int32, device=q.device,
+                )
+            )
+            _max_logits = torch.zeros(
+                _B, _H, dtype=torch.float32, device=q.device,
+            )
+            _lse = torch.zeros(
+                _B, _H, dtype=torch.float32, device=q.device,
+            )
+            _sink = (
+                attn_sink
+                if isinstance(attn_sink, torch.Tensor)
+                else torch.empty(0, dtype=torch.float32, device=q.device)
+            )
+            # NOTE: qlod_cpu and kvseqlen_cpu are required by the Python
+            # wrapper. To stay cudagraph-safe, materialize them as on-device
+            # tensors and let the wrapper perform the (likely trivial) .cpu().
+            # If capture later complains, this is the place to pre-allocate.
+            _qlod_cpu = _qlod_xpu
+            _kvseqlen_cpu = _kvseqlen_xpu
+
+            kunlun_ops.hybrid_attention(
+                q=q[:, 0, :, :],
+                win_kv_cache=_win_kv,
+                win_indices=_win_idx,
+                com_kv_cache=_com_kv,
+                com_indices=_com_idx if _com_idx is not None
+                             else torch.empty(
+                                 0, dtype=_win_idx.dtype, device=q.device),
+                o=_out2d,
+                max_logits=_max_logits,
+                lse=_lse,
+                qlod_cpu=_qlod_cpu,
+                qlod_xpu=_qlod_xpu,
+                kvseqlen_cpu=_kvseqlen_cpu,
+                kvseqlen_xpu=_kvseqlen_xpu,
+                sm_scale=float(softmax_scale),
+                is_causal=bool(causal),
+                max_window_size=int(max_window_size),
+                compress_ratio=int(compress_ratio),
+                com_topk=int(com_topk) if _com_idx is not None else 0,
+                attn_sink=_sink,
+                side_stream=-1,
+                use_xfa_boost=False,
+            )
+            return output, _max_logits
+        except Exception as _e:
+            if not getattr(flash_mla_with_kvcache, "_native_warned", False):
+                logger.warning(
+                    "[DSv4-NATIVE-ATTN] hybrid_attention failed, "
+                    "falling back to torch: %s: %s",
+                    type(_e).__name__, _e,
+                )
+                flash_mla_with_kvcache._native_warned = True
+
     # ---- V4 path: Vectorized sparse MLA (BF16 cache only; no per-token loop) ----
     batch_size = q.shape[0]
     seq_q = q.shape[1]
@@ -116,14 +342,6 @@ def flash_mla_with_kvcache(
     d_qk = q.shape[3]
     kv_lora_rank = head_dim_v  # 512
     qk_rope_head_dim = d_qk - kv_lora_rank  # 64 (or 0 if d_qk==512)
-
-    if out is not None:
-        output = out
-    else:
-        output = torch.zeros(
-            batch_size, seq_q, num_heads, head_dim_v,
-            dtype=q.dtype, device=q.device,
-        )
 
     if indices is None or topk_length is None:
         # Returning zeros here silently produces wrong attention output for the
