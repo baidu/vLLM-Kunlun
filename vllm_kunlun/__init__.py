@@ -25,6 +25,51 @@ def _configure_kunlun_logger() -> logging.Logger:
     return kunlun_logger
 
 
+# ---------------------------------------------------------------------------
+# Wiring inventory — single source of truth for "what did each hook actually
+# bind?" (Question 1 from wangtianyu15, 2026-08-08.)
+# Format: op_name -> source (one of):
+#   "xspeedgate_ops_module"     getattr(xs, op) — never used in practice, py mod
+#                              is just a shim
+#   "torch.ops.xspeedgate_ops"  registered to dispatcher + xray wrapper
+#   "kunlun_ops_module"         getattr(kunlun_ops, op) — NOT in torch.ops
+#   "torch_fallback"            no native — the call falls through to a torch
+#                              reference inside the hook
+#   "skip"                      intentionally not attempted
+# Triggered to log from _op_inventory_final_apply (after gpu_model_runner is
+# loaded, so dispatcher hooks have all fired by then).
+# ---------------------------------------------------------------------------
+_WIRED_INVENTORY: dict[str, str] = {}
+
+
+def record_wired(op_name: str, source: str) -> None:
+    """Record that an op got bound via `source`. Called from any hook.
+
+    Logs immediately so the binding is visible even if a later summary
+    hook races with the install hook.
+    """
+    _WIRED_INVENTORY[op_name] = source
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] wired: %-40s via %s", op_name, source)
+
+
+def _log_wired_inventory() -> None:
+    """Dump one INFO summary + per-op lines."""
+    if not _WIRED_INVENTORY:
+        return
+    logger = logging.getLogger("vllm_kunlun")
+    by_src: dict[str, list[str]] = {}
+    for op, src in _WIRED_INVENTORY.items():
+        by_src.setdefault(src, []).append(op)
+    summary = ", ".join(
+        f"{src}({len(ops)})" for src, ops in sorted(by_src.items())
+    )
+    logger.info("[KunlunPlugin] wired inventory: %s", summary)
+    for src in sorted(by_src):
+        for op in sorted(by_src[src]):
+            logger.info("[KunlunPlugin]   %-40s <- %s", op, src)
+
+
 # Re-entry sentinel for the post-import hooks dispatcher. Some hooks
 # trigger their own imports (e.g. importing ``vllm_kunlun.v1.worker.utils``
 # to apply the KVBlockZeroer patch), which would re-enter
@@ -1233,6 +1278,7 @@ def _op_inventory_final_applied(mod):
 def _op_inventory_final_apply(mod):
     mod._kunlun_op_inventory_logged = True
     _log_op_inventory(logging.getLogger("vllm_kunlun"), tag="final")
+    _log_wired_inventory()
 
 
 # gpu_model_runner is imported during engine init, i.e. after the quantization

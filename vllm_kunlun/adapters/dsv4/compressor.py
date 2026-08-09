@@ -22,6 +22,7 @@ import torch
 
 from ..runtime_utils import WarningOnce
 from .registry import _register_lazy
+from vllm_kunlun import record_wired
 
 LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.compressor")
 _APPLIED_SENTINEL = "_dsv4_compressor_applied"
@@ -141,16 +142,19 @@ def _find_save_partial_states_op():
     if _sps_op_handle is not _FALSE:
         return _sps_op_handle
     handle = None
+    src = "torch_fallback"
     for mod_name, attr_name in _SPS_OP_CANDIDATE_NAMES:
         try:
             mod = __import__(mod_name, fromlist=[attr_name])
             candidate = getattr(mod, attr_name, None)
             if callable(candidate):
                 handle = candidate
+                src = f"{mod_name}_module"
                 break
         except Exception:  # noqa: BLE001
             continue
     _sps_op_handle = handle
+    record_wired("save_partial_states", src)
     return handle
 
 
@@ -237,32 +241,71 @@ def _warn_once_compress_missing(kind: str):
 
 
 def _find_xsg_compress_ops(native_allowed: bool):
-    if not native_allowed:
-        return False, [], []
+    """Lookup fused_kv_compress_gather + dpsk_v4_norm_rope_gptj.
+
+    Three lookup layers (§8-#0 fix, 2026-08-08):
+      1. xspeedgate_ops Python module (only a shim in practice)
+      2. torch.ops.xspeedgate_ops (registered via TORCH_LIBRARY)
+      3. kunlun_ops Python module (these two ops are NOT registered to
+         torch.ops but ARE in the kunlun_ops ctypes Python module —
+         vllm_kunlun/adapters/dsv4/compressor.py verification).
+
+    Records what was found (or fell back to) into the vllm_kunlun
+    wired inventory for the startup log.
+    """
     desired = ["fused_kv_compress_gather", "dpsk_v4_norm_rope_gptj"]
-    handles = {}
-    missing_flag = False
+    if not native_allowed:
+        for n in desired:
+            record_wired(n, "skip")
+        return False, [], []
+    handles: dict[str, object] = {}
+    sources: dict[str, str] = {}
+    # Layer 1: xspeedgate_ops Python module
     try:
         xspeedgate_module = __import__("xspeedgate_ops", fromlist=[desired[-1]])
         for n in desired:
             h = getattr(xspeedgate_module, n, None)
             if callable(h):
                 handles[n] = h
-            else:
-                # Try alternate namespace wrapper (torch.ops.xspeedgate_ops.n)
-                alt_ns = getattr(torch.ops, "xspeedgate_ops", None)
-                h2 = getattr(alt_ns, n, None) if alt_ns is not None else None
+                sources[n] = "xspeedgate_ops_module"
+    except Exception:  # noqa: BLE001
+        pass
+    # Layer 2: torch.ops.xspeedgate_ops
+    try:
+        alt_ns = getattr(torch.ops, "xspeedgate_ops", None)
+        if alt_ns is not None:
+            for n in desired:
+                if n in handles:
+                    continue
+                h2 = getattr(alt_ns, n, None)
                 if callable(h2):
                     handles[n] = h2
-                else:
-                    missing_flag = True
+                    sources[n] = "torch.ops.xspeedgate_ops"
     except Exception:  # noqa: BLE001
-        missing_flag = True
+        pass
+    # Layer 3 (§8-#0 fix): kunlun_ops Python module
+    try:
+        kunlun_module = __import__("kunlun_ops", fromlist=desired)
+        for n in desired:
+            if n in handles:
+                continue
+            h3 = getattr(kunlun_module, n, None)
+            if callable(h3):
+                handles[n] = h3
+                sources[n] = "kunlun_ops_module"
+    except Exception:  # noqa: BLE001
+        pass
+    # Record inventory (one entry per desired op)
+    for n in desired:
+        if n in handles:
+            record_wired(n, sources[n])
+        else:
+            record_wired(n, "torch_fallback")
     if len(handles) == len(desired):
-        return True, [handles["fused_kv_compress_gather"], handles["dpsk_v4_norm_rope_gptj"]]
+        return True, [handles["fused_kv_compress_gather"], handles["dpsk_v4_norm_rope_gptj"]], sources
     for k in set(desired) - set(handles.keys()):
-        _warn_once_compress_missing(f"xspeedgate_ops.{k}")
-    return False, [], []
+        _warn_once_compress_missing(f"{k}")
+    return False, [], sources
 
 
 def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
