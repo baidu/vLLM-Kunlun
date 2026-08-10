@@ -78,10 +78,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: Optional[torch.Tensor] = None,
         spec_step_index: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert inputs_embeds is not None
-        # masking inputs at position 0, as not needed by MTP
-        inputs_embeds[positions == 0] = 0
+        # masking inputs at position 0, as not needed by MTP.
+        # torch.where rather than a boolean-mask assignment: the mask is
+        # data-dependent and would be baked in at cudagraph capture time.
+        inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -95,8 +97,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = residual + hidden_states
-        return hidden_states
+        hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+        # vLLM 0.25.1 contract: DeepSeek-family MTP returns
+        # (logit_hidden, recycle_hidden); see LlmBaseProposer.model_returns_tuple,
+        # which keys off the DeepSeekMTPModel architecture name. compute_logits
+        # applies shared_head (== final norm) to the pre-norm element, so the
+        # logits path and the recycled hidden each get exactly one final norm.
+        return hidden_states, self.shared_head(hidden_states)
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):

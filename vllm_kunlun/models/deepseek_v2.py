@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -86,12 +87,40 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
 from vllm_kunlun.ops.activation import SiluAndMul
 from vllm_kunlun.ops.attention.layer import Attention
-from vllm_kunlun.ops.deep_gemm import int8_mqa_logits, int8_paged_mqa_logits
+from vllm_kunlun.ops.deep_gemm import (
+    int8_mqa_logits,
+    int8_paged_mqa_logits,
+    pack_seq_native,
+    unpack_seq_native,
+)
 from vllm_kunlun.ops.linear import ReplicatedLinear
+from vllm_kunlun.v1.attention.backends.mla.flashmla_sparse import (
+    _DSA_TRACE_DIR,
+    _dsa_trace,
+    _dsa_trace_rows,
+)
+
+# debug switch: re-sort the indexer's top-k indices into ascending order
+_DSA_SORT_TOPK = os.environ.get("DSA_SORT_TOPK") == "1"
+
+
+def _dsa_sort_topk_ascending(topk_indices: torch.Tensor) -> None:
+    """Sort each row of ``topk_indices`` ascending in place, -1 padding last.
+
+    Rows whose span exceeds topk_tokens come back from ``topk_per_row`` in the
+    kernel's tile order rather than ascending position order, and that order
+    varies from run to run. Rows within budget are already ascending.
+    """
+    sentinel = torch.iinfo(topk_indices.dtype).max
+    ordered = torch.where(
+        topk_indices < 0, torch.full_like(topk_indices, sentinel), topk_indices
+    ).sort(dim=-1)[0]
+    topk_indices.copy_(
+        torch.where(ordered == sentinel, torch.full_like(ordered, -1), ordered)
+    )
 from vllm_kunlun.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 if current_platform.is_cuda_alike():
@@ -560,6 +589,17 @@ def sparse_attn_indexer_vllm_kunlun(
             )
             del k_fp8, k_scale
 
+            if _DSA_TRACE_DIR is not None:
+                # Rows whose span exceeds topk_tokens are the only ones that
+                # exercise a real selection, so keep their logits verbatim.
+                probe = [
+                    r
+                    for r in (100, topk_tokens - 1, topk_tokens, topk_tokens + 1)
+                    if r < logits.shape[0]
+                ]
+                _dsa_probe_rows = probe
+                _dsa_probe_logits = {str(r): logits[r, : r + 1] for r in probe}
+
             num_rows = logits.shape[0]
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
@@ -580,6 +620,18 @@ def sparse_attn_indexer_vllm_kunlun(
                 next_n=None,
             )
 
+            if _DSA_SORT_TOPK:
+                _dsa_sort_topk_ascending(topk_indices)
+
+            if _DSA_TRACE_DIR is not None:
+                rows = dict(_dsa_probe_logits)
+                rows.update(
+                    {f"idx{r}": topk_indices[r].clone() for r in _dsa_probe_rows}
+                )
+                _dsa_trace_rows(
+                    f"indexer_{k_cache_prefix}", rows, logits=logits
+                )
+
     if has_decode:
         decode_metadata = attn_metadata.decode
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
@@ -591,8 +643,10 @@ def sparse_attn_indexer_vllm_kunlun(
             # decode_threshold since we unstrictly split
             # prefill and decode by decode_threshold
             # (currently set to 1 + speculative tokens)
-            padded_q_fp8_decode_tokens = pack_seq_triton(
-                q_fp8[:num_decode_tokens], decode_lens
+            # q_fp8 is int8, so pad with 0 rather than the -inf default; the
+            # padded lanes are discarded by topk_per_row via seq_lens/next_n.
+            padded_q_fp8_decode_tokens = pack_seq_native(
+                q_fp8[:num_decode_tokens], decode_lens, pad_value=0
             )
         else:
             padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
@@ -603,10 +657,19 @@ def sparse_attn_indexer_vllm_kunlun(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        if decode_metadata.requires_padding:
+            # weights are per query token, so they need the same packing as q:
+            # slicing the first num_padded_tokens rows would misalign them with
+            # the padded q rows (and can overrun into the prefill tokens).
+            padded_weights = pack_seq_native(
+                weights[:num_decode_tokens], decode_lens, pad_value=0.0
+            )
+        else:
+            padded_weights = weights[:num_padded_tokens]
         logits = int8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
-            weights[:num_padded_tokens],
+            padded_weights,
             decode_metadata.seq_lens,
             decode_metadata.seq_lens_cpu,
             decode_metadata.block_table,
@@ -632,10 +695,22 @@ def sparse_attn_indexer_vllm_kunlun(
             next_n=next_n,
         )
 
+        if _DSA_SORT_TOPK:
+            _dsa_sort_topk_ascending(topk_indices)
+
+        if _DSA_TRACE_DIR is not None:
+            _dsa_trace_rows(
+                f"decode_{k_cache_prefix}",
+                {
+                    "logits0": logits[0, : min(8192, logits.shape[1])],
+                    "idx0": topk_indices[0].clone(),
+                },
+            )
+
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
-            topk_indices = unpack_seq_triton(
+            topk_indices = unpack_seq_native(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,
             )
@@ -1112,6 +1187,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
+        if _DSA_TRACE_DIR is not None:
+            _dsa_trace(f"L{self.layer_idx:02d}_a_postattn", hs=hidden_states)
 
         if hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -1125,7 +1202,18 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if _DSA_TRACE_DIR is not None:
+            _dsa_trace(f"L{self.layer_idx:02d}_b_premlp", hs=hidden_states, res=residual)
         hidden_states = self.mlp(hidden_states)
+        if _DSA_TRACE_DIR is not None:
+            _dsa_trace(f"L{self.layer_idx:02d}_c_postmlp", hs=hidden_states)
+            if hidden_states.shape[0] > 2100:
+                # keep a few raw rows so the magnitude of the divergence can be
+                # judged, not just its presence
+                _dsa_trace_rows(
+                    f"L{self.layer_idx:02d}_d_rawrows",
+                    {r: hidden_states[int(r)] for r in ("9", "100", "2100")},
+                )
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

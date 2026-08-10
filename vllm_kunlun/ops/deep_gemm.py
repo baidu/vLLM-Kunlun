@@ -119,3 +119,63 @@ def int8_paged_mqa_logits(
     )
     logits = logits.view(-1, max_model_len)
     return logits
+
+
+def pack_seq_native(
+    x: torch.Tensor,
+    lengths: torch.Tensor,
+    pad_value: float | int = -float("inf"),
+) -> torch.Tensor:
+    """Native replacement for vllm's ``pack_seq_triton``.
+
+    Triton kernels cannot be launched on Kunlun XPU (the driver rejects
+    load_binary with CUDA_ERROR_NOT_SUPPORTED), and the indexer hits this
+    path whenever a decode batch has mixed query lengths — which is the norm
+    with MTP, where spec-decode requests contribute 1 + num_spec_tokens
+    tokens while freshly prefilled ones contribute 1.
+
+    Args:
+        x: [N, ...] where N is the total token count, laid out as the
+            concatenation of each batch's tokens in order.
+        lengths: [B] token count per batch.
+        pad_value: fill for the padded tail of each row.
+
+    Returns:
+        [B, Lmax, ...] packed tensor.
+    """
+    B = lengths.numel()
+    Lmax = int(lengths.max().item())
+    N = x.shape[0]
+    tail = x.shape[1:]
+
+    starts = torch.cumsum(lengths, 0) - lengths  # [B]
+    offsets = torch.arange(Lmax, device=x.device, dtype=starts.dtype)  # [Lmax]
+    # Clamp so the gather stays in bounds; padded lanes are masked out below.
+    idx = (starts[:, None] + offsets[None, :]).clamp_(max=max(N - 1, 0))
+    gathered = x[idx.reshape(-1)].reshape((B, Lmax) + tail)
+
+    valid = offsets[None, :] < lengths[:, None]  # [B, Lmax]
+    valid = valid.reshape((B, Lmax) + (1,) * len(tail))
+    return torch.where(valid, gathered, gathered.new_full((), pad_value))
+
+
+def unpack_seq_native(
+    packed_tensor: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Native replacement for vllm's ``unpack_seq_triton``; inverse of
+    :func:`pack_seq_native`.
+
+    Args:
+        packed_tensor: [B, Lmax, ...] as produced by ``pack_seq_native``.
+        lengths: [B] token count per batch.
+
+    Returns:
+        [N, ...] where N == lengths.sum().
+    """
+    B, Lmax = packed_tensor.shape[:2]
+    tail = packed_tensor.shape[2:]
+
+    offsets = torch.arange(Lmax, device=packed_tensor.device, dtype=lengths.dtype)
+    valid = offsets[None, :] < lengths[:, None]  # [B, Lmax]
+    return packed_tensor.reshape((B * Lmax,) + tail)[valid.reshape(-1)]

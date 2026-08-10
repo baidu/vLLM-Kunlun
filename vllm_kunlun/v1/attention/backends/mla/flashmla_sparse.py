@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Union
 
@@ -69,6 +70,79 @@ def _lse2_to_lse(lse_base2: torch.Tensor) -> torch.Tensor:
     # Convert base-2 LSE to natural-log LSE
     # Keep FP32 for numerical stability during the merge.
     return lse_base2.to(torch.float32) * math.log(2.0)
+
+
+# --- debug: per-row checksum tracing for the long-context corruption bug ---
+# Enable by exporting DSA_TRACE_DIR=/some/dir before starting the server. Each
+# rank appends one npz per sparse-MLA forward, holding a wrap-around int32
+# checksum per token row for the kernel's inputs and output. Comparing two
+# identical requests row-by-row localizes the first layer that diverges.
+_DSA_TRACE_DIR = os.environ.get("DSA_TRACE_DIR") or None
+_dsa_trace_step = 0
+_dsa_weight_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _dsa_row_checksum(x: torch.Tensor) -> np.ndarray:
+    """Wrap-around int32 checksum of every row of ``x``, flattened past dim 0.
+
+    Integer arithmetic is used so the reduction is exact and insensitive to
+    summation order, unlike a float sum.
+    """
+    t = x.detach().contiguous().reshape(x.shape[0], -1)
+    if t.dtype in (torch.bfloat16, torch.float16):
+        t = t.view(torch.int16)
+    elif t.dtype in (torch.float32, torch.float64):
+        t = t.float().view(torch.int32)
+    key = (t.shape[1], t.device)
+    w = _dsa_weight_cache.get(key)
+    if w is None:
+        w = (torch.arange(t.shape[1], device=t.device, dtype=torch.int32) % 9973) + 1
+        _dsa_weight_cache[key] = w
+    try:
+        return (t.to(torch.int32) * w).sum(dim=-1, dtype=torch.int32).cpu().numpy()
+    except Exception:
+        t_cpu = t.cpu().to(torch.int32)
+        w_cpu = w.cpu()
+        return (t_cpu * w_cpu).sum(dim=-1, dtype=torch.int32).numpy()
+
+
+def _dsa_trace(layer_name: str, **tensors: torch.Tensor) -> None:
+    global _dsa_trace_step
+    step = _dsa_trace_step
+    _dsa_trace_step += 1
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        rank = -1
+    sums = {k: _dsa_row_checksum(v) for k, v in tensors.items()}
+    safe = layer_name.replace("/", "_").replace(".", "_")
+    path = os.path.join(
+        _DSA_TRACE_DIR, f"trace_r{rank}_s{step:05d}_{safe}.npz"
+    )
+    np.savez(path, **sums)
+
+
+def _dsa_trace_rows(
+    tag: str, rows: dict[str, torch.Tensor], **checksums: torch.Tensor
+) -> None:
+    """Like _dsa_trace but also stores a few raw rows verbatim (fp32)."""
+    global _dsa_trace_step
+    step = _dsa_trace_step
+    _dsa_trace_step += 1
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+    except Exception:
+        rank = -1
+    payload = {k: _dsa_row_checksum(v) for k, v in checksums.items()}
+    payload.update(
+        {f"row_{k}": v.detach().float().cpu().numpy() for k, v in rows.items()}
+    )
+    safe = tag.replace("/", "_").replace(".", "_")
+    np.savez(os.path.join(_DSA_TRACE_DIR, f"trace_r{rank}_s{step:05d}_{safe}.npz"), **payload)
 
 
 class FlashMLASparseBackend(AttentionBackend):
@@ -815,4 +889,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         attn_out = self._forward_bf16_kv(
             q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
         )
+        if _DSA_TRACE_DIR is not None and attn_metadata.num_prefills > 0:
+            _dsa_trace(
+                getattr(layer, "layer_name", "unknown"),
+                q=q,
+                topk_indices=topk_indices,
+                attn_out=attn_out,
+            )
         return attn_out, None
