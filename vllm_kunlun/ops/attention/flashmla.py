@@ -294,12 +294,12 @@ def flash_mla_with_kvcache(
                 if isinstance(attn_sink, torch.Tensor)
                 else torch.empty(0, dtype=torch.float32, device=q.device)
             )
-            # NOTE: qlod_cpu and kvseqlen_cpu are required by the Python
-            # wrapper. To stay cudagraph-safe, materialize them as on-device
-            # tensors and let the wrapper perform the (likely trivial) .cpu().
-            # If capture later complains, this is the place to pre-allocate.
-            _qlod_cpu = _qlod_xpu
-            _kvseqlen_cpu = _kvseqlen_xpu
+            # NOTE: qlod_cpu and kvseqlen_cpu must be DISTINCT CPU tensors
+            # (not the same storage as the xpu ones). qlod_cpu=qlod_xpu was
+            # the root cause of the native worker crash -- isolation test
+            # variant B proved it. .cpu() forces a host-side copy.
+            _qlod_cpu = _qlod_xpu.cpu()
+            _kvseqlen_cpu = _kvseqlen_xpu.cpu()
 
             kunlun_ops.hybrid_attention(
                 q=q[:, 0, :, :],
