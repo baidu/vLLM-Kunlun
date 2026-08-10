@@ -785,9 +785,16 @@ class KunlunOps:
             _inv = torch.empty_like(_order)
             _inv[_order] = torch.arange(_order.numel(), device=_order.device)
             sorted_tokens_idx.copy_(_inv.to(sorted_tokens_idx.dtype))
-            _cnt = torch.bincount(
-                _flat_expert, minlength=global_num_experts
-            ).to(torch.int32)
+            # ``torch.bincount`` is unusable here: inside the XCCL/TP context it
+            # aborts with a bogus "tried to allocate more than 1EB" OOM even for
+            # small, in-range inputs (probed: min=26 max=869 for E=896).
+            # ``scatter_add_`` is equivalent when every index is within [0, E),
+            # which topk guarantees, and needs no max-scan or dynamic allocation.
+            _cnt = torch.zeros(
+                global_num_experts, dtype=torch.int64, device=_flat_expert.device
+            )
+            _cnt.scatter_add_(0, _flat_expert, torch.ones_like(_flat_expert))
+            _cnt = _cnt.to(torch.int32)
             expert_m.copy_(_cnt)
             sorted_tokens_num_lod.copy_(
                 torch.cat(

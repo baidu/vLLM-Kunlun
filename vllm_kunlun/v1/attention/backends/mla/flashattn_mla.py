@@ -35,14 +35,12 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
     AttentionType,
+    CommonAttentionMetadata,
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_kunlun.ops.attention.flashmla import (
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
+from vllm_kunlun.ops.attention.flashmla import flash_mla_with_kvcache
 
 logger = init_logger(__name__)
 
@@ -110,6 +108,10 @@ class FlashAttnMLADecodeMetadata(MLACommonDecodeMetadata):
     query_start_loc: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    # Slice of the builder's persistent pinned buffer holding the per-request
+    # context lengths for `paged_attention`'s `context_lens_cpu`. Filled in
+    # `_build_decode`, i.e. outside the cuda graph capture region.
+    seq_lens_cpu: torch.Tensor
     # Kept for API compatibility with the upstream metadata; unused on Kunlun.
     scheduler_metadata: torch.Tensor | None = None
     max_num_splits: int = 0
@@ -121,6 +123,15 @@ class FlashAttnMLAMetadata(MLACommonMetadata[FlashAttnMLADecodeMetadata]):
 
 
 class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]):
+    # NOTE(kunlun): `paged_attention` takes the per-request context lengths as
+    # int32 twice, once on the host and once on the device (`context_lens_cpu` /
+    # `context_lens_xpu`). Only the device copy drives the kernel -- probed
+    # standalone: changing the host values leaves the output bit-identical, and a
+    # captured graph follows in-place updates of the device tensor on replay. The
+    # device side therefore needs no staging (vLLM's `seq_lens` is already a
+    # persistent int32 buffer); the host copy is produced in `_build_decode`,
+    # outside the capture region, because the `.cpu()` that used to produce it
+    # per step is an illegal sync during capture.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
     # Upstream routes query_len <= 512 through the decode (MQA) pathway. Kunlun's
@@ -149,6 +160,16 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         # Kunlun paged-attention does not use FA3 AOT scheduler metadata.
         self.max_num_splits = 0
 
+        # Persistent pinned buffer for `paged_attention`'s `context_lens_cpu`.
+        # A fixed address keeps the host side valid across cuda graph replays.
+        max_bs = max(
+            vllm_config.scheduler_config.max_num_seqs,
+            self.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        self._seq_lens_cpu = torch.zeros(
+            max_bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+
     def _build_decode(
         self,
         block_table_tensor: torch.Tensor,
@@ -162,16 +183,36 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_query_len = query_lens_cpu.max().item()
 
+        # Host copy for `context_lens_cpu`. Produced here, in `build()`, because
+        # a `.cpu()` inside the captured region is an illegal sync; the copy is
+        # async since the host values do not affect the kernel result.
+        num_reqs = seq_lens_device.shape[0]
+        seq_lens_cpu = self._seq_lens_cpu[:num_reqs]
+        seq_lens_cpu.copy_(seq_lens_device, non_blocking=True)
+
         return FlashAttnMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
             query_start_loc=query_start_loc_device,
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
+            seq_lens_cpu=seq_lens_cpu,
             scheduler_metadata=None,
             max_num_splits=0,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
         )
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashAttnMLAMetadata:
+        attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
+        # Capturing with seq_lens == max_model_len makes the paged-attention
+        # kernel walk the whole block table, which makes capture extremely slow.
+        # Replay reads the refreshed values from the same buffers anyway.
+        assert attn_metadata.decode is not None
+        attn_metadata.decode.seq_lens.fill_(1)
+        attn_metadata.decode.seq_lens_cpu.fill_(1)
+        return attn_metadata
 
 
 class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
@@ -252,17 +293,19 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         num_tokens, num_heads, head_dim = q.shape
         q = q.view(num_tokens, 1, num_heads, head_dim)
 
-        cache_seqlens = attn_metadata.decode.seq_lens.to(torch.int32)
-        tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens)
-
+        # Read-only: the host-side copy must not be produced here. A `.cpu()`
+        # inside the captured region is an illegal sync during capture and cannot
+        # be replayed. `flash_mla_with_kvcache` forwards these as
+        # `context_lens_cpu` / `context_lens_xpu`.
+        decode_meta = attn_metadata.decode
         out, lse = flash_mla_with_kvcache(
             q=q,
             k_cache=kv_c_and_k_pe_cache,
-            block_table=attn_metadata.decode.block_table,
-            cache_seqlens=cache_seqlens,
+            block_table=decode_meta.block_table,
+            cache_seqlens=decode_meta.seq_lens,
             head_dim_v=self.kv_lora_rank,
-            tile_scheduler_metadata=tile_scheduler_metadata,
-            num_splits=num_splits,
+            tile_scheduler_metadata=decode_meta.seq_lens_cpu,
+            num_splits=decode_meta.seq_lens,
             softmax_scale=self.scale,
             causal=True,
         )
