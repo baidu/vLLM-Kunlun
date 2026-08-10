@@ -2,13 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -23,6 +28,84 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
+
+
+def forward_prequantized(
+    self,
+    x_q: torch.Tensor,
+    x_max: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+    """Column-parallel forward for Kunlun dynamic prequantized inputs."""
+    scheme = getattr(self, "scheme", None)
+    kernel = getattr(scheme, "kernel", None)
+    apply = getattr(kernel, "apply_prequantized_weights", None)
+    if not callable(apply):
+        raise TypeError(
+            f"{self.__class__.__name__} does not use a prequantized Kunlun "
+            "W8A8 kernel"
+        )
+
+    bias = self.bias if not self.skip_bias_add else None
+    output_parallel = apply(self, x_q, x_max, out_dtype, bias)
+    if self.gather_output and self.tp_size > 1:
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        output = tensor_model_parallel_all_gather(output_parallel)
+    else:
+        output = output_parallel
+
+    if not self.return_bias:
+        return output
+    output_bias = self.bias if self.skip_bias_add else None
+    return output, output_bias
+
+
+# MiniMax-M3 calls this explicit entry point only after its fused norm has
+# produced quant2d-compatible INT8 data and per-token maxima.  Keeping the
+# extension in the OOT plugin avoids changing the generic vLLM Linear API.
+ColumnParallelLinear.forward_prequantized = forward_prequantized
+
+
+def row_forward_prequantized(
+    self,
+    x_q: torch.Tensor,
+    x_max: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+    """Row-parallel forward for an already partitioned Kunlun INT8 input."""
+    if not self.input_is_parallel:
+        raise ValueError(
+            "prequantized RowParallelLinear input must already be TP-partitioned"
+        )
+
+    scheme = getattr(self, "scheme", None)
+    kernel = getattr(scheme, "kernel", None)
+    apply = getattr(kernel, "apply_prequantized_weights", None)
+    if not callable(apply):
+        raise TypeError(
+            f"{self.__class__.__name__} does not use a prequantized Kunlun "
+            "W8A8 kernel"
+        )
+
+    # Match RowParallelLinear.forward: add bias only on rank 0, then reduce
+    # the local GEMM result across TP ranks.
+    bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+    output_parallel = apply(self, x_q, x_max, out_dtype, bias)
+    if self.reduce_results and self.tp_size > 1:
+        output = tensor_model_parallel_all_reduce(output_parallel)
+    else:
+        output = output_parallel
+
+    if not self.return_bias:
+        return output
+    output_bias = self.bias if self.skip_bias_add else None
+    return output, output_bias
+
+
+# MiniMax-M3's dense FFN calls this after fused SwigluOAI + dynamic INT8
+# quantization.  The activation is already TP-sharded by gate_up_proj.
+RowParallelLinear.forward_prequantized = row_forward_prequantized
 
 
 def get_weights(self):
@@ -69,7 +152,8 @@ def create_weights(
 
 # rewrite create_weights and remove weight_loader_v2 to suport cuda graph
 UnquantizedLinearMethod.create_weights = create_weights
-WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
+if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
+    WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
 
 def adjust_bitblas_shard(param, shard_size, shard_offset):

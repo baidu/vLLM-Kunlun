@@ -54,14 +54,42 @@ class KunlunRotaryEmbedding(RotaryEmbedding):
         key: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Kunlun-optimized forward_oot using Kunlun RoPE kernels."""
+        """Kunlun-optimized forward_oot using the Kunlun RoPE kernel.
+
+        [20260629] Un-bypassed (item ⑤). The previous body short-circuited to
+        super().forward_native(...) as a debug measure ("test if XPU kernel is
+        garbage root cause"). The kernel was re-verified against an fp32-accurate
+        partial-rotary reference (head_dim=128, rotary_dim=64, neox) in
+        test/test_rope_kernel.py: kernel-vs-fp32 mean_abs ~3e-4, i.e. no worse
+        (slightly better) than the native bf16 path it replaces. Same kernel runs
+        un-bypassed in M2.7 production. Details mirror M2.7's forward_oot:
+        match cos_sin_cache dtype/device once outside torch.compile tracing,
+        squeeze a 4D cache to 2D, and make it contiguous before the kernel call.
+        """
         from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
+        cos_sin_cache = self.cos_sin_cache
         if (
-            self.cos_sin_cache.device != query.device
-            or self.cos_sin_cache.dtype != query.dtype
+            cos_sin_cache.device != query.device
+            or cos_sin_cache.dtype != query.dtype
         ):
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+            if not torch.compiler.is_compiling():
+                self.cos_sin_cache = cos_sin_cache
+
+        # The kernel expects a 2D cache [max_pos, rot_dim]; some build paths
+        # produce [1, 1, max_pos, rot_dim]. Squeeze defensively (M3 default is 2D).
+        if cos_sin_cache.ndim == 4:
+            cos_sin_cache = cos_sin_cache.squeeze(0).squeeze(0)
+        cos_sin_cache = cos_sin_cache.contiguous()
+
+        # KunlunOps.rotary_embedding requires a real key tensor. Native RoPE
+        # supports key=None, but silently falling back would bypass the XPU op.
+        if key is None:
+            raise NotImplementedError(
+                "KunlunRotaryEmbedding.forward_oot requires key for the XPU "
+                "rotary_embedding kernel; key=None is not wired to a Kunlun op."
+            )
 
         # ops.rotary_embedding()/batched_rotary_embedding()
         # are in-place operations that update the query and key tensors.
@@ -73,19 +101,16 @@ class KunlunRotaryEmbedding(RotaryEmbedding):
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                     self.rotary_dim,
                     offsets,
                 )
             else:
-                # Fallback to the base implementation when Kunlun does not
-                # provide a batched_rotary_embedding kernel.
-                return super().forward_native(
-                    positions,
-                    query,
-                    key,
-                    offsets=offsets,
+                raise NotImplementedError(
+                    "KunlunRotaryEmbedding.forward_oot received offsets, but "
+                    "KunlunOps.batched_rotary_embedding is not available. "
+                    "Refusing to silently bypass the XPU op."
                 )
         else:
             query, key = ops.rotary_embedding(
@@ -93,7 +118,7 @@ class KunlunRotaryEmbedding(RotaryEmbedding):
                 query,
                 key,
                 self.head_size,
-                self.cos_sin_cache,
+                cos_sin_cache,
                 self.is_neox_style,
             )
         return query, key
