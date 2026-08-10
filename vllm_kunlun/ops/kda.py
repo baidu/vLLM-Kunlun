@@ -279,36 +279,18 @@ def fused_recurrent_kda_packed_decode(
     ``mixed_qkv`` is ``[B, 2 * H * K + H * V]``, ``initial_state`` is the paged
     ``[num_slots, H, V, K]`` cache and is updated in place at ``state_indices``.
     """
-    num_heads, head_dim = raw_g.shape[-2:]
-    batch = mixed_qkv.shape[0]
-    if scale is None:
-        scale = head_dim**-0.5
-
-    q, k, v = mixed_qkv.split([num_heads * head_dim] * 3, dim=-1)
-    qf = _l2norm_scaled(q.view(batch, num_heads, head_dim), scale)
-    kf = _l2norm_scaled(k.view(batch, num_heads, head_dim))
-    vf = v.view(batch, num_heads, head_dim).float()
-    decay = kda_gate(raw_g, A_log, dt_bias, lower_bound)[0].exp()
-    beta = torch.sigmoid(raw_beta[0].float())
-
-    slots = state_indices[:batch].tolist()
-    out = torch.empty_like(vf)
-    # Per-slot basic indexing on purpose: advanced indexing / index_select on the
-    # paged state cache copies the *whole* cache on XPU (a single row out of
-    # [85585, 12, 128, 128] fp32 tried to allocate 62.69 GiB), while
-    # `state[int]` is a view.
-    for i in range(batch):
-        slot = slots[i]
-        if slot < 0:
-            continue
-        state = initial_state[slot].float()  # [H, V, K]
-        state = state * decay[i].unsqueeze(-2)
-        kt = kf[i]
-        delta = (vf[i] - (state @ kt.unsqueeze(-1)).squeeze(-1)) * beta[i].unsqueeze(-1)
-        state = state + delta.unsqueeze(-1) * kt.unsqueeze(-2)
-        out[i] = (state @ qf[i].unsqueeze(-1)).squeeze(-1)
-        initial_state[slot] = state.to(initial_state.dtype)
-    return out.unsqueeze(0).to(mixed_qkv.dtype), initial_state
+    out = torch.ops.xspeedgate_ops.fused_recurrent_kda_packed_decode(
+        mixed_qkv,
+        raw_g,
+        raw_beta,
+        A_log,
+        dt_bias,
+        lower_bound,
+        initial_state,
+        state_indices,
+        scale,
+    )
+    return out, initial_state
 
 
 def fused_recurrent_kda(
