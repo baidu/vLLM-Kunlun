@@ -32,6 +32,35 @@ else:
     _flashmla_extension_C_AVAILABLE = False
 
 
+# ---- Static CPU lod cache (cudagraph FULL capture safety) ----
+# kunlun_ops.hybrid_attention's cpp wrapper reads vsl.kv_lod_vp.cpu[i] in a
+# host-side for-loop to compute max_seqlen. Reading CPU memory is fine, but
+# the .cpu() call that PRODUCES the CPU tensor triggers a D2H sync which
+# BREAKS cudagraph capture (we see it as `xops_block_ERROR line 126`).
+#
+# Workaround: pre-allocate the CPU lod tensor once per shape; update its
+# contents via .copy_() OUTSIDE capture (during warmup); during capture/replay
+# the static tensor's data_ptr is read directly by the cpp wrapper -- no D2H
+# needed. This mirrors SGLang's per-BS metadata cache + copy_() replay pattern.
+_static_qlod_cpu_cache: dict = {}
+_static_kvseqlen_cpu_cache: dict = {}
+
+
+def _get_static_cpu_lod(xpu_lod, cache):
+    """Return pre-allocated CPU lod; update from xpu only if NOT capturing."""
+    key = (xpu_lod.shape[0], xpu_lod.numel(), xpu_lod.dtype)
+    if key not in cache:
+        cache[key] = torch.empty(
+            xpu_lod.shape, dtype=xpu_lod.dtype,
+            device='cpu', pin_memory=True,
+        )
+    static = cache[key]
+    if not torch.cuda.is_current_stream_capturing():
+        # D2H sync -- OK outside capture (warmup, decode non-capture path)
+        static.copy_(xpu_lod)
+    return static
+
+
 def is_flashmla_supported() -> Tuple[bool, Optional[str]]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
@@ -59,7 +88,196 @@ def get_mla_metadata(
     return cache_seqlens_cpu, cache_seqlens
 
 
-_SHAPE_SENTINEL_DONE = {}
+# ---- V4 capture-safe native path (SGLang-style: fwd_kvcache_mla family + LSE merge) ----
+# NOTE: attention_merge_stage's docstring says log2/exp2, but empirical testing
+# (v_a=v_b=v, s_a=s_b=s -> s_merged = s + ln(2)) shows it uses natural log
+# (exp/log) internally, NOT log2. Do not apply a base-2 conversion here.
+#
+# Per-(B,) static kv_lod caches. Shape [batch_num] (per-seq lengths, not cumsum) per
+# kunlun_ops._attention.py:fwd_kvcache_mla docstring. Each entry holds a pre-allocated
+# int32 [B] tensor on the same device as the source lens; outside capture we copy
+# fresh lens into it, inside capture we reuse the storage without any D2H sync.
+_static_kvlod_swa_xpu_cache: dict = {}
+_static_kvlod_swa_cpu_cache: dict = {}
+_static_kvlod_com_xpu_cache: dict = {}
+_static_kvlod_com_cpu_cache: dict = {}
+
+# Pre-allocated int32 [B, 1, topk] clamped-index buffers. The native fwd_kvcache_mla
+# kernel attends to ALL topk slots in every row (no per-token length mask), so we
+# pre-fill positions j >= topk_length[i] with src[i, 0, topk_length[i]-1] (the last
+# valid slot for that row). This bounds the bias to "attend to one extra real slot"
+# instead of attending to garbage OOB.
+_static_clamped_swa_idx_cache: dict = {}
+_static_clamped_com_idx_cache: dict = {}
+
+
+def _build_static_per_seq_lens(lens: torch.Tensor, cache: dict) -> torch.Tensor:
+    """Return a static int32 [B] tensor of per-seq kv lengths (NOT cumsum).
+    The contents are refreshed only when NOT capturing; during capture/replay the
+    static storage is reused as-is, mirroring SGLang's per-BS metadata cache.
+    """
+    key = (lens.shape[0],)
+    if key not in cache:
+        cache[key] = torch.empty(
+            lens.shape, dtype=torch.int32, device=lens.device,
+        )
+    static = cache[key]
+    if not torch.cuda.is_current_stream_capturing():
+        static.copy_(lens.to(torch.int32))
+    return static
+
+
+def _prepare_static_clamped_indices(
+    src_indices_3d: torch.Tensor,  # [B, 1, topk] int32 (already clamped to cache size)
+    lens: torch.Tensor,            # [B] int32 per-seq valid length
+    cache: dict,
+) -> torch.Tensor:
+    """Pre-fill j >= lens[i] slots with the last-valid-index for that row.
+    Returns static int32 [B, 1, topk] tensor.
+    """
+    B, _, TOPK = src_indices_3d.shape
+    key = (B, TOPK)
+    if key not in cache:
+        cache[key] = torch.empty(
+            src_indices_3d.shape, dtype=torch.int32, device=src_indices_3d.device,
+        )
+    static = cache[key]
+    if torch.cuda.is_current_stream_capturing():
+        return static
+    # Outside capture: recompute clamped indices from current src+lens.
+    src2d = src_indices_3d.squeeze(1)  # [B, TOPK]
+    safe = src2d.clamp(min=0)  # safety; assume upstream already clamped to cache size
+    # last valid index per row: clamp to 0 when lens==0 so the gather is well-defined
+    last = (lens.long() - 1).clamp(min=0)  # [B]
+    tail_fill = safe.gather(1, last.unsqueeze(1).expand(-1, TOPK))  # [B, TOPK]
+    arange = torch.arange(TOPK, device=safe.device).unsqueeze(0)  # [1, TOPK]
+    valid = arange < lens.long().unsqueeze(1)  # [B, TOPK]
+    clamped = torch.where(valid, safe, tail_fill).to(torch.int32)
+    static.copy_(clamped.unsqueeze(1))
+    return static
+
+
+def _v4_sparse_native_path(
+    q: torch.Tensor,                 # [B, 1, H, D] (B=num_decode_tokens)
+    k_cache: torch.Tensor,           # [NB_swa, BS_swa, 1, D]
+    indices: torch.Tensor,           # [B, 1, window_size] int32
+    topk_length: torch.Tensor,       # [B] int32, valid SWA slots per row
+    attn_sink,                       # None | [H] fp32
+    extra_k_cache,                   # None | [NB_com, BS_com, 1, D] (only when compress_ratio>1)
+    extra_indices_in_kvcache,        # None | [B, 1, com_topk] int32
+    extra_topk_length,               # None | [B] int32
+    head_dim_v: int,
+    softmax_scale: float,
+    output: torch.Tensor,            # [B, 1, H, head_dim_v] pre-allocated by caller
+    compress_ratio: int,
+    max_window_size: int,
+    com_topk: int,
+) -> Tuple[torch.Tensor, None]:
+    """Capture-safe V4 sparse MLA decode path.
+
+    Mirrors SGLang DeepseekV4BackendRadix.forward which routes through the
+    capture-safe `paged_attention` family. Our Kunlun equivalent is:
+        SWA part   -> kunlun_ops.fwd_kvcache_mla   (capture-safe, sparse via indices)
+        Compressed -> kunlun_ops.fwd_kvcache_mla   (same op, second call)
+        Combine    -> kunlun_ops.attention_merge_stage (LSE-based merge)
+    All metadata tensors are static pre-allocated buffers whose contents are
+    refreshed only OUTSIDE capture (mirrors SGLang's per-BS metadata cache).
+    """
+    _B, _S, _H, _D = q.shape
+    assert _S == 1, f"V4 decode-only path; got seq_q={_S}"
+    KV_LORA = head_dim_v  # 512
+
+    # ---- SWA cache as flat [NB_swa*BS_swa, D] (view, no copy) ----
+    flat_swa = k_cache.reshape(-1, _D)
+    swa_size = flat_swa.shape[0]
+    kv_lod_swa_xpu = _build_static_per_seq_lens(
+        topk_length[:_B], _static_kvlod_swa_xpu_cache)
+    kv_lod_swa_cpu = _get_static_cpu_lod(kv_lod_swa_xpu, _static_kvlod_swa_cpu_cache)
+
+    swa_idx_2d = indices.squeeze(1) if indices.dim() == 3 else indices
+    if not swa_idx_2d.is_contiguous():
+        swa_idx_2d = swa_idx_2d.contiguous()
+    clamped_swa = _prepare_static_clamped_indices(
+        swa_idx_2d.unsqueeze(1), topk_length[:_B],
+        _static_clamped_swa_idx_cache,
+    )
+
+    out_swa = torch.empty(_B, _S, _H, KV_LORA, dtype=q.dtype, device=q.device)
+    ml_swa = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
+    ps_swa = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
+
+    kunlun_ops.fwd_kvcache_mla(
+        q_c=q, kv_cache=flat_swa, indices=clamped_swa,
+        kv_lod_cpu=kv_lod_swa_cpu,
+        out=out_swa, max_logits=ml_swa, p_sums=ps_swa,
+        softmax_scale=float(softmax_scale),
+        max_seq_kv=int(max_window_size),
+        kv_lod_xpu=kv_lod_swa_xpu,
+    )
+    # LSE in natural log (units of scaled logits, same as `sink`):
+    #   lse = log(ps) + ml   (where ps = sum exp(scores_scaled - ml))
+    # NOTE: attention_merge_stage uses natural log internally (verified
+    # empirically: with same v and same lse inputs, s_merged - lse = ln(2),
+    # which is `log(d) + s_max` only when d=2 and `log` is natural).
+    lse_swa_e = torch.log(ps_swa.clamp_min(1e-30)) + ml_swa
+
+    if extra_k_cache is None:
+        out_merged = out_swa
+        lse_merged_e = lse_swa_e
+    else:
+        flat_com = extra_k_cache.reshape(-1, _D)
+        com_size = flat_com.shape[0]
+        kv_lod_com_xpu = _build_static_per_seq_lens(
+            extra_topk_length[:_B], _static_kvlod_com_xpu_cache)
+        kv_lod_com_cpu = _get_static_cpu_lod(
+            kv_lod_com_xpu, _static_kvlod_com_cpu_cache)
+        com_idx_2d = (extra_indices_in_kvcache.squeeze(1)
+                      if extra_indices_in_kvcache.dim() == 3
+                      else extra_indices_in_kvcache)
+        if not com_idx_2d.is_contiguous():
+            com_idx_2d = com_idx_2d.contiguous()
+        clamped_com = _prepare_static_clamped_indices(
+            com_idx_2d.unsqueeze(1), extra_topk_length[:_B],
+            _static_clamped_com_idx_cache,
+        )
+
+        out_com = torch.empty(_B, _S, _H, KV_LORA, dtype=q.dtype, device=q.device)
+        ml_com = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
+        ps_com = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
+
+        kunlun_ops.fwd_kvcache_mla(
+            q_c=q, kv_cache=flat_com, indices=clamped_com,
+            kv_lod_cpu=kv_lod_com_cpu,
+            out=out_com, max_logits=ml_com, p_sums=ps_com,
+            softmax_scale=float(softmax_scale),
+            max_seq_kv=int(com_topk),
+            kv_lod_xpu=kv_lod_com_xpu,
+        )
+        lse_com_e = torch.log(ps_com.clamp_min(1e-30)) + ml_com
+
+        # attention_merge_stage expects 3-D (tokens, heads, dim) and operates on
+        # natural-log LSE (s_a, s_b in natural log units; s_merged also natural).
+        # Empirical: with v_a=v_b and s_a=s_b=s, v_merged = v (max|diff|=0) and
+        # s_merged = s + ln(2) (consistent with `s_merged = log(d) + s_max`
+        # where `log` is natural, despite the kernel docstring saying `log2`).
+        out_merged = torch.empty(_B, _H, KV_LORA, dtype=q.dtype, device=q.device)
+        lse_merged_e = torch.empty(_B, _H, dtype=torch.float32, device=q.device)
+        kunlun_ops.attention_merge_stage(
+            v_a=out_swa.squeeze(1), s_a=lse_swa_e.squeeze(1),
+            v_b=out_com.squeeze(1), s_b=lse_com_e.squeeze(1),
+            v_merged=out_merged, s_merged=lse_merged_e,
+        )
+        out_merged = out_merged.unsqueeze(1)  # restore [B, 1, H, D]
+        # s_merged already in natural log units — no further conversion needed.
+
+    # ---- Attention sink post-processing: out *= sigmoid(lse - sink) ----
+    if isinstance(attn_sink, torch.Tensor):
+        sink = attn_sink[:_H].to(device=q.device, dtype=torch.float32)
+        scale = torch.sigmoid(lse_merged_e - sink.view(1, 1, _H))
+        out_merged = out_merged * scale.unsqueeze(-1).to(out_merged.dtype)
+
+    output.copy_(out_merged)
+    return output, None
 
 
 def flash_mla_with_kvcache(
@@ -117,109 +335,6 @@ def flash_mla_with_kvcache(
         )
         return output, None
 
-    # ---- one-shot shape sentinel (env-gated, default OFF) ----
-    _sentinel_kind = "swa_only" if extra_k_cache is None else "dual"
-    if (os.environ.get("KUNLUN_DSV4_SHAPE_SENTINEL", "0") == "1"
-            and _sentinel_kind not in _SHAPE_SENTINEL_DONE):
-        _SHAPE_SENTINEL_DONE[_sentinel_kind] = True
-
-        def _d(name, t):
-            if t is None:
-                return f"    {name}: None"
-            if isinstance(t, torch.Tensor):
-                extra = ""
-                try:
-                    _st = t.untyped_storage()
-                    _elems = _st.size() // t.element_size()
-                    _base = t._base
-                    extra = (f" storage_elems={_elems}"
-                             f" numel={t.numel()}"
-                             f" base_shape="
-                             f"{tuple(_base.shape) if _base is not None else None}")
-                except Exception as _e:
-                    extra = f" (storage probe failed: {_e})"
-                return (f"    {name}: shape={tuple(t.shape)} dtype={t.dtype} "
-                        f"stride={t.stride()} contig={t.is_contiguous()}"
-                        + extra)
-            return f"    {name}: {type(t).__name__}={t!r}"
-
-        lines = ["[DSv4-SHAPE-SENTINEL] flash_mla_with_kvcache route=" + _sentinel_kind + ":"]
-        for _n, _t in (
-                ("q", q), ("k_cache", k_cache), ("block_table", block_table),
-                ("cache_seqlens", cache_seqlens),
-                ("indices", indices), ("topk_length", topk_length),
-                ("attn_sink", attn_sink),
-                ("extra_k_cache", extra_k_cache),
-                ("extra_indices_in_kvcache", extra_indices_in_kvcache),
-                ("extra_topk_length", extra_topk_length),
-                ("out", out),
-                ("head_dim_v", head_dim_v),
-                ("softmax_scale", softmax_scale),
-                ("is_fp8_kvcache", is_fp8_kvcache),
-        ):
-            lines.append(_d(_n, _t))
-        # Value summaries for the length/index tensors decide whether the
-        # native op's kvseqlen-derived masking can reproduce these.
-        for _n, _t in (("topk_length", topk_length),
-                       ("extra_topk_length", extra_topk_length)):
-            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
-                lines.append(f"    {_n} values: {_t.flatten()[:16].tolist()}")
-        for _n, _t in (("indices", indices),
-                       ("extra_indices_in_kvcache", extra_indices_in_kvcache)):
-            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
-                _f = _t.flatten()
-                lines.append(
-                    f"    {_n}: min={int(_f.min())} max={int(_f.max())} "
-                    f"n_neg={int((_f < 0).sum())} head={_f[:12].tolist()}")
-        # Row 0 of each index tensor, so the padding convention (-1 vs
-        # clamped vs repeated) is unambiguous.
-        for _n, _t in (("indices", indices),
-                       ("extra_indices_in_kvcache", extra_indices_in_kvcache)):
-            if isinstance(_t, torch.Tensor) and _t.numel() > 0:
-                _r = _t.reshape(_t.shape[0], -1)[0]
-                lines.append(f"    {_n} row0[:32]: {_r[:32].tolist()}")
-                lines.append(f"    {_n} row0[-8:]: {_r[-8:].tolist()}")
-        try:
-            import time as _time
-
-            _nb, _bs = k_cache.shape[0], k_cache.shape[1]
-
-            def _timeit(fn, reps=5):
-                fn()
-                torch.cuda.synchronize()
-                _t0 = _time.perf_counter()
-                for _ in range(reps):
-                    fn()
-                torch.cuda.synchronize()
-                return (_time.perf_counter() - _t0) * 1e3 / reps
-
-            # (a) current: full flatten (materializes a copy), then gather.
-            _slots = indices.reshape(-1).long().clamp(0, _nb * _bs - 1)
-
-            def _cur():
-                _flat = k_cache.reshape(_nb * _bs, -1)
-                return _flat[_slots]
-
-            # (b) proposed: decompose slot -> (block, offset), gather in place.
-            def _new():
-                _blk = torch.div(_slots, _bs, rounding_mode="floor")
-                _off = _slots - _blk * _bs
-                return k_cache[_blk, _off, 0, :]
-
-            _ms_cur = _timeit(_cur)
-            _ms_new = _timeit(_new)
-            _same = torch.equal(_cur().to(torch.float32),
-                                _new().to(torch.float32))
-            lines.append(
-                f"    GATHER BENCH  flatten+gather={_ms_cur:.3f} ms  "
-                f"strided_gather={_ms_new:.3f} ms  "
-                f"speedup={_ms_cur / max(_ms_new, 1e-9):.1f}x  "
-                f"results_identical={_same}  "
-                f"n_slots={_slots.numel()}")
-        except Exception as _e:
-            lines.append(f"    gather bench failed: {type(_e).__name__}: {_e}")
-        logger.info("\n".join(lines))
-
     # ---- Allocate output buffer (used by both native and torch paths) ----
     if out is not None:
         output = out
@@ -229,112 +344,38 @@ def flash_mla_with_kvcache(
             dtype=q.dtype, device=q.device,
         )
 
-    # ---- Native hybrid_attention short-circuit (env-gated, default OFF,
-    #        DUAL path only). For SWA-only layers the torch path is fast
-    #        enough and the native op's host-side dim check rejects the
-    #        1D empty tensors we'd have to pass. ----
+    # ---- Native V4 path (capture-safe; fwd_kvcache_mla + attention_merge_stage).
+    # Replaces the previous kunlun_ops.hybrid_attention short-circuit which
+    # allocated L3 scratch per call (capture-unsafe) and the per-batch torch
+    # loop fallback (also capture-unsafe). Both old paths are removed.
+    # BF16-only first iteration: FP8 KV cache layers still go through the
+    # torch fallback further below (which handles uint8 dequant). ----
     _native_ok = (
-        os.environ.get("KUNLUN_DSV4_HYBRID_NATIVE", "0") == "1"
-        and hasattr(kunlun_ops, "hybrid_attention")
-        and extra_k_cache is not None
-        and extra_indices_in_kvcache is not None
-        and extra_topk_length is not None
+        os.environ.get("KUNLUN_DSV4_HYBRID_NATIVE", "1") == "1"
+        and hasattr(kunlun_ops, "fwd_kvcache_mla")
+        and hasattr(kunlun_ops, "attention_merge_stage")
+        and indices is not None
+        and topk_length is not None
+        and (k_cache.dtype == torch.bfloat16)
+        and (extra_k_cache is None or extra_k_cache.dtype == torch.bfloat16)
     )
     if _native_ok:
         try:
-            _B, _S, _H, _D = q.shape
-            assert _S == 1, (
-                f"native hybrid_attention decode-only path; got seq_q={_S}"
+            return _v4_sparse_native_path(
+                q=q, k_cache=k_cache, indices=indices,
+                topk_length=topk_length, attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices_in_kvcache,
+                extra_topk_length=extra_topk_length,
+                head_dim_v=head_dim_v, softmax_scale=softmax_scale,
+                output=output,
+                compress_ratio=compress_ratio,
+                max_window_size=max_window_size, com_topk=com_topk,
             )
-            # ---- 2D view of caches: (NB, BS, 1, D) -> (NB*BS, D) ----
-            _win_kv = k_cache.reshape(-1, k_cache.shape[-1])
-            _com_kv = (
-                extra_k_cache.reshape(-1, extra_k_cache.shape[-1])
-                if extra_k_cache is not None
-                else torch.empty(0, dtype=k_cache.dtype, device=q.device)
-            )
-            # ---- 2D view of indices: (B, 1, N) -> (B, N) ----
-            # SGLang pattern: clamp to valid range so kernel never reads OOB
-            # memory; the kernel uses kvseqlen/topk_length to mask invalid
-            # positions out of attention.
-            _win_idx = (
-                indices.squeeze(1) if indices.dim() == 3 else indices
-            ).contiguous().clamp_(min=0, max=_win_kv.shape[0] - 1)
-            _com_idx = (
-                extra_indices_in_kvcache.squeeze(1)
-                if (extra_indices_in_kvcache is not None
-                    and extra_indices_in_kvcache.dim() == 3)
-                else extra_indices_in_kvcache
-            )
-            if _com_idx is not None:
-                _com_idx = _com_idx.contiguous().clamp_(min=0, max=_com_kv.shape[0] - 1)
-            # ---- 2D view of out: (B, 1, H, head_dim_v) -> (B, H, head_dim_v) ----
-            _out2d = output[:, 0, :, :]
-            # ---- qlod: cumulative q-token count, length B+1 ----
-            # seq_q=1 for decode, so qlod = [0, 1, 2, ..., B]
-            _qlod_xpu = torch.arange(
-                _B + 1, dtype=torch.int32, device=q.device
-            )
-            # ---- kvseqlen: per-seq uncompressed kv length ----
-            # Window tokens contribute topk_length positions.
-            # Compressed tokens contribute extra_topk_length * compress_ratio
-            # positions each (per wrapper docstring).
-            if topk_length is not None:
-                _win_len = topk_length[:_B].to(torch.int32)
-                _com_len = extra_topk_length[:_B].to(torch.int32) * int(compress_ratio)
-                _kvseqlen_xpu = (_win_len + _com_len).contiguous()
-            else:
-                _kvseqlen_xpu = torch.full(
-                    (_B,), max_window_size + com_topk,
-                    dtype=torch.int32, device=q.device,
-                )
-            _max_logits = torch.zeros(
-                _B, _H, dtype=torch.float32, device=q.device,
-            )
-            _lse = torch.zeros(
-                _B, _H, dtype=torch.float32, device=q.device,
-            )
-            _sink = (
-                attn_sink
-                if isinstance(attn_sink, torch.Tensor)
-                else torch.empty(0, dtype=torch.float32, device=q.device)
-            )
-            # NOTE: qlod_cpu and kvseqlen_cpu must be DISTINCT CPU tensors
-            # (not the same storage as the xpu ones). qlod_cpu=qlod_xpu was
-            # the root cause of the native worker crash -- isolation test
-            # variant B proved it. .cpu() forces a host-side copy.
-            _qlod_cpu = _qlod_xpu.cpu()
-            _kvseqlen_cpu = _kvseqlen_xpu.cpu()
-
-            kunlun_ops.hybrid_attention(
-                q=q[:, 0, :, :],
-                win_kv_cache=_win_kv,
-                win_indices=_win_idx,
-                com_kv_cache=_com_kv,
-                com_indices=_com_idx if _com_idx is not None
-                             else torch.empty(
-                                 0, dtype=_win_idx.dtype, device=q.device),
-                o=_out2d,
-                max_logits=_max_logits,
-                lse=_lse,
-                qlod_cpu=_qlod_cpu,
-                qlod_xpu=_qlod_xpu,
-                kvseqlen_cpu=_kvseqlen_cpu,
-                kvseqlen_xpu=_kvseqlen_xpu,
-                sm_scale=float(softmax_scale),
-                is_causal=bool(causal),
-                max_window_size=int(max_window_size),
-                compress_ratio=int(compress_ratio),
-                com_topk=int(com_topk) if _com_idx is not None else 0,
-                attn_sink=_sink,
-                side_stream=-1,
-                use_xfa_boost=False,
-            )
-            return output, _max_logits
         except Exception as _e:
             if not getattr(flash_mla_with_kvcache, "_native_warned", False):
                 logger.warning(
-                    "[DSv4-NATIVE-ATTN] hybrid_attention failed, "
+                    "[DSv4-NATIVE-ATTN] fwd_kvcache_mla path failed, "
                     "falling back to torch: %s: %s",
                     type(_e).__name__, _e,
                 )

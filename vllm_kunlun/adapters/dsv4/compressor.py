@@ -325,6 +325,14 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
                          rms_norm_eps):
         if not native_available:
             return None
+        # Skip native compressor under cudagraph FULL capture: the underlying
+        # fused_kv_compress_gather .xpu kernel returns ret=2 inside a capture
+        # stream (verified on Kunlun XPU; see /root/serve_full.log). Caller
+        # falls back to the torch reference path which IS capture-safe
+        # (pure-torch index_select / masked_paged_write, all device-only).
+        _capturing = getattr(torch.cuda, "is_current_stream_capturing", lambda: False)()
+        if _capturing:
+            return None
         try:
             selected_positions = all_positions.index_select(0, sel)
             selected_slots = all_slots.index_select(0, sel)
