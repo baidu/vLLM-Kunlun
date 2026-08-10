@@ -160,23 +160,23 @@ def causal_conv1d_update(
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    # Per-slot basic indexing: advanced indexing on the paged conv cache copies
-    # the whole cache on XPU (see fused_recurrent_kda_packed_decode).
-    slots = conv_state_indices[: x.shape[0]].tolist()
+    # Vectorised on purpose: `.tolist()` plus python-int row indexing bakes the
+    # capture-time slots into a cuda graph, so every replay would read and write
+    # the wrong conv-state rows (and since the capture dummy run passes all-`-1`
+    # indices the loop body would not be recorded at all, leaving `y`
+    # uninitialised). `index_select`/`index_copy_` keep it a gather/scatter over
+    # a device tensor, which replay re-executes against the refreshed indices.
+    # Padded lanes carry -1; send them to slot 0, vLLM's reserved null block
+    # (block_pool.py reserves the first block, so no request owns slot 0).
+    slots = conv_state_indices[: x.shape[0]].to(torch.long).clamp_min(0)
     w = weight.float()
     b = None if bias is None else bias.float()
-    y = torch.empty_like(x, dtype=torch.float32)
-    for i, slot in enumerate(slots):
-        if slot < 0:
-            continue
-        window = torch.cat(
-            [conv_state[slot].float(), x[i].unsqueeze(-1).float()], dim=-1
-        )  # [dim, width]
-        row = (window * w).sum(-1)
-        if b is not None:
-            row = row + b
-        y[i] = row
-        conv_state[slot] = window[:, 1:].to(conv_state.dtype)
+    state = conv_state.index_select(0, slots).float()  # [tokens, dim, state_len]
+    window = torch.cat([state, x.unsqueeze(-1).float()], dim=-1)  # [tokens, dim, width]
+    y = (window * w).sum(-1)
+    if b is not None:
+        y = y + b
+    conv_state.index_copy_(0, slots, window[:, :, 1:].to(conv_state.dtype))
     if activation is not None:
         y = F.silu(y)
 

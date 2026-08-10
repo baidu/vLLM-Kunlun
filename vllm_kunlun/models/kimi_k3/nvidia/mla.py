@@ -487,13 +487,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         ).to(cache.dtype)
         flat_cache = cache.reshape(-1, latent.shape[-1])
         slots = slot_mapping[:num_tokens].to(torch.long)
-        # Padded / profile-run tokens carry slot -1; drop them before scatter.
-        if bool((slots < 0).any()):
-            keep = slots >= 0
-            slots = slots[keep]
-            latent = latent[keep]
-        if slots.numel() == 0:
-            return
+        # Padded / profile-run tokens carry slot -1 (``PAD_SLOT_ID``). Filtering
+        # them out with a boolean mask makes both the branch and the tensor
+        # shapes depend on device values, which a captured cuda graph freezes at
+        # capture time: the dummy run passes all -1, so the scatter below would
+        # never be recorded and every replay would leave the latent cache stale
+        # (decode then attends over an unwritten cache and emits garbage).
+        # Redirect them to slot 0 instead -- block 0 is vLLM's reserved null
+        # block (``NULL_BLOCK_ID``, see v1/core/block_pool.py), so nothing real
+        # reads it -- and keep the shapes static.
+        slots = slots.clamp_min(0)
         flat_cache.index_copy_(0, slots, latent)
 
     # ------------------------------------------------------------------
