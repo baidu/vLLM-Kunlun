@@ -254,9 +254,12 @@ def flash_mla_with_kvcache(
                 else torch.empty(0, dtype=k_cache.dtype, device=q.device)
             )
             # ---- 2D view of indices: (B, 1, N) -> (B, N) ----
+            # SGLang pattern: clamp to valid range so kernel never reads OOB
+            # memory; the kernel uses kvseqlen/topk_length to mask invalid
+            # positions out of attention.
             _win_idx = (
                 indices.squeeze(1) if indices.dim() == 3 else indices
-            ).contiguous()
+            ).contiguous().clamp_(min=0, max=_win_kv.shape[0] - 1)
             _com_idx = (
                 extra_indices_in_kvcache.squeeze(1)
                 if (extra_indices_in_kvcache is not None
@@ -264,7 +267,7 @@ def flash_mla_with_kvcache(
                 else extra_indices_in_kvcache
             )
             if _com_idx is not None:
-                _com_idx = _com_idx.contiguous()
+                _com_idx = _com_idx.contiguous().clamp_(min=0, max=_com_kv.shape[0] - 1)
             # ---- 2D view of out: (B, 1, H, head_dim_v) -> (B, H, head_dim_v) ----
             _out2d = output[:, 0, :, :]
             # ---- qlod: cumulative q-token count, length B+1 ----
@@ -272,17 +275,19 @@ def flash_mla_with_kvcache(
             _qlod_xpu = torch.arange(
                 _B + 1, dtype=torch.int32, device=q.device
             )
-            # ---- kvseqlen: per-seq kv length ----
-            # Caller passes cache_seqlens=None on the sparse decode path.
-            # Use topk_length[:B] as an upper bound (gathered tokens < total seq).
-            _kvseqlen_xpu = (
-                topk_length[:_B].to(torch.int32).contiguous()
-                if topk_length is not None
-                else torch.full(
+            # ---- kvseqlen: per-seq uncompressed kv length ----
+            # Window tokens contribute topk_length positions.
+            # Compressed tokens contribute extra_topk_length * compress_ratio
+            # positions each (per wrapper docstring).
+            if topk_length is not None:
+                _win_len = topk_length[:_B].to(torch.int32)
+                _com_len = extra_topk_length[:_B].to(torch.int32) * int(compress_ratio)
+                _kvseqlen_xpu = (_win_len + _com_len).contiguous()
+            else:
+                _kvseqlen_xpu = torch.full(
                     (_B,), max_window_size + com_topk,
                     dtype=torch.int32, device=q.device,
                 )
-            )
             _max_logits = torch.zeros(
                 _B, _H, dtype=torch.float32, device=q.device,
             )
