@@ -295,10 +295,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx = None
             spec_state_indices_tensor = None
             spec_conv_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
-            non_spec_state_indices_tensor_cpu = (
-                block_table_tensor[:, 0] if block_table_tensor is not None else None
-            )
+            # ``[:, 0]`` is a strided column view (typically stride 4 in MTP
+            # align mode). Kunlun causal-conv consumes this tensor as a raw
+            # contiguous int32 array, so materialize it once here. Without
+            # this, logical indices [45, 61] are read as physical neighbors
+            # [45, 46] by the batched state-scatter path.
+            non_spec_state_indices_tensor = block_table_tensor[:, 0].contiguous()
+            non_spec_state_indices_tensor_cpu = non_spec_state_indices_tensor
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -388,12 +391,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 non_spec_state_indices_tensor = block_table_tensor[
                     ~spec_sequence_masks_cpu, 0
-                ]
-                non_spec_state_indices_tensor_cpu = (
-                    block_table_tensor[~spec_sequence_masks_cpu, 0]
-                    if block_table_tensor is not None
-                    else None
-                )
+                ].contiguous()
+                non_spec_state_indices_tensor_cpu = non_spec_state_indices_tensor
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,

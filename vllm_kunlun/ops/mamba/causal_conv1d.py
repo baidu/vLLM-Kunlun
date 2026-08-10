@@ -24,6 +24,14 @@ def causal_conv1d_fn(
 ):
     if not x.is_contiguous():
         x = x.contiguous()
+    # kunlun_ops accepts raw host/device pointers for the metadata arrays and
+    # currently assumes unit stride. In MTP align mode, selecting the first
+    # column of a multi-column block table produces a non-contiguous view such
+    # as logical [45, 61] backed by physical [45, 46, ..., 61, ...].
+    if cache_indices is not None and not cache_indices.is_contiguous():
+        cache_indices = cache_indices.contiguous()
+    if cache_indices_cpu is not None and not cache_indices_cpu.is_contiguous():
+        cache_indices_cpu = cache_indices_cpu.contiguous()
 
     out = torch.empty_like(x)
 
