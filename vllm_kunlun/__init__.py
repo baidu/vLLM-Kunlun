@@ -845,6 +845,84 @@ _register_post_import_hook(
 )
 
 
+# === DSv4 FULL cudagraph: raise attention-backend cudagraph support to ALWAYS ===
+#
+# WHY. `init_attn_backend()` (vllm/v1/worker/gpu/attn_utils.py) takes the MINIMUM
+# `get_cudagraph_support()` over every metadata builder in the forward pass, and
+# `CompilationConfig.resolve_cudagraph_mode_and_sizes()` demotes
+# `cudagraph_mode=FULL` -> `FULL_DECODE_ONLY` whenever that minimum is not ALWAYS.
+# All four builders DSv4 uses advertise UNIFORM_BATCH, so FULL is silently demoted.
+#
+# WHAT. Behind `KUNLUN_DSV4_FORCE_FULL_CG=1`, raise those four builders to ALWAYS.
+# `_cudagraph_support` is enough for three of them (the base
+# `get_cudagraph_support` just returns it); the indexer builder overrides the
+# method itself (indexer.py:244), so that one needs the method replaced too.
+#
+# SCOPE. Off by default. When on, only the four DSv4 builder classes below are
+# touched -- no other model's backend changes, and no vllm source file is edited.
+
+_V4_FULL_CG_BUILDERS: tuple[tuple[str, str, bool], ...] = (
+    # (module, class, also_override_get_cudagraph_support_method)
+    ("vllm.v1.attention.backends.mla.indexer", "DeepseekV32IndexerMetadataBuilder", True),
+    ("vllm.models.deepseek_v4.sparse_mla", "DeepseekV4FlashMLAMetadataBuilder", False),
+    ("vllm.v1.attention.backends.mla.sparse_swa", "DeepseekSparseSWAMetadataBuilder", False),
+    (
+        "vllm_kunlun.v1.attention.backends.mla.flashmla_sparse",
+        "FlashMLASparseMetadataBuilder",
+        False,
+    ),
+)
+
+
+def _v4_full_cg_enabled() -> bool:
+    return os.environ.get("KUNLUN_DSV4_FORCE_FULL_CG", "0") in ("1", "true", "True", "yes")
+
+
+def _v4_full_cg_applied(mod):
+    # Always re-run: the hook fires on several modules and each call patches only
+    # the classes that are already importable, so later calls pick up the rest.
+    return False
+
+
+def _v4_full_cg_apply(mod):
+    if not _v4_full_cg_enabled():
+        return
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    patched = []
+    for mod_name, cls_name, override_method in _V4_FULL_CG_BUILDERS:
+        target_mod = sys.modules.get(mod_name)
+        if target_mod is None:
+            continue
+        cls = getattr(target_mod, cls_name, None)
+        if cls is None or getattr(cls, "_kunlun_full_cg_patched", False):
+            continue
+        cls._cudagraph_support = AttentionCGSupport.ALWAYS
+        if override_method:
+            cls.get_cudagraph_support = classmethod(
+                lambda cls, vllm_config, kv_cache_spec: AttentionCGSupport.ALWAYS
+            )
+        cls._kunlun_full_cg_patched = True
+        patched.append(cls_name)
+
+    if patched:
+        logging.getLogger("vllm_kunlun").info(
+            "[KunlunPlugin] KUNLUN_DSV4_FORCE_FULL_CG=1: cudagraph_support -> ALWAYS for %s",
+            ", ".join(patched),
+        )
+
+
+for _full_cg_target in (
+    "vllm.models.deepseek_v4.sparse_mla",
+    "vllm.v1.attention.backends.mla.sparse_swa",
+    "vllm.v1.worker.gpu.attn_utils",
+):
+    _register_post_import_hook(
+        _full_cg_target,
+        _v4_full_cg_applied,
+        _v4_full_cg_apply,
+    )
+
 
 def _v4_attention_mm_dtype_applied(mod):
     return getattr(mod, "_kunlun_mm_dtype_library", None) is not None
