@@ -13,7 +13,9 @@ channel (``g`` is ``[B, T, H, head_dim]``).
 
 Each function below replaces exactly one kernel entry point and keeps its
 signature, so ``KimiK3DeltaAttention._forward`` and its prefill/decode split,
-cache bookkeeping and spec-decode handling all run unchanged.
+cache bookkeeping and spec-decode handling all run unchanged. Where a native XPU
+kernel exists the replacement forwards to it (``xspeedgate_ops.l2norm_fwd``,
+``xspeedgate_ops.fused_recurrent_kda_packed_decode``) instead of using torch.
 
 Recurrence ported from
 ``vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py``:
@@ -54,9 +56,14 @@ def kda_gate(
     return -a * softplus
 
 
-def _l2norm_scaled(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    x = x.float()
-    return x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + 1e-6) * scale
+def l2norm_fwd(x: torch.Tensor) -> torch.Tensor:
+    """L2-normalise ``[B, T, H, D]`` along the last dim, same as upstream.
+
+    ``xspeedgate_ops.l2norm_fwd`` computes ``x / sqrt(sum(x^2) + 1e-6)`` (eps is
+    fixed in the wrapper) and requires a contiguous 4-D fp32 input; it flattens
+    the leading dims into a row count.
+    """
+    return torch.ops.xspeedgate_ops.l2norm_fwd(x.float().contiguous())
 
 
 def _delta_rule_scan(
@@ -206,7 +213,7 @@ def gather_initial_states(
     return out
 
 
-def chunk_kda_with_fused_gate(
+def chunk_kda_with_fused_gate_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -214,28 +221,20 @@ def chunk_kda_with_fused_gate(
     raw_beta: torch.Tensor,
     A_log: torch.Tensor,
     g_bias: torch.Tensor | None,
-    scale: float | None = None,
-    initial_state: torch.Tensor | None = None,
-    output_final_state: bool = False,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
     lower_bound: float | None = None,
-    use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
-    **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """KDA prefill: sequential scan instead of the chunked triton kernels.
+    """Sequential scan standing in for the chunked KDA prefill kernels.
 
     ``initial_state`` is the dense per-request state ``[N, H, V, K]`` produced by
     ``gather_initial_states``; the per-request final states are returned rather
     than written into the paged cache (the caller does that).
     """
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
-    if use_qk_l2norm_in_kernel:
-        qf = _l2norm_scaled(q[0], scale)
-        kf = _l2norm_scaled(k[0])
-    else:
-        qf = q[0].float() * scale
-        kf = k[0].float()
+    qf = q[0].float() * scale
+    kf = k[0].float()
     vf = v[0].float()
     decay = kda_gate(raw_g, A_log, g_bias, lower_bound)[0].exp()
     beta = torch.sigmoid(raw_beta[0].float())
@@ -261,6 +260,49 @@ def chunk_kda_with_fused_gate(
         )
     final_state = states.to(state_dtype) if output_final_state else None
     return out.unsqueeze(0).to(v.dtype), final_state
+
+
+def chunk_kda_with_fused_gate(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    lower_bound: float | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run chunk KDA from raw gate and beta projections."""
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    o, final_state = chunk_kda_with_fused_gate_fwd(
+        q=q,
+        k=k,
+        v=v.contiguous(),
+        raw_g=raw_g.contiguous(),
+        raw_beta=raw_beta,
+        A_log=A_log,
+        g_bias=g_bias,
+        scale=scale,
+        initial_state=initial_state.contiguous()
+        if initial_state is not None
+        else None,
+        output_final_state=output_final_state,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+    )
+    return o, final_state
 
 
 def fused_recurrent_kda_packed_decode(
@@ -311,8 +353,8 @@ def fused_recurrent_kda(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """KDA multi-query (spec decode) recurrence over the paged state cache."""
     scale = k.shape[-1] ** -0.5
-    qf = _l2norm_scaled(q[0], scale)
-    kf = _l2norm_scaled(k[0])
+    qf = l2norm_fwd(q)[0] * scale
+    kf = l2norm_fwd(k)[0]
     vf = v[0].float()
     decay = kda_gate(raw_g, A_log, dt_bias, lower_bound)[0].exp()
     beta = torch.sigmoid(raw_beta[0].float())
