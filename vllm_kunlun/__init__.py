@@ -217,6 +217,31 @@ _register_post_import_hook(
 )
 
 
+# --- hook 4c: SiluAndMul / SituAndMul forward_native --------------------
+# Kimi-K3 and other models instantiate upstream SiluAndMul / SituAndMul
+# directly, so the class methods must be patched at their definition site
+# rather than relying on a `from vllm_kunlun.ops.activation import ...`
+# side-effect. Import the kunlun module once the upstream one is loaded;
+# it applies the monkey-patch idempotently.
+def _activation_applied(mod):
+    silu = getattr(mod, "SiluAndMul", None)
+    situ = getattr(mod, "SituAndMul", None)
+    silu_ok = silu is None or getattr(silu, "_kunlun_silu_and_mul_patched", False)
+    situ_ok = situ is None or getattr(situ, "_kunlun_situ_and_mul_patched", False)
+    return silu_ok and situ_ok
+
+
+def _activation_apply(mod):
+    import vllm_kunlun.ops.activation 
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.activation",
+    _activation_applied,
+    _activation_apply,
+)
+
+
 # --- hook 5: Worker._maybe_get_memory_pool_context -----------------------
 # vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
 # is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
