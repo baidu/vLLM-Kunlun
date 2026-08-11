@@ -46,8 +46,19 @@ _static_qlod_cpu_cache: dict = {}
 _static_kvseqlen_cpu_cache: dict = {}
 
 
-def _get_static_cpu_lod(xpu_lod, cache):
-    """Return pre-allocated CPU lod; update from xpu only if NOT capturing."""
+def _get_static_cpu_lod(xpu_lod, cache, bound=None):
+    """Return pre-allocated CPU lod; update from xpu only if NOT capturing.
+
+    `bound` is a static upper bound on the per-seq kv length (the topk width).
+    During capture the D2H refresh is illegal, and whatever the warmup left
+    behind (all zeros) would be frozen into the graph as the host-side length
+    hint that xops_decoder_dsa_attention_block uses to size its schedule. So
+    when capturing we write the upper bound instead -- a plain host memset,
+    legal inside capture, and safe because the per-row bounds the kernel
+    actually honours come from the xpu lod (refreshed on every replay); the
+    cpu copy is only a scheduling hint. Evidence: with the hint pinned at 0 the
+    output is still bit-correct, so it cannot be the loop bound.
+    """
     key = (xpu_lod.shape[0], xpu_lod.numel(), xpu_lod.dtype)
     if key not in cache:
         cache[key] = torch.empty(
@@ -55,9 +66,12 @@ def _get_static_cpu_lod(xpu_lod, cache):
             device='cpu', pin_memory=True,
         )
     static = cache[key]
-    if not torch.cuda.is_current_stream_capturing():
+    _cap = torch.cuda.is_current_stream_capturing()
+    if not _cap:
         # D2H sync -- OK outside capture (warmup, decode non-capture path)
         static.copy_(xpu_lod)
+    elif bound is not None:
+        static.fill_(int(bound))
     return static
 
 
@@ -108,17 +122,72 @@ _static_kvlod_swa_cpu_cache: dict = {}
 _static_kvlod_com_xpu_cache: dict = {}
 _static_kvlod_com_cpu_cache: dict = {}
 
-# Pre-allocated int32 [B, 1, topk] clamped-index buffers. The native fwd_kvcache_mla
-# kernel attends to ALL topk slots in every row (no per-token length mask), so we
-# pre-fill positions j >= topk_length[i] with src[i, 0, topk_length[i]-1] (the last
-# valid slot for that row). This bounds the bias to "attend to one extra real slot"
-# instead of attending to garbage OOB.
+# Pre-allocated int32 [B, 1, topk] clamped-index buffers.
+#
+# CORRECTION (Step T, docs/stepT_kernel.py): the earlier claim here -- that
+# fwd_kvcache_mla attends ALL topk slots in every row -- is WRONG.  `kv_lod`
+# IS a per-row mask: with identical q/cache/indices, p_sums = 1.987 at
+# kv_lod=2 vs 3.923 at kv_lod=4, and lod=2 is NOT equal to feeding
+# clamp-filled indices at lod=4.  So slots j >= topk_length[i] are never
+# read and this pre-fill is belt-and-braces only: it keeps the buffer free
+# of the -1 padding that the kernel would treat as an OOB row index.
 _static_clamped_swa_idx_cache: dict = {}
 _static_clamped_com_idx_cache: dict = {}
 
 # Pre-allocated output buffers for kunlun_flash_mla_with_kvcache (V4 production decode).
 # Same shape -> same tensor -> stable data_ptr across cudagraph FULL replays.
 _kunlun_mla_out_cache: dict = {}
+
+# Pre-allocated contiguous [rows, D] staging buffers for the kv-cache.
+#
+# WHY. The production kv-cache view is [NB, BS, 1, D] whose block pitch is larger
+# than BS*D (each layer is a column slice of a shared pool), so
+# `k_cache.reshape(-1, D)` MATERIALISES a copy -- 1.80 GiB for the SWA cache at
+# NB=29515. Outside capture the caching allocator recycles that block; during
+# cudagraph capture the allocation is served from the graph private pool, which
+# cannot reuse it, and FULL capture died with `OutOfMemoryError: Tried to
+# allocate 1.80 GiB ... 5.80 GiB allocated in private pools`.
+#
+# WHY NOT SOMETHING CHEAPER (measured at production shapes):
+#   reshape(-1, D)                   2.079 ms   <- allocates
+#   static.copy_(cache_4d)           2.077 ms   <- allocates nothing
+#   gather only the ~32 MiB of rows
+#   the kernel reads, then arange
+#   indices                          2.188 ms + kernel 0.230 ms
+# The bulk copy already runs at full HBM bandwidth; the strided advanced-index
+# gather does not (~0.9 GB/s), so materialising less is not faster. And
+# `fwd_kvcache_mla` ignores `kv_cache` strides (verified: a strided view is
+# accepted but silently read as if contiguous), so the copy cannot be skipped
+# by passing the paged view. Hence: keep the copy, move only its ALLOCATION out
+# of the graph. Eliminating it needs a kernel that takes the paged layout.
+_static_flat_cache: dict = {}
+
+
+def _flatten_cache_static(cache_4d: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous [rows, D] view of a [NB, BS, 1, D] kv-cache.
+
+    Free when `cache_4d` is contiguous. Otherwise copies into a persistent
+    buffer, so nothing is allocated while a graph is being captured. The copy_
+    is recorded in the graph and reads `cache_4d` at replay time, so the
+    staging buffer holds fresh tokens on every step.
+    """
+    last = cache_4d.shape[-1]
+    rows = cache_4d.numel() // last
+    if cache_4d.is_contiguous():
+        return cache_4d.view(rows, last)
+    key = (rows, last, cache_4d.dtype, cache_4d.device.index)
+    buf = _static_flat_cache.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "[DSv4-NATIVE-ATTN] no kv-cache staging buffer for shape "
+                f"{tuple(cache_4d.shape)}; it must be allocated before capture"
+            )
+        buf = torch.empty(rows, last, dtype=cache_4d.dtype,
+                          device=cache_4d.device)
+        _static_flat_cache[key] = buf
+    buf.view(cache_4d.shape).copy_(cache_4d)
+    return buf
 
 
 def _get_kunlun_mla_output_buffers(
@@ -267,12 +336,16 @@ def _v4_sparse_native_path(
     assert _S == 1, f"V4 decode-only path; got seq_q={_S}"
     KV_LORA = head_dim_v  # 512
 
-    # ---- SWA cache as flat [NB_swa*BS_swa, D] (view, no copy) ----
-    flat_swa = k_cache.reshape(-1, _D)
+    # ---- SWA cache as flat [NB_swa*BS_swa, D] (static staging buffer; the
+    # production view is strided, so this is a copy -- see _flatten_cache_static
+    # for why the copy is unavoidable and why it must not allocate here) ----
+    flat_swa = _flatten_cache_static(k_cache)
     swa_size = flat_swa.shape[0]
     kv_lod_swa_xpu = _build_static_per_seq_lens(
         topk_length[:_B], _static_kvlod_swa_xpu_cache)
-    kv_lod_swa_cpu = _get_static_cpu_lod(kv_lod_swa_xpu, _static_kvlod_swa_cpu_cache)
+    kv_lod_swa_cpu = _get_static_cpu_lod(
+        kv_lod_swa_xpu, _static_kvlod_swa_cpu_cache,
+        bound=indices.shape[-1])
 
     swa_idx_2d = indices.squeeze(1) if indices.dim() == 3 else indices
     if not swa_idx_2d.is_contiguous():
@@ -306,12 +379,13 @@ def _v4_sparse_native_path(
         out_merged = out_swa
         lse_merged_e = lse_swa_e
     else:
-        flat_com = extra_k_cache.reshape(-1, _D)
+        flat_com = _flatten_cache_static(extra_k_cache)
         com_size = flat_com.shape[0]
         kv_lod_com_xpu = _build_static_per_seq_lens(
             extra_topk_length[:_B], _static_kvlod_com_xpu_cache)
         kv_lod_com_cpu = _get_static_cpu_lod(
-            kv_lod_com_xpu, _static_kvlod_com_cpu_cache)
+            kv_lod_com_xpu, _static_kvlod_com_cpu_cache,
+            bound=extra_indices_in_kvcache.shape[-1])
         com_idx_2d = (extra_indices_in_kvcache.squeeze(1)
                       if extra_indices_in_kvcache.dim() == 3
                       else extra_indices_in_kvcache)
@@ -336,6 +410,38 @@ def _v4_sparse_native_path(
             **_zero_rope_side_channel(q, com_size, KV_LORA),
         )
         lse_com_e = torch.log(ps_com.clamp_min(1e-30)) + ml_com
+
+        # ---- The case this two-call+merge decomposition does not express ----
+        # The op this path replaced (`kunlun_ops.hybrid_attention`) took BOTH
+        # `topk_length` and `extra_topk_length` into ONE kernel, so a row with no
+        # compressed slots was handled inside the kernel and degenerated to
+        # SWA-only by construction.  Splitting into two `fwd_kvcache_mla` calls
+        # plus `attention_merge_stage` loses that: the merge has no notion of "this
+        # branch is empty for this row", and `extra_topk_length[i] == 0` happens for
+        # every row whose context is shorter than that layer's compress_ratio
+        # (config compress_ratios alternate 4 / 128).
+        #
+        # So state it explicitly, from the METADATA rather than from the kernel's
+        # output: an empty branch contributes a zero payload at a log-weight of
+        # -inf, which the merge turns into exactly the SWA-only answer
+        # (docs/stepS_fix.py: torch.equal(v_merged, v_a) is True, s_merged == s_a).
+        # `-1e30` is the finite stand-in for -inf: exp() of it underflows to 0
+        # while keeping every value the merge sees finite.
+        #
+        # Not done by scrubbing NaN: the kernel's kv_lod==0 output happens to be
+        # out=NaN / max_logits=-1e12 / p_sums=0 (docs/stepT_kernel.py), but that is
+        # undocumented behaviour, and masking NaN would also silently swallow a
+        # NaN arriving for any other reason.  The condition that is actually
+        # meaningful is `extra_topk_length == 0`.
+        _com_empty = (extra_topk_length[:_B] == 0).view(_B, 1, 1)   # [B,1,1]
+        out_com = torch.where(_com_empty.unsqueeze(-1),
+                              torch.zeros((), dtype=out_com.dtype,
+                                          device=out_com.device),
+                              out_com)
+        lse_com_e = torch.where(_com_empty, torch.full((), -1e30,
+                                                       dtype=lse_com_e.dtype,
+                                                       device=lse_com_e.device),
+                                lse_com_e)
 
         # attention_merge_stage expects 3-D (tokens, heads, dim) and operates on
         # natural-log LSE (s_a, s_b in natural log units; s_merged also natural).
@@ -460,6 +566,15 @@ def flash_mla_with_kvcache(
                 max_window_size=max_window_size, com_topk=com_topk,
             )
         except Exception as _e:
+            # C5 -- no silent fallback during capture. The code below this
+            # `except` is the torch loop path, which is capture-unsafe: if it
+            # were recorded we would get a graph that is wrong AND silent.
+            # The diagnostic `int(tensor.min())` reads are themselves illegal
+            # during capture (on Kunlun they return garbage instead of raising:
+            # a real capture-time failure printed
+            # `idx min/max=1016332288/1016332288`), so they must not run either.
+            if torch.cuda.is_current_stream_capturing():
+                raise
             if not getattr(flash_mla_with_kvcache, "_native_warned", False):
                 def _d(t):
                     if not isinstance(t, torch.Tensor):
