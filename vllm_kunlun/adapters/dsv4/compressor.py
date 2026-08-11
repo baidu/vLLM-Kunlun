@@ -18,6 +18,8 @@ dispatchers while probing available XSpeedGate kernels so the hot path can use
 import logging
 from typing import List
 
+import os
+
 import torch
 
 from ..runtime_utils import WarningOnce
@@ -308,6 +310,15 @@ def _find_xsg_compress_ops(native_allowed: bool):
     return False, [], sources
 
 
+_NATIVE_OFF = os.environ.get("KUNLUN_DSV4_COMPRESS_NATIVE", "1") != "1"
+# With both native kernel modules loaded before capture (`_warm_native_once`),
+# the native compressor is usable inside a capture and the old "always fall back
+# to torch while capturing" gate is not needed. KUNLUN_DSV4_COMPRESS_WARMUP=0
+# restores that gate, i.e. the pre-warmup behaviour, exactly.
+_WARMUP_ON = os.environ.get("KUNLUN_DSV4_COMPRESS_WARMUP", "1") != "0"
+_WARMED: set = set()
+
+
 def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
     fn_name = "compress_norm_rope_store_triton"
     mod_attr = f"{fn_name}{_COMPRESSED_FN_ATTR}"
@@ -323,15 +334,16 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
                          block_table, block_size, state_width, cos_sin_cache, head_dim,
                          rope_head_dim, compress_ratio, overlap, rms_norm_weight,
                          rms_norm_eps):
-        if not native_available:
+        if not native_available or _NATIVE_OFF:
             return None
-        # Skip native compressor under cudagraph FULL capture: the underlying
-        # fused_kv_compress_gather .xpu kernel returns ret=2 inside a capture
-        # stream (verified on Kunlun XPU; see /root/serve_full.log). Caller
-        # falls back to the torch reference path which IS capture-safe
-        # (pure-torch index_select / masked_paged_write, all device-only).
+        # Capture gate, only meaningful when the warmup above is disabled: a
+        # native kernel whose module has never been loaded returns ret=2 when
+        # first launched inside a capture stream, which puts the device into an
+        # error state that the try/except below cannot recover from (the next
+        # pure-torch index_select and capture_end() both then raise
+        # "unrecognized error code") and engine-core init dies.
         _capturing = getattr(torch.cuda, "is_current_stream_capturing", lambda: False)()
-        if _capturing:
+        if _capturing and not _WARMUP_ON:
             return None
         try:
             selected_positions = all_positions.index_select(0, sel)
@@ -388,6 +400,54 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
                 str(exc),
             )
             return None
+
+    def _warm_native_once(state_cache, token_to_req_indices, all_positions,
+                          all_slots, block_table, block_size, cos_sin_cache,
+                          head_dim, rope_head_dim, state_width, compress_ratio,
+                          overlap, rms_norm_weight, rms_norm_eps):
+        """Launch both native kernels once per geometry, outside any capture.
+
+        A kernel's module is loaded/relocated on its FIRST launch, and that
+        load is illegal inside stream capture on this XPU -- the launch then
+        returns XPU error 2, which surfaces as
+        ``optimized_ops::fused_kv_compress_gather failed ret=2``
+        (probe20: cold capture FAILs, warm capture OKs, one eager call being
+        the only difference).
+
+        The launch here is a guaranteed no-op on the device: the kernel's own
+        prescan drops every token with ``slot_id < 0`` (see
+        infer_kv_compress_pipeline.h:310), so with slot_mapping = -1 it reads
+        neither state_cache nor block_table. Kernel selection depends only on
+        (compress_ratio, overlap, head_size, state_width), and the C++ template
+        is instantiated on the index dtypes, so every tensor here is either the
+        real one or a 1-element tensor cloned from the real one's dtype -- the
+        specialized binary that gets loaded is exactly the one serve needs
+        (C4_H512 / C4_H128 / C128_H512).
+        """
+        if not native_available or _NATIVE_OFF or not _WARMUP_ON:
+            return
+        key = (int(head_dim), int(state_width), int(compress_ratio),
+               int(bool(overlap)))
+        if key in _WARMED:
+            return
+        _WARMED.add(key)
+        dev = state_cache.device
+        req0 = torch.zeros(1, dtype=token_to_req_indices.dtype, device=dev)
+        pos0 = torch.zeros(1, dtype=all_positions.dtype, device=dev)
+        slot_skip = torch.full((1,), -1, dtype=all_slots.dtype, device=dev)
+        scratch = torch.zeros((1, head_dim), dtype=torch.float32, device=dev)
+        gather_op(state_cache, req0, pos0, slot_skip, block_table, scratch,
+                  block_size, head_dim, state_width, compress_ratio,
+                  int(bool(overlap)))
+        half_rope = rope_head_dim // 2
+        cs = cos_sin_cache[:1]
+        freqs = (torch.stack((cs[:, :half_rope], cs[:, half_rope:]), dim=-1)
+                 .reshape(1, rope_head_dim).float().contiguous())
+        normrope_op(scratch, rms_norm_weight.float().contiguous(),
+                    torch.zeros(1, dtype=torch.int64, device=dev), freqs,
+                    mode=2, compress_ratio=0, eps=rms_norm_eps)
+        LOGGER.info("[compress-warm] loaded native modules for head=%d "
+                    "state_width=%d ratio=%d overlap=%d", *key)
 
     def _compress_core(
         sel, wv, state_cache, token_to_req_indices, all_positions, all_slots,
@@ -453,10 +513,17 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
             else torch.zeros(window, dtype=torch.long, device=device)
         )
 
-        sc_block_size = state_cache.shape[1]
-        sc_flat = state_cache.reshape(-1, state_cache.shape[-1])
-        flat_sc_idx = (block_numbers * sc_block_size + block_off).reshape(-1)
-        gathered = sc_flat[flat_sc_idx].reshape(T, window, -1)
+        # Strided gather straight out of the paged view. state_cache is a
+        # non-contiguous view into the KV pool (observed in serve:
+        # (17138, 4, 2048) stride (416384, 2048, 1)), so the previous
+        # reshape(-1, last) had to materialise the WHOLE cache (~562 MB) just to
+        # read T*window <= 2048 rows -- O(cache) work per call, 62 calls/step,
+        # and unavoidable under FULL capture because the native path is gated
+        # off there. Two-dim advanced indexing is bit-identical to
+        # sc_flat[bn * block_size + bo] and capture-safe (docs/probe14_*.py).
+        gathered = state_cache[
+            block_numbers.reshape(-1).long(), block_off.reshape(-1).long()
+        ].reshape(T, window, -1)
 
         ho = head_offset.unsqueeze(0).expand(T, -1)
         dim_idx = torch.arange(head_dim, device=device)
@@ -517,6 +584,16 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
             sel = torch.arange(num_actual, device=state_cache.device)
             wv = valid_mask
         else:
+            _warm_native_once(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                all_positions=all_positions, all_slots=all_slots,
+                block_table=block_table, block_size=block_size,
+                cos_sin_cache=cos_sin_cache, head_dim=head_dim,
+                rope_head_dim=rope_head_dim, state_width=state_width,
+                compress_ratio=compress_ratio, overlap=overlap,
+                rms_norm_weight=rms_norm_weight, rms_norm_eps=rms_norm_eps,
+            )
             if not bool(valid_mask.any()):
                 return
             sel = valid_mask.nonzero(as_tuple=True)[0]
