@@ -679,67 +679,41 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         cos_sin_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
     ) -> torch.Tensor:
-        """Fused decode query-concat + latent cache insert, dispatched by cache
-        dtype (same policy as prefill: fp8 cache -> fp8 query)."""
-        # [KUNLUN] fused_mla_decode_q_concat_kv_cache_insert (NV) does, in one
-        # launch: (1) RoPE on q_pe and k_pe, (2) build the decode query
-        # mqa_q = [ql_nope | q_pe], (3) insert the latent [kv_c_normed | k_pe]
-        # into the paged cache at slot_mapping. Only the bf16 path is ported;
-        # the fp8 / fp8_ds_mla branches are left commented for comparison.
-        # if self.kv_cache_dtype == "fp8_ds_mla":
-        #     cache = self.kv_cache
-        #     if cache.dtype != torch.uint8:
-        #         cache = cache.view(torch.uint8)
-        #     return fused_mla_decode_q_concat_kv_cache_insert(
-        #         ql_nope,
-        #         q_pe,
-        #         kv_c_normed,
-        #         k_pe,
-        #         cache,
-        #         slot_mapping,
-        #         ds_mla=True,
-        #         positions=positions,
-        #         cos_sin_cache=cos_sin_cache,
-        #     )
-        # if is_quantized_kv_cache(self.kv_cache_dtype):
-        #     assert self.impl.supports_quant_query_input, (  # type: ignore[attr-defined]
-        #         "Kimi-K3 fp8 KV cache decode requires a backend that accepts an "
-        #         "fp8 (quantized) query input."
-        #     )
-        #     cache = self.kv_cache
-        #     if cache.dtype != torch.float8_e4m3fn:
-        #         cache = cache.view(torch.float8_e4m3fn)
-        #     return fused_mla_decode_q_concat_kv_cache_insert(
-        #         ql_nope,
-        #         q_pe,
-        #         kv_c_normed,
-        #         k_pe,
-        #         cache,
-        #         slot_mapping,
-        #         q_scale_inv=self._q_scale_inv,
-        #         cache_scale_inv=self._k_scale_inv,
-        #         positions=positions,
-        #         cos_sin_cache=cos_sin_cache,
-        #     )
-        # return fused_mla_decode_q_concat_kv_cache_insert(
-        #     ql_nope,
-        #     q_pe,
-        #     kv_c_normed,
-        #     k_pe,
-        #     self.kv_cache,
-        #     slot_mapping,
-        #     positions=positions,
-        #     cos_sin_cache=cos_sin_cache,
-        # )
-        # --- naive begin (bf16 only) ---
-        # (1) RoPE on q_pe / k_pe, (2) build mqa_q = [ql_nope | q_pe],
-        # (3) insert the decode-token latent into the paged cache.
-        del cos_sin_cache  # rotary_emb owns the table in the torch path
-        q_pe, k_pe = self._apply_pe_rope(positions, q_pe, k_pe)
-        mqa_q = torch.cat([ql_nope, q_pe], dim=-1)
-        self._write_latent_cache(kv_c_normed, k_pe, slot_mapping)
+        """Fused decode query-concat + latent cache insert.
+
+        One launch: optional GPT-J RoPE on ``q_pe`` / ``k_pe``, build the decode
+        query ``mqa_q = [ql_nope | q_pe]``, and insert the latent
+        ``[kv_c_normed | k_pe]`` into the paged cache at ``slot_mapping``. The
+        kernel skips negative slots, so padded / profile-run tokens need no
+        filtering here.
+        """
+        if self.kv_cache_dtype == "fp8_ds_mla" or is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ):
+            # The Kunlun kernel's quantized path is symmetric int8, not fp8, and
+            # there is no fp8_ds_mla (656B block-scaled) layout.
+            raise NotImplementedError(
+                "[KUNLUN] fp8 KV cache decode cache-insert not supported"
+            )
+        k_pe = k_pe.reshape(k_pe.shape[0], -1)
+        b, num_heads, kv_lora_rank = ql_nope.shape
+        entry = kv_lora_rank + q_pe.shape[-1]
+        mqa_q = torch.empty(
+            (b, num_heads, entry), dtype=ql_nope.dtype, device=ql_nope.device
+        )
+        torch.ops.xspeedgate_ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert(
+            ql_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            mqa_q,
+            self.kv_cache,
+            slot_mapping,
+            self.kv_cache.shape[1],
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+        )
         return mqa_q
-        # --- naive end ---
 
     def _forward_prefill_fused(
         self,
