@@ -15,18 +15,25 @@
 # This file is a part of the vllm-kunlun project.
 #
 """
-Kunlun-optimized VocabParallelEmbedding using vLLM's CustomOp.register_oot mechanism.
+Kunlun-optimized VocabParallelEmbedding using vLLM's PluggableLayer.register_oot mechanism.
 
 Design:
-- Uses @CustomOp.register_oot to register Kunlun-optimized VocabParallelEmbedding
+- Uses @PluggableLayer.register_oot to register Kunlun-optimized VocabParallelEmbedding
 - This class automatically replaces the default implementation when instantiated
-- Since KunlunPlatform uses _enum=PlatformEnum.OOT, dispatch_forward() selects
-  forward_oot, so we implement forward_oot
 
 OOT Mechanism:
-- When code calls VocabParallelEmbedding(...), vLLM's CustomOp.__new__ checks op_registry_oot
+- When code calls VocabParallelEmbedding(...), vLLM's PluggableLayer.__new__ checks
+  op_registry_oot
 - If "VocabParallelEmbedding" is found in OOT registry, it returns KunlunVocabParallelEmbedding instance
 - This is the official vLLM way to replace operators without modifying source code
+
+NOTE:
+- VocabParallelEmbedding inherits from PluggableLayer, not CustomOp. PluggableLayer
+  has no forward_native/forward_oot dispatch (that mechanism only exists on CustomOp),
+  so the Kunlun-optimized logic must override forward() directly here -- defining
+  forward_oot() (the CustomOp convention) is never called and silently falls back to
+  the base class's forward(), which triggers vLLM's torch.compile'd
+  get_masked_input_and_mask and can fail on Kunlun XPU.
 """
 
 import logging
@@ -34,7 +41,7 @@ import logging
 import torch
 import xspeedgate_ops  # noqa
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 logger = logging.getLogger("vllm_kunlun.ops.vocab_parallel_embedding")
@@ -72,14 +79,15 @@ def get_masked_input_and_mask(
 # =============================================================================
 
 
-@CustomOp.register_oot(name="VocabParallelEmbedding")
+@PluggableLayer.register_oot(name="VocabParallelEmbedding")
 class KunlunVocabParallelEmbedding(VocabParallelEmbedding):
     """
     Kunlun-optimized VocabParallelEmbedding registered via OOT mechanism.
 
     This class replaces the default VocabParallelEmbedding when instantiated through
-    vLLM's CustomOp registry. When code calls VocabParallelEmbedding(...), vLLM's
-    CustomOp.__new__ checks op_registry_oot and returns KunlunVocabParallelEmbedding instance.
+    vLLM's PluggableLayer registry. When code calls VocabParallelEmbedding(...), vLLM's
+    PluggableLayer.__new__ checks op_registry_oot and returns KunlunVocabParallelEmbedding
+    instance.
     """
 
     def __init__(self, *args, **kwargs):
@@ -91,8 +99,14 @@ class KunlunVocabParallelEmbedding(VocabParallelEmbedding):
             )
             _oot_vocab_embedding_init_logged = True
 
-    def forward_oot(self, input_):
-        """Kunlun-optimized forward_oot implementation."""
+    def forward(self, input_):
+        """Kunlun-optimized forward implementation.
+
+        VocabParallelEmbedding derives from PluggableLayer, which has no
+        forward_native/forward_oot dispatch (that mechanism only exists on
+        CustomOp). forward() must be overridden directly, or this
+        implementation is never invoked.
+        """
         if self.tp_size > 1:
             # Build the mask using compiled function
             masked_input, input_mask = get_masked_input_and_mask(
@@ -120,5 +134,5 @@ class KunlunVocabParallelEmbedding(VocabParallelEmbedding):
 
 # Log that OOT registration is complete
 logger.info(
-    "[KunlunOOT] Registered KunlunVocabParallelEmbedding via CustomOp.register_oot"
+    "[KunlunOOT] Registered KunlunVocabParallelEmbedding via PluggableLayer.register_oot"
 )
