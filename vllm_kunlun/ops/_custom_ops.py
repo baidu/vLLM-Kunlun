@@ -3009,3 +3009,34 @@ def _fake_lora_matmul_inplace(
 
 
 lora_matmul_inplace.register_fake(_fake_lora_matmul_inplace)
+
+
+# ``_C_cache_ops::gather_and_maybe_dequant_cache`` gathers a prefill's paged
+# context KV into a contiguous workspace; upstream reaches it from
+# ``MLACommonImpl._compute_prefill_context`` via ``vllm/_custom_ops.py``.
+# Upstream passes ``token_to_seq`` and ``num_tokens``, which the Kunlun kernel
+# derives itself from ``cu_seq_lens`` (binary search for the seq index,
+# ``cu_seq_lens[-1]`` for the token count), so they are accepted for signature
+# compatibility and dropped. The index math is identical on both sides.
+@custom_op("_C_cache_ops::gather_and_maybe_dequant_cache", mutates_args=())
+def gather_and_maybe_dequant_cache(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    num_tokens: int,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+    seq_starts: Optional[torch.Tensor] = None,
+) -> None:
+    torch.ops.xspeedgate_ops.gather_and_maybe_dequant_cache(
+        src_cache=src_cache,
+        dst=dst,
+        block_table=block_table,
+        cu_seq_lens=cu_seq_lens,
+        batch_size=block_table.size(0),
+        kv_cache_dtype=kv_cache_dtype,
+        scale=scale,
+        seq_starts=seq_starts,
+    )
