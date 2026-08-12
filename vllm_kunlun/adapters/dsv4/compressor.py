@@ -198,6 +198,11 @@ def _install_save_partial_states(sps_module: object) -> None:
         block_size, state_width, compress_ratio, pdl_kwargs=None,
     ):
         del pdl_kwargs
+        global _c4_stashed_kv_score, _c4_stashed_ape
+        if _C4_FUSED_ENABLED and compress_ratio == 4:
+            _c4_stashed_kv_score = torch.cat([kv, score], dim=-1)
+            _c4_stashed_ape = ape
+            return
         if sps_native is not None:
             try:
                 sps_native(
@@ -317,6 +322,153 @@ _NATIVE_OFF = os.environ.get("KUNLUN_DSV4_COMPRESS_NATIVE", "1") != "1"
 # restores that gate, i.e. the pre-warmup behaviour, exactly.
 _WARMUP_ON = os.environ.get("KUNLUN_DSV4_COMPRESS_WARMUP", "1") != "0"
 _WARMED: set = set()
+
+# ---------------------------------------------------------------------------
+# flash_compress_4_decode fused path (write + compress in one kernel)
+# ---------------------------------------------------------------------------
+_C4_FUSED_ENABLED = os.environ.get("KUNLUN_DSV4_C4_FUSED", "0") == "1"
+_c4_fused_op: object = _FALSE
+_c4_fused_warned_key = "dsv4-c4-fused-failed-once"
+_c4_stashed_kv_score: object = None
+_c4_stashed_ape: object = None
+
+
+def _find_c4_fused_op():
+    global _c4_fused_op
+    if _c4_fused_op is not _FALSE:
+        return _c4_fused_op
+    handle = None
+    src = "unavailable"
+    try:
+        kunlun_module = __import__("kunlun_ops", fromlist=["flash_compress_4_decode"])
+        candidate = getattr(kunlun_module, "flash_compress_4_decode", None)
+        if callable(candidate):
+            handle = candidate
+            src = "kunlun_ops_module"
+    except Exception:
+        pass
+    _c4_fused_op = handle
+    record_wired("flash_compress_4_decode", src)
+    return handle
+
+
+def _fused_c4_path_full(
+    state_cache, num_actual, positions, slot_mapping, block_size, block_table,
+    token_to_req_indices, cos_sin_cache, kv_cache, kv_slot_mapping,
+    head_dim, rope_head_dim, compress_ratio, rms_norm_weight, rms_norm_eps,
+    kv_score_input_full, ape_param,
+):
+    """Fused C4 decode: flash_compress_4_decode (write+compress) + norm_rope + write KV cache."""
+    c4_op = _find_c4_fused_op()
+    if c4_op is None:
+        return False
+
+    all_slots = slot_mapping[:num_actual]
+    all_positions = positions[:num_actual]
+    device = state_cache.device
+
+    # seq_lens (1-based) and page indices
+    seq_lens = (all_positions + 1).to(torch.int32)
+    indices = (all_slots // block_size).clamp(min=0).to(torch.int32)
+
+    # Compute extra (overlap page) for Page4Align mode
+    req_indices = token_to_req_indices[:num_actual].long()
+    overlap_block_id = ((all_positions - compress_ratio).clamp(min=0) // block_size).long()
+    overlap_block_id_safe = overlap_block_id.clamp(max=block_table.shape[1] - 1)
+    extra = block_table[req_indices, overlap_block_id_safe].to(torch.int32).unsqueeze(1)
+
+    # APE: [4, 2*head_dim] fp32 -> [8, head_dim] same dtype as buffer
+    ape_for_kernel = ape_param.view(8, head_dim).to(state_cache.dtype)
+
+    # kv_score_input: [num_actual, 4*head_dim], same dtype as buffer
+    kv_input = kv_score_input_full[:num_actual].to(state_cache.dtype)
+
+    # Output buffer for compressed result
+    compressed_out = torch.zeros(
+        (num_actual, head_dim), dtype=state_cache.dtype, device=device
+    )
+
+    try:
+        ret = c4_op(
+            state_cache, kv_input, compressed_out, ape_for_kernel,
+            indices, seq_lens, extra,
+        )
+        if ret != 0:
+            raise RuntimeError(f"flash_compress_4_decode returned {ret}")
+    except Exception as exc:
+        WarningOnce.emit(
+            _c4_fused_warned_key,
+            "flash_compress_4_decode failed (%s); falling back to legacy path",
+            str(exc),
+        )
+        return False
+
+    # Identify boundary tokens (seq_len % 4 == 0)
+    boundary_mask = (seq_lens.long() % compress_ratio == 0)
+
+    capturing_func = getattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    capturing = capturing_func()
+    if not capturing:
+        if not bool(boundary_mask.any()):
+            return True  # Write done, no compress needed
+        boundary_sel = boundary_mask.nonzero(as_tuple=True)[0]
+    else:
+        boundary_sel = torch.arange(num_actual, device=device)
+
+    # Compressed values for boundary tokens
+    compressed_boundary = compressed_out.index_select(0, boundary_sel).float()
+
+    # Apply norm + rope (reuse existing native op)
+    result = _find_xsg_compress_ops(True)
+    normrope_op = result[1][1] if len(result[1]) > 1 else None
+    half_rope = rope_head_dim // 2
+
+    if normrope_op is not None:
+        boundary_positions = all_positions.index_select(0, boundary_sel).long()
+        compressed_positions = (boundary_positions // compress_ratio) * compress_ratio
+        cs = cos_sin_cache.index_select(0, compressed_positions)
+        interleaved_freqs = (
+            torch.stack((cs[:, :half_rope], cs[:, half_rope:]), dim=-1)
+            .reshape(boundary_sel.shape[0], rope_head_dim)
+            .float()
+            .contiguous()
+        )
+        local_pos = torch.arange(boundary_sel.shape[0], dtype=torch.int64, device=device)
+        status = normrope_op(
+            compressed_boundary,
+            rms_norm_weight.float().contiguous(),
+            local_pos,
+            interleaved_freqs,
+            mode=2, compress_ratio=0, eps=rms_norm_eps,
+        )
+        if status != 0:
+            WarningOnce.emit(
+                _c4_fused_warned_key + "-normrope",
+                "dpsk_v4_norm_rope_gptj returned %d in fused c4 path", status,
+            )
+            return False
+    else:
+        # Torch fallback for norm + rope
+        nope_head_dim = head_dim - rope_head_dim
+        variance = (compressed_boundary * compressed_boundary).mean(dim=-1, keepdim=True)
+        rrms = torch.rsqrt(variance + rms_norm_eps)
+        compressed_boundary = compressed_boundary * rrms * rms_norm_weight.float().unsqueeze(0)
+        boundary_positions = all_positions.index_select(0, boundary_sel).long()
+        compressed_pos = (boundary_positions // compress_ratio) * compress_ratio
+        cs = cos_sin_cache[compressed_pos]
+        cos_vals, sin_vals = cs[:, :half_rope], cs[:, half_rope:]
+        rope_part = compressed_boundary[:, nope_head_dim:]
+        rope_even, rope_odd = rope_part[:, 0::2], rope_part[:, 1::2]
+        compressed_boundary[:, nope_head_dim::2] = rope_even * cos_vals - rope_odd * sin_vals
+        compressed_boundary[:, nope_head_dim + 1::2] = rope_even * sin_vals + rope_odd * cos_vals
+
+    # Write to KV cache
+    kv_slots = kv_slot_mapping.index_select(0, boundary_sel).long()
+    write_ok = kv_slots >= 0
+    if capturing:
+        write_ok = write_ok & boundary_mask.index_select(0, boundary_sel)
+    _masked_paged_write(kv_cache, dest=kv_slots, write_ok=write_ok, data=compressed_boundary)
+    return True
 
 
 def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
@@ -574,6 +726,40 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
         quant_block, token_stride, scale_dim,
     ):
         del pdl_kwargs, quant_block, token_stride, scale_dim, use_fp4_cache
+
+        # --- Fused C4 path: flash_compress_4_decode + norm_rope ---
+        global _c4_stashed_kv_score, _c4_stashed_ape
+        _kv_score_input_full = _c4_stashed_kv_score
+        _ape_param = _c4_stashed_ape
+        if (_C4_FUSED_ENABLED and compress_ratio == 4
+                and _kv_score_input_full is not None and _ape_param is not None):
+            success = _fused_c4_path_full(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+                block_table=block_table,
+                token_to_req_indices=token_to_req_indices,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                head_dim=head_dim,
+                rope_head_dim=rope_head_dim,
+                compress_ratio=compress_ratio,
+                rms_norm_weight=rms_norm_weight,
+                rms_norm_eps=rms_norm_eps,
+                kv_score_input_full=_kv_score_input_full,
+                ape_param=_ape_param,
+            )
+            if success:
+                _c4_stashed_kv_score = None
+                _c4_stashed_ape = None
+                return
+            _c4_stashed_kv_score = None
+            _c4_stashed_ape = None
+            # Fall through to legacy path
+
         all_positions = positions[:num_actual]
         all_slots = slot_mapping[:num_actual]
         valid_mask = (all_slots >= 0) & ((all_positions + 1) % compress_ratio == 0)
