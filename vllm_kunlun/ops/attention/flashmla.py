@@ -306,6 +306,102 @@ def _zero_rope_side_channel(q: torch.Tensor, kv_rows: int, kv_lora: int) -> dict
     return {"q_r": q_r, "pe_cache": pe}
 
 
+# ---- Static auxiliary buffer caches for hybrid_attention (cudagraph-safe) ----
+_static_qlod_cpu_ha: dict = {}
+_static_qlod_xpu_ha: dict = {}
+_static_kvseqlen_cpu_ha: dict = {}
+_static_kvseqlen_xpu_ha: dict = {}
+_static_out_ha: dict = {}
+_static_ml_ha: dict = {}
+_static_lse_ha: dict = {}
+
+
+def _v4_hybrid_attention_fused(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink,
+    extra_k_cache,
+    extra_indices_in_kvcache,
+    extra_topk_length,
+    head_dim_v: int,
+    softmax_scale: float,
+    output: torch.Tensor,
+    compress_ratio: int,
+    max_window_size: int,
+    com_topk: int,
+):
+    """Fused V4 decode attention via kunlun_ops.hybrid_attention (single kernel)."""
+    _B = q.shape[0]
+    _H = q.shape[2]
+    _D = q.shape[3]
+    KV_LORA_RANK = head_dim_v
+    q_3d = q.squeeze(1)
+    flat_swa = _flatten_cache_static(k_cache)
+    swa_idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    swa_idx = swa_idx[:, :max_window_size].contiguous()
+    swa_idx = swa_idx.clamp(min=0, max=flat_swa.shape[0] - 1)
+    if extra_k_cache is not None and extra_topk_length is not None:
+        flat_com = _flatten_cache_static(extra_k_cache)
+        com_idx = (extra_indices_in_kvcache.squeeze(1)
+                   if extra_indices_in_kvcache.dim() == 3
+                   else extra_indices_in_kvcache)
+        actual_com_topk = com_topk
+        if actual_com_topk > 0 and actual_com_topk % 2 != 0:
+            actual_com_topk = actual_com_topk + 1
+            if actual_com_topk > com_idx.shape[-1]:
+                actual_com_topk = actual_com_topk - 2
+        if com_idx.shape[-1] > actual_com_topk:
+            com_idx = com_idx[:, :actual_com_topk].contiguous()
+        com_idx = com_idx.clamp(min=0, max=flat_com.shape[0] - 1)
+        effective_compress_ratio = compress_ratio
+    else:
+        flat_com = torch.empty((0, _D), dtype=k_cache.dtype, device=q.device)
+        com_idx = torch.empty((_B, 0), dtype=torch.int32, device=q.device)
+        actual_com_topk = 0
+        effective_compress_ratio = max(compress_ratio, 1)
+    out_key = (_B, _H, KV_LORA_RANK, q.dtype, str(q.device))
+    if out_key not in _static_out_ha:
+        _static_out_ha[out_key] = torch.empty(_B, _H, KV_LORA_RANK, dtype=q.dtype, device=q.device)
+        _static_ml_ha[out_key] = torch.empty(_B, _H, dtype=torch.float32, device=q.device)
+        _static_lse_ha[out_key] = torch.empty(_B, _H, dtype=torch.float32, device=q.device)
+    out_3d = _static_out_ha[out_key]
+    max_logits = _static_ml_ha[out_key]
+    lse_buf = _static_lse_ha[out_key]
+    qlod_key = (_B,)
+    if qlod_key not in _static_qlod_cpu_ha:
+        _static_qlod_cpu_ha[qlod_key] = torch.arange(_B + 1, dtype=torch.int32)
+        _static_qlod_xpu_ha[qlod_key] = _static_qlod_cpu_ha[qlod_key].to(q.device)
+    qlod_cpu = _static_qlod_cpu_ha[qlod_key]
+    qlod_xpu = _static_qlod_xpu_ha[qlod_key]
+    if extra_topk_length is not None:
+        kvseqlen_xpu = topk_length[:_B].int() + extra_topk_length[:_B].int() * compress_ratio
+    else:
+        kvseqlen_xpu = topk_length[:_B].int()
+    kvseqlen_key = (_B,)
+    if kvseqlen_key not in _static_kvseqlen_cpu_ha:
+        _static_kvseqlen_cpu_ha[kvseqlen_key] = torch.empty(_B, dtype=torch.int32)
+    kvseqlen_cpu = _static_kvseqlen_cpu_ha[kvseqlen_key]
+    # kvseqlen_cpu = scheduling hint for C++ wrapper; always fill with upper bound
+    # to avoid D2H sync issues during cudagraph capture/warmup.
+    kvseqlen_cpu.fill_(max_window_size + actual_com_topk * compress_ratio)
+    kunlun_ops.hybrid_attention(
+        q=q_3d, win_kv_cache=flat_swa, win_indices=swa_idx,
+        com_kv_cache=flat_com, com_indices=com_idx,
+        o=out_3d, max_logits=max_logits, lse=lse_buf,
+        qlod_cpu=qlod_cpu, qlod_xpu=qlod_xpu,
+        kvseqlen_cpu=kvseqlen_cpu, kvseqlen_xpu=kvseqlen_xpu,
+        sm_scale=float(softmax_scale), is_causal=True,
+        max_window_size=max_window_size, compress_ratio=effective_compress_ratio,
+        com_topk=actual_com_topk,
+        attn_sink=attn_sink if isinstance(attn_sink, torch.Tensor) else torch.empty(0),
+    )
+    output[:, 0, :, :KV_LORA_RANK] = out_3d
+    return output, None
+
+
+
 def _v4_sparse_native_path(
     q: torch.Tensor,                 # [B, 1, H, D] (B=num_decode_tokens)
     k_cache: torch.Tensor,           # [NB_swa, BS_swa, 1, D]
@@ -536,6 +632,40 @@ def flash_mla_with_kvcache(
             q.shape[0], q.shape[1], q.shape[2], head_dim_v,
             dtype=q.dtype, device=q.device,
         )
+
+    # ---- Fused V4 decode: kunlun_ops.hybrid_attention (single kernel) ----
+    _fused_ok = (
+        os.environ.get("KUNLUN_DSV4_ATTN_DECODE_FUSED", "0") == "1"
+        and hasattr(kunlun_ops, "hybrid_attention")
+        and indices is not None
+        and topk_length is not None
+        and (k_cache.dtype == torch.bfloat16)
+        and (extra_k_cache is None or extra_k_cache.dtype == torch.bfloat16)
+    )
+    if _fused_ok:
+        try:
+            return _v4_hybrid_attention_fused(
+                q=q, k_cache=k_cache, indices=indices,
+                topk_length=topk_length, attn_sink=attn_sink,
+                extra_k_cache=extra_k_cache,
+                extra_indices_in_kvcache=extra_indices_in_kvcache,
+                extra_topk_length=extra_topk_length,
+                head_dim_v=head_dim_v, softmax_scale=softmax_scale,
+                output=output,
+                compress_ratio=compress_ratio,
+                max_window_size=max_window_size, com_topk=com_topk,
+            )
+        except Exception as _e:
+            if torch.cuda.is_current_stream_capturing():
+                raise
+            if not getattr(flash_mla_with_kvcache, "_fused_warned", False):
+                logger.warning(
+                    "[DSv4-FUSED-ATTN] hybrid_attention failed, "
+                    "falling back to decomposed: %s: %s",
+                    type(_e).__name__, _e,
+                )
+                flash_mla_with_kvcache._fused_warned = True
+
 
     # ---- Native V4 path (capture-safe; fwd_kvcache_mla + attention_merge_stage).
     # Replaces the previous kunlun_ops.hybrid_attention short-circuit which
