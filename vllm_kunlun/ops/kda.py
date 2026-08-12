@@ -880,7 +880,7 @@ def layer_norm_gated_fwd(
     H: int = 1,
     g_stride_n: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """Gated (RMS) norm, ``x`` and ``g`` are ``[T, D]`` / ``[T, H, D]``.
+    """Gated (RMS) norm, ``x`` is ``[T, D]`` and ``g`` is ``[T, H, D]``.
 
     ``xspeedgate_ops.layer_norm_gated_fwd`` takes upstream's arguments in the
     same order and supports the ``sigmoid`` gate K3's ``o_norm`` uses (the
