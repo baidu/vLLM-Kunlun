@@ -421,11 +421,51 @@ def patch_kda_ops(mod) -> None:
     logger.info("[KunlunPlugin] KDA delta-rule kernels -> torch")
 
 
+def layer_norm_gated_fwd(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    activation: str = "swish",
+    eps: float = 1e-5,
+    residual: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
+    is_rms_norm: bool = False,
+    H: int = 1,
+    g_stride_n: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Gated (RMS) norm, ``x`` is ``[T, D]`` and ``g`` is ``[T, H, D]``.
+
+    ``xspeedgate_ops.layer_norm_gated_fwd`` takes upstream's arguments in the
+    same order and supports the ``sigmoid`` gate K3's ``o_norm`` uses (the
+    separate ``rms_norm_gated_fwd`` op hardcodes the swish gate). Returns
+    upstream's ``(y, mean, rstd, residual_out)``.
+    """
+    return torch.ops.xspeedgate_ops.layer_norm_gated_fwd(
+        x,
+        g,
+        weight,
+        bias,
+        activation,
+        eps,
+        residual,
+        out_dtype,
+        residual_dtype,
+        is_rms_norm,
+        H,
+        g_stride_n,
+    )
+
+
 def patch_rms_norm_gated(mod) -> None:
-    """``o_norm``'s forward_cuda is the triton rms_norm_gated kernel."""
-    cls = getattr(mod, "FusedRMSNormGated", None)
-    if cls is None:
+    """``o_norm``'s forward_cuda goes through the triton layer_norm_gated_fwd.
+
+    Only the kernel entry point is swapped, so ``rms_norm_gated``'s reshaping
+    (``H``, ``g_stride_n``, residual dtype) stays upstream's.
+    """
+    if not hasattr(mod, "FusedRMSNormGated"):
         return
-    cls.forward_cuda = cls.forward_native
+    mod.layer_norm_gated_fwd = layer_norm_gated_fwd
     mod._kunlun_kda_patched = True
-    logger.info("[KunlunPlugin] FusedRMSNormGated.forward_cuda -> forward_native")
+    logger.info("[KunlunPlugin] layer_norm_gated_fwd -> xspeedgate_ops")
