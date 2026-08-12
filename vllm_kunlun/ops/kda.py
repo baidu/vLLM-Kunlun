@@ -332,7 +332,40 @@ def fused_kda_gate_chunk_cumsum(
     Returns ``g`` (``[1, T, H, D]``: the *chunk-local* cumulative sum of the
     per-token gate, scaled by ``RCP_LN2`` so consumers rebuild ``exp(gate)`` with
     ``exp2``) and ``beta`` (``[1, T, H]`` fp32 ``sigmoid(raw_beta)``).
+
+    ``xspeedgate_ops.fused_kda_gate_chunk_cumsum`` implements this stage with the
+    same contract; ``beta``/``threshold`` are the softplus parameters of the
+    ``lower_bound is None`` branch, which upstream leaves at their defaults.
     """
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    return torch.ops.xspeedgate_ops.fused_kda_gate_chunk_cumsum(
+        raw_g.contiguous(),
+        raw_beta,
+        A_log.float().contiguous(),
+        None if g_bias is None else g_bias.float().contiguous(),
+        1.0,
+        _SOFTPLUS_THRESHOLD,
+        lower_bound,
+        cu_seqlens.to(torch.int32).contiguous(),
+        chunk_indices.to(torch.int32).contiguous(),
+        chunk_size,
+        output_dtype or raw_g.dtype,
+    )
+
+
+def _fused_kda_gate_chunk_cumsum_torch(
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype | None = torch.float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference for the gate stage, kept for numerical comparison."""
     if chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     gate = kda_gate(raw_g, A_log, g_bias, lower_bound)  # [1, T, H, D] fp32
@@ -840,11 +873,51 @@ def patch_kda_ops(mod) -> None:
     logger.info("[KunlunPlugin] KDA delta-rule kernels -> torch")
 
 
+def layer_norm_gated_fwd(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    activation: str = "swish",
+    eps: float = 1e-5,
+    residual: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
+    is_rms_norm: bool = False,
+    H: int = 1,
+    g_stride_n: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Gated (RMS) norm, ``x`` and ``g`` are ``[T, D]`` / ``[T, H, D]``.
+
+    ``xspeedgate_ops.layer_norm_gated_fwd`` takes upstream's arguments in the
+    same order and supports the ``sigmoid`` gate K3's ``o_norm`` uses (the
+    separate ``rms_norm_gated_fwd`` op hardcodes the swish gate). Returns
+    upstream's ``(y, mean, rstd, residual_out)``.
+    """
+    return torch.ops.xspeedgate_ops.layer_norm_gated_fwd(
+        x,
+        g,
+        weight,
+        bias,
+        activation,
+        eps,
+        residual,
+        out_dtype,
+        residual_dtype,
+        is_rms_norm,
+        H,
+        g_stride_n,
+    )
+
+
 def patch_rms_norm_gated(mod) -> None:
-    """``o_norm``'s forward_cuda is the triton rms_norm_gated kernel."""
-    cls = getattr(mod, "FusedRMSNormGated", None)
-    if cls is None:
+    """``o_norm``'s forward_cuda goes through the triton layer_norm_gated_fwd.
+
+    Only the kernel entry point is swapped, so ``rms_norm_gated``'s reshaping
+    (``H``, ``g_stride_n``, residual dtype) stays upstream's.
+    """
+    if not hasattr(mod, "FusedRMSNormGated"):
         return
-    cls.forward_cuda = cls.forward_native
+    mod.layer_norm_gated_fwd = layer_norm_gated_fwd
     mod._kunlun_kda_patched = True
-    logger.info("[KunlunPlugin] FusedRMSNormGated.forward_cuda -> forward_native")
+    logger.info("[KunlunPlugin] layer_norm_gated_fwd -> xspeedgate_ops")
