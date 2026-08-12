@@ -17,6 +17,12 @@ cache bookkeeping and spec-decode handling all run unchanged. Where a native XPU
 kernel exists the replacement forwards to it (``xspeedgate_ops.l2norm_fwd``,
 ``xspeedgate_ops.fused_recurrent_kda_packed_decode``) instead of using torch.
 
+The chunked prefill path keeps upstream's staging too -- ``prepare_chunk_indices``,
+``fused_kda_gate_chunk_cumsum``, ``chunk_kda_fwd_intra``, ``recompute_w_u_fwd``,
+``chunk_gated_delta_rule_fwd_h``, ``chunk_gla_fwd_o_gk`` -- with the same
+argument and tensor layouts, so each stage can be swapped for an XPU kernel on
+its own.
+
 Recurrence ported from
 ``vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py``:
 
@@ -36,6 +42,13 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _SOFTPLUS_THRESHOLD = 20.0
+
+# Upstream chunk length of the KDA prefill kernels, its intra-chunk sub-block
+# size, and the natural-log -> log2 factor folded into the cumulative gate so
+# consumers can use exp2.
+FLA_CHUNK_SIZE = 64
+_SUB_CHUNK_SIZE = 16
+RCP_LN2 = 1.4426950216
 
 
 def kda_gate(
@@ -213,6 +226,418 @@ def gather_initial_states(
     return out
 
 
+def prepare_chunk_indices(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """``[NT, 2]`` table of ``(sequence index, chunk index inside the sequence)``.
+
+    Same layout and order as upstream's triton-side helper, so a kernel taking
+    ``chunk_indices`` can be dropped in unchanged. The sequence column is built
+    explicitly instead of upstream's ``indices.eq(0).cumsum(0) - 1``: that form
+    skips a zero-length sequence and shifts every later sequence index by one.
+    """
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    num_chunks = ((lens + chunk_size - 1) // chunk_size).tolist()
+    seq = torch.cat([torch.full((n,), i) for i, n in enumerate(num_chunks)])
+    indices = torch.cat([torch.arange(n) for n in num_chunks])
+    return torch.stack([seq, indices], 1).to(cu_seqlens)
+
+
+def _chunk_token_span(
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``([NT] first token of every chunk, [NT] end of its sequence)``."""
+    seq = chunk_indices[:, 0].long()
+    starts = cu_seqlens[seq].long() + chunk_indices[:, 1].long() * chunk_size
+    return starts, cu_seqlens[seq + 1].long()
+
+
+def _chunk_tiles(
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    chunk_size: int,
+    num_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token index and validity of every chunk row, both ``[NT, BT]``.
+
+    The rows of a chunk that fall past the end of its sequence (only the last
+    chunk can have any) are marked invalid and index-clamped, which keeps every
+    stage on static shapes instead of ragged per-sequence slices.
+    """
+    starts, seq_ends = _chunk_token_span(cu_seqlens, chunk_indices, chunk_size)
+    pos = starts.unsqueeze(1) + torch.arange(chunk_size, device=cu_seqlens.device)
+    valid = pos < seq_ends.unsqueeze(1)
+    return pos.clamp_max(num_tokens - 1), valid
+
+
+def _tile(x: torch.Tensor, pos: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """``[1, T, H, D]`` -> fp32 ``[NT, H, BT, D]`` tiles, invalid rows zeroed."""
+    tiles = x[0][pos].float().masked_fill(~valid[:, :, None, None], 0.0)
+    return tiles.transpose(1, 2).contiguous()
+
+
+def _untile(
+    tiles: torch.Tensor,
+    pos: torch.Tensor,
+    valid: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter ``[NT, H, BT, D]`` tiles back into the ``[1, T, H, D]`` ``out``."""
+    out[0][pos[valid]] = tiles.transpose(1, 2)[valid].to(out.dtype)
+    return out
+
+
+def _chunk_last_gate(g: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Cumulative gate of each chunk's last valid token, ``[NT, H, 1, D]``."""
+    last = valid.sum(1) - 1
+    rows = torch.arange(g.shape[0], device=g.device)
+    return g[rows, :, last].unsqueeze(-2)
+
+
+def _inv_unit_lower(L: torch.Tensor) -> torch.Tensor:
+    """``(I + L)^-1`` for strictly lower-triangular ``L``, ``[..., BT, BT]``.
+
+    ``L`` is nilpotent, so the Neumann series terminates and factorises:
+    ``sum_j (-L)^j == prod_i (I + (-L)^(2^i))``, i.e. ``log2(BT)`` batched
+    matmuls. Upstream forward-substitutes instead; torch would need a triangular
+    solve, which has no XPU kernel.
+    """
+    size = L.shape[-1]
+    eye = torch.eye(size, dtype=L.dtype, device=L.device)
+    m = -L
+    inv = eye + m
+    power = m @ m
+    for _ in range(size.bit_length() - 2):
+        inv = inv @ (eye + power)
+        power = power @ power
+    return inv
+
+
+def fused_kda_gate_chunk_cumsum(
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype | None = torch.float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate stage, same contract as the upstream fused kernel.
+
+    Returns ``g`` (``[1, T, H, D]``: the *chunk-local* cumulative sum of the
+    per-token gate, scaled by ``RCP_LN2`` so consumers rebuild ``exp(gate)`` with
+    ``exp2``) and ``beta`` (``[1, T, H]`` fp32 ``sigmoid(raw_beta)``).
+    """
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    gate = kda_gate(raw_g, A_log, g_bias, lower_bound)  # [1, T, H, D] fp32
+    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, chunk_size, raw_g.shape[1])
+    # Tiling is what makes the cumulative sum chunk-local: it cannot leak across
+    # a chunk (nor a sequence) boundary.
+    tiles = _tile(gate, pos, valid).cumsum(-2) * RCP_LN2
+    g = torch.zeros_like(gate, dtype=output_dtype or raw_g.dtype)
+    _untile(tiles, pos, valid, g)
+    return g, torch.sigmoid(raw_beta.float())
+
+
+def chunk_kda_fwd_intra(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    gk: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    chunk_indices: torch.Tensor | None = None,
+    safe_gate: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Intra-chunk attention matrices ``Aqk`` and ``A``, both ``[1, T, H, BT]``.
+
+    With ``d`` the gate channel and ``s``, ``t`` two tokens of one chunk::
+
+        Aqk[t, s] = scale * sum_d q[t, d] * k[s, d] * exp2(g[t, d] - g[s, d])
+        Akk[t, s] = beta[t] * sum_d k[t, d] * k[s, d] * exp2(g[t, d] - g[s, d])
+        A         = (I + tril(Akk, -1))^-1
+
+    ``A`` is the WY transform that turns the delta rule's sequential correction
+    into one triangular solve, and row ``t`` of both matrices holds the ``BT``
+    columns of ``t``'s own chunk -- upstream's layout exactly. ``safe_gate`` is
+    accepted for signature parity: the gate difference is always evaluated
+    exactly (and clamped at 0 before ``exp2``) inside a sub-block, so no
+    intermediate can overflow, which is what upstream's safe path buys.
+    """
+    num_tokens, num_heads = q.shape[1], q.shape[2]
+    bt, bc = chunk_size, _SUB_CHUNK_SIZE
+    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, bt, num_tokens)
+    q_t = _tile(q, pos, valid) * scale
+    k_t = _tile(k, pos, valid)
+    g_t = _tile(gk, pos, valid)
+    b_t = _tile(beta.unsqueeze(-1), pos, valid)
+
+    Aqk_t = q_t.new_zeros(pos.shape[0], num_heads, bt, bt)
+    Akk_t = torch.zeros_like(Aqk_t)
+    for i_c in range(bt // bc):
+        rows = slice(i_c * bc, (i_c + 1) * bc)
+        q_i, k_i, g_i = q_t[:, :, rows], k_t[:, :, rows], g_t[:, :, rows]
+        # Diagonal sub-block: subtract the gates before exponentiating. The upper
+        # triangle is masked off below, so clamping it at 0 only keeps a long
+        # decay run from overflowing on its way to being discarded.
+        decay = torch.exp2((g_i.unsqueeze(-2) - g_i.unsqueeze(-3)).clamp_max(0.0))
+        Aqk_t[:, :, rows, rows] = (
+            q_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)
+        ).sum(-1)
+        Akk_t[:, :, rows, rows] = (
+            k_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)
+        ).sum(-1)
+        if i_c:
+            # Earlier sub-blocks: factor the decay through this sub-block's first
+            # gate, which turns the pairwise term into a matmul. For a valid row
+            # both exponents are already <= 0 (the cumulative gate never
+            # increases); the clamp only bounds padding rows, whose gate reads as
+            # 0 and would otherwise overflow to inf and poison the matmul.
+            cols = slice(0, i_c * bc)
+            g_ref = g_i[:, :, :1]
+            lhs_decay = torch.exp2((g_i - g_ref).clamp_max(0.0))
+            rhs = k_t[:, :, cols] * torch.exp2(
+                (g_ref - g_t[:, :, cols]).clamp_max(0.0)
+            )
+            rhs = rhs.transpose(-1, -2)
+            Aqk_t[:, :, rows, cols] = (q_i * lhs_decay) @ rhs
+            Akk_t[:, :, rows, cols] = (k_i * lhs_decay) @ rhs
+
+    o_i = torch.arange(bt, device=q.device)
+    Akk_t = (Akk_t * b_t).masked_fill_(o_i.unsqueeze(-1) <= o_i, 0.0)
+    Aqk = torch.zeros(
+        1, num_tokens, num_heads, bt, dtype=torch.float32, device=q.device
+    )
+    A = torch.zeros_like(Aqk)
+    _untile(Aqk_t, pos, valid, Aqk)
+    _untile(_inv_unit_lower(Akk_t), pos, valid, A)
+    return Aqk, A
+
+
+def recompute_w_u_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    q: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """WY-transformed keys and values, plus the chunk-end scaled keys::
+
+        u  = A @ (beta * v)
+        w  = A @ (beta * k * exp2(g))
+        kg = k * exp2(g_last - g)
+
+    ``g_last`` is the cumulative gate of the chunk's last valid token, so ``kg``
+    carries every key forward to the chunk boundary. The third slot of the tuple
+    keeps upstream's ``w, u, _, kg`` unpacking; ``q`` is unused for the same
+    reason (upstream can fuse the ``q`` gating here, this port does it in
+    ``chunk_gla_fwd_o_gk``).
+    """
+    chunk_size = A.shape[-1]
+    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, chunk_size, k.shape[1])
+    k_t = _tile(k, pos, valid)
+    g_t = _tile(gk, pos, valid)
+    b_t = _tile(beta.unsqueeze(-1), pos, valid)
+    A_t = _tile(A, pos, valid)
+
+    u_t = A_t @ (b_t * _tile(v, pos, valid))
+    w_t = A_t @ (b_t * k_t * torch.exp2(g_t))
+    kg_t = k_t * torch.exp2(_chunk_last_gate(g_t, valid) - g_t)
+
+    # fp32 everywhere: unlike the triton kernels there is no tensor-core reason
+    # to round these intermediates down to the input dtype.
+    w = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
+    u = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
+    kg = torch.zeros_like(w)
+    _untile(w_t, pos, valid, w)
+    _untile(u_t, pos, valid, u)
+    _untile(kg_t, pos, valid, kg)
+    return w, u, None, kg
+
+
+def chunk_gated_delta_rule_fwd_h(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    use_exp2: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Chunk-level state recurrence over the WY-transformed chunks::
+
+        v_new = u - w @ h^T
+        h_next = h * exp2(g_last) + v_new^T @ kg
+
+    ``k`` is the ``kg`` of ``recompute_w_u_fwd``. Returns the state ``h``
+    *entering* each chunk (``[1, NT, H, V, K]``), the corrected values ``v_new``
+    and, if asked, the fp32 per-sequence ``final_state``. Only the chunk axis is
+    sequential: chunks that sit at the same position in different sequences are
+    stepped together.
+    """
+    num_heads, head_dim, value_dim = k.shape[2], k.shape[3], u.shape[-1]
+    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, chunk_size, k.shape[1])
+    kg_t = _tile(k, pos, valid)
+    w_t = _tile(w, pos, valid)
+    u_t = _tile(u, pos, valid)
+    decay_last = torch.exp2(_chunk_last_gate(_tile(gk, pos, valid), valid))
+
+    if initial_state is None:
+        state = torch.zeros(
+            cu_seqlens.numel() - 1,
+            num_heads,
+            value_dim,
+            head_dim,
+            dtype=torch.float32,
+            device=k.device,
+        )
+    else:
+        state = initial_state.float().clone()
+    h = state.new_zeros(1, pos.shape[0], num_heads, value_dim, head_dim)
+    v_new_t = torch.zeros_like(u_t)
+
+    seq, step = chunk_indices[:, 0].long(), chunk_indices[:, 1].long()
+    for i_t in range(int(step.max().item()) + 1 if pos.shape[0] else 0):
+        rows = (step == i_t).nonzero().flatten()
+        i_n = seq[rows]
+        h_t = state[i_n]
+        h[0, rows] = h_t
+        v_new_t[rows] = u_t[rows] - w_t[rows] @ h_t.transpose(-1, -2)
+        state[i_n] = (
+            h_t * decay_last[rows] + v_new_t[rows].transpose(-1, -2) @ kg_t[rows]
+        )
+
+    v_new = torch.zeros_like(u)
+    _untile(v_new_t, pos, valid, v_new)
+    return h, v_new, state if output_final_state else None
+
+
+def chunk_gla_fwd_o_gk(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    A: torch.Tensor,
+    h: torch.Tensor,
+    o: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Chunk output: inter-chunk state read plus intra-chunk attention::
+
+        o[t] = (scale * q[t] * exp2(g[t])) @ h_chunk^T + sum_{s <= t} A[t, s] * v[s]
+
+    ``v`` is the ``v_new`` of the state recurrence, ``A`` is ``Aqk`` (which
+    already carries ``scale``) and ``h`` the state entering ``t``'s chunk. Like
+    upstream the result is written into the caller's ``o`` buffer.
+    """
+    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, chunk_size, q.shape[1])
+    q_t = _tile(q, pos, valid) * scale
+    g_t = _tile(g, pos, valid)
+    A_t = _tile(A, pos, valid)
+
+    o_i = torch.arange(chunk_size, device=q.device)
+    A_t = A_t.masked_fill_(o_i.unsqueeze(-1) < o_i, 0.0)
+    o_t = (q_t * torch.exp2(g_t)) @ h[0].transpose(-1, -2)
+    o_t += A_t @ _tile(v, pos, valid)
+    return _untile(o_t, pos, valid, o)
+
+
+def _chunk_kda_fwd_with_cumulative_g(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    safe_gate: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Chunked delta rule, one torch stage per upstream kernel.
+
+    ``g`` must already be chunk-local cumulatively-summed AND scaled by
+    ``RCP_LN2`` -- exactly what ``fused_kda_gate_chunk_cumsum`` returns -- so
+    every stage boundary keeps upstream's contract and can be swapped for a
+    kernel one at a time.
+
+    ``initial_state`` is the dense per-request state ``[N, H, V, K]`` produced by
+    ``gather_initial_states``; the per-request final states are returned rather
+    than written into the paged cache (the caller does that).
+    """
+    Aqk, A = chunk_kda_fwd_intra(
+        q=q,
+        k=k,
+        gk=g,
+        beta=beta,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        safe_gate=safe_gate,
+    )
+    w, u, _, kg = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        gk=g,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    del A
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        use_exp2=True,
+    )
+    del w, u, kg
+    o = chunk_gla_fwd_o_gk(
+        q=q,
+        v=v_new,
+        g=g,
+        A=Aqk,
+        h=h,
+        o=v,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+    )
+    del Aqk, v_new, h
+    if final_state is not None:
+        # The paged cache keeps the state in its own dtype; upstream hands back
+        # fp32 and lets the caller round.
+        final_state = final_state.to(
+            v.dtype if initial_state is None else initial_state.dtype
+        )
+    return o, final_state
+
+
 def chunk_kda_with_fused_gate_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -227,39 +652,33 @@ def chunk_kda_with_fused_gate_fwd(
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Sequential scan standing in for the chunked KDA prefill kernels.
-
-    ``initial_state`` is the dense per-request state ``[N, H, V, K]`` produced by
-    ``gather_initial_states``; the per-request final states are returned rather
-    than written into the paged cache (the caller does that).
-    """
-    qf = q[0].float() * scale
-    kf = k[0].float()
-    vf = v[0].float()
-    decay = kda_gate(raw_g, A_log, g_bias, lower_bound)[0].exp()
-    beta = torch.sigmoid(raw_beta[0].float())
-
-    out = torch.empty_like(vf)
-    starts = cu_seqlens.tolist()
-    if initial_state is None:
-        states = torch.zeros(
-            len(starts) - 1,
-            vf.shape[1],
-            vf.shape[2],
-            kf.shape[2],
-            dtype=torch.float32,
-            device=vf.device,
-        )
-        state_dtype = v.dtype
-    else:
-        states = initial_state.float().clone()
-        state_dtype = initial_state.dtype
-    for i in range(len(starts) - 1):
-        states[i] = _delta_rule_scan(
-            qf, kf, vf, decay, beta, states[i], starts[i], starts[i + 1], out
-        )
-    final_state = states.to(state_dtype) if output_final_state else None
-    return out.unsqueeze(0).to(v.dtype), final_state
+    """Chunked KDA prefill, split like upstream: chunk table, gate, delta rule."""
+    chunk_size = FLA_CHUNK_SIZE
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    g, beta = fused_kda_gate_chunk_cumsum(
+        raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        g_bias=g_bias,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        lower_bound=lower_bound,
+    )
+    return _chunk_kda_fwd_with_cumulative_g(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        chunk_size=chunk_size,
+        safe_gate=lower_bound is not None,
+    )
 
 
 def chunk_kda_with_fused_gate(
