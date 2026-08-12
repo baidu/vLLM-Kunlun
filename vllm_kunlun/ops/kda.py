@@ -17,12 +17,6 @@ cache bookkeeping and spec-decode handling all run unchanged. Where a native XPU
 kernel exists the replacement forwards to it (``xspeedgate_ops.l2norm_fwd``,
 ``xspeedgate_ops.fused_recurrent_kda_packed_decode``) instead of using torch.
 
-The chunked prefill path keeps upstream's staging too -- ``prepare_chunk_indices``,
-``fused_kda_gate_chunk_cumsum``, ``chunk_kda_fwd_intra``, ``recompute_w_u_fwd``,
-``chunk_gated_delta_rule_fwd_h``, ``chunk_gla_fwd_o_gk`` -- with the same
-argument and tensor layouts, so each stage can be swapped for an XPU kernel on
-its own.
-
 Recurrence ported from
 ``vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py``:
 
@@ -42,13 +36,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _SOFTPLUS_THRESHOLD = 20.0
-
-# Upstream chunk length of the KDA prefill kernels, its intra-chunk sub-block
-# size, and the natural-log -> log2 factor folded into the cumulative gate so
-# consumers can use exp2.
-FLA_CHUNK_SIZE = 64
-_SUB_CHUNK_SIZE = 16
-RCP_LN2 = 1.4426950216
 
 
 def kda_gate(
@@ -685,33 +672,39 @@ def chunk_kda_with_fused_gate_fwd(
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Chunked KDA prefill, split like upstream: chunk table, gate, delta rule."""
-    chunk_size = FLA_CHUNK_SIZE
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    g, beta = fused_kda_gate_chunk_cumsum(
-        raw_g,
-        raw_beta=raw_beta,
-        A_log=A_log,
-        g_bias=g_bias,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=chunk_size,
-        lower_bound=lower_bound,
-    )
-    return _chunk_kda_fwd_with_cumulative_g(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_size=chunk_size,
-        safe_gate=lower_bound is not None,
-    )
+    """Sequential scan standing in for the chunked KDA prefill kernels.
+
+    ``initial_state`` is the dense per-request state ``[N, H, V, K]`` produced by
+    ``gather_initial_states``; the per-request final states are returned rather
+    than written into the paged cache (the caller does that).
+    """
+    qf = q[0].float() * scale
+    kf = k[0].float()
+    vf = v[0].float()
+    decay = kda_gate(raw_g, A_log, g_bias, lower_bound)[0].exp()
+    beta = torch.sigmoid(raw_beta[0].float())
+
+    out = torch.empty_like(vf)
+    starts = cu_seqlens.tolist()
+    if initial_state is None:
+        states = torch.zeros(
+            len(starts) - 1,
+            vf.shape[1],
+            vf.shape[2],
+            kf.shape[2],
+            dtype=torch.float32,
+            device=vf.device,
+        )
+        state_dtype = v.dtype
+    else:
+        states = initial_state.float().clone()
+        state_dtype = initial_state.dtype
+    for i in range(len(starts) - 1):
+        states[i] = _delta_rule_scan(
+            qf, kf, vf, decay, beta, states[i], starts[i], starts[i + 1], out
+        )
+    final_state = states.to(state_dtype) if output_final_state else None
+    return out.unsqueeze(0).to(v.dtype), final_state
 
 
 def chunk_kda_with_fused_gate(
