@@ -82,7 +82,7 @@ from vllm.v1.attention.backend import (
 )
 # [KUNLUN] get_mla_prefill_backend is NV-only; prefill new-tokens is routed
 # directly to kunlun_ops.attention below.
-# from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
@@ -102,17 +102,6 @@ _GATE_MULTI_STREAM_TOKEN_THRESHOLD = 512
 def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Apply the sigmoid output gate to a precomputed ``g_proj`` projection."""
     return attn_out * gate.sigmoid()
-
-
-class _KunlunNoopPrefillBackend:
-    def clone(self):
-        return self
-    def prepare_metadata(self, *args, **kwargs):
-        return None
-    def supports_quant_output(self, *args, **kwargs):
-        return False
-    def supports_out(self, *args, **kwargs):
-        return False
 
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
@@ -316,6 +305,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_b_proj=self.kv_b_proj,
             indexer=None,
         )
+        if getattr(self.impl, "dcp_world_size", -1) < 1:
+            # FlashAttention requires the cp_world_size is positive and the cp_rank
+            # is non negative; manually set here if not set by caller (-1 is unset)
+            self.impl.dcp_world_size = 1
+            self.impl.dcp_rank = 0
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
 
         vllm_config = get_current_vllm_config()
@@ -327,16 +321,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # [KUNLUN] NV prefill backend unavailable on P800. Prefill new-tokens
         # attention is done inline via kunlun_ops.attention in
         # _forward_prefill_fused, so no prefill_backend object is constructed.
-        # self.prefill_backend = get_mla_prefill_backend(vllm_config)(
-        #     num_heads=self.num_local_heads,
-        #     scale=self.scale,
-        #     kv_lora_rank=self.kv_lora_rank,
-        #     qk_nope_head_dim=self.qk_nope_head_dim,
-        #     qk_rope_head_dim=self.qk_rope_head_dim,
-        #     v_head_dim=self.v_head_dim,
-        #     vllm_config=vllm_config,
-        # )
-        self.prefill_backend = _KunlunNoopPrefillBackend()
+        self.prefill_backend = get_mla_prefill_backend(vllm_config)(
+            num_heads=self.num_local_heads,
+            scale=self.scale,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            vllm_config=vllm_config,
+        )
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -853,7 +846,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         softmax_lse = torch.zeros(
             q.size(1), q.size(0), dtype=torch.float32, device=q.device
         )
-        softmax_lse.fill_(float("-inf"))
+        tp_q_head_num=q.size(1)
+        softmax_lse = torch.full((tp_q_head_num, q.size(0)), float('-inf'), dtype=torch.float32, device=q.device)
         kunlun_ops.attention(
             q=q,
             k_cache=k,
@@ -873,6 +867,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             v_trans_threshold=0,
             alpha=_ds_alpha,
             softmax_lse=softmax_lse,
+            unpadded_lse=True,
         )
         output_prefill = (attn_out, softmax_lse) if has_context else attn_out
         # --- naive end ---

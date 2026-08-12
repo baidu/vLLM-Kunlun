@@ -40,7 +40,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
-    "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
+    "vllm.v1.attention.ops.merge_attn_states": "vllm_kunlun.v1.attention.ops.merge_attn_states",
     "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     "vllm.v1.attention.backends.mla.flashattn_mla": "vllm_kunlun.v1.attention.backends.mla.flashattn_mla",
     "vllm.models.kimi_k3.nvidia.mla": "vllm_kunlun.models.kimi_k3.nvidia.mla",
@@ -395,6 +395,96 @@ _register_post_import_hook(
 )
 
 
+# --- hook: precompute prefill.query_start_loc_cpu at metadata build ---------
+# MLACommonPrefillMetadata carries only query_start_loc (device); the Kunlun MLA
+# prefill backend needs a CPU copy for kunlun_ops.attention's context_seq_lod_cpu.
+# Instead of a per-layer .cpu() in the hot path, attach it once per build here,
+# reusing the CPU query_start_loc the builder already has (pure CPU slice, no
+# extra D2H). Runs on host each step for both eager and cudagraph modes
+# (metadata build is never inside a captured graph).
+def _mla_qsl_cpu_applied(mod):
+    cls = getattr(mod, "MLACommonMetadataBuilder", None)
+    return cls is None or getattr(cls.build, "_kunlun_qsl_cpu", False)
+
+
+def _mla_qsl_cpu_apply(mod):
+    cls = getattr(mod, "MLACommonMetadataBuilder", None)
+    if cls is None:
+        return
+    _orig_build = cls.build
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        md = _orig_build(self, common_prefix_len, common_attn_metadata, fast_build)
+        prefill = getattr(md, "prefill", None)
+        if prefill is not None and getattr(prefill, "query_start_loc_cpu", None) is None:
+            full_cpu = common_attn_metadata.query_start_loc_cpu
+            # prefill slice starts at reqs_start = num_decodes; recover it from
+            # the (num_prefills + 1)-length prefill query_start_loc.
+            reqs_start = full_cpu.numel() - prefill.query_start_loc.numel()
+            prefill.query_start_loc_cpu = (
+                full_cpu[reqs_start:] - full_cpu[reqs_start]
+            )
+        # Precompute the chunked-context key/value cu_seq_lens CPU copy once per
+        # build (shared across all layers/chunks) so run_prefill_context_chunk
+        # does not do a per-layer .cpu() for context_kvlen_lod_cpu.
+        chunked = getattr(prefill, "chunked_context", None) if prefill else None
+        if (
+            chunked is not None
+            and getattr(chunked, "cu_seq_lens", None) is not None
+            and getattr(chunked, "cu_seq_lens_cpu", None) is None
+        ):
+            chunked.cu_seq_lens_cpu = chunked.cu_seq_lens.cpu()
+        return md
+
+    build._kunlun_qsl_cpu = True
+    cls.build = build
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched MLACommonMetadataBuilder.build to attach "
+        "prefill.query_start_loc_cpu"
+    )
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.attention.mla_attention",
+    _mla_qsl_cpu_applied,
+    _mla_qsl_cpu_apply,
+)
+
+
+# --- hook: skip fa4_cutedsl_warmup on Kunlun XPU --------------------------
+# FA4 CuTeDSL MLA-prefill warmup is NV-only. Because our FlashAttnPrefillBackend
+# override reports get_name()=="FLASH_ATTN", fa4_cutedsl_warmup() does not early
+# return and imports upstream vllm...mla.prefill.flash_attn, whose top-level
+# `from fa_utils import compile_flash_attn_varlen_func_from_specs` fails on this
+# vllm build (symbol absent) -> ImportError kills every worker. No-op it.
+def _fa4_warmup_applied(mod):
+    fn = getattr(mod, "fa4_cutedsl_warmup", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _fa4_warmup_apply(mod):
+    if not hasattr(mod, "fa4_cutedsl_warmup"):
+        return
+
+    def _noop(*args, **kwargs):
+        logging.getLogger("vllm_kunlun").info(
+            "[KunlunPlugin] Skipping fa4_cutedsl_warmup (NV-only)"
+        )
+
+    _noop._kunlun_patched = True
+    mod.fa4_cutedsl_warmup = _noop
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched kernel_warmup.fa4_cutedsl_warmup -> no-op"
+    )
+
+
+_register_post_import_hook(
+    "vllm.model_executor.warmup.kernel_warmup",
+    _fa4_warmup_applied,
+    _fa4_warmup_apply,
+)
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
@@ -570,6 +660,33 @@ def register():
     except Exception:
         logger.exception("[KunlunPlugin] Qwen3ReasoningParser registration failed")
         # Non-fatal: continue without the override
+
+    # --- override MLA prefill backend selection for P800 ---
+    # get_mla_prefill_backend() only knows about FLASH_ATTN on non-Blackwell
+    # devices, and its class (vllm...prefill.flash_attn.FlashAttnPrefillBackend)
+    # needs flash_attn_varlen_func which is unavailable on Kunlun -> ImportError
+    # -> "No valid MLA prefill backend found". Override FLASH_ATTN to our
+    # kunlun_ops-backed implementation so selection + import succeed.
+    try:
+        from vllm.v1.attention.backends.mla.prefill.registry import (
+            MLAPrefillBackendEnum,
+            register_mla_prefill_backend,
+        )
+
+        register_mla_prefill_backend(
+            MLAPrefillBackendEnum.FLASH_ATTN,
+            "vllm_kunlun.v1.attention.backends.mla.prefill.flash_attn."
+            "FlashAttnPrefillBackend",
+        )
+        logger.info(
+            "[KunlunPlugin] registered Kunlun FlashAttnPrefillBackend override "
+            "for MLAPrefillBackendEnum.FLASH_ATTN"
+        )
+    except Exception:
+        logger.exception(
+            "[KunlunPlugin] failed to register MLA prefill backend override"
+        )
+        raise
 
     logger.info("[KunlunPlugin] register() done")
     return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
