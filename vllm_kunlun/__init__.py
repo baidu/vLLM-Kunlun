@@ -41,6 +41,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
     "vllm.v1.attention.ops.merge_attn_states": "vllm_kunlun.v1.attention.ops.merge_attn_states",
+    "vllm.v1.attention.ops.triton_merge_attn_states": "vllm_kunlun.v1.attention.ops.triton_merge_attn_states",
     "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     "vllm.v1.attention.backends.mla.flashattn_mla": "vllm_kunlun.v1.attention.backends.mla.flashattn_mla",
     "vllm.models.kimi_k3.nvidia.mla": "vllm_kunlun.models.kimi_k3.nvidia.mla",
