@@ -37,6 +37,9 @@ logger = init_logger(__name__)
 
 _SOFTPLUS_THRESHOLD = 20.0
 
+# Upstream chunk length of the KDA prefill kernels.
+FLA_CHUNK_SIZE = 64
+
 
 def kda_gate(
     raw_g: torch.Tensor,
@@ -864,6 +867,15 @@ def patch_kda_ops(mod) -> None:
     mod.fused_recurrent_kda_packed_decode = fused_recurrent_kda_packed_decode
     mod._kunlun_kda_patched = True
     logger.info("[KunlunPlugin] KDA delta-rule kernels -> torch")
+    # The gate stage is only reached if the upstream chunk path runs (the
+    # replacement above bypasses it), so patch it on ``chunk`` as well as on the
+    # package: chunk_kda_with_fused_gate_fwd resolves the name in its own module.
+    chunk_mod = getattr(mod, "chunk", None)
+    if chunk_mod is None or not hasattr(chunk_mod, "fused_kda_gate_chunk_cumsum"):
+        return
+    mod.fused_kda_gate_chunk_cumsum = fused_kda_gate_chunk_cumsum
+    chunk_mod.fused_kda_gate_chunk_cumsum = fused_kda_gate_chunk_cumsum
+    logger.info("[KunlunPlugin] fused_kda_gate_chunk_cumsum -> xspeedgate_ops")
 
 
 def layer_norm_gated_fwd(
