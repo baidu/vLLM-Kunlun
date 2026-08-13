@@ -694,6 +694,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         mqa_q = torch.empty(
             (b, num_heads, entry), dtype=ql_nope.dtype, device=ql_nope.device
         )
+        if b == 0:
+            return mqa_q
         torch.ops.xspeedgate_ops.fused_kimi_k3_mla_decode_q_concat_kv_cache_insert(
             ql_nope,
             q_pe,
@@ -807,18 +809,25 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             #     positions,
             #     cos_sin_cache,
             # )
-            # --- naive begin ---
-            # (1) RoPE on q's rope part and on k_pe, (2) K = [k_nope | k_pe
-            # broadcast to heads], (3) write the latent into the paged cache.
-            q_nope, q_pe = q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            k_pe = k_pe.reshape(k_pe.shape[0], -1)
+            tp, num_heads, qk_nope_head_dim = k_nope.shape
+            qk_head_dim = qk_nope_head_dim + k_pe.shape[1]
+            k = torch.empty(
+                (tp, num_heads, qk_head_dim), dtype=k_nope.dtype, device=k_nope.device
             )
-            q_pe, k_pe = self._apply_pe_rope(positions, q_pe, k_pe)
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            k_pe_heads = k_pe.expand(-1, self.num_local_heads, -1)
-            k = torch.cat([k_nope, k_pe_heads], dim=-1)
-            self._write_latent_cache(kv_c_normed, k_pe, slot_mapping)
-            # --- naive end ---
+            if tp != 0:
+                k = torch.ops.xspeedgate_ops.fused_kimi_k3_mla_key_concat_kv_cache_insert(
+                    q,
+                    k_nope,
+                    k_pe,
+                    kv_c_normed,
+                    k,
+                    self.kv_cache,
+                    slot_mapping,
+                    self.kv_cache.shape[1],
+                    positions,
+                    cos_sin_cache,
+                )
 
         # [KUNLUN] prefill new-token attention. NV used
         # prefill.prefill_backend.run_prefill_new_tokens(...); on P800 we call
