@@ -37,6 +37,9 @@ logger = init_logger(__name__)
 
 _SOFTPLUS_THRESHOLD = 20.0
 
+# Upstream chunk length of the KDA prefill kernels.
+FLA_CHUNK_SIZE = 64
+
 
 def kda_gate(
     raw_g: torch.Tensor,
@@ -211,6 +214,62 @@ def gather_initial_states(
         if flags[i] and slot >= 0:
             out[i] = state[slot]
     return out
+
+
+def prepare_chunk_indices(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """``[NT, 2]`` table of ``(sequence index, chunk index inside the sequence)``.
+
+    Same layout and order as upstream's triton-side helper, so a kernel taking
+    ``chunk_indices`` can be dropped in unchanged. The sequence column is built
+    explicitly instead of upstream's ``indices.eq(0).cumsum(0) - 1``: that form
+    skips a zero-length sequence and shifts every later sequence index by one.
+    """
+    lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    num_chunks = ((lens + chunk_size - 1) // chunk_size).tolist()
+    seq = torch.cat([torch.full((n,), i) for i, n in enumerate(num_chunks)])
+    indices = torch.cat([torch.arange(n) for n in num_chunks])
+    return torch.stack([seq, indices], 1).to(cu_seqlens)
+
+
+def fused_kda_gate_chunk_cumsum(
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    g_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_size: int = FLA_CHUNK_SIZE,
+    output_dtype: torch.dtype | None = torch.float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gate stage, same contract as the upstream fused kernel.
+
+    Returns ``g`` (``[1, T, H, D]``: the *chunk-local* cumulative sum of the
+    per-token gate, scaled by ``RCP_LN2`` so consumers rebuild ``exp(gate)`` with
+    ``exp2``) and ``beta`` (``[1, T, H]`` fp32 ``sigmoid(raw_beta)``).
+
+    ``xspeedgate_ops.fused_kda_gate_chunk_cumsum`` implements this stage with the
+    same contract; ``beta``/``threshold`` are the softplus parameters of the
+    ``lower_bound is None`` branch, which upstream leaves at their defaults.
+    """
+    if chunk_indices is None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    return torch.ops.xspeedgate_ops.fused_kda_gate_chunk_cumsum(
+        raw_g.contiguous(),
+        raw_beta,
+        A_log.float().contiguous(),
+        None if g_bias is None else g_bias.float().contiguous(),
+        1.0,
+        _SOFTPLUS_THRESHOLD,
+        lower_bound,
+        cu_seqlens.to(torch.int32).contiguous(),
+        chunk_indices.to(torch.int32).contiguous(),
+        chunk_size,
+        output_dtype or raw_g.dtype,
+    )
 
 
 def chunk_kda_with_fused_gate_fwd(
@@ -419,6 +478,15 @@ def patch_kda_ops(mod) -> None:
     mod.fused_recurrent_kda_packed_decode = fused_recurrent_kda_packed_decode
     mod._kunlun_kda_patched = True
     logger.info("[KunlunPlugin] KDA delta-rule kernels -> torch")
+    # The gate stage is only reached if the upstream chunk path runs (the
+    # replacement above bypasses it), so patch it on ``chunk`` as well as on the
+    # package: chunk_kda_with_fused_gate_fwd resolves the name in its own module.
+    chunk_mod = getattr(mod, "chunk", None)
+    if chunk_mod is None or not hasattr(chunk_mod, "fused_kda_gate_chunk_cumsum"):
+        return
+    mod.fused_kda_gate_chunk_cumsum = fused_kda_gate_chunk_cumsum
+    chunk_mod.fused_kda_gate_chunk_cumsum = fused_kda_gate_chunk_cumsum
+    logger.info("[KunlunPlugin] fused_kda_gate_chunk_cumsum -> xspeedgate_ops")
 
 
 def layer_norm_gated_fwd(
