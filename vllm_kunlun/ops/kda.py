@@ -465,26 +465,16 @@ def recompute_w_u_fwd(
     reason (upstream can fuse the ``q`` gating here, this port does it in
     ``chunk_gla_fwd_o_gk``).
     """
-    chunk_size = A.shape[-1]
-    pos, valid = _chunk_tiles(cu_seqlens, chunk_indices, chunk_size, k.shape[1])
-    k_t = _tile(k, pos, valid)
-    g_t = _tile(gk, pos, valid)
-    b_t = _tile(beta.unsqueeze(-1), pos, valid)
-    A_t = _tile(A, pos, valid)
-
-    u_t = A_t @ (b_t * _tile(v, pos, valid))
-    w_t = A_t @ (b_t * k_t * torch.exp2(g_t))
-    kg_t = k_t * torch.exp2(_chunk_last_gate(g_t, valid) - g_t)
-
-    # fp32 everywhere: unlike the triton kernels there is no tensor-core reason
-    # to round these intermediates down to the input dtype.
-    w = torch.zeros(k.shape, dtype=torch.float32, device=k.device)
-    u = torch.zeros(v.shape, dtype=torch.float32, device=v.device)
-    kg = torch.zeros_like(w)
-    _untile(w_t, pos, valid, w)
-    _untile(u_t, pos, valid, u)
-    _untile(kg_t, pos, valid, kg)
-    return w, u, None, kg
+    return kunlun_ops.recompute_w_u_fwd_k3(
+        k,
+        v,
+        beta,
+        A,
+        q,
+        gk,
+        cu_seqlens,
+        chunk_indices,
+    )
 
 
 def chunk_gated_delta_rule_fwd_h(
