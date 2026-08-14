@@ -10,7 +10,7 @@ import urllib.request
 
 # The workflow includes complete changed files plus bounded related files. Keep
 # one request below the model context limit; very large PRs should be split.
-MAX_PROMPT_CHARS = 450_000
+MAX_PROMPT_CHARS = 1000_0000
 
 
 SYSTEM_PROMPT = """You are a senior software engineer reviewing a GitHub pull request.
