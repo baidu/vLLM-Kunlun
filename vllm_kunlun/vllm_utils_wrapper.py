@@ -1,19 +1,20 @@
 """vllm_utils_wrapper.py"""
 
 import socket
+import sys
 from types import SimpleNamespace
-from typing import Any, Union
+from typing import Any
 
 import torch
-import vllm.distributed.parallel_state as parallel_state
-import vllm.envs as envs
 import vllm.utils as _orig
+from vllm import envs
+from vllm.distributed import parallel_state
 
 try:
     import vllm_kunlun._kunlun  # noqa: F401
 except ImportError as e:
     try:
-        from . import _kunlun  # noqa: F401, F403
+        from . import _kunlun  # noqa: F401
     except ImportError:
         print(f"Warning: Failed to load vllm_kunlun native extension: {e}")
 
@@ -32,8 +33,8 @@ def vllm_kunlun_weak_ref_tensor(tensor: Any) -> Any:
 
 
 def vllm_kunlun_weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor],
+) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.
@@ -68,8 +69,6 @@ _wrapped = SimpleNamespace(**_orig.__dict__)
 _wrapped.weak_ref_tensor = vllm_kunlun_weak_ref_tensor
 _wrapped.weak_ref_tensors = vllm_kunlun_weak_ref_tensors
 _wrapped._get_open_port = _get_open_port
-
-import sys  # noqa: E402
 
 sys.modules["vllm.utils"] = _wrapped
 

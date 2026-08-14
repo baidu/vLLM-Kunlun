@@ -188,7 +188,7 @@ if not getattr(_upstream_utils.bind_kv_cache, "_kunlun_patched", False):
             continue
         if getattr(module, "bind_kv_cache", None) is _original_bind:
             try:
-                setattr(module, "bind_kv_cache", _bind_kv_cache)
+                module.bind_kv_cache = _bind_kv_cache
                 rebind_count += 1
             except Exception:
                 pass

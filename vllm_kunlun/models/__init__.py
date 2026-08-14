@@ -5,7 +5,7 @@ def register_model():
 
     # TODO Remove all of models registration below
 
-    # from .demo_model import DemoModel  # noqa: F401
+    # from .demo_model import DemoModel
 
     # ModelRegistry.register_model(
     #     "DemoModel",

@@ -17,8 +17,6 @@
 
 """kunlun custom op entry"""
 
-from typing import Optional
-
 import cocopod  # noqa
 import torch
 import xspeedgate_ops  # noqa
@@ -385,12 +383,12 @@ class KunlunOps:
         renormalize: bool,
         inplace: bool = False,
         use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
+        num_expert_group: int | None = None,
+        topk_group: int | None = None,
+        w1_bias: torch.Tensor | None = None,
+        w2_bias: torch.Tensor | None = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        e_score_correction_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """fused_moe"""
         global_num_experts, up_gate_size, _ = w1.shape
@@ -631,10 +629,10 @@ class KunlunOps:
         renormalize: bool,
         inplace: bool = False,
         use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
+        num_expert_group: int | None = None,
+        topk_group: int | None = None,
+        w1_bias: torch.Tensor | None = None,
+        w2_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = hidden_states
         batch, hidden_size = x.shape

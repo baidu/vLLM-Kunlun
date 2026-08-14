@@ -5,12 +5,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import kunlun_ops
 import torch
-import torch.nn as nn
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
+from torch import nn
 from vllm.logger import init_logger
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
@@ -64,8 +64,8 @@ class RejectionSampler(nn.Module):
     def __init__(
         self,
         sampler: Sampler,
-        spec_config: Optional["SpeculativeConfig"] = None,
-        device: Optional[torch.device] = None,
+        spec_config: SpeculativeConfig | None = None,
+        device: torch.device | None = None,
     ):
         super().__init__()
         self.sampler = sampler
@@ -73,7 +73,7 @@ class RejectionSampler(nn.Module):
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
 
-        self.synthetic_conditional_rates: Optional[torch.Tensor] = None
+        self.synthetic_conditional_rates: torch.Tensor | None = None
         if (
             spec_config is not None
             and getattr(spec_config, "rejection_sample_method", None) == "synthetic"
@@ -97,7 +97,7 @@ class RejectionSampler(nn.Module):
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
-        draft_probs: Optional[torch.Tensor],
+        draft_probs: torch.Tensor | None,
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -255,8 +255,8 @@ class RejectionSampler(nn.Module):
         output_token_ids: torch.Tensor,
         vocab_size: int,
         discard_req_indices: Sequence[int] = (),
-        logprobs_tensors: Optional[LogprobsTensors] = None,
-    ) -> tuple[list[list[int]], Optional[LogprobsLists]]:
+        logprobs_tensors: LogprobsTensors | None = None,
+    ) -> tuple[list[list[int]], LogprobsLists | None]:
         """Parse the output of the rejection sampler.
         Args:
             output_token_ids: The sampled token IDs in shape
@@ -308,7 +308,7 @@ class RejectionSampler(nn.Module):
             )
 
         # Calculate indices of target logits.
-        repeat_indices: Optional[torch.Tensor] = None
+        repeat_indices: torch.Tensor | None = None
         need_repeat_indices = (
             sampling_metadata.allowed_token_ids_mask is not None
             or has_penalties
@@ -381,7 +381,7 @@ class RejectionSampler(nn.Module):
     @staticmethod
     def _combine_outputs_with_spec_tokens(
         output_token_ids: list[list[int]],
-        spec_token_ids: Optional[list[list[int]]] = None,
+        spec_token_ids: list[list[int]] | None = None,
     ) -> list[list[int]]:
         if spec_token_ids is None:
             return output_token_ids
@@ -405,7 +405,7 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_logits: torch.Tensor,
     # [batch_size, 1]
@@ -667,7 +667,7 @@ def sample_recovered_tokens(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
     # [num_tokens, vocab_size]
-    draft_probs: Optional[torch.Tensor],
+    draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     sampling_metadata: SamplingMetadata,

@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import Optional
 
 import kunlun_ops
 import torch
-import torch.nn as nn
+from torch import nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -31,8 +30,8 @@ class TopKTopPSampler(nn.Module):
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
-        k: Optional[torch.Tensor],
-        p: Optional[torch.Tensor],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
@@ -52,8 +51,8 @@ class TopKTopPSampler(nn.Module):
         self,
         logits: torch.Tensor,
         generators: dict[int, torch.Generator],
-        k: Optional[torch.Tensor],
-        p: Optional[torch.Tensor],
+        k: torch.Tensor | None,
+        p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
         if (k is None and p is None) or generators:
@@ -72,8 +71,8 @@ class TopKTopPSampler(nn.Module):
 
 def apply_top_k_top_p(
     logits: torch.Tensor,
-    k: Optional[torch.Tensor],
-    p: Optional[torch.Tensor],
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
@@ -115,8 +114,8 @@ def apply_top_k_top_p(
 
 def apply_top_k_top_p_optimized(
     logits: torch.Tensor,
-    k: Optional[torch.Tensor],
-    p: Optional[torch.Tensor],
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
     max_select_k: int = 8192,
 ) -> torch.Tensor:
     """Sort-free top-k + top-p, mathematically identical to
@@ -246,8 +245,8 @@ def random_sample(
 
 def flashinfer_sample(
     logits: torch.Tensor,
-    k: Optional[torch.Tensor],
-    p: Optional[torch.Tensor],
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
     generators: dict[int, torch.Generator],
 ) -> torch.Tensor:
     """Sample from the logits using FlashInfer.
