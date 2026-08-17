@@ -27,9 +27,9 @@ import sys
 if "_vllm_kunlun_custom_ops_registration" not in sys.modules:
     import vllm_kunlun.ops._custom_ops  # noqa: F401
 
-import vllm_kunlun.ops.fused_moe.layer  # noqa: E402,F401
-
 # base layers
+import vllm_kunlun.ops.activation
+import vllm_kunlun.ops.fused_moe.layer  # noqa: E402,F401
 import vllm_kunlun.ops.layernorm
 import vllm_kunlun.ops.linear
 

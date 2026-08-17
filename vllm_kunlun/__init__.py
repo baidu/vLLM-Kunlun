@@ -312,16 +312,15 @@ _register_post_import_hook(
 )
 
 
-# --- hook 7: SiluAndMul.forward_native ------------------------------------
-# Replace SiluAndMul.forward_native with the fused silu_and_mul kernel.
-# The patch lives at module scope in ``vllm_kunlun/ops/activation.py``, so it
-# only takes effect once that module is imported. Nothing else imports it,
-# hence this hook. It cannot be a top-level import here: that would pull in
+# --- hook 7: SiluAndMul OOT registration ------------------------------------
+# Import the activation module so its CustomOp.register_oot decorator runs.
+# This cannot be a top-level import here: it would pull in
 # ``vllm.model_executor.layers.*`` while the platform plugin is still
-# registering.
+# registering. The import also activates the other OOT registrations in the
+# ``vllm_kunlun.ops`` package.
 def _activation_applied(mod):
     cls = getattr(mod, "SiluAndMul", None)
-    return cls is None or getattr(cls, "_kunlun_silu_and_mul_patched", False)
+    return cls is None or "vllm_kunlun.ops.activation" in sys.modules
 
 
 def _activation_apply(mod):
