@@ -18,10 +18,10 @@ from typing import List, Tuple
 import torch
 import torch.nn.functional as F
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.moe_hash_router")
+LOGGER = logging.getLogger("vllm_kunlun.ops.fused_moe.moe_hash_router")
 _HASH_TOPK_MODULE = "vllm._custom_ops"
 _ROUTER_MODULE = (
     "vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router"
@@ -38,7 +38,7 @@ def _get_flags():
     """Parse feature gates once per process at first routing call."""
     if not _flag_cache:
         # Lazy local import avoids cycles during adapter package startup.
-        from .gates import FeatureFlags
+        from vllm_kunlun.config.deepseek_v4 import FeatureFlags
         _flag_cache[0] = FeatureFlags()
     return _flag_cache[0]
 
@@ -258,7 +258,7 @@ def apply(master_enabled_check=True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not (flags.hash_topk_fused or flags.activation_routing_accel):

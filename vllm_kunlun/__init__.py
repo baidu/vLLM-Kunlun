@@ -1163,7 +1163,7 @@ def register():
             "_custom_ops.py",
         )
         _private = "_vllm_kunlun_custom_ops_registration"
-        if _private not in sys.modules:
+        if "vllm_kunlun.ops._custom_ops" not in sys.modules and _private not in sys.modules:
             _spec = _ilu.spec_from_file_location(_private, _ops_file)
             _mod = _ilu.module_from_spec(_spec)
             sys.modules[_private] = _mod
@@ -1370,15 +1370,12 @@ _register_post_import_hook(
 
 # ---- DeepSeek-V4 OOT adapters -----------------------------------------------
 # The per-feature monkey-patches for DeepSeek-V4-on-Kunlum live in the adapter
-# package below rather than being hard-coded here. Calling install_all() keeps
-# the original plugin bootstrap code unchanged while still enabling incremental
-# migration of V4-specific hooks.
+# package below rather than being hard-coded here. ``apply_all`` is the same
+# explicit adapter facade used by the other model-specific integrations.
 try:
-    from .adapters.dsv4.installer import (
-        install_all as _install_v4_adapters,
-    )
+    from .patches.deepseek_v4 import apply_all as _apply_v4_adapters
 
-    _install_v4_adapters(_register_post_import_hook)
+    _apply_v4_adapters(_register_post_import_hook)
 except Exception:
     logging.getLogger("vllm_kunlun").exception(
         "[KunlunPlugin] DSV4 adapter pack failed to load"

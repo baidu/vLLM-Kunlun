@@ -13,10 +13,10 @@ lives here so the quantization source stays free of ad-hoc env reads.
 import logging
 from typing import Any, List
 
-from .gates import FeatureFlags
-from ..runtime_utils import WarningOnce
+from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.moe_int8_factory")
+LOGGER = logging.getLogger("vllm_kunlun.quantization.deepseek_v4")
 _METHOD_CLS_CACHE: "dict[str, Any]" = {}
 _FLAGS_CACHE = None
 _INSTALL_WARNED = False

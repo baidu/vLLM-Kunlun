@@ -8,7 +8,7 @@ from typing import List, Optional
 import logging
 import sys
 import typing
-from .gates import FeatureFlags
+from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
 __all__ = ["FeatureFlags", "get_applied_labels", "clear_application_state", "apply_all"]
 
@@ -51,7 +51,7 @@ def apply_all(
 
     labels_installed: "List[str]" = []
     try:
-        from .registry import populate_hooks as _populate_registry_hooks
+        from vllm_kunlun.patches.registry import populate_hooks as _populate_registry_hooks
 
         # If caller passed no callback, attempt to retrieve it automatically so that this function can be called safely in isolation too.
         if register_post_import_hook is None:
@@ -61,7 +61,7 @@ def apply_all(
     except Exception as exc:  # noqa: BLE001
         import logging
 
-        logging.getLogger("vllm_kunlun.adapters.dsv4").warning(
+        logging.getLogger("vllm_kunlun.patches.deepseek_v4").warning(
             "DSV4 adapter install step failed (%s); continuing without V4-specific patches",
             exc,
         )
@@ -87,6 +87,6 @@ def _root_register_callback() -> Optional["Callable[..., None]"]:
 
 def _noop_register(*_args, **_kwargs):
     """Placeholder used when no real dispatcher callback is available (e.g., unit tests)."""
-    logging.getLogger("vllm_kunlun.adapters.dsv4").debug(
+    logging.getLogger("vllm_kunlun.patches.deepseek_v4").debug(
         "Skipping lazy post-import hook because dispatcher not available",
     )

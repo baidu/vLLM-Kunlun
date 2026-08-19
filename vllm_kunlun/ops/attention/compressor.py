@@ -22,11 +22,11 @@ import os
 
 import torch
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 from vllm_kunlun import record_wired
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.compressor")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.compressor")
 _APPLIED_SENTINEL = "_dsv4_compressor_applied"
 _FALSE = object()
 
@@ -255,7 +255,7 @@ def _find_xsg_compress_ops(native_allowed: bool):
       2. torch.ops.xspeedgate_ops (registered via TORCH_LIBRARY)
       3. kunlun_ops Python module (these two ops are NOT registered to
          torch.ops but ARE in the kunlun_ops ctypes Python module —
-         vllm_kunlun/adapters/dsv4/compressor.py verification).
+         vllm_kunlun/ops/attention/compressor.py verification).
 
     Records what was found (or fell back to) into the vllm_kunlun
     wired inventory for the startup log.
@@ -823,7 +823,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not (flags.compressor_save_native or flags.compressor_vectorized_fallback):

@@ -19,10 +19,10 @@ from typing import Callable, List
 
 import torch
 
-from ..runtime_utils import WarningOnce, find_op
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce, find_op
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.qkv_cache_insert")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.qkv_cache_insert")
 _APPLIED_SENTINEL = "_dsv4_qkv_cache_wired"
 _WARNED_BF16_FALLBACK_KEY = "qkv-insert-bf16-native-failed-once"
 _INSERT_OP_NAME = "fused_deepseek_v4_qnorm_rope_kv_insert"
@@ -188,7 +188,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not flags.qkv_cache_insert_native:

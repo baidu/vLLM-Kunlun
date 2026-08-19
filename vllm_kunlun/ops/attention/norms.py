@@ -22,10 +22,10 @@ from typing import Callable, List, Tuple
 import torch
 
 from ...ops.layernorm import KunlunRMSNorm
-from ..runtime_utils import WarningOnce, find_op
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce, find_op
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.norms")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.norms")
 
 # ---------------------------------------------------------------------------
 # Capability probe cache (lazy, once per process)
@@ -298,7 +298,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not flags.rmsnorm_shortcut:

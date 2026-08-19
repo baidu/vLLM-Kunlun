@@ -16,10 +16,10 @@ variants untouched.
 import logging
 from typing import List
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.mhc_hyperconnection")
+LOGGER = logging.getLogger("vllm_kunlun.ops.fused_moe.mhc_hyperconnection")
 _TILELANG_SENTINEL = "_dsv4_mhc_tilelang_wired"
 _MODEL_SENTINEL = "_dsv4_mhc_model_wired"
 

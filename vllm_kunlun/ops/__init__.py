@@ -17,6 +17,9 @@
 
 import sys
 
+_torch_utils = sys.modules.get("vllm.utils.torch_utils")
+_OOT_IMPORTS_READY = getattr(_torch_utils, "is_quantized_kv_cache", None) is not None
+
 # ``_custom_ops`` registers torch custom ops via ``@custom_op`` decorators.
 # Each decorator may be executed at most ONCE per process. The plugin's
 # ``register()`` already loads ``_custom_ops.py`` directly via
@@ -24,18 +27,23 @@ import sys
 # package's ``__init__.py`` is reached, in order to avoid a circular
 # import chain through ``vllm.model_executor.layers.fused_moe.*``.
 # Skip the second registration when that has already happened.
-if "_vllm_kunlun_custom_ops_registration" not in sys.modules:
+if _OOT_IMPORTS_READY and "_vllm_kunlun_custom_ops_registration" not in sys.modules:
     import vllm_kunlun.ops._custom_ops  # noqa: F401
 
-import vllm_kunlun.ops.fused_moe.layer  # noqa: E402,F401
+if _OOT_IMPORTS_READY:
+    import vllm_kunlun.ops.fused_moe.layer  # noqa: E402,F401
 
 # base layers
-import vllm_kunlun.ops.layernorm
-import vllm_kunlun.ops.linear
+if _OOT_IMPORTS_READY:
+    import vllm_kunlun.ops.layernorm
+if _OOT_IMPORTS_READY:
+    import vllm_kunlun.ops.linear
 
 # embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
+if _OOT_IMPORTS_READY:
+    import vllm_kunlun.ops.rotary_embedding
+if _OOT_IMPORTS_READY:
+    import vllm_kunlun.ops.vocab_parallel_embedding
 
 # Spec-decode helpers (eagle / dflash) import upstream symbols that may not
 # exist on every vllm version (e.g. ``vllm.v1.attention.backends.tree_attn``

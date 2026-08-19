@@ -4,7 +4,7 @@ from unittest.mock import patch
 # This module is importable even before full vLLM model loading, because it uses runtime-utils only.
 def test_apply_sets_block_size_for_dsv4():
     # Import here so earlier tests can run without needing the platform module.
-    from vllm_kunlun.adapters.dsv4.platform_policy import apply as policy_apply
+    from vllm_kunlun.models.deepseek_v4_policy import apply as policy_apply
     from vllm_kunlun.platforms.kunlun import KunlunPlatform
 
     class FakeHFConfig:
@@ -35,7 +35,7 @@ def test_apply_sets_block_size_for_dsv4():
 
         # Explicit force should still win.
         with patch.dict(os.environ, {"KUNLUN_DSV4_FORCE_MLA_BLOCK_SIZE": "128"}, clear=False):
-            from vllm_kunlun.adapters.dsv4.gates import FeatureFlags
+            from vllm_kunlun.config.deepseek_v4 import FeatureFlags
             _ff = FeatureFlags()
             Vcfg.cache_config.block_size = 64
             KunlunPlatform.check_and_update_config(KunlunPlatform, Vcfg)

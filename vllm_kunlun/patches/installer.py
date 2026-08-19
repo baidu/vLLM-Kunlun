@@ -2,15 +2,15 @@
 
 This thin wrapper lets :file:`vllm_kunlun/__init__.py` stay free of per-feature
 gating logic. It simply checks the master switch ``KUNLUN_DSV4_PLUGINS_ENABLED``,
-then hands off to ``adapters.dsv4.registry.populate_hooks()``.
+then hands off to ``patches.registry.populate_hooks()``.
 """
 from typing import Callable, List
 
-from .gates import FeatureFlags
-from .registry import populate_hooks
-from ..runtime_utils import WarningOnce
+from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+from vllm_kunlun.patches.registry import populate_hooks
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
 
-LOGGER_NAME = "vllm_kunlun.adapters.dsv4.installer"
+LOGGER_NAME = "vllm_kunlun.patches.deepseek_v4.installer"
 _WARN_KEY_DISABLED = "dsv4-installer-master-switch-off"
 _SUMMARY_LOGGED = False
 

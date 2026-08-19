@@ -15,7 +15,7 @@ import logging
 import os
 from typing import List, Optional
 
-from ..runtime_utils import WarningOnce, env_int
+from vllm_kunlun.adapters.runtime_utils import WarningOnce, env_int
 
 LOGGER = logging.getLogger("vllm_kunlun.adapters")
 _APPLIED_KEY = "_dsv4_platform_adapter_installed"

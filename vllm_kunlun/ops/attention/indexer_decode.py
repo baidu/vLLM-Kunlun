@@ -17,10 +17,10 @@ from typing import List
 
 import torch
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.indexer_decode")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.indexer_decode")
 _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"
 _WARNED_DECODE_NATIVE_FAILED_KEY = "dsv4-indexer-decode-native-failed"
 _FALSE = object()
@@ -331,7 +331,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not flags.indexer_decode_native:

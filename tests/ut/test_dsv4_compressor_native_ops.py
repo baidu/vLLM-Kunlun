@@ -394,7 +394,7 @@ def _reference_store(case, norm_weight, cos_sin_cache):
 
 def _run_installed_dispatcher(case, norm_weight, cos_sin_cache, native, monkeypatch):
     """Install the adapter's dispatcher with the native flag forced, then call it."""
-    from vllm_kunlun.adapters.dsv4 import compressor
+    from vllm_kunlun.ops.attention import compressor
 
     monkeypatch.setenv(_NATIVE_FLAG, "1" if native else "0")
     emitted = []

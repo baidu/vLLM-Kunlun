@@ -49,7 +49,7 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
     _register_lazy(
         "vllm.v1.worker.gpu_worker",
         lambda m: True,  # fire once, platform_policy.apply() is idempotent
-        lambda m: __import__("vllm_kunlun.adapters.dsv4.platform_policy", fromlist=["apply"]).apply(),
+        lambda m: __import__("vllm_kunlun.models.deepseek_v4_policy", fromlist=["apply"]).apply(),
         label="dsv4.platform_policy",
     )
     if os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1":
@@ -57,7 +57,7 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
             "vllm.model_executor.layers.logits_processor",
             lambda m: getattr(m.LogitsProcessor._gather_logits, "_kunlun_dsv4_debug", False),
             lambda m: __import__(
-                "vllm_kunlun.adapters.dsv4.logits_debug", fromlist=["apply"]
+                "vllm_kunlun.patches.dsv4_logits_debug", fromlist=["apply"]
             ).apply(m),
             label="dsv4.logits_debug",
         )
@@ -65,61 +65,61 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
             "vllm.v1.worker.gpu_model_runner",
             lambda m: getattr(m.GPUModelRunner.execute_model, "_kunlun_dsv4_debug", False),
             lambda m: __import__(
-                "vllm_kunlun.adapters.dsv4.runner_debug", fromlist=["apply"]
+                "vllm_kunlun.patches.dsv4_runner_debug", fromlist=["apply"]
             ).apply(m),
             label="dsv4.runner_debug",
         )
 
     try:
-        from .norms import apply as _norms_apply
+        from vllm_kunlun.ops.attention.norms import apply as _norms_apply
         _norms_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 RMSNorm-shortcut installation failed (%s)", exc)
 
     try:
-        from .qkv_cache_insert import apply as _qkv_insert_apply
+        from vllm_kunlun.ops.attention.qkv_cache_insert import apply as _qkv_insert_apply
         _qkv_insert_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 QKV-cache-insert installation failed (%s)", exc)
 
     try:
-        from .o_proj_alias import apply as _o_proj_apply
+        from vllm_kunlun.ops.attention.o_proj_alias import apply as _o_proj_apply
         _o_proj_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 O-projection alias installation failed (%s)", exc)
 
     try:
-        from .mhc_hyperconnection import apply as _mhc_apply
+        from vllm_kunlun.ops.fused_moe.mhc_hyperconnection import apply as _mhc_apply
         _mhc_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 MHC hyperconnection installation failed (%s)", exc)
 
     try:
-        from .flashmla_bridge import apply as _flashmla_bridge_apply
+        from vllm_kunlun.ops.attention.flashmla_bridge import apply as _flashmla_bridge_apply
         _flashmla_bridge_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 FlashMLA metadata bridge registration failed (%s)", exc)
 
     try:
-        from .indexer_decode import apply as _indexer_decode_apply
+        from vllm_kunlun.ops.attention.indexer_decode import apply as _indexer_decode_apply
         _indexer_decode_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 sparse-indexer decode registration failed (%s)", exc)
 
     try:
-        from .compressor import apply as _compressor_apply
+        from vllm_kunlun.ops.attention.compressor import apply as _compressor_apply
         _compressor_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 compressor adapter registration failed (%s)", exc)
 
     try:
-        from .moe_hash_router import apply as _moe_hash_apply
+        from vllm_kunlun.ops.fused_moe.moe_hash_router import apply as _moe_hash_apply
         _moe_hash_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 MoE hash/softplus router registration failed (%s)", exc)
 
     try:
-        from .moe_int8_factory import apply as _moe_int8_apply
+        from vllm_kunlun.quantization.deepseek_v4 import apply as _moe_int8_apply
         _moe_int8_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 INT8-W8A8-MoE bridge registration failed (%s)", exc)

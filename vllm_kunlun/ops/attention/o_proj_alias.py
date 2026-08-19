@@ -11,10 +11,10 @@ available XPU kernels, falling back to PyTorch reference automatically.
 import logging
 from typing import List
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.o_proj_alias")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.o_proj_alias")
 _APPLIED_SENTINEL = "_dsv4_o_proj_wired"
 _O_PROJ_FN_NAME = "deep_gemm_fp8_o_proj"
 _EXPECTED_SOURCE = "vllm_kunlun.ops.deepseek_v4_o_proj"
@@ -57,7 +57,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not flags.oproj_native:

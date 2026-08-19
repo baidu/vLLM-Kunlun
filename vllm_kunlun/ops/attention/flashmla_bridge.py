@@ -16,10 +16,10 @@ from typing import Any, List, Tuple
 
 import torch
 
-from ..runtime_utils import WarningOnce
-from .registry import _register_lazy
+from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.patches.registry import _register_lazy
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.flashmla_bridge")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.flashmla_bridge")
 _INDEXER_KERNEL_ATTR = "_build_prefill_chunk_metadata_kernel"
 _C128A_FN_NAME = "build_c128a_topk_metadata"
 _SWA_KERNEL_ATTR = "_compute_swa_indices_and_lens_kernel"
@@ -344,7 +344,7 @@ def apply(master_enabled_check: bool = True) -> List[str]:  # type: ignore[name-
     if not master_enabled_check:
         return []
 
-    from .gates import FeatureFlags
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
     if not flags.flashmla_sparse_backend:

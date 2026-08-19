@@ -42,7 +42,7 @@ from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 from vllm_kunlun.ops.activation import swiglu
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
-from vllm_kunlun.adapters.dsv4.moe_int8_factory import (
+from vllm_kunlun.quantization.deepseek_v4 import (
     create_modular_v4_method as _dsv4_create_v4_i8_method,
     int8_w8a8_route_native_enabled as _dsv4_i8_native_enabled,
 )
