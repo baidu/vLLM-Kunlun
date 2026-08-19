@@ -20,7 +20,6 @@ from typing import Callable, List
 import torch
 
 from vllm_kunlun.adapters.runtime_utils import WarningOnce, find_op
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.qkv_cache_insert")
 _APPLIED_SENTINEL = "_dsv4_qkv_cache_wired"
@@ -181,26 +180,3 @@ def _applier(attention_module: object) -> None:
 
 def _predicate(attention_module: object) -> bool:
     return bool(getattr(attention_module, _APPLIED_SENTINEL, False))
-
-
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Register lazy hooks that wire DSV4 cache insertion once V4 attention loads."""
-    if not master_enabled_check:
-        return []
-
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-
-    flags = FeatureFlags()
-    if not flags.qkv_cache_insert_native:
-        WarningOnce.emit(
-            "dsv4-qkv-cache-disabled",
-            "KUNLUN_DSV4_QKV_CACHE_INSERT_NATIVE disabled; skipping QKV cache insert shortcuts",
-        )
-        return []
-
-    _register_lazy(
-        "vllm.models.deepseek_v4.attention",
-        _predicate,
-        _applier,
-    )
-    return []

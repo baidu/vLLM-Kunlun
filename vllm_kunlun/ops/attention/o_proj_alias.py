@@ -12,7 +12,6 @@ import logging
 from typing import List
 
 from vllm_kunlun.adapters.runtime_utils import WarningOnce
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.o_proj_alias")
 _APPLIED_SENTINEL = "_dsv4_o_proj_wired"
@@ -50,23 +49,3 @@ def _applier(mod: object) -> None:
     setattr(mod, _O_PROJ_FN_NAME, replacement)
     setattr(mod, _APPLIED_SENTINEL, True)
     LOGGER.info("Wired DSV4 O-projection alias into %s", mod.__name__)
-
-
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Register lazy hooks for all DSV4 O-projection consumers."""
-    if not master_enabled_check:
-        return []
-
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-
-    flags = FeatureFlags()
-    if not flags.oproj_native:
-        WarningOnce.emit(
-            "dsv4-oproj-disabled",
-            "KUNLUN_DSV4_OPROJ_NATIVE disabled; skipping V4 output-projection alias",
-        )
-        return []
-
-    for target in _TARGET_MODULES:
-        _register_lazy(target, _predicate, _applier)
-    return []

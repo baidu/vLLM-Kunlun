@@ -24,7 +24,6 @@ import torch
 
 from ...ops.layernorm import KunlunRMSNorm
 from vllm_kunlun.adapters.runtime_utils import WarningOnce, find_op
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.norms")
 
@@ -288,38 +287,3 @@ def _attn_predicate(mod: object) -> bool:
 # ---------------------------------------------------------------------------
 # Public entry point used by registry/installer
 # ---------------------------------------------------------------------------
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Register DSV4 RMSNorm hooks lazily against V4 target modules.
-
-    Args:
-        master_enabled_check: higher-level installers use this short-circuit so
-            KUNLUN_DSV4_PLUGINS_ENABLED=0 disables this subsystem entirely.
-    Returns:
-        Labels describing registered lazy hook slots.
-    """
-    if not master_enabled_check:
-        return []
-
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-
-    flags = FeatureFlags()
-    if not flags.rmsnorm_shortcut:
-        WarningOnce.emit(
-            "dsv4-rmsnorm-disabled",
-            "KUNLUN_DSV4_RMSNORM_SHORTCUT disabled; norm shortcuts not installed",
-        )
-        return []
-
-    _register_lazy(
-        "vllm.models.deepseek_v4.nvidia.model",
-        _model_predicate,
-        _model_apply,
-    )
-    _register_lazy(
-        "vllm.models.deepseek_v4.attention",
-        _attn_predicate,
-        _attn_apply,
-    )
-
-    # Label reporting happens centrally in :func:`populate_hooks()`.
-    return []
