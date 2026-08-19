@@ -16,7 +16,7 @@ variants untouched.
 import logging
 from typing import List
 
-from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce
 from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.fused_moe.mhc_hyperconnection")

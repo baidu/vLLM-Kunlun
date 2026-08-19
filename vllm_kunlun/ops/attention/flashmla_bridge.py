@@ -16,7 +16,7 @@ from typing import Any, List, Tuple
 
 import torch
 
-from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce
 from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.flashmla_bridge")

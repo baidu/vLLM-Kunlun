@@ -11,7 +11,7 @@ available XPU kernels, falling back to PyTorch reference automatically.
 import logging
 from typing import List
 
-from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.o_proj_alias")
 _APPLIED_SENTINEL = "_dsv4_o_proj_wired"

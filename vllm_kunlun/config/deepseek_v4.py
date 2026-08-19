@@ -6,7 +6,7 @@ emit a deprecation warning telling the user the canonical replacement.
 """
 from typing import Dict, Optional, Tuple, Union
 
-from vllm_kunlun.adapters.runtime_utils import env_bool, env_int, env_str, WarningOnce
+from vllm_kunlun.runtime_utils import env_bool, env_int, env_str, WarningOnce
 
 # ---------------------------------------------------------------------------
 # Legacy alias lookup: old name -> (canonical primary name)

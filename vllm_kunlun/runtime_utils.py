@@ -1,7 +1,7 @@
-"""Small, side-effect-free runtime utilities shared by vllm-kunlun adapter packs.
+"""Small, side-effect-free runtime utilities shared across vllm-kunlun.
 
-The goal is to keep fallback/probe/env-gating logic uniform so that individual
-adapter modules don't invent their own warning latches.
+Keeps fallback/probe/env-gating logic uniform so individual adapter modules
+don't invent their own warning latches.
 """
 import logging
 import os
@@ -10,7 +10,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters")
+LOGGER = logging.getLogger("vllm_kunlun.runtime_utils")
 
 _T = typing.TypeVar("_T")
 

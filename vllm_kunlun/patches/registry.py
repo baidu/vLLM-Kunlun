@@ -9,7 +9,7 @@ import logging
 import os
 from typing import Callable, List, Tuple
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters")
+LOGGER = logging.getLogger("vllm_kunlun.runtime_utils")
 HookSpec = Tuple[str, str, Callable[[object], bool], Callable[[object], None]]
 # Targets that will be patched lazily through the plugin dispatcher once their host modules are loaded.
 _LAZY_HOOKS: List[Tuple[str, str, Callable[[object], bool], Callable[[object], None]]] = []

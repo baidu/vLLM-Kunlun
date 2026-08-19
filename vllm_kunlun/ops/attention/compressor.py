@@ -22,7 +22,7 @@ import os
 
 import torch
 
-from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce
 from vllm_kunlun.patches.registry import _register_lazy
 from vllm_kunlun import record_wired
 

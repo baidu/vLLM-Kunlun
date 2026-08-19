@@ -8,7 +8,7 @@ from typing import Callable, List
 
 from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 from vllm_kunlun.patches.registry import populate_hooks
-from vllm_kunlun.adapters.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce
 
 LOGGER_NAME = "vllm_kunlun.patches.deepseek_v4.installer"
 _WARN_KEY_DISABLED = "dsv4-installer-master-switch-off"

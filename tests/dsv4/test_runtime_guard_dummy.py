@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 
 # exercise the package under construction directly from source tree
-import vllm_kunlun.adapters.runtime_utils as ru
+import vllm_kunlun.runtime_utils as ru
 
 
 def _env(monkeypatch):
@@ -48,7 +48,7 @@ def test_alias_deprecation_warning_emitted_once(caplog):
 
 
 def test_invalid_value_warns_once_and_defaults():
-    logger_name = "vllm_kunlun.adapters"
+    logger_name = "vllm_kunlun.runtime_utils"
     ru.WarningOnce.clear()
     handler = logging.Handler()
     emitted = []

@@ -15,9 +15,9 @@ import logging
 import os
 from typing import List, Optional
 
-from vllm_kunlun.adapters.runtime_utils import WarningOnce, env_int
+from vllm_kunlun.runtime_utils import WarningOnce, env_int
 
-LOGGER = logging.getLogger("vllm_kunlun.adapters")
+LOGGER = logging.getLogger("vllm_kunlun.runtime_utils")
 _APPLIED_KEY = "_dsv4_platform_adapter_installed"
 _POLICY_LOG_KEY = "dsv4.platform.block_size_adjusted_once"
 
