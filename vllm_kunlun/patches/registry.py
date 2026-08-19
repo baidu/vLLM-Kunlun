@@ -40,6 +40,12 @@ _STATIC_PATCHES = (
      "vllm_kunlun.ops.fused_moe.mhc_hyperconnection",
      "_tilelang_predicate", "_tilelang_applier",
      "mhc_tilelang_native"),
+
+    ("dsv4.mhc.model",
+     "vllm.models.deepseek_v4.nvidia.model",
+     "vllm_kunlun.ops.fused_moe.mhc_hyperconnection",
+     "_model_applied", "_model_applier",
+     "mhc_model_native"),
 )
 
 

@@ -95,6 +95,10 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_MHC_TILELANG_NATIVE")
 
     @property
+    def mhc_model_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_MHC_MODEL_NATIVE")
+
+    @property
     def oproj_native(self) -> bool:
         return self._bool("KUNLUN_DSV4_OPROJ_NATIVE")
 
