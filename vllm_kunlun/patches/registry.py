@@ -4,6 +4,7 @@ This module bridges between ``vllm_kunlun.__init__.py``'s existing
 post-import machinery and individual functional adapters kept under this
 package.
 """
+import importlib
 import logging
 import os
 from typing import Callable, List, Tuple
@@ -14,6 +15,52 @@ HookSpec = Tuple[str, str, Callable[[object], bool], Callable[[object], None]]
 _LAZY_HOOKS: List[Tuple[str, str, Callable[[object], bool], Callable[[object], None]]] = []
 
 _LAZY_DESCRIPTOR = "__dsv4_lazy_applied_sentinel__"
+
+_STATIC_PATCHES = (
+    ("dsv4.norms.model", "vllm.models.deepseek_v4.nvidia.model",
+     "vllm_kunlun.ops.attention.norms", "_model_predicate", "_model_apply",
+     "rmsnorm_shortcut"),
+    ("dsv4.norms.attention", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.ops.attention.norms", "_attn_predicate", "_attn_apply",
+     "rmsnorm_shortcut"),
+    ("dsv4.qkv_cache_insert", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.ops.attention.qkv_cache_insert", "_predicate", "_applier",
+     "qkv_cache_insert_native"),
+    ("dsv4.oproj", "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+     "vllm_kunlun.ops.attention.o_proj_alias", "_predicate", "_applier",
+     "oproj_native"),
+    ("dsv4.oproj.flashmla", "vllm.models.deepseek_v4.nvidia.flashmla",
+     "vllm_kunlun.ops.attention.o_proj_alias", "_predicate", "_applier",
+     "oproj_native"),
+    ("dsv4.oproj.flashinfer", "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
+     "vllm_kunlun.ops.attention.o_proj_alias", "_predicate", "_applier",
+     "oproj_native"),
+)
+
+
+def _register_static_patches(register_post_import_hook: Callable[..., None]) -> None:
+    for label, target, module_path, predicate_name, apply_name, flag_name in _STATIC_PATCHES:
+        def _enabled(_flag_name=flag_name):
+            from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+            return bool(getattr(FeatureFlags(), _flag_name))
+
+        def _applied(mod, _module_path=module_path, _predicate_name=predicate_name,
+                     _enabled=_enabled):
+            if not _enabled():
+                return True
+            feature = importlib.import_module(_module_path)
+            return bool(getattr(feature, _predicate_name)(mod))
+
+        def _apply(mod, _label=label, _module_path=module_path,
+                   _apply_name=apply_name, _enabled=_enabled):
+            if not _enabled():
+                return
+            feature = importlib.import_module(_module_path)
+            getattr(feature, _apply_name)(mod)
+            LOGGER.debug("Applied %s to %s", _label, getattr(mod, "__name__", mod))
+
+        register_post_import_hook(target, _applied, _apply)
+
 
 
 def _register_lazy(
@@ -70,23 +117,7 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
             label="dsv4.runner_debug",
         )
 
-    try:
-        from vllm_kunlun.ops.attention.norms import apply as _norms_apply
-        _norms_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 RMSNorm-shortcut installation failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.attention.qkv_cache_insert import apply as _qkv_insert_apply
-        _qkv_insert_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 QKV-cache-insert installation failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.attention.o_proj_alias import apply as _o_proj_apply
-        _o_proj_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 O-projection alias installation failed (%s)", exc)
+    _register_static_patches(register_post_import_hook)
 
     try:
         from vllm_kunlun.ops.fused_moe.mhc_hyperconnection import apply as _mhc_apply
@@ -123,6 +154,12 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
         _moe_int8_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 INT8-W8A8-MoE bridge registration failed (%s)", exc)
+
+    try:
+        from vllm_kunlun.patches.dsv4_cache import register as _cache_register
+        labels_installed.extend(_cache_register(register_post_import_hook))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("DSV4 cache patch registration failed (%s)", exc)
 
     # Note for future extraction work:
     # Other functional adapters should append entries to _LAZY_HOOKS inside their own apply().

@@ -201,72 +201,6 @@ _register_post_import_hook(
 )
 
 
-def _deepseek_v4_cache_applied(mod):
-    fn = getattr(mod, "dequantize_and_gather_k_cache", None)
-    return getattr(fn, "_kunlun_patched_v2", False)
-
-
-def _deepseek_v4_cache_apply(mod):
-    # [kunlun-hook v2] dsv4 dequant fallback
-    #
-    # Kunlun's Triton cannot bitcast float8 (data-type of size 8 <-> 16),
-    # so the upstream triton dequant-gather kernel raises a CompilationError
-    # at first call. We replace the public dispatcher in every caller-side
-    # namespace with a PyTorch fallback that handles both plain bf16 and
-    # packed UE8M0 fp8 cache pages. This also short-circuits the cutedsl
-    # branch (which pulls in CUDA CuTe DSL).
-    from vllm_kunlun.ops.deepseek_v4_cache import (
-        dequantize_and_gather_k_cache_pytorch,
-    )
-
-    def _kunlun_dequant_and_gather(
-        out, k_cache, seq_lens, gather_lens, block_table, block_size, offset,
-        use_fnuz: bool = False,
-    ):
-        return dequantize_and_gather_k_cache_pytorch(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset,
-            use_fnuz=use_fnuz,
-        )
-
-    _kunlun_dequant_and_gather._kunlun_patched_v2 = True
-    mod.dequantize_and_gather_k_cache = _kunlun_dequant_and_gather
-    # Also override the triton entry so any lingering direct callers
-    # (or a re-import via cache_utils.dequantize_and_gather_k_cache_triton)
-    # route through the PyTorch fallback.
-    if hasattr(mod, "dequantize_and_gather_k_cache_triton"):
-        mod.dequantize_and_gather_k_cache_triton = _kunlun_dequant_and_gather
-
-    # Kunlun Triton also cannot execute _compute_global_topk_indices_and_lens
-    # and _combine_topk_swa_indices (CUDA_ERROR_NOT_SUPPORTED). Replace the
-    # public helpers in this namespace with PyTorch equivalents.
-    from vllm_kunlun.ops.deepseek_v4_sparse_index import (
-        compute_global_topk_indices_and_lens_pytorch as _kunlun_compute_global,
-        combine_topk_swa_indices_pytorch as _kunlun_combine_topk_swa,
-    )
-    if hasattr(mod, "compute_global_topk_indices_and_lens"):
-        mod.compute_global_topk_indices_and_lens = _kunlun_compute_global
-    if hasattr(mod, "combine_topk_swa_indices"):
-        mod.combine_topk_swa_indices = _kunlun_combine_topk_swa
-
-
-# The dequant name is bound into three namespaces at import time:
-#   - vllm.models.deepseek_v4.common.ops.cache_utils   (definition)
-#   - vllm.models.deepseek_v4.common.ops               (package re-export)
-#   - vllm.models.deepseek_v4.nvidia.flashmla          (from-import)
-# Python from-import creates a fresh local binding, so we must patch each
-# module's namespace independently after it is imported.
-for _dsv4_cache_mod in (
-    "vllm.models.deepseek_v4.common.ops.cache_utils",
-    "vllm.models.deepseek_v4.common.ops",
-    "vllm.models.deepseek_v4.nvidia.flashmla",
-):
-    _register_post_import_hook(
-        _dsv4_cache_mod,
-        _deepseek_v4_cache_applied,
-        _deepseek_v4_cache_apply,
-    )
-
-
 def _dsv4_layout_applied(mod):
     return getattr(mod, "_kunlun_dsv4_layout_patched", False)
 
@@ -657,15 +591,6 @@ def _v4_model_mhc_applied(mod):
     mhc_applied = fn is not None and getattr(fn, "__module__", "") == (
         "vllm_kunlun.ops.hyper_connection"
     )
-    patched_classes = (
-        getattr(mod, "DeepseekV4DecoderLayer", None),
-        getattr(mod, "DeepseekV4ForCausalLM", None),
-    )
-    instances_patched = all(
-        cls is not None
-        and getattr(cls.__init__, "_kunlun_rmsnorm_patched", False)
-        for cls in patched_classes
-    )
     moe_cls = getattr(mod, "DeepseekV4MoE", None)
     moe_forward = getattr(moe_cls, "forward", None)
     moe_uses_fused_apply = "apply_weights" in getattr(
@@ -681,7 +606,6 @@ def _v4_model_mhc_applied(mod):
     return (
         mhc_applied
         and head_patched
-        and instances_patched
         and moe_patched
         and getattr(mod, "_kunlun_v4_kv_insert_patched", False)
     )
@@ -700,53 +624,6 @@ def _v4_model_mhc_apply(mod):
     mod.mhc_post_tilelang = mhc_post_tilelang
     mod.mhc_fused_post_pre_tilelang = mhc_fused_post_pre_tilelang
     mod.hc_head_fused_kernel_tilelang = hc_head_fused_kernel_kunlun
-
-    if hasattr(mod, "RMSNorm"):
-        from vllm_kunlun.ops.layernorm import (
-            KunlunRMSNorm,
-            fused_add_rms_norm_kunlun,
-            rms_norm_kunlun,
-        )
-
-        native_fn = mod.RMSNorm.forward_native
-        native_globals = getattr(native_fn, "__globals__", None)
-        if native_globals is not None:
-            native_globals["rms_norm"] = rms_norm_kunlun
-            native_globals["fused_add_rms_norm"] = fused_add_rms_norm_kunlun
-
-        from functools import wraps
-
-        def _patch_rmsnorm_instances(root):
-            for submodule in root.modules():
-                if submodule.__class__.__name__ == "RMSNorm":
-                    submodule._forward_method = KunlunRMSNorm.forward_oot.__get__(
-                        submodule, submodule.__class__
-                    )
-
-        for class_name in (
-            "DeepseekV4DecoderLayer",
-            "DeepseekV4ForCausalLM",
-        ):
-            model_cls = getattr(mod, class_name, None)
-            if model_cls is None or getattr(
-                model_cls.__init__, "_kunlun_rmsnorm_patched", False
-            ):
-                continue
-
-            original_init = model_cls.__init__
-
-            @wraps(original_init)
-            def _kunlun_model_init(
-                self,
-                *args,
-                __original_init=original_init,
-                **kwargs,
-            ):
-                __original_init(self, *args, **kwargs)
-                _patch_rmsnorm_instances(self)
-
-            _kunlun_model_init._kunlun_rmsnorm_patched = True
-            model_cls.__init__ = _kunlun_model_init
 
     moe_cls = getattr(mod, "DeepseekV4MoE", None)
     moe_forward = getattr(moe_cls, "forward", None)
@@ -796,29 +673,6 @@ _register_post_import_hook(
     "vllm.models.deepseek_v4.nvidia.model",
     _v4_model_mhc_applied,
     _v4_model_mhc_apply,
-)
-
-
-def _v4_attention_rmsnorm_applied(mod):
-    fn = getattr(mod, "fused_q_kv_rmsnorm", None)
-    return fn is not None and getattr(fn, "__module__", "") == (
-        "vllm_kunlun.ops.layernorm"
-    )
-
-
-def _v4_attention_rmsnorm_apply(mod):
-    from vllm_kunlun.ops.layernorm import fused_q_kv_rmsnorm_kunlun
-
-    mod.fused_q_kv_rmsnorm = fused_q_kv_rmsnorm_kunlun
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched V4 fused Q/KV RMSNorm"
-    )
-
-
-_register_post_import_hook(
-    "vllm.models.deepseek_v4.attention",
-    _v4_attention_rmsnorm_applied,
-    _v4_attention_rmsnorm_apply,
 )
 
 

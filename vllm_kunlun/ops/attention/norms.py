@@ -17,6 +17,7 @@ capability-probed wrappers around :obj:`torch.ops._C.rmsnorm` /
 original formulas if native kernels are unavailable or fail at runtime.
 """
 import logging
+from functools import wraps
 from typing import Callable, List, Tuple
 
 import torch
@@ -164,6 +165,7 @@ def _wire_instance_method_overrides(v4_model_module: object) -> List[str]:
         old_init = init_func
 
         def make_new(oi=old_init):
+            @wraps(oi)
             def new_init(self, *args, **kwargs):
                 oi(self, *args, **kwargs)
                 patch_instances(self)
