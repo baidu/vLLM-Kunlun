@@ -35,6 +35,11 @@ _STATIC_PATCHES = (
     ("dsv4.oproj.flashinfer", "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
      "vllm_kunlun.ops.attention.o_proj_alias", "_predicate", "_applier",
      "oproj_native"),
+    ("dsv4.mhc.tile",
+     "vllm.model_executor.kernels.mhc.tilelang",
+     "vllm_kunlun.ops.fused_moe.mhc_hyperconnection",
+     "_tilelang_predicate", "_tilelang_applier",
+     "mhc_tilelang_native"),
 )
 
 

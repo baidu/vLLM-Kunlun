@@ -94,6 +94,11 @@ def _tilelang_applier(tile_mod) -> List[str]:
     return [_TILE_TARGET]
 
 
+def _tilelang_predicate(tile_mod) -> bool:
+    """Static-spec contract predicate paired with `_tilelang_applier`."""
+    return bool(getattr(tile_mod, _TILELANG_SENTINEL, False))
+
+
 def _model_applied(mod) -> bool:
     fn = getattr(mod, "mhc_pre_tilelang", None)
     mhc_okay = fn is not None and getattr(fn, "__module__", "") == "vllm_kunlun.ops.hyper_connection"
@@ -138,5 +143,5 @@ def apply(master_enabled_check: bool = True) -> List[str]:
 
     for target in _MODULE_TARGETS:
         _register_lazy(target, _model_applied, _model_applier)
-    _register_lazy(_TILE_TARGET, lambda m: getattr(m, _TILELANG_SENTINEL, False), _tilelang_applier)
+    _register_lazy(_TILE_TARGET, _tilelang_predicate, _tilelang_applier)
     return []

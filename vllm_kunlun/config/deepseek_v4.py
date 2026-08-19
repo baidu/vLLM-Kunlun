@@ -91,6 +91,10 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_INDEXER_DECODE_NATIVE")
 
     @property
+    def mhc_tilelang_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_MHC_TILELANG_NATIVE")
+
+    @property
     def oproj_native(self) -> bool:
         return self._bool("KUNLUN_DSV4_OPROJ_NATIVE")
 

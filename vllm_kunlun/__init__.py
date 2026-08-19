@@ -405,8 +405,6 @@ _register_post_import_hook(
 )
 
 
-
-
 def _flashmla_metadata_applied(mod):
     fn = getattr(mod, "get_mla_metadata", None)
     return fn is not None and getattr(fn, "_kunlun_patched", False)
@@ -555,34 +553,6 @@ _register_post_import_hook(
     "vllm.models.deepseek_v4.nvidia.model",
     _v4_attention_alias_applied,
     _v4_attention_alias_apply,
-)
-
-
-# --- hook: DeepSeek V4 mHC TileLang replacement --------------------------
-def _mhc_tilelang_applied(mod):
-    return getattr(mod, "_kunlun_mhc_patched", False)
-
-
-def _mhc_tilelang_apply(mod):
-    from vllm_kunlun.ops.hyper_connection import (
-        mhc_fused_post_pre_tilelang,
-        mhc_post_tilelang,
-        mhc_pre_tilelang,
-    )
-
-    mod.mhc_pre_tilelang = mhc_pre_tilelang
-    mod.mhc_post_tilelang = mhc_post_tilelang
-    mod.mhc_fused_post_pre_tilelang = mhc_fused_post_pre_tilelang
-    mod._kunlun_mhc_patched = True
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched V4 mHC TileLang helpers"
-    )
-
-
-_register_post_import_hook(
-    "vllm.model_executor.kernels.mhc.tilelang",
-    _mhc_tilelang_applied,
-    _mhc_tilelang_apply,
 )
 
 
@@ -931,7 +901,6 @@ _register_post_import_hook(
 )
 
 
-
 # ---------------------------------------------------------------------------
 # V4 compressor ops: save_partial_states + compress_norm_rope_store
 # These Triton kernels are not available on Kunlun; replace with PyTorch.
@@ -1128,7 +1097,6 @@ def register_tool_parser():
     )
 
     _reg_tool_parser()
-
 
 
 # --- hook: DeepSeek V4 FlashMLA padded heads (Kunlun does not need NVIDIA h_q alignment) ---
