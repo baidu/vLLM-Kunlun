@@ -201,39 +201,6 @@ _register_post_import_hook(
 )
 
 
-def _dsv4_layout_applied(mod):
-    return getattr(mod, "_kunlun_dsv4_layout_patched", False)
-
-
-def _dsv4_layout_apply(mod):
-    # [kunlun-hook] dsv4 use_fp8_ds_mla_layout False
-    #
-    # Upstream default is ``use_fp8_ds_mla_layout: ClassVar[bool] = True``
-    # on DeepseekV4Attention, which asserts fp8 kv-cache. Kunlun ships bf16
-    # kv-cache; flip the ClassVar on every DSv4 attention subclass in the
-    # module so backend dispatch selects the bf16 plain-row page format.
-    import inspect
-
-    for _name, _cls in list(mod.__dict__.items()):
-        if not inspect.isclass(_cls):
-            continue
-        if _cls.__module__ != mod.__name__:
-            continue
-        if "use_fp8_ds_mla_layout" in vars(_cls) or hasattr(_cls, "use_fp8_ds_mla_layout"):
-            try:
-                _cls.use_fp8_ds_mla_layout = False
-            except Exception:
-                pass
-    mod._kunlun_dsv4_layout_patched = True
-
-
-_register_post_import_hook(
-    "vllm.models.deepseek_v4.attention",
-    _dsv4_layout_applied,
-    _dsv4_layout_apply,
-)
-
-
 # --- hook 4: apply_grammar_bitmask in vllm.v1.structured_output.utils -----
 # Replace the upstream xgrammar auto backend with torch_native on Kunlun XPU.
 def _grammar_bitmask_applied(mod):
@@ -516,29 +483,6 @@ _register_post_import_hook(
 )
 
 
-def _v4_indexer_q_applied(mod):
-    fn = getattr(mod, "fused_indexer_q_rope_quant", None)
-    return fn is not None and getattr(fn, "__module__", "") == (
-        "vllm_kunlun.ops.fp8"
-    )
-
-
-def _v4_indexer_q_apply(mod):
-    from vllm_kunlun.ops.fp8 import fused_indexer_q_rope_quant_kunlun
-
-    mod.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_kunlun
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched V4 Indexer Q RoPE/FP8 quantization"
-    )
-
-
-_register_post_import_hook(
-    "vllm.models.deepseek_v4.attention",
-    _v4_indexer_q_applied,
-    _v4_indexer_q_apply,
-)
-
-
 # === DSv4 FULL cudagraph: raise attention-backend cudagraph support to ALWAYS ===
 #
 # WHY. `init_attn_backend()` (vllm/v1/worker/gpu/attn_utils.py) takes the MINIMUM
@@ -616,31 +560,6 @@ for _full_cg_target in (
         _v4_full_cg_applied,
         _v4_full_cg_apply,
     )
-
-
-def _v4_attention_mm_dtype_applied(mod):
-    return getattr(mod, "_kunlun_mm_dtype_library", None) is not None
-
-
-def _v4_attention_mm_dtype_apply(mod):
-    torch = mod.torch
-    library = torch.library.Library("aten", "IMPL", "CUDA")
-
-    def _kunlun_mm_dtype(input, mat2, out_dtype):
-        return torch.mm(input.to(out_dtype), mat2.to(out_dtype))
-
-    library.impl("mm.dtype", _kunlun_mm_dtype)
-    mod._kunlun_mm_dtype_library = library
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] registered V4 aten::mm.dtype fallback"
-    )
-
-
-_register_post_import_hook(
-    "vllm.models.deepseek_v4.attention",
-    _v4_attention_mm_dtype_applied,
-    _v4_attention_mm_dtype_apply,
-)
 
 
 def _v4_o_proj_applied(mod):

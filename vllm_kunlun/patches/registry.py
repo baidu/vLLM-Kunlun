@@ -75,6 +75,21 @@ _STATIC_PATCHES = (
      "vllm_kunlun.ops.attention.flashmla_bridge",
      "_flashmla_padded_heads_predicate", "_flashmla_padded_heads_applier",
      "flashmla_padded_heads_native"),
+
+    ("dsv4.mla.layout", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.patches.dsv4_mla_layout",
+     "_layout_predicate", "_layout_applier",
+     "mla_layout_native"),
+
+    ("dsv4.indexer.q", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.patches.dsv4_attention_subst",
+     "_indexer_q_predicate", "_indexer_q_applier",
+     "indexer_q_native"),
+
+    ("dsv4.mm.dtype", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.patches.dsv4_attention_subst",
+     "_mm_dtype_predicate", "_mm_dtype_applier",
+     "mm_dtype_native"),
 )
 
 
@@ -201,8 +216,10 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 cache patch registration failed (%s)", exc)
 
-    # Note for future extraction work:
-    # Other functional adapters should append entries to _LAZY_HOOKS inside their own apply().
+    # NOTE: prefer declaring new patches statically via _STATIC_PATCHES above;
+    # _LAZY_HOOKS below remains ONLY as transitional bridge carrying adapters
+    # whose populate_hooks() eager-install blocks haven't been migrated yet.
+
 
     # --- heavier paths flushed only when their owning modules actually load ---
     def _make_predicate(pred):

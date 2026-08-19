@@ -107,6 +107,18 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_FLASHMLA_PADDED_HEADS_NATIVE")
 
     @property
+    def mla_layout_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_MLA_LAYOUT_NATIVE")
+
+    @property
+    def indexer_q_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_INDEXER_Q_NATIVE")
+
+    @property
+    def mm_dtype_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_MM_DTYPE_NATIVE")
+
+    @property
     def oproj_native(self) -> bool:
         return self._bool("KUNLUN_DSV4_OPROJ_NATIVE")
 
