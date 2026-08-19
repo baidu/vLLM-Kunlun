@@ -12,6 +12,7 @@ the paged compressed KV cache, matching the behaviour of the source-patched
 bring-up branch.
 """
 import logging
+import os
 from typing import List
 
 import torch
@@ -23,6 +24,56 @@ LOGGER = logging.getLogger("vllm_kunlun.adapters.dsv4.indexer_decode")
 _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"
 _WARNED_DECODE_NATIVE_FAILED_KEY = "dsv4-indexer-decode-native-failed"
 _FALSE = object()
+
+# The native decode top-K kernel (xspeedgate_ops.topk_per_row ->
+# xpu/src/kunlun3cpp/topk/topk_per_row.xpu:infer_topk_decode) ignores its
+# runtime `topK` argument when sizing the output: both branches write
+# `constexpr int TOPK = 2048` int32 per row (short branch: 64 cores x
+# TOPK/64; long branch: fast_topk<T, TOPK>). DSv4 has index_topk=512, so
+# every row overruns `topk_indices_buffer` by 1536 int32 (6 KiB), clobbering
+# the next three rows and racing with the clusters that own them. That
+# destroys both the selected indices and the -1 padding sentinels every
+# decode step. Its UT never caught it because every case uses topK=2048.
+# Set KUNLUN_DSV4_INDEXER_TOPK_NATIVE=1 to go back to the native kernel.
+_TOPK_NATIVE = os.environ.get("KUNLUN_DSV4_INDEXER_TOPK_NATIVE", "0") == "1"
+_WARNED_TOPK_TORCH_KEY = "dsv4-indexer-topk-torch"
+
+
+def _decode_topk_torch(
+    logits_flat: torch.Tensor,          # [rows, max_model_len], fp32
+    seq_lens: torch.Tensor,             # [batch_size] int32
+    batch_size: int,
+    next_n: int,
+    topk_tokens: int,
+    topk_indices_buffer: torch.Tensor,  # [max_tokens, topk_tokens] int32
+) -> None:
+    """Capture-safe torch replacement for ``xspeedgate_ops.topk_per_row``.
+
+    Mirrors vLLM's ``ops.top_k_per_row_decode`` semantics: row ``r`` carries
+    query position ``r % next_n`` and may attend columns
+    ``[0, seq_len - next_n + (r % next_n) + 1)``; slots past the valid count
+    keep the -1 sentinel the caller pre-filled. All shapes are static and no
+    D2H sync is involved, so this is safe inside a cudagraph capture.
+    """
+    rows = batch_size * next_n
+    device = logits_flat.device
+    num_cols = logits_flat.shape[1]
+    width = min(topk_tokens, num_cols)
+
+    offsets = torch.arange(next_n, device=device, dtype=torch.int32).view(1, next_n)
+    row_ends = (
+        seq_lens[:batch_size].to(torch.int32).view(batch_size, 1) - next_n + offsets + 1
+    ).reshape(rows, 1)
+
+    cols = torch.arange(num_cols, device=device, dtype=torch.int32).view(1, num_cols)
+    scores = logits_flat.masked_fill(cols >= row_ends, float("-inf"))
+    chosen = scores.topk(width, dim=1).indices.to(torch.int32)
+
+    ranks = torch.arange(width, device=device, dtype=torch.int32).view(1, width)
+    keep = ranks < row_ends.clamp(min=0)
+    topk_indices_buffer[:rows, :width] = torch.where(
+        keep, chosen, torch.full_like(chosen, -1)
+    )
 
 
 def _install_kunlun_indexer(indexer_module: object) -> List[str]:
@@ -124,21 +175,39 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                     )
 
                     logits_flat = logits_out.reshape(-1, max_model_len)
-                    topk_input_buf = self.topk_indices_buffer[
-                        :batch_size * next_n, :topk_tokens
-                    ]
-                    torch.ops.xspeedgate_ops.topk_per_row(
-                        logits=logits_flat,
-                        srcIndices=topk_input_buf,
-                        numRows=batch_size * next_n,
-                        stride0=logits_flat.stride(0),
-                        stride1=1,
-                        topK=topk_tokens,
-                        rowStarts=None,
-                        rowEnds=None,
-                        seqLens=effective_seq_lens,
-                        next_n=next_n,
-                    )
+                    if _TOPK_NATIVE:
+                        topk_input_buf = self.topk_indices_buffer[
+                            :batch_size * next_n, :topk_tokens
+                        ]
+                        torch.ops.xspeedgate_ops.topk_per_row(
+                            logits=logits_flat,
+                            srcIndices=topk_input_buf,
+                            numRows=batch_size * next_n,
+                            stride0=logits_flat.stride(0),
+                            stride1=1,
+                            topK=topk_tokens,
+                            rowStarts=None,
+                            rowEnds=None,
+                            seqLens=effective_seq_lens,
+                            next_n=next_n,
+                        )
+                    else:
+                        WarningOnce.emit(
+                            _WARNED_TOPK_TORCH_KEY,
+                            "Using torch decode top-K; the native topk_per_row "
+                            "kernel writes 2048 indices per row regardless of "
+                            "topK=%d and corrupts topk_indices_buffer. Set "
+                            "KUNLUN_DSV4_INDEXER_TOPK_NATIVE=1 to override.",
+                            topk_tokens,
+                        )
+                        _decode_topk_torch(
+                            logits_flat,
+                            effective_seq_lens,
+                            batch_size,
+                            next_n,
+                            topk_tokens,
+                            self.topk_indices_buffer,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     # Log once and surface unfilled indices so attention fails fast
                     # instead of producing garbage tokens silently.

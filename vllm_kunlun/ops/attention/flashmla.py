@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 import os
+import time
 from typing import Optional, Tuple
 
 import kunlun_ops
@@ -10,6 +11,25 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+_DSV4_DEBUG_ENABLED = os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1"
+_DSV4_DEBUG_EVERY = max(1, int(os.getenv("KUNLUN_DSV4_DEBUG_EVERY", "1")))
+_DSV4_DEBUG_CALL_ID = 0
+
+
+def _dsv4_debug(stage: str, event: str, call_id: int, **fields: object) -> None:
+    if not _DSV4_DEBUG_ENABLED:
+        return
+    if event == "end" and call_id % _DSV4_DEBUG_EVERY:
+        return
+    rank = os.getenv("RANK", os.getenv("LOCAL_RANK", "?"))
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(
+        f"[DSV4_DEBUG] rank={rank} pid={os.getpid()} call={call_id} "
+        f"stage={stage} event={event} {details}",
+        flush=True,
+    )
+
 
 if current_platform.is_cuda():
     try:
@@ -428,8 +448,17 @@ def _v4_sparse_native_path(
     All metadata tensors are static pre-allocated buffers whose contents are
     refreshed only OUTSIDE capture (mirrors SGLang's per-BS metadata cache).
     """
+    global _DSV4_DEBUG_CALL_ID
+    _DSV4_DEBUG_CALL_ID += 1
+    debug_call_id = _DSV4_DEBUG_CALL_ID
     _B, _S, _H, _D = q.shape
     assert _S == 1, f"V4 decode-only path; got seq_q={_S}"
+    native_started = time.monotonic()
+    _dsv4_debug(
+        "native_attention", "begin", debug_call_id,
+        batch=_B, heads=_H, head_dim=_D, window=max_window_size,
+        topk=indices.shape[-1], has_compressed=int(extra_k_cache is not None),
+    )
     KV_LORA = head_dim_v  # 512
 
     # ---- SWA cache as flat [NB_swa*BS_swa, D] (static staging buffer; the
@@ -446,6 +475,11 @@ def _v4_sparse_native_path(
     swa_idx_2d = indices.squeeze(1) if indices.dim() == 3 else indices
     if not swa_idx_2d.is_contiguous():
         swa_idx_2d = swa_idx_2d.contiguous()
+    # Defense in depth: bound the upper end too. `_prepare_static_clamped_indices`
+    # only clamps min=0, so a corrupted upstream index would reach fwd_kvcache_mla
+    # as a wild row id and fault the device. The fused path already clamps both
+    # ends -- mirror it here.
+    swa_idx_2d = swa_idx_2d.clamp(max=swa_size - 1)
     clamped_swa = _prepare_static_clamped_indices(
         swa_idx_2d.unsqueeze(1), topk_length[:_B],
         _static_clamped_swa_idx_cache,
@@ -455,6 +489,11 @@ def _v4_sparse_native_path(
     ml_swa = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
     ps_swa = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
 
+    _dsv4_debug(
+        "swa_fwd_kvcache_mla", "begin", debug_call_id,
+        cache_rows=swa_size, kv_lod_bound=indices.shape[-1],
+    )
+    swa_started = time.monotonic()
     kunlun_ops.fwd_kvcache_mla(
         q_c=q, kv_cache=flat_swa, indices=clamped_swa,
         kv_lod_cpu=kv_lod_swa_cpu,
@@ -463,6 +502,10 @@ def _v4_sparse_native_path(
         max_seq_kv=int(max_window_size),
         kv_lod_xpu=kv_lod_swa_xpu,
         **_zero_rope_side_channel(q, swa_size, KV_LORA),
+    )
+    _dsv4_debug(
+        "swa_fwd_kvcache_mla", "end", debug_call_id,
+        elapsed_ms=round((time.monotonic() - swa_started) * 1000, 3),
     )
     # LSE in natural log (units of scaled logits, same as `sink`):
     #   lse = log(ps) + ml   (where ps = sum exp(scores_scaled - ml))
@@ -487,6 +530,7 @@ def _v4_sparse_native_path(
                       else extra_indices_in_kvcache)
         if not com_idx_2d.is_contiguous():
             com_idx_2d = com_idx_2d.contiguous()
+        com_idx_2d = com_idx_2d.clamp(max=com_size - 1)
         clamped_com = _prepare_static_clamped_indices(
             com_idx_2d.unsqueeze(1), extra_topk_length[:_B],
             _static_clamped_com_idx_cache,
@@ -496,6 +540,12 @@ def _v4_sparse_native_path(
         ml_com = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
         ps_com = torch.empty(_B, _S, _H, dtype=torch.float32, device=q.device)
 
+        _dsv4_debug(
+            "compressed_fwd_kvcache_mla", "begin", debug_call_id,
+            cache_rows=com_size,
+            kv_lod_bound=extra_indices_in_kvcache.shape[-1],
+        )
+        compressed_started = time.monotonic()
         kunlun_ops.fwd_kvcache_mla(
             q_c=q, kv_cache=flat_com, indices=clamped_com,
             kv_lod_cpu=kv_lod_com_cpu,
@@ -504,6 +554,10 @@ def _v4_sparse_native_path(
             max_seq_kv=int(com_topk),
             kv_lod_xpu=kv_lod_com_xpu,
             **_zero_rope_side_channel(q, com_size, KV_LORA),
+        )
+        _dsv4_debug(
+            "compressed_fwd_kvcache_mla", "end", debug_call_id,
+            elapsed_ms=round((time.monotonic() - compressed_started) * 1000, 3),
         )
         lse_com_e = torch.log(ps_com.clamp_min(1e-30)) + ml_com
 
@@ -546,10 +600,16 @@ def _v4_sparse_native_path(
         # where `log` is natural, despite the kernel docstring saying `log2`).
         out_merged = torch.empty(_B, _H, KV_LORA, dtype=q.dtype, device=q.device)
         lse_merged_e = torch.empty(_B, _H, dtype=torch.float32, device=q.device)
+        _dsv4_debug("attention_merge_stage", "begin", debug_call_id)
+        merge_started = time.monotonic()
         kunlun_ops.attention_merge_stage(
             v_a=out_swa.squeeze(1), s_a=lse_swa_e.squeeze(1),
             v_b=out_com.squeeze(1), s_b=lse_com_e.squeeze(1),
             v_merged=out_merged, s_merged=lse_merged_e,
+        )
+        _dsv4_debug(
+            "attention_merge_stage", "end", debug_call_id,
+            elapsed_ms=round((time.monotonic() - merge_started) * 1000, 3),
         )
         # attention_merge_stage returns 2-D outputs [B, H]; restore the seq
         # axis so downstream sink broadcast matches out_swa/out_com layout.
@@ -566,6 +626,10 @@ def _v4_sparse_native_path(
         out_merged = out_merged * scale.unsqueeze(-1).to(out_merged.dtype)
 
     output.copy_(out_merged)
+    _dsv4_debug(
+        "native_attention", "end", debug_call_id,
+        elapsed_ms=round((time.monotonic() - native_started) * 1000, 3),
+    )
     return output, None
 
 

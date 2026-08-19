@@ -5,6 +5,7 @@ post-import machinery and individual functional adapters kept under this
 package.
 """
 import logging
+import os
 from typing import Callable, List, Tuple
 
 LOGGER = logging.getLogger("vllm_kunlun.adapters")
@@ -51,6 +52,23 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
         lambda m: __import__("vllm_kunlun.adapters.dsv4.platform_policy", fromlist=["apply"]).apply(),
         label="dsv4.platform_policy",
     )
+    if os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1":
+        _register_lazy(
+            "vllm.model_executor.layers.logits_processor",
+            lambda m: getattr(m.LogitsProcessor._gather_logits, "_kunlun_dsv4_debug", False),
+            lambda m: __import__(
+                "vllm_kunlun.adapters.dsv4.logits_debug", fromlist=["apply"]
+            ).apply(m),
+            label="dsv4.logits_debug",
+        )
+        _register_lazy(
+            "vllm.v1.worker.gpu_model_runner",
+            lambda m: getattr(m.GPUModelRunner.execute_model, "_kunlun_dsv4_debug", False),
+            lambda m: __import__(
+                "vllm_kunlun.adapters.dsv4.runner_debug", fromlist=["apply"]
+            ).apply(m),
+            label="dsv4.runner_debug",
+        )
 
     try:
         from .norms import apply as _norms_apply
