@@ -18,7 +18,6 @@ from typing import List
 import torch
 
 from vllm_kunlun.adapters.runtime_utils import WarningOnce
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.indexer_decode")
 _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"
@@ -324,26 +323,3 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
 # ---------------------------------------------------------------------------
 def _applied(mod: object) -> bool:
     return bool(getattr(mod, _APPLIED_SENTINEL_KEY, False))
-
-
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Install lazy hook registering the Kunlun sparse-lightning-indexer backend."""
-    if not master_enabled_check:
-        return []
-
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-
-    flags = FeatureFlags()
-    if not flags.indexer_decode_native:
-        WarningOnce.emit(
-            "dsv4-indexer-decode-disabled",
-            "KUNLUN_DSV4_INDEXER_DECODE_NATIVE disabled; skipping sparse-lightning-indexer override",
-        )
-        return []
-
-    _register_lazy(
-        "vllm.model_executor.layers.sparse_attn_indexer",
-        _applied,
-        _install_kunlun_indexer,
-    )
-    return []

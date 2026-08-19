@@ -90,6 +90,10 @@ _STATIC_PATCHES = (
      "vllm_kunlun.patches.dsv4_attention_subst",
      "_mm_dtype_predicate", "_mm_dtype_applier",
      "mm_dtype_native"),
+
+    ("dsv4.indexer.sparse", "vllm.model_executor.layers.sparse_attn_indexer",
+     "vllm_kunlun.ops.attention.indexer_decode", "_applied", "_install_kunlun_indexer",
+     "indexer_decode_native"),
 )
 
 
@@ -115,7 +119,6 @@ def _register_static_patches(register_post_import_hook: Callable[..., None]) -> 
             LOGGER.debug("Applied %s to %s", _label, getattr(mod, "__name__", mod))
 
         register_post_import_hook(target, _applied, _apply)
-
 
 
 def _register_lazy(
@@ -185,12 +188,6 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
         _flashmla_bridge_apply()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 FlashMLA metadata bridge registration failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.attention.indexer_decode import apply as _indexer_decode_apply
-        _indexer_decode_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 sparse-indexer decode registration failed (%s)", exc)
 
     try:
         from vllm_kunlun.ops.attention.compressor import apply as _compressor_apply
