@@ -334,6 +334,61 @@ def _install_prefill_gather_lenses(sparse_swa_mod: Any) -> List[str]:
 # ---------------------------------------------------------------------------
 # Public entry point used by registry/installer
 # ---------------------------------------------------------------------------
+import torch
+
+
+def _flashmla_metadata_predicate(mod) -> bool:
+    fn = getattr(mod, "get_mla_metadata", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _flashmla_metadata_applier(mod):
+    """Replace get_mla_metadata plus main FlashMLA API symbols with Kunlun impl.
+
+    Mirrors legacy root-hook behaviour; registered once per target namespace via
+    patches.registry._STATIC_PATCHES so identical substitution lands whether or
+    not eager-install block fires first.
+    """
+    from vllm_kunlun.ops.attention.flashmla import (
+        get_mla_metadata as _kunlun_get,
+        flash_mla_with_kvcache as _kunlun_flash_mla_with_kvcache,
+        flash_mla_sparse_prefill as _kunlun_flash_mla_sparse_fwd,
+    )
+
+    def get_mla_metadata(cache_seqlens=None, num_heads_per_head_k=1,
+                         num_heads_k=1):
+        if cache_seqlens is None:
+            empty = torch.empty(0, dtype=torch.int32)
+            return empty, empty
+        return _kunlun_get(cache_seqlens, num_heads_per_head_k, num_heads_k)
+
+    get_mla_metadata._kunlun_patched = True
+    mod.get_mla_metadata = get_mla_metadata
+    mod.flash_mla_with_kvcache = _kunlun_flash_mla_with_kvcache
+    mod.flash_mla_sparse_fwd = _kunlun_flash_mla_sparse_fwd
+
+
+def _flashmla_padded_heads_predicate(mod) -> bool:
+    cls = getattr(mod, "DeepseekV4FlashMLAAttention", None)
+    if cls is None:
+        return False
+    return bool(getattr(cls, "_kunlun_no_pad", False))
+
+
+def _flashmla_padded_heads_applier(mod):
+    cls = getattr(mod, "DeepseekV4FlashMLAAttention", None)
+    if cls is None:
+        return
+
+    @classmethod
+    def _kunlun_get_padded_num_q_heads(cls_, num_heads: int) -> int:
+        return num_heads
+
+    cls.get_padded_num_q_heads = _kunlun_get_padded_num_q_heads
+    cls._kunlun_no_pad = True
+    LOGGER.info("Patched DeepseekV4FlashMLAAttention.get_padded_num_q_heads (no padding)")
+
+
 def apply(master_enabled_check: bool = True) -> List[str]:  # type: ignore[name-defined]  -- returns labels via side effects
     """Register lazy hooks that install flashmla/sparse-attention metadata shims.
 

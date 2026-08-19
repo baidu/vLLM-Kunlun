@@ -46,6 +46,35 @@ _STATIC_PATCHES = (
      "vllm_kunlun.ops.fused_moe.mhc_hyperconnection",
      "_model_applied", "_model_applier",
      "mhc_model_native"),
+
+    ("dsv4.flashmla.metadata.ops", "vllm.v1.attention.ops.flashmla",
+     "vllm_kunlun.ops.attention.flashmla_bridge",
+     "_flashmla_metadata_predicate", "_flashmla_metadata_applier",
+     "flashmla_metadata_native"),
+
+    ("dsv4.flashmla.metadata.sparse_backend",
+     "vllm.v1.attention.backends.mla.flashmla_sparse",
+     "vllm_kunlun.ops.attention.flashmla_bridge",
+     "_flashmla_metadata_predicate", "_flashmla_metadata_applier",
+     "flashmla_metadata_native"),
+
+    ("dsv4.flashmla.metadata.sparse_swa",
+     "vllm.v1.attention.backends.mla.sparse_swa",
+     "vllm_kunlun.ops.attention.flashmla_bridge",
+     "_flashmla_metadata_predicate", "_flashmla_metadata_applier",
+     "flashmla_metadata_native"),
+
+    ("dsv4.flashmla.metadata.nvidia",
+     "vllm.models.deepseek_v4.nvidia.flashmla",
+     "vllm_kunlun.ops.attention.flashmla_bridge",
+     "_flashmla_metadata_predicate", "_flashmla_metadata_applier",
+     "flashmla_metadata_native"),
+
+    ("dsv4.flashmla.padded_heads",
+     "vllm.models.deepseek_v4.nvidia.flashmla",
+     "vllm_kunlun.ops.attention.flashmla_bridge",
+     "_flashmla_padded_heads_predicate", "_flashmla_padded_heads_applier",
+     "flashmla_padded_heads_native"),
 )
 
 

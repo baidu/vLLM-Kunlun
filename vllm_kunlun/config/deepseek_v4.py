@@ -99,6 +99,14 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_MHC_MODEL_NATIVE")
 
     @property
+    def flashmla_metadata_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_FLASHMLA_METADATA_NATIVE")
+
+    @property
+    def flashmla_padded_heads_native(self) -> bool:
+        return self._bool("KUNLUN_DSV4_FLASHMLA_PADDED_HEADS_NATIVE")
+
+    @property
     def oproj_native(self) -> bool:
         return self._bool("KUNLUN_DSV4_OPROJ_NATIVE")
 
