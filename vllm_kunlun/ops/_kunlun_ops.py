@@ -692,55 +692,16 @@ class KunlunOps:
             # up to 512 experts; for larger expert counts it silently fails
             # (returns non-zero and leaves topk_index uninitialized), so fall
             # back to a pure-torch implementation of sigmoid + group-topk + norm.
-            if global_num_experts <= 512:
-                torch.ops._C.moe_sigmoid_group_topk_norm(
-                    x=router_logits,
-                    topk_index=topk_ids,
-                    norm_score=normed_score,
-                    block_static=block_statistic,
-                    bias=e_score_correction_bias,
-                    scale=1.0,
-                    n_group=num_expert_group,
-                    topk_group=topk_group,
-                )
-            else:
-                _top_k = topk_ids.shape[1]
-                # sigmoid scores; add correction bias only for group/expert selection
-                _scores = torch.sigmoid(router_logits.to(torch.float32))
-                if e_score_correction_bias is not None:
-                    _choice = _scores + e_score_correction_bias.to(
-                        torch.float32
-                    ).view(1, -1)
-                else:
-                    _choice = _scores
-                _ng = num_expert_group if num_expert_group else 1
-                _tg = topk_group if topk_group else _ng
-                if _ng > 1:
-                    _epg = global_num_experts // _ng
-                    _group_scores = (
-                        _choice.view(-1, _ng, _epg)
-                        .topk(min(2, _epg), dim=-1)
-                        .values.sum(dim=-1)
-                    )
-                    _group_idx = torch.topk(
-                        _group_scores, k=_tg, dim=-1, sorted=False
-                    ).indices
-                    _group_mask = torch.zeros(
-                        _choice.shape[0], _ng, dtype=torch.bool, device=_choice.device
-                    )
-                    _group_mask.scatter_(1, _group_idx, True)
-                    _expert_mask = (
-                        _group_mask.unsqueeze(-1)
-                        .expand(-1, _ng, _epg)
-                        .reshape(-1, global_num_experts)
-                    )
-                    _choice = _choice.masked_fill(~_expert_mask, float("-inf"))
-                _topk_idx = torch.topk(_choice, k=_top_k, dim=-1, sorted=False).indices
-                # weights come from the original (unbiased) sigmoid scores
-                _weights = _scores.gather(1, _topk_idx)
-                _weights = _weights / _weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-                topk_ids.copy_(_topk_idx.to(topk_ids.dtype))
-                normed_score.copy_(_weights.to(normed_score.dtype))
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                topk_index=topk_ids,
+                norm_score=normed_score,
+                block_static=block_statistic,
+                bias=e_score_correction_bias,
+                scale=1.0,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+            )
         else:
             raise ValueError(f"Unsupported scoring_func: {scoring_func}")
 
