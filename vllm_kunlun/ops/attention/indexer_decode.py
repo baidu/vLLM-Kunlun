@@ -1,15 +1,8 @@
-"""DeepSeek-V4 Lightning Indexer sparse-attention top-K selection adapter.
+"""DeepSeek-V4 Lightning Indexer sparse top-K selection on Kunlun XPU.
 
-On CUDA the community backend dispatches ``forward_cuda`` through Triton/CUTLASS;
-VLLM additionally defines a generic CPU reference. On Kunlun XPU neither GPU-only
-path exists, but XPU custom operators cover the decode hot path:
-
-* :obj:`torch.ops._C.I8_paged_mqa_logits`
-* :obj:`torch.ops.xspeedgate_ops.topk_per_row`
-
-Prefill scoring remains an explicit Python loop gathering K values/scales from
-the paged compressed KV cache, matching the behaviour of the source-patched
-bring-up branch.
+Decode scoring uses the XPU kernels ``torch.ops._C.I8_paged_mqa_logits`` and
+``xspeedgate_ops.topk_per_row``; prefill scoring is a Python loop over the
+paged compressed KV cache.
 """
 import logging
 import os
@@ -24,16 +17,10 @@ _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"
 _WARNED_DECODE_NATIVE_FAILED_KEY = "dsv4-indexer-decode-native-failed"
 _FALSE = object()
 
-# The native decode top-K kernel (xspeedgate_ops.topk_per_row ->
-# xpu/src/kunlun3cpp/topk/topk_per_row.xpu:infer_topk_decode) ignores its
-# runtime `topK` argument when sizing the output: both branches write
-# `constexpr int TOPK = 2048` int32 per row (short branch: 64 cores x
-# TOPK/64; long branch: fast_topk<T, TOPK>). DSv4 has index_topk=512, so
-# every row overruns `topk_indices_buffer` by 1536 int32 (6 KiB), clobbering
-# the next three rows and racing with the clusters that own them. That
-# destroys both the selected indices and the -1 padding sentinels every
-# decode step. Its UT never caught it because every case uses topK=2048.
-# Set KUNLUN_DSV4_INDEXER_TOPK_NATIVE=1 to go back to the native kernel.
+# The native topk_per_row kernel sizes its output with a hard-coded TOPK=2048
+# instead of the runtime topK argument, so with index_topk=512 it writes 6 KiB
+# past each row and corrupts neighbouring rows of topk_indices_buffer. Default
+# to the torch path; set KUNLUN_DSV4_INDEXER_TOPK_NATIVE=1 to use the kernel.
 _TOPK_NATIVE = os.environ.get("KUNLUN_DSV4_INDEXER_TOPK_NATIVE", "0") == "1"
 _WARNED_TOPK_TORCH_KEY = "dsv4-indexer-topk-torch"
 
@@ -208,8 +195,8 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                             self.topk_indices_buffer,
                         )
                 except Exception as exc:  # noqa: BLE001
-                    # Log once and surface unfilled indices so attention fails fast
-                    # instead of producing garbage tokens silently.
+                    # Keep the -1 sentinels so attention fails fast instead of
+                    # silently producing garbage tokens.
                     WarningOnce.emit(
                         _WARNED_DECODE_NATIVE_FAILED_KEY,
                         "Native sparse-indexer decode kernel failed (%s); "
@@ -239,14 +226,11 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                     if total_seq_len_chunk == 0 or local_cu is None:
                         continue
 
-                    # `cu_seqlen_ks` / `cu_seqlen_ke` are per *query token*: row t of
-                    # the logits matrix is valid on the half-open column range
-                    # [ks[t], ke[t]) of the chunk's concatenated compressed K, and
-                    # ke[t] - ks[t] == (position + 1) // compress_ratio, which is
-                    # exactly the entry count `combine_topk_swa_indices` will read
-                    # back. Treating them as per-sequence query bounds leaves the
-                    # first request's slots at the -1 sentinel and every later
-                    # request's shifted into the previous request's KV workspace.
+                    # cu_seqlen_ks/ke are per *query token*: row t is valid on
+                    # columns [ks[t], ke[t]) of the chunk's compressed K, and
+                    # ke-ks is the entry count combine_topk_swa_indices reads
+                    # back. Treat them as per-sequence bounds and the requests'
+                    # slots shift into each other's workspace.
                     num_seqs = local_cu.shape[0] - 1
                     gathered_values: list[torch.Tensor] = []
                     gathered_scales: list[torch.Tensor] = []
@@ -320,6 +304,5 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
     return [f"{indexer_module.__name__}.KunlunSparseAttnIndexer(SparseAttnIndexer OOT)"]
 
 
-# ---------------------------------------------------------------------------
 def _applied(mod: object) -> bool:
     return bool(getattr(mod, _APPLIED_SENTINEL_KEY, False))

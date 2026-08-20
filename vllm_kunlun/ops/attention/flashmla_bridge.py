@@ -1,15 +1,8 @@
-"""DeepSeek-V4 sparse-attention/FlashMLA metadata CPU-loop bridges.
+"""Host-side replacements for DeepSeek-V4 Triton metadata/auxiliary kernels.
 
-On Kunlun XPU there is no Triton, so several DSV4 Triton-based
-metadata/auxiliary kernels must be replaced by equivalent host-side dispatchers.
-The actual ``get_mla_metadata`` / ``flash_mla_with_kvcache`` /
-``sparse_prefill_fwd_opt`` heavy-kernel wiring will move here separately;
-this commit extracts only the self-contained pure-Python CPU loop builders:
-
-* indexer prefill-chunk metadata builder
-* C128A compressed-topk metadata builder
-* SWA indices-and-lengths launcher shim
-* prefill gather-lens launcher shim
+Kunlun XPU has no Triton, so these small bookkeeping kernels are replaced
+with CPU-loop launchers: indexer prefill-chunk metadata, C128A compressed
+top-K metadata, SWA indices-and-lengths, and prefill gather-lens.
 """
 import logging
 from typing import Any, List, Tuple

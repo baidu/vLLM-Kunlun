@@ -1,3 +1,9 @@
+"""FP8 helpers for DeepSeek-V4: indexer Q RoPE+quant and block dequant.
+
+Each entry tries the native XPU kernel first and falls back to a host
+round-trip; the fallbacks cross PCIe on the decode hot path, so each warns
+once instead of limping silently.
+"""
 import logging
 import os
 
@@ -7,8 +13,7 @@ logger = logging.getLogger("vllm_kunlun")
 
 try:
     import xspeedgate_ops  # noqa: F401  registers torch.ops.xspeedgate_ops
-    # Locally hand-written op (not present in any upstream branch).
-    # Gated off by default until validated; opt in with
+    # Locally hand-written op, absent from upstream builds; opt in with
     # KUNLUN_XSG_DEQUANT_FP8_BLOCKS=1.
     _HAS_XSG_DEQUANT_FP8_BLOCKS = (
         os.getenv("KUNLUN_XSG_DEQUANT_FP8_BLOCKS", "0") == "1"
@@ -17,10 +22,6 @@ try:
 except Exception:
     _HAS_XSG_DEQUANT_FP8_BLOCKS = False
 
-# Both fallbacks below cross PCIe on the decode hot path, which is a ~100x
-# slowdown rather than a mild regression, so say so once instead of silently
-# limping. `dequantize_fp8_blocks` in particular only exists in the source-tree
-# xspeedgate_ops build, so a PYTHONPATH mistake lands here.
 _warned_rope_fallback = [False]
 _warned_dequant_fallback = [False]
 
@@ -64,13 +65,8 @@ def fused_indexer_q_rope_quant_kunlun(
     """
     assert not use_fp4, "Kunlun does not support FP4 Indexer Q"
 
-    # --- Native path: fused RoPE + INT8 quant in one kernel ---
     if _probe_fused_rope_int8():
         import kunlun_ops
-        # index_q: [T, n_heads=64, head_dim=128] bf16
-        # positions: [T] int64
-        # cos_sin_cache: [max_pos, rot_dim=64] fp32
-        # index_weights: [T, n_heads=64] fp32/bf16
         T, n_heads, head_dim = index_q.shape
         y = torch.empty_like(index_q, dtype=torch.int8)
         scale = torch.empty(T, n_heads, dtype=torch.float32, device=index_q.device)
@@ -87,10 +83,11 @@ def fused_indexer_q_rope_quant_kunlun(
             float(index_weights_softmax_scale),  # softmax_scale
             float(index_weights_head_scale),     # head_scale
         )
-        # Native kernel folds weights: scale already contains weight * q_scale * softmax_scale * head_scale
+        # Kernel folds the weights into scale (weight * q_scale *
+        # softmax_scale * head_scale).
         return y, scale
 
-    # --- Fallback: Python (correctness only, slow due to .cpu() round-trip) ---
+    # Fallback: correctness only, slow (.cpu() round-trip per decode step).
     _warn_once(
         _warned_rope_fallback,
         "kunlun_ops.fused_rope_int8_quant is unavailable; V4 indexer Q "
@@ -147,7 +144,7 @@ def dequantize_fp8_blocks(weight, weight_scale):
     assert weight_scale.shape[0] >= n_blocks
     assert weight_scale.shape[1] >= k_blocks
 
-    # ---- fast path: on-device fused decode + block scale ----
+    # Fast path: on-device fused decode + block scale.
     if (
         _HAS_XSG_DEQUANT_FP8_BLOCKS
         and weight.is_contiguous()
@@ -157,7 +154,7 @@ def dequantize_fp8_blocks(weight, weight_scale):
     ):
         return torch.ops.xspeedgate_ops.dequantize_fp8_blocks(weight, weight_scale)
 
-    # ---- fallback: CPU round-trip cast + on-device scale multiply ----
+    # Fallback: CPU round-trip cast + on-device scale multiply.
     _warn_once(
         _warned_dequant_fallback,
         "xspeedgate_ops.dequantize_fp8_blocks unavailable or inputs "

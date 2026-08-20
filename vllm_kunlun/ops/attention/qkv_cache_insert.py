@@ -1,18 +1,11 @@
 """DSV4 fused Q-norm + RoPE + KV-cache insertion adapter.
 
-DeepSeek-V4's attention does not use the standard vLLM rotary-embedding/
-cache-write helpers directly.  Instead it calls custom op symbols:
-
-* ``torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert``
-* ``torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert``
-
-Upstream only registers these inside the GPU-specific CUDA/AMD implementations.
-Kunlun's equivalent native op is
-:obj:`kunlun_ops.fused_deepseek_v4_qnorm_rope_kv_insert`;
-this adapter wires that implementation into
-:mod:`vllm.models.deepseek_v4.attention`'s namespace at import time,
-and provides a bit-identical PyTorch fallback for the BF16 cache path when the
-native kernel is absent or fails at runtime.
+DeepSeek-V4 attention calls
+``torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` /
+``..._full_cache_bf16_insert``, which upstream only registers for CUDA/AMD.
+This adapter binds them onto the Kunlun native op
+:obj:`kunlun_ops.fused_deepseek_v4_qnorm_rope_kv_insert`, with a
+bit-identical PyTorch fallback for the BF16 path.
 """
 import logging
 from typing import Callable, List

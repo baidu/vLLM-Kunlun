@@ -1,19 +1,8 @@
-"""Kunlun PyTorch fallbacks for DSv4 common/ops topk helpers.
+"""PyTorch fallbacks for the DSv4 top-K cache helpers.
 
-Upstream vLLM uses Triton kernels in
-``vllm.models.deepseek_v4.common.ops.cache_utils`` for:
-  - dequantize_and_gather_k_cache (handled elsewhere via
-    ``vllm_kunlun.ops.deepseek_v4_cache.dequantize_and_gather_k_cache_pytorch``)
-  - compute_global_topk_indices_and_lens
-  - combine_topk_swa_indices
-
-Kunlun Triton does not support the constructs those kernels use; the last
-two error with ``RuntimeError: Triton Error [CUDA]: CUDA_ERROR_NOT_SUPPORTED``.
-This module provides pure-PyTorch equivalents that produce bit-identical
-outputs for the shapes seen during DSv4 prefill/decode on Kunlun. The
-inner loops are simple enough that TorchScript-style compilation is not
-necessary; per-token latency is negligible compared with the sparse
-attention itself.
+Pure-torch equivalents of the upstream Triton kernels in
+``vllm.models.deepseek_v4.common.ops.cache_utils`` (Kunlun Triton does not
+support the constructs they use).
 """
 from __future__ import annotations
 import torch
@@ -28,11 +17,7 @@ def compute_global_topk_indices_and_lens_pytorch(
     block_size: int,
     is_valid_token: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map local topk indices to global KV cache slots and count valid entries.
-
-    Vectorised PyTorch equivalent of the upstream Triton kernel. All ops are
-    element-wise / gather; complexity is O(num_tokens * topk).
-    """
+    """Map local top-K indices to global KV cache slots; return slots + valid counts."""
     device = topk_indices.device
     num_tokens, topk = topk_indices.shape
     is_valid_idx = topk_indices >= 0
@@ -45,7 +30,7 @@ def compute_global_topk_indices_and_lens_pytorch(
     block_i_safe = block_i.clamp(max=max_blocks - 1)
     req_idx = token_to_req_indices[:num_tokens].to(torch.int64).unsqueeze(1).expand(-1, topk)
 
-    # Flat indexing (avoids 2D advanced indexing crash on Kunlun XPU)
+    # Flat indexing: 2D advanced indexing crashes on Kunlun XPU.
     flat_idx = (req_idx * max_blocks + block_i_safe).reshape(-1)
     block_numbers = block_table.reshape(-1)[flat_idx].reshape(num_tokens, topk)
     slots = block_numbers * block_size + block_off
@@ -73,11 +58,10 @@ def combine_topk_swa_indices_pytorch(
     M: int,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """PyTorch equivalent of the upstream Triton kernel.
+    """Concatenate top-K slots and sliding-window slots into one combined index.
 
-    Uses a per-request, per-token loop with tensor scatter. num_reqs and
-    per-request query length in DSv4 prefill are small (chunk sizes ~4),
-    so the loop overhead is acceptable for correctness bring-up.
+    Per-request loop; prefill chunk query lengths are small so the loop
+    overhead is acceptable.
     """
     device = topk_indices.device
     num_tokens, _source_topk = topk_indices.shape
@@ -113,14 +97,11 @@ def combine_topk_swa_indices_pytorch(
         gather_len = int(gather_lens_cpu[b])
         start_pos = seq_len - q_len
         gather_start = seq_len - gather_len
-        # Compute positions for every query token in this request in one shot.
         positions = torch.arange(q_len, device=device) + start_pos  # int64
-        # topk_len per token
         tl_topk = torch.clamp((positions + 1) // compress_ratio, max=topk).to(torch.int32)
         tl_swa = torch.clamp(positions + 1, max=window_size).to(torch.int32)
         combined_lens[q_start:q_end] = tl_topk + tl_swa
 
-        # Fill topk portion and swa portion per token (small q_len).
         for t in range(q_len):
             token_idx = q_start + t
             n_top = int(tl_topk[t].item())

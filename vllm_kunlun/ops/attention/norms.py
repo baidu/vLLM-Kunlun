@@ -1,20 +1,8 @@
-"""DeepSeek-V4 RMSNorm shortcuts with a guarded native/fallback path.
+"""RMSNorm shortcuts for DeepSeek-V4 on Kunlun XPU.
 
-The V4 model uses three normalization hot paths:
-
-1. ``rms_norm(x, weight, eps)`` -- standard input-only RMSNorm.
-2. ``fused_add_rms_norm(x, residual, weight, eps)`` -- fused addition +
-   in-place normalization.
-3. ``fused_q_kv_rmsnorm(q, kv, q_weight, kv_weight, eps)`` -- Q and KV
-   normalizations used by the MLA attention helper.
-
-Upstream stores pure-PyTorch implementations as free functions referenced from
-:class:`vllm.model_executor.layers.layernorm.RMSNorm.forward_native`.  This
-adapter leaves that upstream module untouched; instead it registers post-import
-hooks for the V4 modules that replace those function references with thin
-capability-probed wrappers around :obj:`torch.ops._C.rmsnorm` /
-:obj:`torch.ops._C.add_rmsnorm` while preserving an unchanged fallback to the
-original formulas if native kernels are unavailable or fail at runtime.
+Wraps the V4 normalization entry points (``rms_norm``, ``fused_add_rms_norm``,
+``fused_q_kv_rmsnorm``) so they call the native ``torch.ops._C`` kernels when
+available, falling back to the original PyTorch implementations otherwise.
 """
 import logging
 from functools import wraps
@@ -27,9 +15,6 @@ from vllm_kunlun.runtime_utils import WarningOnce, find_op
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.norms")
 
-# ---------------------------------------------------------------------------
-# Capability probe cache (lazy, once per process)
-# ---------------------------------------------------------------------------
 _NATIVE_OP_CACHE: dict[str, object] = {}
 _FAILED_KEYS: set[str] = set()
 _MISSING_KEYS_LOGGED: set[str] = set()
@@ -39,19 +24,17 @@ _FALSE = object()
 
 
 def _native_op(name: str):
-    """Return cached callable handle or None when absent/unimplemented."""
+    """Return a cached callable handle, or None when absent/unimplemented."""
     value = _NATIVE_OP_CACHE.get(name, _FALSE)
     if value is not _FALSE:
         return value if value is not None else None
     try:
-        op = find_op(torch.ops._C, name)
-        # Some ops appear in dispatcher tables but raise RuntimeError on call;
-        # we keep the real object here and warn only when actually executed.
-        _NATIVE_OP_CACHE[name] = op
+        # A dispatcher entry may still raise when called; that is reported
+        # by the caller-side warn-once, not here.
+        _NATIVE_OP_CACHE[name] = find_op(torch.ops._C, name)
     except Exception:  # noqa: BLE001
-        op = None
         _NATIVE_OP_CACHE[name] = None
-    return op
+    return _NATIVE_OP_CACHE[name]
 
 
 def _warn_once_missing(kind: str) -> None:
@@ -77,9 +60,6 @@ def _warn_failed(kind: str, exc: BaseException) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Reference-level wrappers (installed into V4 modules' namespaces)
-# ---------------------------------------------------------------------------
 def _make_rms_norm_wrapper(original_rms_norm: Callable) -> Callable:
     def rms_norm_kunlun(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
         native = _native_op("rmsnorm")
@@ -251,9 +231,8 @@ def _attn_apply(mod: object) -> List[str]:
     if fn_old is not None and getattr(fn_old, _ATTN_FN_LABEL_ATTR, None) == "rmsnorm-shortcut":
         return []
 
-    # If there was no pre-existing helper we install our own minimal one so
-    # that downstream branches can still fall back without crashing under CPU/
-    # no-extension environments.
+    # Without a pre-existing helper, install a torch-only fallback so the
+    # wrapper still works on CPU / extension-less environments.
     if fn_old is None:
         def torch_only_fallback(
             q: torch.Tensor,
@@ -284,6 +263,3 @@ def _attn_predicate(mod: object) -> bool:
     return fn is not None and getattr(fn, _ATTN_FN_LABEL_ATTR, None) == "rmsnorm-shortcut"
 
 
-# ---------------------------------------------------------------------------
-# Public entry point used by registry/installer
-# ---------------------------------------------------------------------------

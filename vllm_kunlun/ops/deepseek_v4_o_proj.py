@@ -1,3 +1,9 @@
+"""DeepSeek-V4 attention output projection on Kunlun XPU.
+
+Computes the projection as inverse-GPTJ-RoPE followed by a grouped BF16
+bmm (``wo_a``) plus the ``wo_b`` tail; FP8 weights are dequantized once
+and cached on the layer.
+"""
 import torch
 
 from vllm_kunlun.ops.fp8 import dequantize_fp8_blocks
@@ -36,14 +42,9 @@ def deepseek_v4_bf16_o_proj(
 
     half_rope = rope_dim // 2
 
-    # ------------------------------------------------------------------
-    # Native V4 inv-GPTJ RoPE via kunlun_ops.
-    # The kernel performs the standard GPT-J forward rotation; by passing a
-    # cos_sin table whose sine half has been negated we obtain the inverse
-    # rotation required for DeepSeek-V4's output projection. If the kernel is
-    # unavailable or raises (e.g., dtype/layout mismatch), fall back to the
-    # original PyTorch formula exactly once per process and keep going.
-    # ------------------------------------------------------------------
+    # Native inverse GPT-J RoPE: the kernel only does the forward rotation,
+    # so we pass a cos_sin table with the sine half negated to obtain the
+    # inverse. Falls back to the torch formula when unavailable or failing.
     _warned_inv_rope_fallback = getattr(deepseek_v4_bf16_o_proj,
                                         "_warned_inv_rope_fallback", False)
     use_native_rotary = (
@@ -54,13 +55,9 @@ def deepseek_v4_bf16_o_proj(
     )
     if use_native_rotary:
         try:
-            # Process-wide inverse-RoPE lookup table, keyed by the identity of
-            # the source table. DeepSeek-V4 builds two distinct rotary tables of
-            # identical shape and dtype -- `rope_theta` for compress_ratio <= 1
-            # layers and `compress_rope_theta` for the rest (see
-            # `vllm/models/deepseek_v4/common/rope.py`) -- so a (shape, dtype)
-            # key makes every layer reuse whichever table was seen first and
-            # rotate by the wrong angle.
+            # Key the cache by table identity, not (shape, dtype): V4 builds
+            # two same-shaped tables (rope_theta / compress_rope_theta) and a
+            # shape key would mix them up.
             caches = getattr(deepseek_v4_bf16_o_proj, "_global_inv_rope_caches", None)
             if caches is None:
                 caches = {}
@@ -87,7 +84,7 @@ def deepseek_v4_bf16_o_proj(
                 positions.to(o.device)
                 if positions.device != o.device else positions
             )
-            # dpsk_decode_rotary_embedding_v3 takes one position per token and broadcasts across q/k heads.
+            # One position per token; the kernel broadcasts it across heads.
             rotated_out = all_heads_3d.clone().contiguous()
             status_obj = kunlun_ops.dpsk_decode_rotary_embedding_v3(
                 positions=positions_xpu.long(),
@@ -112,7 +109,7 @@ def deepseek_v4_bf16_o_proj(
             use_native_rotary = False
             if not _warned_inv_rope_fallback:
                 import logging
-                logging.getLogger("vllm_kunlum.ops.deepseek_v4_o_proj").warning(
+                logging.getLogger("vllm_kunlun.ops.deepseek_v4_o_proj").warning(
                     "native dpsk_decode_rotary_embedding_v3 O-proj inverse-RoPE "
                     "failed (%s), falling back to torch formula", str(e)
                 )
@@ -140,10 +137,8 @@ def deepseek_v4_bf16_o_proj(
             dim=-1,
         ).contiguous().view(n_groups, num_tokens, -1)
 
-    # Cache dequantized weight on first call to avoid per-step CPU round-trip.
-    # The FP8 weight never changes after loading, so this is safe.
-    # For unquantized (BF16) attention (e.g. INT8 MoE model), weight_scale_inv
-    # does not exist — use the weight as-is.
+    # Dequantize once and cache: the weight never changes after loading.
+    # Unquantized (BF16) layers have no weight_scale_inv; use the weight as-is.
     if not hasattr(wo_a, '_bf16_weight_cache'):
         weight = wo_a.weight.data
         output_size_check = n_groups * o_lora_rank
