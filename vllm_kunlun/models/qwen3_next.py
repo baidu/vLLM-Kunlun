@@ -9,6 +9,7 @@ import kunlun_ops
 import torch
 from einops import rearrange
 from torch import nn
+from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
@@ -143,7 +144,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config = vllm_config.model_config.hf_text_config
+        model_config = vllm_config.model_config
+        config = model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
 
@@ -184,6 +186,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
+        self._use_router_decode_gemm_warmup = (
+            config.model_type == "qwen3_next"
+            and model_config.enforce_eager
+            and self.tp_size == 8
+        )
+        self._router_decode_warmed = False
 
         self.shared_expert_gate = ReplicatedLinear(
             config.hidden_size,
@@ -222,6 +230,33 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
         )
 
+    def _warm_up_router_decode_gemm(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Avoid a first-decode hang in each TP8 FP16 router GEMM."""
+        if (
+            not self._use_router_decode_gemm_warmup
+            or self._router_decode_warmed
+            or hidden_states.shape[0] != 1
+            or hidden_states.dtype != torch.float16
+            or self.gate.weight.dtype != torch.float16
+        ):
+            return
+
+        probe_input = torch.ones(
+            (1, hidden_states.shape[-1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        probe_weight = torch.ones_like(self.gate.weight)
+
+        torch.cuda.synchronize()
+        F.linear(probe_input, probe_weight, bias=None)
+        torch.cuda.synchronize()
+
+        self._router_decode_warmed = True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -230,6 +265,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        self._warm_up_router_decode_gemm(hidden_states)
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
