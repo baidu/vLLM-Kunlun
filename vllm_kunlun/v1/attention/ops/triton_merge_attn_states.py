@@ -28,26 +28,4 @@ def mask_empty_context(
         context_start_loc: Chunk context cumulative offsets,
             shape [num_reqs + 1]; an empty chunk has a zero-length span.
     """
-    num_reqs = query_start_loc.shape[0] - 1
-    if num_reqs <= 0:
-        return
-
-    # Identify requests with empty context chunks.
-    # An empty chunk has context_start_loc[i] == context_start_loc[i+1].
-    empty_req = context_start_loc[1:] == context_start_loc[:-1]  # [num_reqs]
-
-    if not empty_req.any():
-        return
-
-    # Compute query lengths for each request.
-    q_lens = query_start_loc[1:] - query_start_loc[:-1]  # [num_reqs]
-
-    # Expand per-request empty mask to per-token mask.
-    # token_empty[token_idx] is True iff token belongs to an empty request.
-    token_empty = torch.repeat_interleave(empty_req, q_lens)  # [num_tokens]
-
-    # Set LSE to -inf for empty tokens (all heads).
-    lse[:, token_empty] = float("-inf")
-
-    # Zero the output for empty tokens.
-    output[token_empty] = 0
+    torch.ops.xspeedgate_ops.mask_empty_context(lse, output, query_start_loc, context_start_loc)
