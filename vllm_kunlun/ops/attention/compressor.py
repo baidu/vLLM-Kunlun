@@ -14,7 +14,7 @@ import os
 
 import torch
 
-from vllm_kunlun.runtime_utils import WarningOnce, record_wired
+from vllm_kunlun.adapter_utils import WarningOnce, record_wired
 from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.compressor")

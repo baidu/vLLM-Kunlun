@@ -58,7 +58,7 @@ def apply_all(
     except Exception as exc:  # noqa: BLE001
         import logging
 
-        logging.getLogger("vllm_kunlun.patches.deepseek_v4").warning(
+        logging.getLogger("vllm_kunlun.patches.dsv4").warning(
             "DSV4 adapter install step failed (%s); continuing without V4-specific patches",
             exc,
         )

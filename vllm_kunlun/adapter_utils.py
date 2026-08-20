@@ -10,7 +10,7 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
-LOGGER = logging.getLogger("vllm_kunlun.runtime_utils")
+LOGGER = logging.getLogger("vllm_kunlun.adapter_utils")
 
 _T = typing.TypeVar("_T")
 

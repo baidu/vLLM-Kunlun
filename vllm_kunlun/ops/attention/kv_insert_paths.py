@@ -14,7 +14,7 @@ except Exception:  # noqa: BLE001
     kunlun_ops = None
 
 
-LOGGER = logging.getLogger("vllm_kunlun.ops.attention.dsv4_kv_insert_paths")
+LOGGER = logging.getLogger("vllm_kunlun.ops.attention.kv_insert_paths")
 
 _ALIAS_FLAG = "_kunlun_v4_kv_insert_patched"
 

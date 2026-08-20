@@ -13,10 +13,10 @@ def apply(mod: object) -> None:
     if is_applied(mod):
         return
 
-    from vllm_kunlun.ops.attention.deepseek_v4_cache import (
+    from vllm_kunlun.ops.attention.cache_utils import (
         dequantize_and_gather_k_cache_pytorch,
     )
-    from vllm_kunlun.ops.attention.deepseek_v4_sparse_index import (
+    from vllm_kunlun.ops.attention.sparse_index import (
         combine_topk_swa_indices_pytorch,
         compute_global_topk_indices_and_lens_pytorch,
     )

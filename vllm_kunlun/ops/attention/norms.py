@@ -11,7 +11,7 @@ from typing import Callable, List, Tuple
 import torch
 
 from ...ops.layernorm import KunlunRMSNorm
-from vllm_kunlun.runtime_utils import WarningOnce, find_op
+from vllm_kunlun.adapter_utils import WarningOnce, find_op
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.norms")
 

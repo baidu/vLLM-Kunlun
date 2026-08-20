@@ -14,7 +14,7 @@ import logging
 from typing import Any, List
 
 from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-from vllm_kunlun.runtime_utils import WarningOnce
+from vllm_kunlun.adapter_utils import WarningOnce
 
 LOGGER = logging.getLogger("vllm_kunlun.quantization.deepseek_v4")
 _METHOD_CLS_CACHE: "dict[str, Any]" = {}

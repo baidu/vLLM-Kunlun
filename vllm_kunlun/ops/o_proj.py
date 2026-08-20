@@ -109,7 +109,7 @@ def deepseek_v4_bf16_o_proj(
             use_native_rotary = False
             if not _warned_inv_rope_fallback:
                 import logging
-                logging.getLogger("vllm_kunlun.ops.deepseek_v4_o_proj").warning(
+                logging.getLogger("vllm_kunlun.ops.o_proj").warning(
                     "native dpsk_decode_rotary_embedding_v3 O-proj inverse-RoPE "
                     "failed (%s), falling back to torch formula", str(e)
                 )

@@ -104,10 +104,10 @@ _STATIC_PATCHES = (
     # Community code calls these via torch.ops._C directly; the alias binding
     # is mandatory whenever DSV4 runs, so no feature flag gates it.
     ("dsv4.kv_insert.attention", "vllm.models.deepseek_v4.attention",
-     "vllm_kunlun.ops.attention.dsv4_kv_insert_paths", "_alias_predicate", "_alias_applier",
+     "vllm_kunlun.ops.attention.kv_insert_paths", "_alias_predicate", "_alias_applier",
      ""),
     ("dsv4.kv_insert.model", "vllm.models.deepseek_v4.nvidia.model",
-     "vllm_kunlun.ops.attention.dsv4_kv_insert_paths", "_alias_predicate", "_alias_applier",
+     "vllm_kunlun.ops.attention.kv_insert_paths", "_alias_predicate", "_alias_applier",
      ""),
     ("dsv4.full_cg.sparse_mla", "vllm.models.deepseek_v4.sparse_mla",
      "vllm_kunlun.patches.dsv4_full_cg", "_predicate", "_applier",
@@ -356,7 +356,7 @@ _PLATFORM_PATCHES = (
     ("platform.worker_kv_bind", "vllm.v1.worker.utils",
      "vllm_kunlun.patches.registry", "_worker_kv_bind_applied", "_worker_kv_bind_apply"),
     ("platform.op_inventory", "vllm.v1.worker.gpu_model_runner",
-     "vllm_kunlun.runtime_utils", "_op_inventory_applied", "_op_inventory_apply"),
+     "vllm_kunlun.adapter_utils", "_op_inventory_applied", "_op_inventory_apply"),
 )
 
 

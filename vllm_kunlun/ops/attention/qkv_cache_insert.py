@@ -12,7 +12,7 @@ from typing import Callable, List
 
 import torch
 
-from vllm_kunlun.runtime_utils import WarningOnce, find_op
+from vllm_kunlun.adapter_utils import WarningOnce, find_op
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.qkv_cache_insert")
 _APPLIED_SENTINEL = "_dsv4_qkv_cache_wired"

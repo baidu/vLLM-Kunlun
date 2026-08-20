@@ -10,7 +10,7 @@ from typing import List
 
 import torch
 
-from vllm_kunlun.runtime_utils import WarningOnce
+from vllm_kunlun.adapter_utils import WarningOnce
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.indexer_decode")
 _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"

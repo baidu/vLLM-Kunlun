@@ -508,7 +508,7 @@ def _install_runtime_patches() -> None:
         logger.exception("Kunlun platform patch registration failed")
 
     try:
-        from vllm_kunlun.patches.deepseek_v4 import apply_all
+        from vllm_kunlun.patches.dsv4 import apply_all
 
         apply_all(register)
     except Exception:

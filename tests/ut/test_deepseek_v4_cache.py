@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from vllm_kunlun.ops.attention.deepseek_v4_cache import (
+from vllm_kunlun.ops.attention.cache_utils import (
     dequantize_and_gather_k_cache_pytorch,
 )
 
