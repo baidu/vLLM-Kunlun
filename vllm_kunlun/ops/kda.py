@@ -101,6 +101,21 @@ def _delta_rule_scan(
     return state
 
 
+def _conv1d_query_start_loc_cpu(
+    query_start_loc: torch.Tensor,
+    metadata=None,
+) -> list[int]:
+    """Host copy of ``query_start_loc``; kunlun_ops requires a python list.
+
+    The GDN metadata already keeps a CPU mirror, so prefer it over ``.tolist()``
+    to avoid a device sync on every layer.
+    """
+    mirror = getattr(metadata, "non_spec_query_start_loc_cpu", None)
+    if mirror is not None and mirror.numel() >= query_start_loc.numel():
+        return mirror[: query_start_loc.numel()].tolist()
+    return query_start_loc.tolist()
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -110,6 +125,7 @@ def causal_conv1d_fn(
     cache_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
+    metadata=None,
     **kwargs,
 ) -> torch.Tensor:
     """Varlen causal depthwise conv, ``x`` is ``[dim, num_tokens]``.
@@ -118,35 +134,36 @@ def causal_conv1d_fn(
     the trailing ``state_len`` inputs of every sequence.
     """
     assert activation in ("silu", "swish", None)
-    dim = x.shape[0]
-    state_len = conv_states.shape[-1]
-    starts = query_start_loc.tolist()
-    num_seqs = len(starts) - 1
-    slots = (
-        list(range(num_seqs)) if cache_indices is None else cache_indices.tolist()
-    )
-    init_flags = (
-        [False] * num_seqs if has_initial_state is None else has_initial_state.tolist()
-    )
 
-    out = torch.empty_like(x)
-    w = weight.float().unsqueeze(1)
+    # kunlun_ops.causal_conv1d_fwd writes its result in place over x, so give it
+    # a private contiguous buffer: callers pass strided views into the packed
+    # QKV tensor and still expect their input to survive.
+    out = x.contiguous() if not x.is_contiguous() else x.clone()
+
+    # kunlun_ops >= 0.1.226 (20260818 build) accepts fp32 weights against fp16
+    # activations, which is how K3 stores them
+    # (ColumnParallelLinear(params_dtype=torch.float32)), so pass them straight
+    # through. Older builds rejected this with "Expected float16".
     b = None if bias is None else bias.float()
-    for i in range(num_seqs):
-        begin, end = starts[i], starts[i + 1]
-        slot = slots[i]
-        if begin == end or slot < 0:
-            continue
-        seq = x[:, begin:end].float()
-        if init_flags[i]:
-            seq = torch.cat([conv_states[slot].float(), seq], dim=-1)
-        else:
-            seq = F.pad(seq, (state_len, 0))
-        y = F.conv1d(seq.unsqueeze(0), w, b, groups=dim)[0]
-        if activation is not None:
-            y = F.silu(y)
-        out[:, begin:end] = y.to(out.dtype)
-        conv_states[slot].copy_(seq[:, -state_len:])
+
+    if has_initial_state is None:
+        # Required by the kernel; no initial state means an all-false mask.
+        has_initial_state = torch.zeros(
+            query_start_loc.numel() - 1, dtype=torch.bool, device=out.device
+        )
+
+    kunlun_ops.causal_conv1d_fwd(
+        out,
+        weight,
+        bias=b,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        silu_activation=activation is not None,
+        is_ncw=True,
+        query_start_loc_cpu=_conv1d_query_start_loc_cpu(query_start_loc, metadata),
+    )
     return out
 
 
@@ -176,31 +193,35 @@ def causal_conv1d_update(
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    # Vectorised on purpose: `.tolist()` plus python-int row indexing bakes the
-    # capture-time slots into a cuda graph, so every replay would read and write
-    # the wrong conv-state rows (and since the capture dummy run passes all-`-1`
-    # indices the loop body would not be recorded at all, leaving `y`
-    # uninitialised). `index_select`/`index_copy_` keep it a gather/scatter over
-    # a device tensor, which replay re-executes against the refreshed indices.
-    # Padded lanes carry -1; send them to slot 0, vLLM's reserved null block
-    # (block_pool.py reserves the first block, so no request owns slot 0).
-    slots = conv_state_indices[: x.shape[0]].to(torch.long).clamp_min(0)
-    w = weight.float()
-    b = None if bias is None else bias.float()
-    state = conv_state.index_select(0, slots).float()  # [tokens, dim, state_len]
-    window = torch.cat([state, x.unsqueeze(-1).float()], dim=-1)  # [tokens, dim, width]
-    y = (window * w).sum(-1)
-    if b is not None:
-        y = y + b
-    conv_state.index_copy_(0, slots, window[:, :, 1:].to(conv_state.dtype))
-    if activation is not None:
-        y = F.silu(y)
+    # In-place kernel, so run it on the caller's output buffer (or a copy) and
+    # leave x untouched.
+    buf = out if out is not None else torch.empty_like(x)
+    if buf.data_ptr() != x.data_ptr():
+        buf.copy_(x)
 
-    y = y.to(x.dtype)
-    if out is not None:
-        out.copy_(y)
-        return out
-    return y
+    # K3 keeps conv1d weights in fp32; the 20260818 kernel accumulates in fp32
+    # and matches an fp64 reference to ~5e-4 that way, an order of magnitude
+    # tighter than casting the weight down to fp16 first.
+    b = None if bias is None else bias.float()
+
+    # Padded cuda-graph lanes carry -1; pad_slot_id makes the kernel skip them
+    # instead of writing a real conv-state row.
+    indices = conv_state_indices[: x.shape[0]]
+    if indices.dtype != torch.int32:
+        indices = indices.to(torch.int32)
+
+    kunlun_ops.causal_conv1d_update(
+        buf.unsqueeze(-1),
+        conv_state,
+        weight,
+        bias=b,
+        silu_activation=activation is not None,
+        cache_seqlens=None,
+        conv_state_indices=indices,
+        is_ncw=True,
+        pad_slot_id=-1,
+    )
+    return buf
 
 
 def gather_initial_states(
