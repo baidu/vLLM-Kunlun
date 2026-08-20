@@ -47,6 +47,11 @@ from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
 
+from typing import Optional
+import torch
+import torch.nn.functional as F
+import kunlun_ops
+
 logger = init_logger(__name__)
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
@@ -167,9 +172,9 @@ def is_flashkda_supported(
     capability = current_platform.get_device_capability()
     return (
         capability is not None
-        and capability.major in (9, 10, 12)
+        and capability.major in (8, 9, 10, 12)
         and head_dim == 128
-        and dtype == torch.bfloat16
+        and (dtype == torch.bfloat16 or dtype == torch.float16)
         and lower_bound is not None
     )
 
@@ -280,6 +285,238 @@ def _make_decode_norm_weight_loader(
 
     return weight_loader
 
+
+def _prepare_xpu_kda_gate(
+    raw_g: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: Optional[float],
+) -> torch.Tensor:
+    if raw_g.ndim != 4:
+        raise ValueError(
+            f"raw_g must be [1, T, H, K], got {tuple(raw_g.shape)}"
+        )
+
+    batch_size, _, num_heads, head_dim = raw_g.shape
+    if batch_size != 1:
+        raise ValueError(
+            "The current varlen KDA path expects raw_g.shape[0] == 1, "
+            f"got {batch_size}"
+        )
+
+    A_log = A_log.reshape(-1).contiguous()
+    dt_bias = dt_bias.reshape(-1, head_dim).contiguous()
+
+    if A_log.numel() != num_heads:
+        raise ValueError(
+            f"A_log must contain {num_heads} values, "
+            f"got {A_log.numel()}"
+        )
+
+    if tuple(dt_bias.shape) != (num_heads, head_dim):
+        raise ValueError(
+            f"dt_bias must be {(num_heads, head_dim)}, "
+            f"got {tuple(dt_bias.shape)}"
+        )
+
+    raw_g_fp32 = raw_g.float()
+    A_log_fp32 = A_log.float()
+    dt_bias_fp32 = dt_bias.float()
+
+    # [H] -> [1, 1, H, 1]
+    decay_rate = torch.exp(A_log_fp32).view(
+        1, 1, num_heads, 1
+    )
+
+    # [H, K] -> [1, 1, H, K]
+    gate_bias = dt_bias_fp32.view(
+        1, 1, num_heads, head_dim
+    )
+
+    gate_input = raw_g_fp32 + gate_bias
+
+    if lower_bound is not None:
+        g_xpu = lower_bound * torch.sigmoid(
+            decay_rate * gate_input
+        )
+    else:
+        g_xpu = -decay_rate * F.softplus(gate_input)
+
+    return g_xpu.contiguous()
+
+
+def _prepare_xpu_kda_beta(
+    raw_beta: torch.Tensor,
+) -> torch.Tensor:
+    if raw_beta.ndim != 3:
+        raise ValueError(
+            f"raw_beta must be [1, T, H], got {tuple(raw_beta.shape)}"
+        )
+
+    return torch.sigmoid(raw_beta.float()).contiguous()
+
+
+def _kimi_delta_attention_xpu_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: Optional[float],
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k and v must be 4D tensors")
+
+    if q.dtype not in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ):
+        raise TypeError(
+            "q, k and v must use torch.float32, torch.bfloat16, "
+            "or torch.float16, "
+            f"got {q.dtype}"
+        )
+
+    if k.dtype != q.dtype or v.dtype != q.dtype:
+        raise TypeError(
+            "q, k and v must have the same dtype, "
+            f"got q={q.dtype}, k={k.dtype}, v={v.dtype}"
+        )
+
+    if k.device != q.device or v.device != q.device:
+        raise ValueError(
+            "q, k and v must be on the same device, "
+            f"got q={q.device}, k={k.device}, v={v.device}"
+        )
+
+    if q.shape[0] != 1 or k.shape[0] != 1 or v.shape[0] != 1:
+        raise ValueError(
+            "q/k/v must have leading batch dimension 1 "
+            "for the current packed varlen path"
+        )
+
+    if q.shape[:2] != k.shape[:2] or q.shape[1] != v.shape[1]:
+        raise ValueError("q, k and v must have the same token count")
+
+    _, token_num, q_head_num, head_dim = q.shape
+    _, _, v_head_num, value_dim = v.shape
+
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("q and k must have the same head dimension")
+
+    if v_head_num % q_head_num != 0:
+        raise ValueError(
+            f"v_head_num must be divisible by q_head_num, "
+            f"got {v_head_num} and {q_head_num}"
+        )
+
+    expected_g_shape = (1, token_num, v_head_num, head_dim)
+    if tuple(g.shape) != expected_g_shape:
+        raise ValueError(
+            f"g must be {expected_g_shape}, got {tuple(g.shape)}"
+        )
+
+    expected_beta_shape = (1, token_num, v_head_num)
+    if tuple(beta.shape) != expected_beta_shape:
+        raise ValueError(
+            f"beta must be {expected_beta_shape}, got {tuple(beta.shape)}"
+        )
+
+    if initial_state.ndim != 4:
+        raise ValueError(
+            "initial_state must be [B, Hv, K, V], "
+            f"got {tuple(initial_state.shape)}"
+        )
+
+    batch_num = cu_seqlens.numel() - 1
+    if initial_state.shape[0] < batch_num:
+        raise ValueError(
+            "initial_state does not contain enough state slots"
+        )
+
+    if tuple(initial_state.shape[1:]) != (
+        v_head_num,
+        head_dim,
+        value_dim,
+    ):
+        raise ValueError(
+            "initial_state must have trailing shape "
+            f"[{v_head_num}, {head_dim}, {value_dim}], "
+            f"got {tuple(initial_state.shape[1:])}"
+        )
+
+    cu_seqlens_cpu = cu_seqlens.detach().to(
+        device="cpu",
+        dtype=torch.int32,
+    ).contiguous()
+
+    cu_seqlens_xpu = cu_seqlens.detach().to(
+        device=q.device,
+        dtype=torch.int32,
+    ).contiguous()
+
+    g_xpu = _prepare_xpu_kda_gate(
+        raw_g=g,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+    )
+
+    beta_xpu = _prepare_xpu_kda_beta(beta)
+
+    # FP32 and BF16 kernels use FP32 gate, beta, and recurrent state. The FP16
+    # kernel uses FP16 for all of them.
+    kernel_aux_dtype = (
+        torch.float16 if q.dtype == torch.float16 else torch.float32
+    )
+    g_xpu = g_xpu.to(
+        device=q.device,
+        dtype=kernel_aux_dtype,
+    ).contiguous()
+    beta_xpu = beta_xpu.to(
+        device=q.device,
+        dtype=kernel_aux_dtype,
+    ).contiguous()
+
+    q_xpu = q.contiguous()
+    k_xpu = k.contiguous()
+    v_xpu = v.contiguous()
+    h0_xpu = initial_state.to(
+        device=q.device,
+        dtype=kernel_aux_dtype,
+    ).contiguous()
+
+    ht_xpu = torch.empty_like(h0_xpu)
+    o_xpu = torch.empty_like(v_xpu)
+
+    scale = head_dim ** -0.5
+
+    ret = kunlun_ops.kimi_delta_attention(
+        q_xpu,
+        k_xpu,
+        v_xpu,
+        g_xpu,
+        beta_xpu,
+        h0_xpu,
+        ht_xpu,
+        o_xpu,
+        alpha=scale,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_xpu=cu_seqlens_xpu,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    if ret != 0:
+        raise RuntimeError(
+            f"kunlun_ops.kimi_delta_attention failed with ret={ret}"
+        )
+
+    return o_xpu, ht_xpu
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -697,7 +934,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
-                    ) = _flashkda_prefill(
+                    ) = _kimi_delta_attention_xpu_prefill(
                         q=q_ns,
                         k=k_ns,
                         v=v_ns,
