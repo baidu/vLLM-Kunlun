@@ -151,26 +151,13 @@ _kunlun_mla_out_cache: dict = {}
 
 # Pre-allocated contiguous [rows, D] staging buffers for the kv-cache.
 #
-# WHY. The production kv-cache view is [NB, BS, 1, D] whose block pitch is larger
-# than BS*D (each layer is a column slice of a shared pool), so
-# `k_cache.reshape(-1, D)` MATERIALISES a copy -- 1.80 GiB for the SWA cache at
-# NB=29515. Outside capture the caching allocator recycles that block; during
-# cudagraph capture the allocation is served from the graph private pool, which
-# cannot reuse it, and FULL capture died with `OutOfMemoryError: Tried to
-# allocate 1.80 GiB ... 5.80 GiB allocated in private pools`.
-#
-# WHY NOT SOMETHING CHEAPER (measured at production shapes):
-#   reshape(-1, D)                   2.079 ms   <- allocates
-#   static.copy_(cache_4d)           2.077 ms   <- allocates nothing
-#   gather only the ~32 MiB of rows
-#   the kernel reads, then arange
-#   indices                          2.188 ms + kernel 0.230 ms
-# The bulk copy already runs at full HBM bandwidth; the strided advanced-index
-# gather does not (~0.9 GB/s), so materialising less is not faster. And
-# `fwd_kvcache_mla` ignores `kv_cache` strides (verified: a strided view is
-# accepted but silently read as if contiguous), so the copy cannot be skipped
-# by passing the paged view. Hence: keep the copy, move only its ALLOCATION out
-# of the graph. Eliminating it needs a kernel that takes the paged layout.
+# The kv-cache view's block pitch is larger than BS*D (each layer is a
+# column slice of a shared pool), so `reshape(-1, D)` materialises a copy.
+# The copy itself is unavoidable -- `fwd_kvcache_mla` ignores kv_cache
+# strides and reads the tensor as if contiguous -- but its allocation must
+# happen outside the graph: during capture it would be served from the
+# graph private pool, which cannot recycle it, and FULL capture ran out
+# of memory.
 _static_flat_cache: dict = {}
 
 

@@ -186,10 +186,9 @@ class KunlunPlatform(Platform):
         Ring all-reduce chunks the buffer and rotates the starting rank, so a
         row's result depends on its offset in the buffer; bit-identical rows
         can come back one bf16 ULP apart and logits drift with batch width.
-        Mesh sums every element in the same rank order (bit-identical logits
-        across repeats, ~3% decode throughput cost; buffers above ~512x4096
-        bf16 fall back to ring regardless). Set ``XCCL_MESH_ALGO=0`` to keep
-        ring.
+        Mesh sums every element in the same rank order, giving bit-identical
+        logits across repeats (buffers above ~512x4096 bf16 fall back to ring
+        regardless). Set ``XCCL_MESH_ALGO=0`` to keep ring.
         """
         if "XCCL_MESH_ALGO" in os.environ:
             return
