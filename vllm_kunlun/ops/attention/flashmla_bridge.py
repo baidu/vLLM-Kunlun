@@ -28,9 +28,7 @@ def _is_already_wired(obj: Any) -> bool:
     return getattr(obj, _DSV4_WIRED_ATTR, False)
 
 
-# ---------------------------------------------------------------------------
-# 1. Indexer prefill-chunk metadata (replaces Triton kernel)
-# ---------------------------------------------------------------------------
+# Indexer prefill-chunk metadata (replaces the Triton kernel).
 def _install_indexer_prefill_kernel(indexer_mod: Any) -> List[str]:
     """Replace ``indexer._build_prefill_chunk_metadata_kernel`` with a CPU-loop launcher.
 
@@ -111,9 +109,7 @@ def _install_indexer_prefill_kernel(indexer_mod: Any) -> List[str]:
     return [f"{indexer_mod.__name__}.{_INDEXER_KERNEL_ATTR}"]
 
 
-# ---------------------------------------------------------------------------
-# 2. C128A compressed-topk metadata (replaces Triton kernel)
-# ---------------------------------------------------------------------------
+# C128A compressed top-K metadata (replaces the Triton kernel).
 def _install_c128a_metadata(sparse_mla_mod: Any) -> List[str]:
     """Replace ``sparse_mla.build_c128a_topk_metadata`` with a host-side version.
 
@@ -196,9 +192,7 @@ def _install_c128a_metadata(sparse_mla_mod: Any) -> List[str]:
     return [f"{sparse_mla_mod.__name__}.{_C128A_FN_NAME}"]
 
 
-# ---------------------------------------------------------------------------
-# 3. SWA indices-and-lengths launcher shim
-# ---------------------------------------------------------------------------
+# SWA indices-and-lengths launcher shim.
 def _install_swa_kernel(sparse_swa_mod: Any) -> List[str]:
     """Provide a CPU-loop fallback for ``sparse_swa._compute_swa_indices_and_lens_kernel``.
 
@@ -272,9 +266,7 @@ def _install_swa_kernel(sparse_swa_mod: Any) -> List[str]:
     return [f"{sparse_swa_mod.__name__}.{_SWA_KERNEL_ATTR}"]
 
 
-# ---------------------------------------------------------------------------
-# 4. Prefill-gather lens launcher shim
-# ---------------------------------------------------------------------------
+# Prefill gather-lens launcher shim.
 def _install_prefill_gather_lenses(sparse_swa_mod: Any) -> List[str]:
     """CPU-loop replacement for ``sparse_swa._compute_prefill_metadata_kernel``.
 

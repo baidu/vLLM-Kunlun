@@ -257,9 +257,7 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
     return labels_installed
 
 
-# ---------------------------------------------------------------------------
-# Platform-level patches (unconditional; apply to every model on Kunlun XPU)
-# ---------------------------------------------------------------------------
+# Platform-level patches (unconditional; apply to every model on Kunlun XPU).
 def _fp8_kernels_applied(mod: object) -> bool:
     from vllm.platforms import PlatformEnum
 

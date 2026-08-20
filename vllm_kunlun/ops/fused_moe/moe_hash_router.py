@@ -64,9 +64,7 @@ def _warn_missing(kind):
         )
 
 
-# ---------------------------------------------------------------------------
-# sqrt(softplus) scorer shared across routes
-# ---------------------------------------------------------------------------
+# sqrt(softplus) scorer shared across routes.
 def sqrt_softplus_scores(gating_output):
     """Return scores equivalent to torch.sqrt(F.softplus(x.float()))."""
     flags = _get_flags()
@@ -90,9 +88,7 @@ def sqrt_softplus_scores(gating_output):
     return torch.sqrt(F.softplus(x))
 
 
-# ---------------------------------------------------------------------------
-# Main route/top-k replacement
-# ---------------------------------------------------------------------------
+# Main route/top-k replacement.
 def _make_kunlun_topk_fn():
     def kunlun_route(
         topk_weights,

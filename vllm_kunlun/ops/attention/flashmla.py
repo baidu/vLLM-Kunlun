@@ -55,8 +55,8 @@ else:
 # ---- Static CPU lod cache (cudagraph FULL capture safety) ----
 # kunlun_ops.hybrid_attention's cpp wrapper reads vsl.kv_lod_vp.cpu[i] in a
 # host-side for-loop to compute max_seqlen. Reading CPU memory is fine, but
-# the .cpu() call that PRODUCES the CPU tensor triggers a D2H sync which
-# BREAKS cudagraph capture (we see it as `xops_block_ERROR line 126`).
+# the .cpu() call that produces the CPU tensor triggers a D2H sync, which
+# breaks cudagraph capture.
 #
 # Workaround: pre-allocate the CPU lod tensor once per shape; update its
 # contents via .copy_() OUTSIDE capture (during warmup); during capture/replay
@@ -69,15 +69,10 @@ _static_kvseqlen_cpu_cache: dict = {}
 def _get_static_cpu_lod(xpu_lod, cache, bound=None):
     """Return pre-allocated CPU lod; update from xpu only if NOT capturing.
 
-    `bound` is a static upper bound on the per-seq kv length (the topk width).
-    During capture the D2H refresh is illegal, and whatever the warmup left
-    behind (all zeros) would be frozen into the graph as the host-side length
-    hint that xops_decoder_dsa_attention_block uses to size its schedule. So
-    when capturing we write the upper bound instead -- a plain host memset,
-    legal inside capture, and safe because the per-row bounds the kernel
-    actually honours come from the xpu lod (refreshed on every replay); the
-    cpu copy is only a scheduling hint. Evidence: with the hint pinned at 0 the
-    output is still bit-correct, so it cannot be the loop bound.
+    `bound` is a static upper bound on the per-seq kv length (the topk
+    width). During capture we write the bound via a host memset (legal inside
+    capture): the kernel honours the per-row bounds from the xpu lod,
+    refreshed on every replay, so the cpu copy is only a scheduling hint.
     """
     key = (xpu_lod.shape[0], xpu_lod.numel(), xpu_lod.dtype)
     if key not in cache:
@@ -144,13 +139,9 @@ _static_kvlod_com_cpu_cache: dict = {}
 
 # Pre-allocated int32 [B, 1, topk] clamped-index buffers.
 #
-# CORRECTION (Step T, docs/stepT_kernel.py): the earlier claim here -- that
-# fwd_kvcache_mla attends ALL topk slots in every row -- is WRONG.  `kv_lod`
-# IS a per-row mask: with identical q/cache/indices, p_sums = 1.987 at
-# kv_lod=2 vs 3.923 at kv_lod=4, and lod=2 is NOT equal to feeding
-# clamp-filled indices at lod=4.  So slots j >= topk_length[i] are never
-# read and this pre-fill is belt-and-braces only: it keeps the buffer free
-# of the -1 padding that the kernel would treat as an OOB row index.
+# `kv_lod` is a per-row mask (slots j >= topk_length[i] are never read), so
+# this pre-fill is belt-and-braces only: it keeps the buffer free of the -1
+# padding the kernel would treat as an OOB row index.
 _static_clamped_swa_idx_cache: dict = {}
 _static_clamped_com_idx_cache: dict = {}
 
@@ -1055,10 +1046,9 @@ def flash_mla_sparse_prefill(
     #   indices= combined_indices.unsqueeze(1)    # [s_q, 1, topk]
     #   topk_length = combined_lens
     # The kunlun sparse_prefill_fwd_opt kernel asserts kv.dim() == 2 and
-    # historically rejected this V4 layout on Kunlun, so we fall back to a
-    # naive PyTorch MLA attention over the gathered bf16 workspace. This
-    # matches the source-patched implementation that produced tokens on the
-    # old pod. The 2-D fast path (V3.2 indexer sparse prefill) is unchanged.
+    # rejects this V4 layout, so fall back to a naive PyTorch MLA attention
+    # over the gathered bf16 workspace. The 2-D fast path (V3.2 indexer
+    # sparse prefill) is unchanged.
     if kv.dim() == 3:
         import torch as _torch
         d_qk_v = q.shape[-1]
@@ -1143,15 +1133,3 @@ def flash_mla_sparse_prefill(
         out.mul_(sink_scale.unsqueeze(-1).to(out.dtype))
     return out, max_logits.float(), lse
 
-
-#
-# TODO: Add fake functions
-#
-# @register_fake("_flashmla_C::get_mla_metadata")
-# def _get_mla_metadata_fake(....) -> Tuple[torch.Tensor, torch.Tensor]:
-#     return ....
-#
-# @register_fake("_flashmla_C::fwd_kvcache_mla")
-# def _fwd_kvcache_mla_fake(....) -> Tuple[torch.Tensor, torch.Tensor]:
-#     return ....
-#

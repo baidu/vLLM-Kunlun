@@ -202,9 +202,7 @@ def find_op(*candidates: object) -> Optional["Callable[..., object]"]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Wiring / op inventory diagnostics
-# ---------------------------------------------------------------------------
+# Wiring / op inventory diagnostics.
 _WIRED_INVENTORY: "dict[str, str]" = {}
 
 

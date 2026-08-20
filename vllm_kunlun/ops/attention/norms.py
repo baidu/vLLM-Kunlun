@@ -162,9 +162,7 @@ def _wire_instance_method_overrides(v4_model_module: object) -> List[str]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Attention-specific fused_qkv helper wrapper
-# ---------------------------------------------------------------------------
+# Fused Q/KV normalization used by the MLA attention helper.
 def _make_attention_qkv_wrapper(original_attn_fn: Callable) -> Callable:
     def fused_q_kv_rmsnorm_kunlan(
         q: torch.Tensor,
