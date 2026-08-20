@@ -95,9 +95,12 @@ def _torch_pre(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
 def mhc_pre_tilelang(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
                      hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
                      n_splits=1, norm_weight=None, norm_eps=1e-6):
-    # Prefer the native Kunlun composite (kunlun_ops.hc_pre_kunlun_impl, hc_mult==4).
-    # Fall back to the pure-torch path if the kernel is missing or rejects the
-    # input, so environments without the kernel never crash. Logs once.
+    """mHC pre-layer transform: sinkhorn-normalized connection matrices.
+
+    Returns (post_mix [.., hc_mult], comb_mix [.., hc_mult, hc_mult],
+    layer_input [.., hidden]). Uses the native composite kernel for
+    hc_mult=4, falling back to the torch formula (warn-once) otherwise.
+    """
     global _mhc_pre_warned
     hc_mult = residual.shape[-2]
     if _HAS_HC_PRE and hc_mult == 4:
@@ -121,6 +124,7 @@ def mhc_pre_tilelang(residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
 
 
 def mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix):
+    """mHC post-layer merge: returns the next residual [.., hc_mult, hidden]."""
     import kunlun_ops
 
     hc_mult = residual.shape[-2]
@@ -146,6 +150,8 @@ def mhc_fused_post_pre_tilelang(
     rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
     sinkhorn_repeat, n_splits=1, tile_n=1, norm_weight=None, norm_eps=1e-6,
 ):
+    """Post-then-pre fusion: returns (residual_next, post_mix, comb_mix,
+    layer_input), i.e. mhc_post followed by mhc_pre in one call."""
     residual_next = mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
     post_mix, comb_mix, layer_input = mhc_pre_tilelang(
         residual_next, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
@@ -163,6 +169,8 @@ def hc_head_fused_kernel_kunlun(
     rms_eps,
     hc_eps,
 ):
+    """Final-layer mHC head: returns [num_tokens, hidden] from the fused
+    kunlun_ops.fused_dpsk_v4_hc_head_nofc kernel."""
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(
         num_tokens, hidden_size, dtype=hs_flat.dtype, device=hs_flat.device

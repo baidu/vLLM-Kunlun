@@ -40,6 +40,8 @@ class _KunlunFp8BlockDequantFallback:
 
 
 class KunlunFP8ScaledMMLinearKernel(CutlassFP8ScaledMMLinearKernel):
+    """Per-tensor FP8 scaled-mm linear kernel for Kunlun XPU."""
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         return True, None
@@ -48,6 +50,9 @@ class KunlunFP8ScaledMMLinearKernel(CutlassFP8ScaledMMLinearKernel):
 class KunlunFp8BlockScaledMMKernel(
     _KunlunFp8BlockDequantFallback, CutlassFp8BlockScaledMMKernel
 ):
+    """Block-scaled FP8 linear kernel; dequantizes blocks on device, with a
+    correctness fallback when the fused op is unavailable."""
+
     @classmethod
     def is_supported(cls, compute_capability=None):
         return True, None

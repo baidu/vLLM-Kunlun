@@ -79,10 +79,6 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_FLASHMLA_SPARSE_BACKEND")
 
     @property
-    def qkv_cache_insert_native(self) -> bool:
-        return self._bool("KUNLUN_DSV4_QKV_CACHE_INSERT_NATIVE")
-
-    @property
     def rmsnorm_shortcut(self) -> bool:
         return self._bool("KUNLUN_DSV4_RMSNORM_SHORTCUT")
 
@@ -157,7 +153,7 @@ class FeatureFlags:
         inst = cls()
         keys = [
             "enabled", "platform_policy", "forced_mla_block_size",
-            "flashmla_sparse_backend", "qkv_cache_insert_native",
+            "flashmla_sparse_backend",
             "rmsnorm_shortcut", "indexer_decode_native", "oproj_native",
             "force_full_cg",
             "activation_routing_accel", "hash_topk_fused",
