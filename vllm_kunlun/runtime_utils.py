@@ -200,3 +200,79 @@ def find_op(*candidates: object) -> Optional["Callable[..., object]"]:
         return typing.cast("Optional[Callable[...,object]]", leaf if callable(leaf) else None)
     except AttributeError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Wiring / op inventory diagnostics
+# ---------------------------------------------------------------------------
+_WIRED_INVENTORY: "dict[str, str]" = {}
+
+
+def record_wired(op_name: str, source: str) -> None:
+    """Record that *op_name* was bound via *source*; logged immediately."""
+    _WIRED_INVENTORY[op_name] = source
+    LOGGER.info("[KunlunPlugin] wired: %-40s via %s", op_name, source)
+
+
+def log_wired_inventory() -> None:
+    """Dump a per-source summary of the wiring inventory."""
+    if not _WIRED_INVENTORY:
+        return
+    by_src: "dict[str, list[str]]" = {}
+    for op, src in _WIRED_INVENTORY.items():
+        by_src.setdefault(src, []).append(op)
+    summary = ", ".join(
+        f"{src}({len(ops)})" for src, ops in sorted(by_src.items())
+    )
+    LOGGER.info("[KunlunPlugin] wired inventory: %s", summary)
+    for src in sorted(by_src):
+        for op in sorted(by_src[src]):
+            LOGGER.info("[KunlunPlugin]   %-40s <- %s", op, src)
+
+
+def log_op_inventory(tag: str = "early") -> None:
+    """Log op counts per torch dispatcher namespace plus mapped native libs.
+
+    Called twice: once at plugin registration ("early") and once after the
+    model runner loads ("final"). About twenty xspeedgate ops register lazily
+    with the quant modules, so the early snapshot under-reports; trust the
+    final line.
+    """
+    try:
+        import torch
+
+        def names(ns):
+            return {n.split("::", 1)[1]
+                    for n in torch._C._dispatch_get_all_op_names()
+                    if n.startswith(ns + "::")}
+
+        xsg, kl = names("xspeedgate_ops"), names("_C")
+        try:
+            import xspeedgate_ops
+            where = xspeedgate_ops.__file__
+        except Exception:  # noqa: BLE001
+            where = "(not importable)"
+        LOGGER.info("[KunlunPlugin] op inventory (%s): xspeedgate_ops=%d _C=%d from %s",
+                    tag, len(xsg), len(kl), where)
+        watch = ("sparse_attn_fwd", "act_sqrt_softplus", "dequantize_fp8_blocks",
+                 "moe_pre_small", "compressed_attention", "mqa_logits_paged",
+                 "moe_hash_topk_fused", "topk_per_row")
+        LOGGER.info("[KunlunPlugin] key ops (%s): %s", tag,
+                    " ".join("%s=%s" % (w, "Y" if w in xsg else "n") for w in watch))
+        with open("/proc/self/maps") as f:
+            libs = sorted({ln.split()[-1] for ln in f
+                           if "xspeedgate" in ln or "kunlun_ops" in ln})
+        for lib in libs:
+            LOGGER.info("[KunlunPlugin] mapped %s", lib)
+    except Exception as e:  # noqa: BLE001
+        LOGGER.warning("[KunlunPlugin] op inventory probe failed: %r", e)
+
+
+def _op_inventory_applied(mod: object) -> bool:
+    return getattr(mod, "_kunlun_op_inventory_logged", False)
+
+
+def _op_inventory_apply(mod: object) -> None:
+    mod._kunlun_op_inventory_logged = True
+    log_op_inventory(tag="final")
+    log_wired_inventory()

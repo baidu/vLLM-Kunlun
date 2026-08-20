@@ -1,19 +1,11 @@
-"""DeepSeek-V4 KV-compressor adapter: metadata lookup + state save +
-compress/RoPE/store dispatcher.
+"""DeepSeek-V4 KV-compressor on Kunlun XPU.
 
-The upstream compressor relies on several CUDA/Triton kernels that are absent
-on Kunlun XPU:
-
-* ``get_compressed_slot_mapping`` / page-table translation helpers.
-* ``save_partial_states`` -- stores uncompressed KV/score/APE values into the
-  paged state cache.
-* ``compress_norm_rope_store_triton`` -- reads those states back over sliding
-  windows, computes softmax-weighted compression, RMSNorm and GPT-J RoPE,
-  then scatters to the final KV cache.
-
-This adapter replaces all three entry points with equivalent host-side/Pythonic
-dispatchers while probing available XSpeedGate kernels so the hot path can use
-``fused_kv_compress_gather`` and ``dpsk_v4_norm_rope_gptj`` when present.
+Provides Kunlun implementations of the three compressor entry points --
+``get_compressed_slot_mapping``, ``save_partial_states`` and
+``compress_norm_rope_store`` -- replacing the upstream Triton kernels.
+The hot path probes and uses the XSpeedGate kernels
+(``fused_kv_compress_gather``, ``dpsk_v4_norm_rope_gptj``) when available,
+with PyTorch fallbacks otherwise.
 """
 import logging
 from typing import List
@@ -22,9 +14,8 @@ import os
 
 import torch
 
-from vllm_kunlun.runtime_utils import WarningOnce
+from vllm_kunlun.runtime_utils import WarningOnce, record_wired
 from vllm_kunlun.patches.registry import _register_lazy
-from vllm_kunlun import record_wired
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.compressor")
 _APPLIED_SENTINEL = "_dsv4_compressor_applied"
@@ -48,9 +39,6 @@ def _mark_wired(obj: object) -> None:
     setattr(obj, "_dsv4_wired", True)
 
 
-# ---------------------------------------------------------------------------
-# Shared graph-safe masked scatter used by save-states and compress-store
-# ---------------------------------------------------------------------------
 def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
     """Scatter ``data`` into paged ``cache`` at flat slots ``dest``, skipping rows.
 
@@ -72,9 +60,7 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
     )
 
 
-# ---------------------------------------------------------------------------
-# A. Compressed-slot-mapping CPU loop
-# ---------------------------------------------------------------------------
+# Compressed-slot-mapping: CPU loop over the page table.
 _SLOT_FN_NAME = "get_compressed_slot_mapping"
 _SLOT_TARGETS = (
     "vllm.v1.attention.backends.mla.compressor_utils",
@@ -128,9 +114,7 @@ def _install_slot_mapping(utils_mod: object) -> None:
     LOGGER.info("Installed compressed-slot-mapping into %s", utils_mod.__name__)
 
 
-# ---------------------------------------------------------------------------
-# B. save_partial_states dispatchers
-# ---------------------------------------------------------------------------
+# save_partial_states dispatchers.
 _SPS_TARGET_MODULE = "vllm.models.deepseek_v4.common.ops.save_partial_states"
 _SPS_OP_CANDIDATE_NAMES = [
     ("kunlun_ops", "save_partial_states"),
@@ -228,9 +212,7 @@ def _install_save_partial_states(sps_module: object) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# C. Vectorized compress/norm/rope/store dispatcher
-# ---------------------------------------------------------------------------
+# Vectorized compress/norm/rope/store dispatcher.
 _VECT_TARGET_MODULE = "vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache"
 _COMPRESSED_FN_ATTR = "_dsv4_compress_core_installed"
 _warned_missing_compress_op_kind: set[str] = set()
@@ -323,9 +305,7 @@ _NATIVE_OFF = os.environ.get("KUNLUN_DSV4_COMPRESS_NATIVE", "1") != "1"
 _WARMUP_ON = os.environ.get("KUNLUN_DSV4_COMPRESS_WARMUP", "1") != "0"
 _WARMED: set = set()
 
-# ---------------------------------------------------------------------------
-# flash_compress_4_decode fused path (write + compress in one kernel)
-# ---------------------------------------------------------------------------
+# flash_compress_4_decode fused path (write + compress in one kernel).
 _C4_FUSED_ENABLED = os.environ.get("KUNLUN_DSV4_C4_FUSED", "0") == "1"
 _c4_fused_op: object = _FALSE
 _c4_fused_warned_key = "dsv4-c4-fused-failed-once"
@@ -815,9 +795,6 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Public entry point used by registry/installer
-# ---------------------------------------------------------------------------
 def apply(master_enabled_check: bool = True) -> List[str]:
     """Register lazy hooks covering compressor metadata + state save + compress pipeline."""
     if not master_enabled_check:

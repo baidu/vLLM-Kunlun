@@ -1,12 +1,10 @@
-"""DeepSeek-V4-Flash Kunlun adapter pack.
+"""DeepSeek-V4 Kunlun adapter pack entry point.
 
-Importing this package does **not** perform monkey-patching; call
-:func:`apply_all` explicitly from a controlled loader such as the root plugin init.
-All adapters are gated by environment flags defined in ``gates.py``.
+Calling :func:`apply_all` registers every DSV4 adapter (see
+``vllm_kunlun.patches.registry``) with the post-import dispatcher; adapters
+are gated by the ``KUNLUN_DSV4_*`` feature flags.
 """
 from typing import List, Optional
-import logging
-import sys
 import typing
 from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
@@ -22,7 +20,7 @@ def get_applied_labels() -> List[str]:
 
 
 def clear_application_state() -> None:
-    """Test-only helper allowing repeated application during unit tests. Do not call at runtime."""
+    """Test-only helper allowing repeated application during unit tests."""
     global _APPLICATION_CLEARED, _APPLIED_LABELS
     _APPLIED_LABELS.clear()
     _APPLICATION_CLEARED = True
@@ -34,9 +32,9 @@ def apply_all(
     """Wire all DSV4 adapters into already-imported or soon-to-be-imported modules.
 
     Args:
-        register_post_import_hook: hook registration callback supplied by root.
-            If ``None`` we look up the dispatcher from inside vllm_kunlun.__init__;
-            if still absent (e.g., unit tests), only eager adapters are applied.
+        register_post_import_hook: hook registration callback; when ``None``
+            the root package's ``_register_post_import_hook`` is looked up
+            automatically.
 
     Returns:
         Labels newly applied on this invocation.
@@ -53,7 +51,6 @@ def apply_all(
     try:
         from vllm_kunlun.patches.registry import populate_hooks as _populate_registry_hooks
 
-        # If caller passed no callback, attempt to retrieve it automatically so that this function can be called safely in isolation too.
         if register_post_import_hook is None:
             register_post_import_hook = _root_register_callback()
 
@@ -73,20 +70,9 @@ def apply_all(
 
 
 def _root_register_callback() -> Optional["Callable[..., None]"]:
-    """Internal helper locating vllm_kunlun's post-import dispatcher when running normally."""
+    """Return the root package's post-import hook registrar, or None."""
     import sys
 
     mod = sys.modules.get("vllm_kunlun")
-    if mod is None:
-        return None
     fn = getattr(mod, "_register_post_import_hook", None)
-    if callable(fn):
-        return typing.cast("Callable[...,None]", fn)
-    return None
-
-
-def _noop_register(*_args, **_kwargs):
-    """Placeholder used when no real dispatcher callback is available (e.g., unit tests)."""
-    logging.getLogger("vllm_kunlun.patches.deepseek_v4").debug(
-        "Skipping lazy post-import hook because dispatcher not available",
-    )
+    return typing.cast("Callable[...,None]", fn) if callable(fn) else None

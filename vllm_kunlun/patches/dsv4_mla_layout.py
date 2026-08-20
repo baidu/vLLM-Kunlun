@@ -1,14 +1,11 @@
-"""DSV4 MLA page-layout toggle.
+"""Flip ``use_fp8_ds_mla_layout`` to False on DSv4 attention classes.
 
-Upstream sets ``use_fp8_ds_mla_layout: ClassVar[bool] = True`` on DeepSeekV4Attention,
-asserting FP8 packed KV-cache pages. Kunlun ships BF16 plain-row pages, so every DSv4
-attention subclass defined inside ``vllm.models.deepseek_v4.attention`` must be flipped
-to False before backend dispatch selects our bf16 path. This adapter performs the
-flip post-import-time behind the master plugin switch.
+Upstream asserts FP8 packed KV-cache pages; Kunlun ships BF16 plain-row pages,
+so every DSv4 attention subclass must be flipped before backend dispatch
+selects the bf16 path.
 """
 import inspect
 import logging
-from typing import List
 
 LOGGER = logging.getLogger("vllm_kunlun.patches.dsv4_mla_layout")
 
@@ -20,17 +17,13 @@ def _layout_predicate(mod) -> bool:
 
 
 def _layout_applier(mod) -> None:
-    """Flip ``use_fp8_ds_mla_layout`` False on every DSv4 Attention subclass in *mod*."""
+    """Flip ``use_fp8_ds_mla_layout`` on every DSv4 attention subclass in *mod*."""
     for _name, _cls in list(mod.__dict__.items()):
         if not inspect.isclass(_cls):
             continue
         if _cls.__module__ != mod.__name__:
             continue
-        attr_present = (
-            "use_fp8_ds_mla_layout" in vars(_cls)
-            or hasattr(_cls, "use_fp8_ds_mla_layout")
-        )
-        if not attr_present:
+        if not hasattr(_cls, "use_fp8_ds_mla_layout"):
             continue
         try:
             _cls.use_fp8_ds_mla_layout = False
@@ -40,14 +33,3 @@ def _layout_applier(mod) -> None:
     LOGGER.info(
         "Flipped use_fp8_ds_mla_layout=False on %s subclasses", mod.__name__
     )
-
-
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Legacy eager-install shim kept for backward-compat callers during transition.
-
-    Real registration happens declaratively through
-    :data:`vllm_kunlun.patches.registry._STATIC_PATCHES`; this stub returns empty labels
-    and never triggers side effects until eventual removal scheduled under G2 cleanup.
-    """
-    del master_enabled_check
-    return []

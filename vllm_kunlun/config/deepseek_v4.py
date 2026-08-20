@@ -123,6 +123,12 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_OPROJ_NATIVE")
 
     @property
+    def force_full_cg(self) -> bool:
+        # Off by default: only the four DSv4 builders below are touched,
+        # so the flag is opt-in to avoid surprising other models.
+        return self._bool("KUNLUN_DSV4_FORCE_FULL_CG", default=False)
+
+    @property
     def activation_routing_accel(self) -> bool:
         return self._bool("KUNLUN_DSV4_ACTIVATION_ROUTING_ACCEL")
 
@@ -153,6 +159,7 @@ class FeatureFlags:
             "enabled", "platform_policy", "forced_mla_block_size",
             "flashmla_sparse_backend", "qkv_cache_insert_native",
             "rmsnorm_shortcut", "indexer_decode_native", "oproj_native",
+            "force_full_cg",
             "activation_routing_accel", "hash_topk_fused",
             "compressor_save_native", "compressor_vectorized_fallback",
             "fp8_moe_grouped_bf16_native", "int8_w8a8_route_method",

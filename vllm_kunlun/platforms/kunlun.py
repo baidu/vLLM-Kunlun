@@ -181,27 +181,15 @@ class KunlunPlatform(Platform):
 
     @classmethod
     def _default_collective_algo(cls) -> None:
-        """Prefer BKCL's mesh all-reduce over its ring all-reduce.
+        """Default to BKCL's mesh all-reduce for run-to-run determinism.
 
-        The ring implementation chunks the flat buffer and rotates which rank
-        starts each chunk's accumulation, so its result depends on where a
-        value sits in the buffer rather than only on the value. Two rows of a
-        batch holding bit-identical activations then come back one bf16 ULP
-        apart, and because every decoder layer's o-proj and MoE end in an
-        all-reduce that asymmetry compounds: measured over 43 layers of
-        DeepSeek-V4-Flash, 171 of the captured tensors had unequal row blocks
-        for a batch of identical prompts, and a request's own logits moved
-        0.4-0.8 nats between runs because the scheduler varied the batch width.
-
-        The mesh algorithm sums every element in the same rank order, which
-        makes the result blind both to a row's position and to the batch
-        width; the same measurement then reports zero unequal tensors and
-        bit-identical logits across repeats. It costs roughly 3% decode
-        throughput, and it only applies below BKCL's own size threshold --
-        buffers of about 512x4096 bf16 and above fall back to ring, so long
-        prefill chunks are still position-dependent.
-
-        Set ``XCCL_MESH_ALGO=0`` to keep the ring algorithm.
+        Ring all-reduce chunks the buffer and rotates the starting rank, so a
+        row's result depends on its offset in the buffer; bit-identical rows
+        can come back one bf16 ULP apart and logits drift with batch width.
+        Mesh sums every element in the same rank order (bit-identical logits
+        across repeats, ~3% decode throughput cost; buffers above ~512x4096
+        bf16 fall back to ring regardless). Set ``XCCL_MESH_ALGO=0`` to keep
+        ring.
         """
         if "XCCL_MESH_ALGO" in os.environ:
             return
@@ -477,3 +465,55 @@ class KunlunPlatform(Platform):
         from vllm_kunlun.quantization.gptq import KunlunGPTQConfig  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_INT8_KERNELS  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_KERNELS  # noqa
+
+
+def _install_runtime_patches() -> None:
+    """Register Kunlun platform and DeepSeek-V4 patches with the plugin.
+
+    The plugin protocol loads this module right after ``vllm_kunlun.register()``
+    returns, before any model-executor module is imported, so this is the
+    earliest platform-owned place to queue post-import hooks.
+    """
+    import sys
+
+    root = sys.modules.get("vllm_kunlun")
+    register_hook = getattr(root, "_register_post_import_hook", None)
+    if register_hook is None:
+        logger.warning(
+            "vllm_kunlun post-import dispatcher unavailable; skipping runtime patches"
+        )
+        return
+
+    def register(target, applied, apply):
+        """Guarded registration: never patch a module mid-import.
+
+        The dispatcher can observe a target in ``sys.modules`` while its body
+        is still executing (imports inside the body re-enter the dispatcher);
+        patching then would be silently overwritten when the body continues.
+        Reporting "already applied" defers the patch to the next dispatch,
+        which fires right after the module finishes importing.
+        """
+        def _applied(mod):
+            spec = getattr(mod, "__spec__", None)
+            if spec is not None and getattr(spec, "_initializing", False):
+                return True
+            return applied(mod)
+
+        register_hook(target, _applied, apply)
+
+    try:
+        from vllm_kunlun.patches.registry import populate_platform_hooks
+
+        populate_platform_hooks(register)
+    except Exception:
+        logger.exception("Kunlun platform patch registration failed")
+
+    try:
+        from vllm_kunlun.patches.deepseek_v4 import apply_all
+
+        apply_all(register)
+    except Exception:
+        logger.exception("DSV4 adapter pack failed to load")
+
+
+_install_runtime_patches()

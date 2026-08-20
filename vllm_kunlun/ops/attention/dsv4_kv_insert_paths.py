@@ -1,9 +1,8 @@
-"""Kunlun-native KV-insert path implementations used by V4 attention alias wiring.
+"""Kunlun-native KV-insert entry points for DeepSeek-V4 attention.
 
-These were originally inlined as closures inside ``vllm_kunlun/__init__``\'s
-``_v4_attention_alias_apply`` bootstrap hook. They are relocated here so the
-package-root init stays free of concrete algorithmic implementations; the hook
-body now merely imports these symbols and binds them onto ``torch.ops._C``.
+Provides the ``fp8_quant_insert`` / ``bf16_full_cache_insert`` implementations
+and binds them onto ``torch.ops._C`` so community code calling
+``fused_deepseek_v4_qnorm_rope_kv_rope_*`` resolves to the Kunlun path.
 """
 import logging
 
@@ -16,6 +15,8 @@ except Exception:  # noqa: BLE001
 
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.dsv4_kv_insert_paths")
+
+_ALIAS_FLAG = "_kunlun_v4_kv_insert_patched"
 
 
 def fp8_quant_insert(
@@ -124,3 +125,23 @@ def bf16_full_cache_insert(
             kv_roped[valid].to(swa_kv_cache_3d.dtype)
         )
     return q
+
+
+def _alias_predicate(mod: object) -> bool:
+    return getattr(mod, _ALIAS_FLAG, False)
+
+
+def _alias_applier(mod: object) -> None:
+    """Bind the KV-insert entry points onto the ``torch.ops._C`` namespace."""
+    setattr(
+        torch.ops._C,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+        fp8_quant_insert,
+    )
+    setattr(
+        torch.ops._C,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
+        bf16_full_cache_insert,
+    )
+    setattr(mod, _ALIAS_FLAG, True)
+    LOGGER.info("Wired DSV4 KV-insert aliases onto torch.ops._C")

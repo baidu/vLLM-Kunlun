@@ -1,17 +1,9 @@
-"""Miscellaneous Kunlun symbol substitutions targeting
-``vllm.models.deepseek_v4.attention``.
+"""Symbol substitutions for ``vllm.models.deepseek_v4.attention``.
 
-Two unrelated but equally-trivial responsibilities live here because neither deserves
-its own package-level directory:
-
-* **indexer Q** swaps ``fused_indexer_q_rope_quant`` to point at the Kunlun-native FP8
-  variant exported from :mod:`vllm_kunlun.ops.fp8`.
-* **mm dtype** registers an ``aten::mm.dtype`` CUDA dispatch-table impl returning a casted
-  torch.mm result, satisfying upstream dtype-fallback expectations on platforms lacking
-  certain mixed-dtype GEMM kernels.
+* ``fused_indexer_q_rope_quant`` -> Kunlun-native FP8 variant.
+* ``aten::mm.dtype`` -> casted torch.mm fallback for mixed-dtype GEMM.
 """
 import logging
-from typing import List
 
 
 LOGGER = logging.getLogger("vllm_kunlun.patches.dsv4_attention_subst")
@@ -28,12 +20,12 @@ def _indexer_q_predicate(mod) -> bool:
 
 
 def _indexer_q_applier(mod) -> None:
-    """Replace ``fused_indexer_q_rope_quant`` with Kunlun-native FP8 quantized variant."""
+    """Point ``fused_indexer_q_rope_quant`` at the Kunlun FP8 implementation."""
     from vllm_kunlun.ops.fp8 import fused_indexer_q_rope_quant_kunlun
 
     mod.fused_indexer_q_rope_quant = fused_indexer_q_rope_quant_kunlun
     setattr(mod, _INDEXER_Q_APPLIED_ATTR, True)
-    LOGGER.info("[KunlunPlugin] patched V4 Indexer Q RoPE/FP8 quantization")
+    LOGGER.info("Patched V4 indexer Q RoPE/FP8 quantization")
 
 
 _MM_DTYPE_APPLIED_ATTR = "_kunlun_mm_dtype_library"
@@ -44,10 +36,7 @@ def _mm_dtype_predicate(mod) -> bool:
 
 
 def _mm_dtype_applier(mod) -> None:
-    """Register ``aten::mm.dtype`` CUDA IMPL returning casted-torch.mm output.
-
-    Lifted verbatim from legacy root hook ``_v4_attention_mm_dtype_apply``.
-    """
+    """Register an ``aten::mm.dtype`` impl that casts inputs then calls torch.mm."""
     torch = mod.torch
     library = torch.library.Library("aten", "IMPL", "CUDA")
 
@@ -56,10 +45,4 @@ def _mm_dtype_applier(mod) -> None:
 
     library.impl("mm.dtype", _kunlun_mm_dtype)
     setattr(mod, _MM_DTYPE_APPLIED_ATTR, library)
-    LOGGER.info("[KunlunPlugin] registered V4 aten::mm.dtype fallback")
-
-
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Legacy eager-install shim retained purely for backward compatibility."""
-    del master_enabled_check
-    return []
+    LOGGER.info("Registered V4 aten::mm.dtype fallback")
