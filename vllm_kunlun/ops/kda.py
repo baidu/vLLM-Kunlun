@@ -234,13 +234,7 @@ def gather_initial_states(
     Per-slot basic indexing: ``state.index_select`` copies the whole paged cache
     on XPU (see fused_recurrent_kda_packed_decode).
     """
-    slots = indices.tolist()
-    flags = has_initial_state.tolist()
-    out = state.new_zeros((len(slots), *state.shape[1:]))
-    for i, slot in enumerate(slots):
-        if flags[i] and slot >= 0:
-            out[i] = state[slot]
-    return out
+    return torch.ops.xspeedgate_ops.gather_initial_states(state, indices, has_initial_state)
 
 
 def prepare_chunk_indices(
