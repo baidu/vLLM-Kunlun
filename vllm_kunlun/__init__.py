@@ -377,96 +377,28 @@ def _v4_attention_alias_applied(mod):
 
 
 def _v4_attention_alias_apply(mod):
+    """Bind Kunlun-native KV-insert paths onto ``torch.ops._C``.
+
+    Algorithmic bodies live in ``vllm_kunlun.ops.attention.dsv4_kv_insert_paths``;
+    this root-level wrapper just performs symbol registration against
+    community-side dispatcher namespaces plus sets the idempotency
+    sentinel consumed by sibling hooks checking whether this target was
+    already wired up during an earlier post-import dispatch round.
+    """
     import torch
-    import kunlun_ops
-
-    def _insert(q, kv, cache, slot_mapping, positions, cos_sin, padded_heads, eps, block_size):
-        # Community vLLM call convention:
-        #   q: [N, H, 512], kv: [N, 512], cache: [num_blocks, block_stride],
-        #   slot_mapping: [M], positions: [N], cos_sin: [max_pos, 64]
-        #   padded_heads: int, eps: float, block_size: int
-        # kunlun_ops convention:
-        #   (kv, cos_sin_cache, position_ids, slot_mapping, q, k_cache, cache_block_size, eps, scale)
-        return kunlun_ops.fused_deepseek_v4_qnorm_rope_kv_insert(
-            kv,
-            cos_sin,
-            positions,
-            slot_mapping,
-            q,
-            cache,
-            block_size,
-            eps,
-            None,
-        )
-
-    _bf16_insert_warned = [False]
-
-    def _bf16_insert(q, kv, swa_kv_cache_3d, slot_mapping, positions, cos_sin, eps, block_size):
-        # BF16 full-cache path: fused Q RMSNorm(no-weight) + GPT-J RoPE + KV
-        # RoPE + paged bf16 cache write — same native kernel as the FP8 _insert
-        # path (fused_deepseek_v4_qnorm_rope_kv_insert) with bf16 k_cache dtype.
-        # Falls back to torch on failure (log-once).
-        try:
-            cache_2d = swa_kv_cache_3d.view(swa_kv_cache_3d.shape[0], -1)
-            kunlun_ops.fused_deepseek_v4_qnorm_rope_kv_insert(
-                kv, cos_sin, positions.long(), slot_mapping.long(),
-                q, cache_2d, block_size, eps, None,
-            )
-            return q
-        except Exception as e:  # noqa: BLE001
-            if not _bf16_insert_warned[0]:
-                import logging as _l
-                _l.getLogger("vllm_kunlun").warning(
-                    "native bf16 fused_deepseek_v4_qnorm_rope_kv_insert "
-                    "failed (%s); using torch fallback", e)
-                _bf16_insert_warned[0] = True
-
-        # Torch fallback: Q RMSNorm (no weight) + GPT-J RoPE + KV RoPE + cache write.
-        num_tokens = q.shape[0]
-        rope_dim = 64
-        q_float = q.float()
-        rms = torch.rsqrt(q_float.square().mean(dim=-1, keepdim=True) + eps)
-        q.copy_((q_float * rms).to(q.dtype))
-
-        cos_sin_selected = cos_sin[positions]
-        cos_val = cos_sin_selected[:, :32]
-        sin_val = cos_sin_selected[:, 32:]
-
-        def apply_gptj_rope(x_rope):
-            x1 = x_rope[..., ::2]
-            x2 = x_rope[..., 1::2]
-            if x_rope.ndim == 3:
-                cos_b = cos_val.unsqueeze(1)
-                sin_b = sin_val.unsqueeze(1)
-            else:
-                cos_b = cos_val
-                sin_b = sin_val
-            out1 = x1.float() * cos_b.float() - x2.float() * sin_b.float()
-            out2 = x1.float() * sin_b.float() + x2.float() * cos_b.float()
-            return torch.stack([out1, out2], dim=-1).flatten(-2).to(x_rope.dtype)
-
-        q[..., -rope_dim:] = apply_gptj_rope(q[..., -rope_dim:])
-        kv_roped = kv.clone()
-        kv_roped[..., -rope_dim:] = apply_gptj_rope(kv[..., -rope_dim:])
-
-        slots = slot_mapping.to(torch.long)
-        valid = slots >= 0
-        if bool(valid.any()):
-            v_slots = slots[valid]
-            swa_kv_cache_3d[v_slots // block_size, v_slots % block_size, :] = (
-                kv_roped[valid].to(swa_kv_cache_3d.dtype)
-            )
-        return q
-
+    from vllm_kunlun.ops.attention.dsv4_kv_insert_paths import (
+        fp8_quant_insert,
+        bf16_full_cache_insert,
+    )
     setattr(
         torch.ops._C,
         "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
-        _insert,
+        fp8_quant_insert,
     )
     setattr(
         torch.ops._C,
         "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
-        _bf16_insert,
+        bf16_full_cache_insert,
     )
     mod._kunlun_v4_kv_insert_patched = True
 
