@@ -1,12 +1,13 @@
-# Contributing
+# Pull Request Workflow
 
 ## Building and Testing
-It's recommended to set up a local development environment to build vllm-kunlun and run tests
+
+It's recommended to set up a local development environment to build vLLM-Kunlun and run tests
 before you submit a PR.
 
 ### Run models locally
 
-After completing Run lint setup which is shown in quicksatrt, you can run your changed locally:
+After completing the setup shown in Quick Start, you can run your changes locally:
 
 ```{code-block} bash
    :substitutions:
@@ -29,16 +30,19 @@ python -m vllm.entrypoints.openai.api_server \
       --served-model-name your_modified_models
 ```
 
-Please save a screenshot of your service running successfully, and attach an accuracy report.
+Save evidence that the service runs successfully, and attach an accuracy report
+when your change affects model behavior.
 
 ### Submit the commit
+
+Use `-s` to add the required DCO sign-off to your commit.
 
 ```bash
 # Commit changed files using `-s`
 git commit -sm "your commit info"
 ```
 
-🎉 Congratulations! You have completed the development environment setup.
+Congratulations! You have completed the development environment setup.
 
 ## PR Title and Classification
 
@@ -49,7 +53,7 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 - `[ModelRunner]` for new features or optimization in model runner.
 - `[Platform]` for new features or optimization in platform.
 - `[Worker]` for new features or optimization in worker.
-- `[Core]` for new features or optimization  in the core vllm-kunlun logic (such as platform, attention, communicators, model runner)
+- `[Core]` for new features or optimization in the core vLLM-Kunlun logic (such as platform, attention, communicators, model runner)
 - `[Kernel]` for changes affecting compute kernels and ops.
 - `[Bugfix]` for bug fixes.
 - `[Doc]` for documentation fixes and improvements.
