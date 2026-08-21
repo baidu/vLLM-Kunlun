@@ -98,6 +98,12 @@ _STATIC_PATCHES = (
     ("dsv4.indexer.sparse", "vllm.model_executor.layers.sparse_attn_indexer",
      "vllm_kunlun.ops.attention.indexer_decode", "_applied", "_install_kunlun_indexer",
      "indexer_decode_native"),
+    # Attach decode host lens at metadata build time so the indexer forward
+    # never blocks on a D2H sync; unconditional like the kv_insert aliases.
+    ("dsv4.indexer.host_lens", "vllm.v1.attention.backends.mla.indexer",
+     "vllm_kunlun.ops.attention.indexer_decode",
+     "_builder_host_lens_applied", "_install_indexer_builder_host_lens",
+     ""),
     # Standalone contiguous KV cache tensors instead of the page-packed
     # backing; planner capacity math is unchanged.
     ("dsv4.kv_unpack.planner", "vllm.v1.core.kv_cache_utils",

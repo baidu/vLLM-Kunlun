@@ -50,6 +50,22 @@ from vllm_kunlun.quantization.deepseek_v4 import (
 logger = init_logger(__name__)
 
 
+
+# 常量 1.0 缩放表：值恒为 1，按 (device, top_k) 常驻复用，免去每 MoE 层每步的 ones fill。
+_DEQUANT_SCALE_ONES: dict = {}
+
+
+def _dequant_scale_buf(device, top_k: int) -> torch.Tensor:
+    """[max_tokens, top_k] 全 1 fp32 表；只切 dim0 保持连续性合同不变。"""
+    key = (device, top_k)
+    buf = _DEQUANT_SCALE_ONES.get(key)
+    if buf is None:
+        # 8192 = max_num_batched_tokens 上界
+        buf = torch.ones((8192, top_k), dtype=torch.float32, device=device)
+        _DEQUANT_SCALE_ONES[key] = buf
+    return buf
+
+
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -322,7 +338,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )
         del x_q, x_scale, sorted_tokens_num_lod
 
-        dequant_scale = torch.ones([M, top_k], dtype=torch.float32, device=out.device)
+        dequant_scale = _dequant_scale_buf(out.device, top_k)[:M]
         output = torch.empty(
             [M, N], dtype=hidden_states.dtype, device=hidden_states.device
         )

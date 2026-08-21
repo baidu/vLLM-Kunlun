@@ -24,6 +24,77 @@ _FALSE = object()
 _TOPK_NATIVE = os.environ.get("KUNLUN_DSV4_INDEXER_TOPK_NATIVE", "0") == "1"
 _WARNED_TOPK_TORCH_KEY = "dsv4-indexer-topk-torch"
 
+# 跨 C4A 层共享的 (1, n) 常量行向量缓存：内容不变，按 (name, n) 常驻。
+_TOPK_CONST_ROWS: dict = {}
+
+
+def _topk_const_row(name: str, n: int, device, fill: int | None = None) -> torch.Tensor:
+    """(1, n) int32 常量行：name="offsets"/"cols"/"ranks" 为 arange，
+    指定 fill 时为常数填充。常驻复用，避免每 C4A 层重复发射小 kernel。"""
+    key = (name, n, fill, device)
+    buf = _TOPK_CONST_ROWS.get(key)
+    if buf is None:
+        if fill is None:
+            buf = torch.arange(n, device=device, dtype=torch.int32).unsqueeze(0)
+        else:
+            buf = torch.full((1, n), fill, device=device, dtype=torch.int32)
+        _TOPK_CONST_ROWS[key] = buf
+    return buf
+
+
+# Single-slot cache: [key, lens_cpu, lens_gpu]. C4A layers in one step share
+# one metadata seq_lens tensor, so only the first pays the D2H sync. The
+# content version in the key rejects stale hits from builder buffers whose
+# data_ptr is stable across steps while contents change.
+_HOST_LENS_CACHE: list = [None, None, None]
+_BUILDER_HOST_LENS_ATTR = "_kunlun_host_lens"
+
+# block_table 的 int64 展开：同一步内 20 个 C4A 层共享同一张量，转一次复用。
+# 版本号入 key 防 builder 复用 buffer 导致的跨步陈旧命中。
+_BLOCKIDX_CACHE: list = [None, None]
+
+
+def _shared_block_indices(block_table: torch.Tensor) -> torch.Tensor:
+    """block_table 展平 int64 视图，per-step 计算一次，跨 C4A 层复用。"""
+    key = (block_table.data_ptr(), block_table._version, tuple(block_table.shape))
+    if _BLOCKIDX_CACHE[0] == key:
+        return _BLOCKIDX_CACHE[1]
+    flat = block_table.flatten().long()
+    _BLOCKIDX_CACHE[:] = [key, flat]
+    return flat
+
+
+
+def _effective_decode_lens(
+    seq_lens_raw: torch.Tensor, decode_meta: object = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(host, device) per-request decode context lengths for context_lens.
+
+    seq_lens_raw is (batch, next_n) or (batch,); the MTP 2D form takes the
+    last column. Prefers the build-time host copy attached to decode_meta
+    (see _install_indexer_builder_host_lens); otherwise caches per scheduler
+    step so the blocking .cpu() runs once per step, not per C4A layer.
+    """
+    host = getattr(decode_meta, _BUILDER_HOST_LENS_ATTR, None)
+    if host is not None:
+        lens_gpu = (
+            seq_lens_raw[:, -1].contiguous()
+            if seq_lens_raw.dim() == 2
+            else seq_lens_raw.contiguous()
+        )
+        return host, lens_gpu
+    key = (seq_lens_raw.data_ptr(), seq_lens_raw._version, tuple(seq_lens_raw.shape))
+    if _HOST_LENS_CACHE[0] == key:
+        return _HOST_LENS_CACHE[1], _HOST_LENS_CACHE[2]
+    lens_gpu = (
+        seq_lens_raw[:, -1].contiguous()
+        if seq_lens_raw.dim() == 2
+        else seq_lens_raw.contiguous()
+    )
+    lens_cpu = lens_gpu.cpu()
+    _HOST_LENS_CACHE[:] = [key, lens_cpu, lens_gpu]
+    return lens_cpu, lens_gpu
+
 
 def _decode_topk_torch(
     logits_flat: torch.Tensor,          # [rows, max_model_len], fp32
@@ -46,20 +117,19 @@ def _decode_topk_torch(
     num_cols = logits_flat.shape[1]
     width = min(topk_tokens, num_cols)
 
-    offsets = torch.arange(next_n, device=device, dtype=torch.int32).view(1, next_n)
+    offsets = _topk_const_row("offsets", next_n, device)
     row_ends = (
         seq_lens[:batch_size].to(torch.int32).view(batch_size, 1) - next_n + offsets + 1
     ).reshape(rows, 1)
 
-    cols = torch.arange(num_cols, device=device, dtype=torch.int32).view(1, num_cols)
+    cols = _topk_const_row("cols", num_cols, device)
     scores = logits_flat.masked_fill(cols >= row_ends, float("-inf"))
     chosen = scores.topk(width, dim=1).indices.to(torch.int32)
 
-    ranks = torch.arange(width, device=device, dtype=torch.int32).view(1, width)
+    ranks = _topk_const_row("ranks", width, device)
     keep = ranks < row_ends.clamp(min=0)
-    topk_indices_buffer[:rows, :width] = torch.where(
-        keep, chosen, torch.full_like(chosen, -1)
-    )
+    neg1 = _topk_const_row("neg1", width, device, fill=-1)
+    topk_indices_buffer[:rows, :width] = torch.where(keep, chosen, neg1)
 
 
 def _install_kunlun_indexer(indexer_module: object) -> List[str]:
@@ -113,11 +183,7 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                 decode_meta = indexer_meta.decode
                 seq_lens_raw = decode_meta.seq_lens
                 block_table = decode_meta.block_table
-                effective_seq_lens = (
-                    seq_lens_raw[:, -1].contiguous()
-                    if seq_lens_raw.dim() == 2
-                    else seq_lens_raw.contiguous()
-                )
+                lens_cpu, effective_seq_lens = _effective_decode_lens(seq_lens_raw, decode_meta)
                 batch_size = effective_seq_lens.shape[0]
                 next_n = num_decode_tokens // batch_size
                 max_model_len = self.max_model_len
@@ -133,7 +199,7 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                     .view(num_blocks_cache, block_size_cache, 1, head_dim)
                 )
 
-                block_indices = block_table.flatten().long()
+                block_indices = _shared_block_indices(block_table)
                 k_scale_all = (
                     kv_flat[block_indices, block_size_cache * head_dim:]
                     .view(-1, 4)
@@ -152,7 +218,7 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                         q=q_4d,
                         fused_kv_cache=[k_val, k_scale],
                         weights=w_3d,
-                        context_lens=[effective_seq_lens.cpu(), effective_seq_lens],
+                        context_lens=[lens_cpu, effective_seq_lens],
                         block_table=block_table,
                         max_context_len=max_model_len,
                         clean_logits=True,
@@ -306,3 +372,46 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
 
 def _applied(mod: object) -> bool:
     return bool(getattr(mod, _APPLIED_SENTINEL_KEY, False))
+
+
+_BUILDER_PATCH_KEY = "_kunlun_builder_host_lens_applied"
+
+
+def _install_indexer_builder_host_lens(builder_module: object) -> None:
+    """Wrap DeepseekV32IndexerMetadataBuilder.build so decode metadata carries
+    a host copy of seq_lens, moving the D2H sync from the per-layer forward on
+    the indexer aux stream to metadata build time."""
+    if getattr(builder_module, _BUILDER_PATCH_KEY, False):
+        return
+    builder_cls = getattr(builder_module, "DeepseekV32IndexerMetadataBuilder", None)
+    if builder_cls is None:
+        return
+    orig_build = builder_cls.build
+
+    def build_with_host_lens(self, *args, **kwargs):
+        meta = orig_build(self, *args, **kwargs)
+        decode_meta = getattr(meta, "decode", None)
+        if (
+            decode_meta is not None
+            and getattr(decode_meta, _BUILDER_HOST_LENS_ATTR, None) is None
+        ):
+            seq_lens = decode_meta.seq_lens
+            setattr(
+                decode_meta,
+                _BUILDER_HOST_LENS_ATTR,
+                (
+                    seq_lens[:, -1].contiguous().cpu()
+                    if seq_lens.dim() == 2
+                    else seq_lens.contiguous().cpu()
+                ),
+            )
+        return meta
+
+    builder_cls.build = build_with_host_lens
+    setattr(builder_module, _BUILDER_PATCH_KEY, True)
+    LOGGER.info("Wrapped %s.build: decode host lens attached at build time",
+                builder_cls.__name__)
+
+
+def _builder_host_lens_applied(mod: object) -> bool:
+    return bool(getattr(mod, _BUILDER_PATCH_KEY, False))
