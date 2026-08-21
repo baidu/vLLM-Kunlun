@@ -20,7 +20,9 @@ if [ $XPU_NUM -gt 0 ]; then
     done
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
-export build_image="xxxxx"
+export build_image="wjie520/vllm_kunlun:uv_base"
+# For Baidu intranet, use:
+# export build_image="iregistry.baidu-int.com/hac_test/aiak-inference-llm:vLLM-Kunlun-Base"
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -50,7 +52,7 @@ The default working directory is `/workspace`. With the fully provisioned enviro
 
 ```
 #Set environment
-chmod +x /workspace/vllm-kunlun/setup_env.sh && source /workspace/vllm-kunlun/setup_env.sh
+chmod +x /workspace/vLLM-Kunlun/setup_env.sh && source /workspace/vLLM-Kunlun/setup_env.sh
 ```
 
 ## Usage
@@ -138,7 +140,7 @@ if __name__ == "__main__":
 
 vLLM can also be deployed as a server that implements the OpenAI API protocol. Run
 the following command to start the vLLM server with the
-[Qwen3-VL-30B-A3B-Instruct]model:
+Qwen3-VL-30B-A3B-Instruct model:
 
 <!-- tests/e2e/doctest/001-quickstart-test.sh should be considered updating as well -->
 

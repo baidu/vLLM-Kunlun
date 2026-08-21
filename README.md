@@ -32,7 +32,7 @@ By utilizing the vLLM Kunlun plugin, popular open-source models, including Trans
 ---
 ## Supported Models
 
-<h3>Generaltive Models</h3>
+<h3>Generative Models</h3>
 <table>
   <thead>
     <tr>
