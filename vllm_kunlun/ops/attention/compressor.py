@@ -20,6 +20,13 @@ from vllm_kunlun.patches.registry import _register_lazy
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.compressor")
 _APPLIED_SENTINEL = "_dsv4_compressor_applied"
 _FALSE = object()
+_slot_map_logged: set = set()
+
+# TODO(perf): get_compressed_slot_mapping below is ~10 elementwise kernels plus a
+# [num_reqs, num_tokens] bool reduction, where upstream runs one triton kernel over
+# num_reqs programs. XSpeedGate has no equivalent yet -- init_compressed_attn_metadata
+# does not fit (per-request output, no page-table lookup, 0 instead of -1 as the
+# skip sentinel, decode-only shape), so this wants a new native op.
 
 
 def _applied(mod: object) -> bool:
@@ -39,6 +46,94 @@ def _mark_wired(obj: object) -> None:
     setattr(obj, "_dsv4_wired", True)
 
 
+# Paged full-row store: xspeedgate_ops.set_k_and_s_v4 replaces the torch scatter
+# when the cache layout is expressible for it (see _paged_store_usable).
+_PAGED_STORE_OFF = os.environ.get("KUNLUN_DSV4_PAGED_STORE_NATIVE", "1") != "1"
+_PAGED_STORE_DEBUG = os.environ.get("KUNLUN_DSV4_PAGED_STORE_DEBUG", "0") == "1"
+_paged_store_op: object = _FALSE
+_paged_store_seen: set = set()
+_paged_store_warm: set = set()
+
+
+def _log_paged_store_route(cache, data, col_start, fast) -> None:
+    key = (tuple(cache.shape), str(cache.dtype), int(col_start), int(data.shape[1]))
+    if key in _paged_store_seen:
+        return
+    _paged_store_seen.add(key)
+    LOGGER.info(
+        "[paged-store] cache=%s %s strides=%s col_start=%d D=%d -> %s",
+        tuple(cache.shape), cache.dtype, tuple(cache.stride()), col_start,
+        data.shape[1], "native" if fast else "torch",
+    )
+
+
+def _find_paged_store_op():
+    global _paged_store_op
+    if _paged_store_op is not _FALSE:
+        return _paged_store_op
+    handle = None
+    source = "skip" if _PAGED_STORE_OFF else "torch_fallback"
+    if not _PAGED_STORE_OFF:
+        try:
+            __import__("xspeedgate_ops")
+        except Exception:  # noqa: BLE001
+            pass
+        ns = getattr(torch.ops, "xspeedgate_ops", None)
+        candidate = getattr(ns, "set_k_and_s_v4", None) if ns is not None else None
+        if candidate is not None:
+            handle = candidate
+            source = "torch.ops.xspeedgate_ops"
+    _paged_store_op = handle
+    record_wired("set_k_and_s_v4", source)
+    return handle
+
+
+def _paged_store_usable(cache, data, col_start) -> bool:
+    """Whether ``set_k_and_s_v4`` can express this write.
+
+    3D mode addresses ``[num_pages, page_size, k_dim]`` with the page stride
+    taken from ``stride(0)``, so pages may be spaced apart (the compressor
+    caches are strided views into the shared KV pool) but rows must be dense
+    and the write must cover a full row of a BF16/FP16 cache.
+    """
+    return (
+        col_start == 0
+        and cache.dim() == 3
+        and data.dim() == 2
+        and cache.dtype in (torch.bfloat16, torch.float16)
+        and data.shape[1] == cache.shape[2]
+        and cache.stride(2) == 1
+        and cache.stride(1) == cache.shape[2]
+        and cache.stride(0) >= cache.shape[1] * cache.shape[2]
+    )
+
+
+def _warm_paged_store_once(cache) -> None:
+    """Launch ``set_k_and_s_v4`` once per cache, outside any cudagraph capture.
+
+    A kernel module is loaded on its first launch and that load is illegal
+    inside stream capture on this XPU (same failure mode documented for
+    ``fused_kv_compress_gather`` in ``_warm_native_once``). The warm write puts
+    zeros into slot 0, the null block vLLM's BlockPool keeps zeroed.
+    """
+    op = _find_paged_store_op()
+    if op is None or cache.dim() != 3:
+        return
+    key = (cache.data_ptr(), int(cache.shape[1]), int(cache.shape[2]))
+    if key in _paged_store_warm:
+        return
+    if not _paged_store_usable(cache, cache[0, :1], 0):
+        return
+    _paged_store_warm.add(key)
+    device = cache.device
+    op(
+        cache,
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.zeros((1, cache.shape[2]), dtype=cache.dtype, device=device),
+        cache.shape[1],
+    )
+
+
 def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
     """Scatter ``data`` into paged ``cache`` at flat slots ``dest``, skipping rows.
 
@@ -46,6 +141,34 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
     skipped rows onto block 0 (the null block kept zeroed by vLLM BlockPool).
     Mask logic runs in fp32 because some xdnn capture ops reject uint8 masks.
     """
+    if cache.dtype.itemsize == 1 and col_start not in _slot_map_logged:
+        _slot_map_logged.add(col_start)
+        probe = ""
+        try:
+            if cache.shape[-1] >= 132:
+                s0 = cache[0, 0, 128:132].view(torch.float32).item()
+                v0 = int(cache[0, 0, 0].item())
+                probe = f" slot0: scale={s0:.6g} val0={v0}"
+        except Exception:  # noqa: BLE001
+            pass
+        LOGGER.info(
+            "[paged-write] cache=%s %s strides=%s col_start=%d data=%s %s%s",
+            tuple(cache.shape), cache.dtype, tuple(cache.stride()), col_start,
+            tuple(data.shape), data.dtype, probe,
+        )
+    op = _find_paged_store_op()
+    fast = op is not None and _paged_store_usable(cache, data, col_start)
+    if _PAGED_STORE_DEBUG:
+        _log_paged_store_route(cache, data, col_start, fast)
+    if fast:
+        dest_safe = torch.where(write_ok, dest, 0)
+        data_ok = data.to(cache.dtype)
+        if data_ok.data_ptr() == data.data_ptr():
+            data_ok = data_ok.clone()
+        data_ok.mul_(write_ok.unsqueeze(-1))
+        op(cache, dest_safe, data_ok, cache.shape[1])
+        return
+
     D = data.shape[1]
     block_size = cache.shape[1]
     data = data.float()
@@ -58,9 +181,9 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
         data_ok,
         accumulate=False,
     )
+    
 
-
-# Compressed-slot-mapping: CPU loop over the page table.
+# Compressed-slot-mapping: vectorized page-table lookup.
 _SLOT_FN_NAME = "get_compressed_slot_mapping"
 _SLOT_TARGETS = (
     "vllm.v1.attention.backends.mla.compressor_utils",
@@ -81,6 +204,20 @@ def _install_slot_mapping(utils_mod: object) -> None:
         compress_ratio,
         out=None,
     ):
+        """Per-token slot in the compressor state cache, ``-1`` where unused.
+
+        query_start_loc [num_reqs+1] int32/int64, seq_lens [num_reqs] int,
+        block_table [num_reqs, max_blocks] int, both on device. A token at
+        absolute position ``pos`` only occupies a slot when it closes a
+        compression window (``(pos + 1) % compress_ratio == 0``); its slot is
+        ``block_table[req, cpos // block_size] * block_size + cpos % block_size``
+        with ``cpos = pos // compress_ratio``. Every other token, and every
+        padding token past the last request, keeps the ``-1`` sentinel that
+        downstream save/compress paths read as "skip".
+
+        Returns ``out`` when given (filled in place), else a fresh
+        [num_tokens] int64 tensor.
+        """
         device = query_start_loc.device
         if out is None:
             result = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
@@ -88,25 +225,46 @@ def _install_slot_mapping(utils_mod: object) -> None:
             out.fill_(-1)
             result = out[:num_tokens]
 
-        starts = query_start_loc.cpu().tolist()
-        lengths = seq_lens.cpu().tolist()
-        tables = block_table.cpu()
-        result_cpu = torch.full((num_tokens,), -1, dtype=torch.int64)
-        for req_idx, query_start in enumerate(starts[:-1]):
-            query_end = starts[req_idx + 1]
-            query_len = query_end - query_start
-            start_pos = lengths[req_idx] - query_len
-            for offset in range(query_len):
-                pos = start_pos + offset
-                if (pos + 1) % compress_ratio != 0:
-                    continue
-                compressed_pos = pos // compress_ratio
-                block_id = int(compressed_pos // block_size)
-                bt_val = tables[req_idx, min(block_id, tables.shape[1] - 1)].item()
-                result_cpu[query_start + offset] = (
-                    bt_val * block_size + compressed_pos % block_size
-                )
-        result.copy_(result_cpu.to(device))
+        num_reqs = min(block_table.shape[0], query_start_loc.shape[0] - 1)
+        if num_reqs <= 0 or num_tokens <= 0:
+            return out if out is not None else result
+
+        if compress_ratio not in _slot_map_logged:
+            _slot_map_logged.add(compress_ratio)
+            LOGGER.info(
+                "[slot-map] ratio=%d num_reqs=%d num_tokens=%d block_size=%d",
+                compress_ratio, num_reqs, num_tokens, block_size,
+            )
+
+        bounds = query_start_loc[: num_reqs + 1].long()
+        req_start = bounds[:-1]
+        query_lens = bounds[1:] - req_start
+
+        token = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        # Request index per token, without the host round-trip a bucketize or a
+        # repeat_interleave would need: count the request ends already passed.
+        req = (token.unsqueeze(0) >= bounds[1:].unsqueeze(1)).sum(0)
+        req.clamp_(max=num_reqs - 1)
+
+        pos = seq_lens.long()[req] - query_lens[req] + (token - req_start[req])
+        compressed_pos = pos // compress_ratio
+        # Clamp before the gather because torch cannot mask it the way the
+        # upstream triton kernel masks its block_table load; the out-of-range
+        # rows are dropped by `keep` below anyway.
+        block_ids = (compressed_pos // block_size).clamp_(
+            min=0, max=block_table.shape[1] - 1
+        )
+        slots = (
+            block_table[req, block_ids].long() * block_size
+            + compressed_pos % block_size
+        )
+
+        keep = (
+            (token < bounds[num_reqs])
+            & (pos >= 0)
+            & ((pos + 1) % compress_ratio == 0)
+        )
+        result.copy_(torch.where(keep, slots, torch.full_like(slots, -1)))
         return out if out is not None else result
 
     _mark_wired(get_compressed_slot_mapping)
@@ -760,6 +918,7 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
                 compress_ratio=compress_ratio, overlap=overlap,
                 rms_norm_weight=rms_norm_weight, rms_norm_eps=rms_norm_eps,
             )
+            _warm_paged_store_once(kv_cache)
             if not bool(valid_mask.any()):
                 return
             sel = valid_mask.nonzero(as_tuple=True)[0]
