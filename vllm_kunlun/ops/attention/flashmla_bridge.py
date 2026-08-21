@@ -149,41 +149,30 @@ def _install_c128a_metadata(sparse_mla_mod: Any) -> List[str]:
         decode_lens_buffer[:num_decode_tokens].zero_()
         prefill_buffer[:num_prefill_tokens].fill_(-1)
 
-        positions_cpu = positions.cpu().tolist()
-        req_cpu = token_to_req_indices.cpu().tolist()
+        positions_cpu = positions.cpu()
+        req_cpu = token_to_req_indices.cpu()
         table_cpu = block_table.cpu()
-        slots_cpu = slot_mapping.cpu().tolist()
+        slots_cpu = slot_mapping.cpu()
 
-        for token_idx, position in enumerate(positions_cpu):
+        # vectorized CPU ops: per-element .item() loops cost ms/step at long
+        # context; copy_ from a CPU tensor does the H2D + dtype cast in one.
+        for token_idx in range(num_tokens):
+            position = int(positions_cpu[token_idx])
             num_compressed = min((position + 1) // compress_ratio, max_compressed_tokens)
             if token_idx < num_decode_tokens:
-                if slots_cpu[token_idx] < 0:
+                if num_compressed == 0 or int(slots_cpu[token_idx]) < 0:
                     continue
-                req_idx = req_cpu[token_idx]
-                values = [
-                    table_cpu[req_idx, offset // block_size].item() * block_size
-                    + offset % block_size
-                    for offset in range(num_compressed)
-                ]
-                if values:
-                    global_decode_buffer[token_idx, :num_compressed].copy_(
-                        torch.tensor(
-                            values,
-                            dtype=global_decode_buffer.dtype,
-                            device=global_decode_buffer.device,
-                        )
-                    )
-                    decode_lens_buffer[token_idx] = num_compressed
-            else:
+                offs = torch.arange(num_compressed)
+                blocks = table_cpu[int(req_cpu[token_idx])].index_select(
+                    0, offs // block_size
+                )
+                global_decode_buffer[token_idx, :num_compressed].copy_(
+                    blocks * block_size + offs % block_size
+                )
+                decode_lens_buffer[token_idx] = num_compressed
+            elif num_compressed:
                 row = token_idx - num_decode_tokens
-                if num_compressed:
-                    prefill_buffer[row, :num_compressed].copy_(
-                        torch.arange(
-                            num_compressed,
-                            dtype=prefill_buffer.dtype,
-                            device=prefill_buffer.device,
-                        )
-                    )
+                prefill_buffer[row, :num_compressed].copy_(torch.arange(num_compressed))
         return global_decode, decode_lens, prefill_local
 
     setattr(build_c128a_topk_metadata, _DSV4_WIRED_ATTR, True)
@@ -232,9 +221,10 @@ def _install_swa_kernel(sparse_swa_mod: Any) -> List[str]:
                 valid = is_valid_token.cpu().tolist()
                 tables = block_table.cpu()
                 rows = swa_indices.shape[0]
-                width = swa_indices.shape[1]
                 swa_indices.fill_(-1)
                 lens_cpu = torch.zeros(rows, dtype=torch.int32)
+                # vectorized CPU ops: per-element .item() loops cost ms/step;
+                # copy_ from a CPU tensor does the H2D + dtype cast in one.
                 for pid in range(rows):
                     token_idx = pid + token_offset
                     if token_idx >= len(valid) or not valid[token_idx]:
@@ -244,19 +234,14 @@ def _install_swa_kernel(sparse_swa_mod: Any) -> List[str]:
                     prefix_len = lengths[req_idx] - query_len
                     pos = prefix_len + token_idx - starts[req_idx]
                     start_pos = max(pos - window_size + 1, 0)
-                    end_pos = pos + 1
-                    swa_len = end_pos - start_pos
+                    swa_len = pos + 1 - start_pos
                     lens_cpu[pid] = swa_len
-                    values = [
-                        tables[req_idx, p // block_size].item() * block_size
-                        + p % block_size
-                        for p in range(start_pos, end_pos)
-                    ]
-                    if values:
-                        copy_width = len(values)
-                        swa_indices[pid, :copy_width].copy_(
-                            torch.tensor(values, dtype=swa_indices.dtype, device=swa_indices.device)
-                        )
+                    offs = torch.arange(start_pos, pos + 1)
+                    blocks = tables[req_idx].index_select(0, offs // block_size)
+                    # buffer rows are (1, window) views: flatten before slicing
+                    swa_indices[pid].view(-1)[:swa_len].copy_(
+                        blocks * block_size + offs % block_size
+                    )
                 swa_lens[:rows].copy_(lens_cpu.to(swa_lens.device))
 
             return launch
