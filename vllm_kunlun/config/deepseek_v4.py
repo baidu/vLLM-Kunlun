@@ -79,6 +79,10 @@ class FeatureFlags:
         return self._bool("KUNLUN_DSV4_FLASHMLA_SPARSE_BACKEND")
 
     @property
+    def kv_cache_unpack(self) -> bool:
+        return self._bool("KUNLUN_DSV4_KV_UNPACK")
+
+    @property
     def rmsnorm_shortcut(self) -> bool:
         return self._bool("KUNLUN_DSV4_RMSNORM_SHORTCUT")
 

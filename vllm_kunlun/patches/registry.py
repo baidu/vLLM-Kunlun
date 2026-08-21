@@ -98,6 +98,11 @@ _STATIC_PATCHES = (
     ("dsv4.indexer.sparse", "vllm.model_executor.layers.sparse_attn_indexer",
      "vllm_kunlun.ops.attention.indexer_decode", "_applied", "_install_kunlun_indexer",
      "indexer_decode_native"),
+    # Standalone contiguous KV cache tensors instead of the page-packed
+    # backing; planner capacity math is unchanged.
+    ("dsv4.kv_unpack.planner", "vllm.v1.core.kv_cache_utils",
+     "vllm_kunlun.patches.dsv4_kv_unpack", "_planner_predicate", "_planner_applier",
+     "kv_cache_unpack"),
     # Community code calls these via torch.ops._C directly; the alias binding
     # is mandatory whenever DSV4 runs, so no feature flag gates it.
     ("dsv4.kv_insert.attention", "vllm.models.deepseek_v4.attention",
