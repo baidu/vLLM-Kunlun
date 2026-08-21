@@ -5,6 +5,7 @@ import importlib
 import logging
 import os
 import sys
+import weakref
 
 from vllm.logger import init_logger as init_vllm_logger
 
@@ -32,6 +33,10 @@ def _configure_kunlun_logger() -> logging.Logger:
 # sufficient because all hooks are idempotent and we only need one to
 # run per real import event.
 _POST_IMPORT_DISPATCH_IN_PROGRESS = {"v": False}
+
+# 已验证生效的 hook 按 (列表下标 -> 模块对象 weakref) 记忆；同一模块对象不再
+# 重查谓词。模块重新加载会产生新对象，自动失效；importing 中的模块不记忆。
+_HOOK_APPLIED_REFS: list = []
 
 
 _MODULE_MAPPINGS = {
@@ -78,17 +83,32 @@ def _dispatch_post_import_hooks():
     Re-entrant safe: importing the kunlun replacement module from within
     a hook re-triggers ``_custom_import`` -> this dispatcher; the
     in-progress sentinel short-circuits the inner call.
+
+    Hooks already verified applied on an idle module are memoized by module
+    object (weakref) and skipped on later dispatches: torch emits lazy
+    imports during steady-state decode, and re-running every predicate
+    (which resolves feature flags) per import statement is pure overhead.
+    A module re-imported after a reload is a fresh object, so it is
+    re-checked automatically.
     """
     if _POST_IMPORT_DISPATCH_IN_PROGRESS["v"]:
         return
     _POST_IMPORT_DISPATCH_IN_PROGRESS["v"] = True
     try:
-        for target, applied, apply in _POST_IMPORT_HOOKS:
+        for i, (target, applied, apply) in enumerate(_POST_IMPORT_HOOKS):
             mod = sys.modules.get(target)
             if mod is None:
                 continue
+            while len(_HOOK_APPLIED_REFS) <= i:
+                _HOOK_APPLIED_REFS.append(None)
+            ref = _HOOK_APPLIED_REFS[i]
+            if ref is not None and ref() is mod:
+                continue
             try:
                 if applied(mod):
+                    spec = getattr(mod, "__spec__", None)
+                    if spec is None or not getattr(spec, "_initializing", False):
+                        _HOOK_APPLIED_REFS[i] = weakref.ref(mod)
                     continue
                 apply(mod)
             except Exception:

@@ -4,6 +4,7 @@ Each flag follows a uniform ``KUNLUN_DSV4_*`` naming convention.  Old names
 introduced during the early bring-up are kept readable for one release cycle but
 emit a deprecation warning telling the user the canonical replacement.
 """
+import functools
 from typing import Dict, Optional, Tuple, Union
 
 from vllm_kunlun.adapter_utils import env_bool, env_int, env_str, WarningOnce
@@ -28,6 +29,10 @@ _DEPRECATED_ALIASES: "dict[str, tuple[str]]" = {
 }
 
 
+_FLAG_VALUE_CACHE: "dict[tuple, bool]" = {}
+
+
+@functools.lru_cache(maxsize=None)
 def _aliases(primary_name: str) -> Optional[Tuple[str, ...]]:
     """Return every legacy alias that maps to *primary_name*."""
     out = []
@@ -179,6 +184,11 @@ class FeatureFlags:
 
     @staticmethod
     def _bool(name: str, *, default: bool = True) -> bool:
-        canon = name.replace("_ENABLED", "") != name  # unused stub for uniformity
         assert isinstance(default, bool), type(default).__name__
-        return env_bool(name, default=default, aliases=_aliases(name))
+        # env 进程启动后不变；flag 读取发生在每次 import hook 分发，按进程缓存。
+        key = (name, default)
+        val = _FLAG_VALUE_CACHE.get(key)
+        if val is None:
+            val = env_bool(name, default=default, aliases=_aliases(name))
+            _FLAG_VALUE_CACHE[key] = val
+        return val
