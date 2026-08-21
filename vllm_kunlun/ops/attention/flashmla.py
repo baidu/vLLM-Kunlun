@@ -145,6 +145,34 @@ _static_kvlod_com_cpu_cache: dict = {}
 _static_clamped_swa_idx_cache: dict = {}
 _static_clamped_com_idx_cache: dict = {}
 
+# lens 派生量与常量的跨层共享缓存（见 _prepare_static_clamped_indices）。
+_LENS_DERIVED_CACHE: dict = {}
+_TOPK_ARANGE: dict = {}
+_EMPTY_MASK_CACHE: dict = {}
+_SCALAR_CACHE: dict = {}
+
+
+def _scalar(dtype, device, value: float) -> torch.Tensor:
+    """0-dim 常数张量按 (dtype, device, value) 常驻。"""
+    key = (dtype, str(device), value)
+    buf = _SCALAR_CACHE.get(key)
+    if buf is None:
+        buf = torch.full((), value, dtype=dtype, device=device)
+        _SCALAR_CACHE[key] = buf
+    return buf
+
+
+def _tensor_stamp(t: torch.Tensor):
+    """同一步内的共享键 (data_ptr, 版本)。inference tensor 无版本计数，且
+    builder 复用持久 buffer，纯指针键会立刻陈旧；不可追踪时返回 None，
+    调用方回退为每次计算。"""
+    base = getattr(t, "_base", None)
+    base = base if base is not None else t
+    try:
+        return (t.data_ptr(), base._version)
+    except RuntimeError:
+        return None
+
 # Pre-allocated output buffers for kunlun_flash_mla_with_kvcache (V4 production decode).
 # Same shape -> same tensor -> stable data_ptr across cudagraph FULL replays.
 _kunlun_mla_out_cache: dict = {}
@@ -219,15 +247,17 @@ def _build_static_per_seq_lens(lens: torch.Tensor, cache: dict) -> torch.Tensor:
     same pattern applied to indices.
     """
     key = (lens.shape[0],)
-    if key not in cache:
-        cache[key] = torch.empty(
-            lens.shape, dtype=torch.int32, device=lens.device,
-        )
-    static = cache[key]
-    # GPU-side copy_; capture-safe. The captured copy_ reads `lens` at REPLAY
-    # time, so the static buffer is refreshed per step (not pinned to the
-    # capture-time value).
-    static.copy_(lens.to(torch.int32))
+    entry = cache.get(key)
+    if entry is None:
+        entry = [torch.empty(lens.shape, dtype=torch.int32, device=lens.device), None]
+        cache[key] = entry
+    static, last_refresh = entry
+    # 同一步内 20 个 C4A 层对同一 static buffer 写同一份 lens：幂等，只留首层
+    # 的 copy_（capture 时也只记录一次，replay 由它负责刷新）。
+    refresh = _tensor_stamp(lens)
+    if refresh is None or last_refresh != refresh:
+        static.copy_(lens.to(torch.int32))
+        entry[1] = refresh
     return static
 
 
@@ -254,13 +284,34 @@ def _prepare_static_clamped_indices(
             src_indices_3d.shape, dtype=torch.int32, device=src_indices_3d.device,
         )
     static = cache[key]
+    # lens 派生量（last/valid）只依赖 lens，同一步内所有 C4A 层相同：共享计
+    # 算，每步最多重算 2 次（swa/com 两份 lens 交替）。capture 时首层的 kernel
+    # 被记录，replay 从新鲜 lens 刷新共享 buffer。
+    def _derive(lens):
+        l64 = lens.long()
+        ar_key = (TOPK, str(lens.device))
+        arange = _TOPK_ARANGE.get(ar_key)
+        if arange is None:
+            arange = torch.arange(TOPK, device=lens.device).unsqueeze(0)
+            _TOPK_ARANGE[ar_key] = arange
+        return ((l64 - 1).clamp(min=0), arange < l64.unsqueeze(1))
+
+    stamp = _tensor_stamp(lens)
+    entry = None
+    if stamp is not None:
+        lk = (*stamp, B, TOPK)
+        entry = _LENS_DERIVED_CACHE.get(lk)
+        if entry is None:
+            if len(_LENS_DERIVED_CACHE) >= 4:
+                _LENS_DERIVED_CACHE.clear()
+            entry = _derive(lens)
+            _LENS_DERIVED_CACHE[lk] = entry
+    if entry is None:
+        entry = _derive(lens)
+    last, valid = entry
     src2d = src_indices_3d.squeeze(1)  # [B, TOPK]
     safe = src2d.clamp(min=0)  # safety; assume upstream already clamped to cache size
-    # last valid index per row: clamp to 0 when lens==0 so the gather is well-defined
-    last = (lens.long() - 1).clamp(min=0)  # [B]
     tail_fill = safe.gather(1, last.unsqueeze(1).expand(-1, TOPK))  # [B, TOPK]
-    arange = torch.arange(TOPK, device=safe.device).unsqueeze(0)  # [1, TOPK]
-    valid = arange < lens.long().unsqueeze(1)  # [B, TOPK]
     clamped = torch.where(valid, safe, tail_fill).to(torch.int32)
     static.copy_(clamped.unsqueeze(1))
     return static
@@ -561,15 +612,23 @@ def _v4_sparse_native_path(
         # undocumented behaviour, and masking NaN would also silently swallow a
         # NaN arriving for any other reason.  The condition that is actually
         # meaningful is `extra_topk_length == 0`.
-        _com_empty = (extra_topk_length[:_B] == 0).view(_B, 1, 1)   # [B,1,1]
-        out_com = torch.where(_com_empty.unsqueeze(-1),
-                              torch.zeros((), dtype=out_com.dtype,
-                                          device=out_com.device),
-                              out_com)
-        lse_com_e = torch.where(_com_empty, torch.full((), -1e30,
-                                                       dtype=lse_com_e.dtype,
-                                                       device=lse_com_e.device),
-                                lse_com_e)
+        # mask 与标量常数同一步内跨 C4A 层相同：共享/常驻，免去每层重复发射。
+        _st = _tensor_stamp(extra_topk_length)
+        _com_empty = None
+        if _st is not None:
+            _lk = (*_st, _B)
+            _com_empty = _EMPTY_MASK_CACHE.get(_lk)
+            if _com_empty is None:
+                if len(_EMPTY_MASK_CACHE) >= 4:
+                    _EMPTY_MASK_CACHE.clear()
+                _com_empty = (extra_topk_length[:_B] == 0).view(_B, 1, 1)  # [B,1,1]
+                _EMPTY_MASK_CACHE[_lk] = _com_empty
+        if _com_empty is None:
+            _com_empty = (extra_topk_length[:_B] == 0).view(_B, 1, 1)  # [B,1,1]
+        _zero_s = _scalar(out_com.dtype, out_com.device, 0.0)
+        _neg_s = _scalar(lse_com_e.dtype, lse_com_e.device, -1e30)
+        out_com = torch.where(_com_empty.unsqueeze(-1), _zero_s, out_com)
+        lse_com_e = torch.where(_com_empty, _neg_s, lse_com_e)
 
         # attention_merge_stage expects 3-D (tokens, heads, dim) and operates on
         # natural-log LSE (s_a, s_b in natural log units; s_merged also natural).
