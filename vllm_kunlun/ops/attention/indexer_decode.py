@@ -11,6 +11,7 @@ from typing import List
 import torch
 
 from vllm_kunlun.adapter_utils import WarningOnce
+from vllm_kunlun.ops.attention.compressor import indexer_cache_planar
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.indexer_decode")
 _APPLIED_SENTINEL_KEY = "_dsv4_sparse_attn_indexer_applied"
@@ -310,20 +311,34 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                         blocks_needed = (seq_k_len + block_size_cache - 1) // block_size_cache
                         bt_row = chunk_bt[seq_idx, :blocks_needed].long()
                         collected_slots = 0
+                        # Native store writes per-page planar [values | scales];
+                        # the torch fallback writes interleaved rows. Read in
+                        # whichever layout the cache is actually maintained in.
+                        planar = indexer_cache_planar(kv_cache)
                         for blk_ref in bt_row.unbind(0):
                             blk_id = int(blk_ref.item())
                             remaining = seq_k_len - collected_slots
                             take = min(block_size_cache, remaining)
-                            slot_data = kv_cache[
-                                max(0, min(blk_id, num_blocks_cache - 1)), :take, :
-                            ]
-                            gathered_values.append(slot_data[:, :head_dim])
-                            raw_scale = (
-                                slot_data[:, head_dim:head_dim + 4]
-                                .contiguous()
-                                .view(torch.float32)
-                            )
-                            gathered_scales.append(raw_scale[:take])
+                            safe_blk = max(0, min(blk_id, num_blocks_cache - 1))
+                            if planar:
+                                page = kv_cache[safe_blk].reshape(-1)
+                                gathered_values.append(
+                                    page[: take * head_dim].reshape(take, head_dim)
+                                )
+                                scale_base = block_size_cache * head_dim
+                                gathered_scales.append(
+                                    page[scale_base:scale_base + take * 4]
+                                    .view(torch.float32)
+                                )
+                            else:
+                                slot_data = kv_cache[safe_blk, :take, :]
+                                gathered_values.append(slot_data[:, :head_dim])
+                                raw_scale = (
+                                    slot_data[:, head_dim:head_dim + 4]
+                                    .contiguous()
+                                    .view(torch.float32)
+                                )
+                                gathered_scales.append(raw_scale[:take])
                             collected_slots += take
 
                     if not gathered_values:

@@ -117,21 +117,132 @@ def _warm_paged_store_once(cache) -> None:
     zeros into slot 0, the null block vLLM's BlockPool keeps zeroed.
     """
     op = _find_paged_store_op()
-    if op is None or cache.dim() != 3:
-        return
-    key = (cache.data_ptr(), int(cache.shape[1]), int(cache.shape[2]))
-    if key in _paged_store_warm:
-        return
-    if not _paged_store_usable(cache, cache[0, :1], 0):
-        return
-    _paged_store_warm.add(key)
-    device = cache.device
-    op(
-        cache,
-        torch.zeros(1, dtype=torch.int64, device=device),
-        torch.zeros((1, cache.shape[2]), dtype=cache.dtype, device=device),
-        cache.shape[1],
+    if op is not None and cache.dim() == 3:
+        key = (cache.data_ptr(), int(cache.shape[1]), int(cache.shape[2]))
+        if key not in _paged_store_warm and _paged_store_usable(
+            cache, cache[0, :1], 0
+        ):
+            _paged_store_warm.add(key)
+            device = cache.device
+            op(
+                cache,
+                torch.zeros(1, dtype=torch.int64, device=device),
+                torch.zeros((1, cache.shape[2]), dtype=cache.dtype, device=device),
+                cache.shape[1],
+            )
+    _probe_indexer_store_once(cache)
+
+
+# Int8 fused quant store: kunlun_ops.indexer_k_quant_and_cache quantizes bf16 k
+# rows (scale = amax/127) and writes the per-page planar layout
+# [block_size*128 values | block_size*fp32 scales] that I8_paged_mqa_logits
+# reads. The kernel derives each page base as block * block_size * stride(1),
+# so a padded cache (stride(0) != block_size * stride(1)) must be re-viewed
+# with row stride stride(0) // block_size.
+_INDEXER_STORE_OFF = os.environ.get("KUNLUN_DSV4_INDEXER_STORE_NATIVE", "1") != "1"
+_indexer_store_op: object = _FALSE
+_indexer_store_ok: set = set()
+_indexer_store_bad: set = set()
+
+
+def _find_indexer_store_op():
+    global _indexer_store_op
+    if _indexer_store_op is not _FALSE:
+        return _indexer_store_op
+    handle = None
+    source = "skip" if _INDEXER_STORE_OFF else "torch_fallback"
+    if not _INDEXER_STORE_OFF:
+        try:
+            mod = __import__("kunlun_ops", fromlist=["indexer_k_quant_and_cache"])
+            candidate = getattr(mod, "indexer_k_quant_and_cache", None)
+            if callable(candidate):
+                handle = candidate
+                source = "kunlun_ops_module"
+        except Exception:  # noqa: BLE001
+            pass
+    _indexer_store_op = handle
+    record_wired("indexer_k_quant_and_cache", source)
+    return handle
+
+
+def indexer_cache_planar(cache) -> bool:
+    """Whether ``cache`` is maintained in the planar layout the native store
+    produces (prefill-side gather must match the write layout)."""
+    return cache.data_ptr() in _indexer_store_ok
+
+
+def _indexer_store_view(cache):
+    page = cache.stride(0)
+    bs = cache.shape[1]
+    if page % bs:
+        return None
+    row = page // bs
+    if row <= cache.shape[2]:
+        return None
+    return cache.as_strided(cache.shape[:2] + (row,), (page, row, 1),
+                            cache.storage_offset())
+
+
+def _indexer_store_usable(cache, data, col_start) -> bool:
+    return (
+        col_start == 0
+        and cache.dtype == torch.int8
+        and cache.dim() == 3
+        and data.dim() == 2
+        and cache.shape[2] == data.shape[1] + 4
+        and cache.stride(2) == 1
+        and cache.data_ptr() in _indexer_store_ok
     )
+
+
+def _probe_indexer_store_once(cache) -> None:
+    """Verify the native store's addressing on this cache, once, outside capture.
+
+    Writes rows with absmax exactly 127 (scale = 127/127 = 1.0f, so int8 bytes
+    equal the source values) into blocks 1 and 2, then reads them back through
+    the planar offsets the decode reader uses. Any mismatch keeps the torch
+    fallback (and the interleaved prefill read) active for this cache.
+    """
+    op = _find_indexer_store_op()
+    if op is None or cache.dim() != 3 or cache.dtype != torch.int8:
+        return
+    key = cache.data_ptr()
+    if key in _indexer_store_ok or key in _indexer_store_bad:
+        return
+    if cache.shape[0] < 3 or cache.shape[2] != 132 or cache.shape[1] < 4:
+        _indexer_store_bad.add(key)
+        return
+    try:
+        view = _indexer_store_view(cache)
+        if view is None:
+            raise ValueError("page stride not divisible")
+        dev = cache.device
+        bs = cache.shape[1]
+        k = torch.zeros(2, 128, dtype=torch.bfloat16, device=dev)
+        k[:, 0], k[:, 1], k[:, 2] = 127.0, -127.0, 64.0
+        slots = torch.tensor([bs, 2 * bs + 3], dtype=torch.int64, device=dev)
+        op(view, k, slots, 128, True, False, False)
+        torch.xpu.synchronize()
+        page1 = cache[1].reshape(-1)
+        page2 = cache[2].reshape(-1)
+        ok = (
+            int(page1[0]) == 127 and int(page1[1]) == -127 and int(page1[2]) == 64
+            and page1[bs * 128:bs * 128 + 4].view(torch.float32).item() == 1.0
+            and int(page2[3 * 128]) == 127 and int(page2[3 * 128 + 1]) == -127
+            and page2[bs * 128 + 12:bs * 128 + 16].view(torch.float32).item() == 1.0
+        )
+        if not ok:
+            raise ValueError("planar readback mismatch")
+        _indexer_store_ok.add(key)
+        LOGGER.info(
+            "[indexer-store] native planar store verified on %s %s strides=%s",
+            tuple(cache.shape), cache.dtype, tuple(cache.stride()),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _indexer_store_bad.add(key)
+        LOGGER.info(
+            "[indexer-store] native store rejected (%s); torch fallback active", exc,
+        )
 
 
 def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
@@ -158,8 +269,10 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
         )
     op = _find_paged_store_op()
     fast = op is not None and _paged_store_usable(cache, data, col_start)
+    iop = _find_indexer_store_op()
+    ifast = iop is not None and _indexer_store_usable(cache, data, col_start)
     if _PAGED_STORE_DEBUG:
-        _log_paged_store_route(cache, data, col_start, fast)
+        _log_paged_store_route(cache, data, col_start, fast or ifast)
     if fast:
         dest_safe = torch.where(write_ok, dest, 0)
         data_ok = data.to(cache.dtype)
@@ -167,6 +280,14 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
             data_ok = data_ok.clone()
         data_ok.mul_(write_ok.unsqueeze(-1))
         op(cache, dest_safe, data_ok, cache.shape[1])
+        return
+    if ifast:
+        # Fused quant + planar store; the kernel skips negative slots itself.
+        dest_arg = torch.where(write_ok, dest.long(), torch.full_like(dest, -1))
+        k_bf16 = data.to(torch.bfloat16)
+        if not k_bf16.is_contiguous():
+            k_bf16 = k_bf16.contiguous()
+        iop(_indexer_store_view(cache), k_bf16, dest_arg, 128, True, False, False)
         return
 
     D = data.shape[1]
