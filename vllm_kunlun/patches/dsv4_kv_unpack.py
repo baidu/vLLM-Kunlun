@@ -27,6 +27,42 @@ def _enabled() -> bool:
     return bool(FeatureFlags().kv_cache_unpack)
 
 
+_UNPAD_KEY = "_kunlun_indexer_unpad_applied"
+
+
+def _unpad_predicate(mod: object) -> bool:
+    return bool(getattr(mod, _UNPAD_KEY, False))
+
+
+def _unpad_applier(mod: object) -> None:
+    """Drop the 512B alignment padding on the indexer cache spec.
+
+    DEAD by default (KUNLUN_DSV4_INDEXER_UNPAD=1 to retry): the padding is
+    load-bearing -- 8448B pages leave odd blocks at 256B alignment and some
+    capture-path kernel requires 512B-aligned block bases (device error at
+    capture_end). The native store op instead needs a stride-aware wrapper
+    (cache_stride = stride(0) // block_size) in a future XSG build."""
+    import os as _os
+    if _os.environ.get("KUNLUN_DSV4_INDEXER_UNPAD", "0") != "1":
+        return
+    if getattr(mod, _UNPAD_KEY, False):
+        return
+    cache_cls = getattr(mod, "DeepseekV4IndexerCache", None)
+    if cache_cls is None:
+        return
+    orig_spec = cache_cls.get_kv_cache_spec
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = orig_spec(self, vllm_config)
+        object.__setattr__(spec, "page_size_padded", None)
+        object.__setattr__(spec, "alignment", None)
+        return spec
+
+    cache_cls.get_kv_cache_spec = get_kv_cache_spec
+    setattr(mod, _UNPAD_KEY, True)
+    LOGGER.info("Patched DeepseekV4IndexerCache.get_kv_cache_spec: alignment padding dropped")
+
+
 _DTYPE_KEY = "_kunlun_indexer_int8_applied"
 
 

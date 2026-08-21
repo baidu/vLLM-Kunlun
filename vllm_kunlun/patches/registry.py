@@ -114,6 +114,11 @@ _STATIC_PATCHES = (
     ("dsv4.indexer.int8_cache", "vllm.models.deepseek_v4.attention",
      "vllm_kunlun.patches.dsv4_kv_unpack", "_dtype_predicate", "_dtype_applier",
      "indexer_cache_int8"),
+    # Drop the indexer cache's page alignment padding so the cache tensor is
+    # truly contiguous (prerequisite for the native indexer store op).
+    ("dsv4.indexer.unpad", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.patches.dsv4_kv_unpack", "_unpad_predicate", "_unpad_applier",
+     "indexer_cache_int8"),
     # Community code calls these via torch.ops._C directly; the alias binding
     # is mandatory whenever DSV4 runs, so no feature flag gates it.
     ("dsv4.kv_insert.attention", "vllm.models.deepseek_v4.attention",
