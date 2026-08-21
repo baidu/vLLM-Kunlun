@@ -284,57 +284,13 @@ def prepare_next_token_ids_padded(
     )
     self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
-    # Mask out the sampled tokens indices that should not be sampled.
-    discard_sampled_tokens_req_indices = discard_request_indices[
-        :num_discarded_requests
-    ]
-
-    valid_sampled_token_ids_gpu = sampled_token_ids.clone()
-    # valid_sampled_token_ids_gpu.index_fill_(
-    #     0, discard_sampled_tokens_req_indices, -1)
-    # ---- FIX START ----
-    # XPU/XMLIR index_fill_ does NOT accept empty index tensor.
-    if num_discarded_requests > 0:
-        # make sure index is on same device and is int64
-        idx = discard_sampled_tokens_req_indices
-        if idx.device != valid_sampled_token_ids_gpu.device:
-            idx = idx.to(valid_sampled_token_ids_gpu.device, non_blocking=True)
-        if idx.dtype != torch.long:
-            idx = idx.to(torch.long)
-        if idx.numel() > 0:
-            valid_sampled_token_ids_gpu.index_fill_(0, idx, -1)
-    # ---- FIX END ----
-    # Generate a mask for all valid tokens within those requests
-    max_gen_len = sampled_token_ids.shape[-1]
-    if max_gen_len == 1:
-        valid_mask = torch.ones_like(valid_sampled_token_ids_gpu, dtype=torch.bool)
-    else:
-        valid_mask = (valid_sampled_token_ids_gpu != -1) & (
-            valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size
-        )
-
-    # Count the number of valid tokens in each request
-    valid_sampled_tokens_count = valid_mask.sum(dim=1)
-
-    # Get the rightmost valid index per row
-    last_valid_indices = valid_sampled_tokens_count - 1
-    last_valid_indices_safe = torch.clamp(last_valid_indices, min=0)
-
-    # Get last valid token from each row
-    # (assume undefined state where there is no valid token)
-    selected_tokens = torch.gather(
-        valid_sampled_token_ids_gpu, 1, last_valid_indices_safe.unsqueeze(1)
-    ).squeeze(1)
-
-    # Use last token if valid, pre-computed backup if not
-    batch_size = valid_sampled_token_ids_gpu.shape[0]
-    next_token_ids = torch.where(
-        last_valid_indices != -1,
-        selected_tokens,
-        self.backup_next_token_ids.gpu[:batch_size],
+    return torch.ops._C.eagle_prepare_next_token_ids_padded(
+        sampled_token_ids,
+        discard_request_indices,
+        num_discarded_requests,
+        self.backup_next_token_ids.gpu[:num_reqs],
+        gpu_input_batch.vocab_size,
     )
-
-    return next_token_ids, valid_sampled_tokens_count
 
 
 EagleProposer.propose = propose
