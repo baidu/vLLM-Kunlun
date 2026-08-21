@@ -172,6 +172,15 @@ def indexer_cache_planar(cache) -> bool:
 
 
 def _indexer_store_view(cache):
+    """Re-view a padded indexer cache as dense rows for the native store.
+
+    ``indexer_k_quant_and_cache`` derives each page base from ``stride(1)``
+    and cannot see the 512B-alignment padding between pages (stride(0) >
+    page_size * stride(1)), so the cache is re-exposed as
+    [num_pages, page_size, row_stride] with row_stride = stride(0)//page_size
+    covering value bytes plus padding. Returns None when the geometry does
+    not allow such a view.
+    """
     page = cache.stride(0)
     bs = cache.shape[1]
     if page % bs:
@@ -184,6 +193,13 @@ def _indexer_store_view(cache):
 
 
 def _indexer_store_usable(cache, data, col_start) -> bool:
+    """Whether the fused int8 quant+planar store can take this write.
+
+    Requires the warm-time probe (``_probe_indexer_store_once``) to have
+    verified the planar layout on this exact cache, plus full-width rows:
+    cache.shape[2] == data.shape[1] + 4 is the [values | fp32 scale] page
+    geometry the decoder reads back.
+    """
     return (
         col_start == 0
         and cache.dtype == torch.int8
@@ -221,8 +237,9 @@ def _probe_indexer_store_once(cache) -> None:
         k = torch.zeros(2, 128, dtype=torch.bfloat16, device=dev)
         k[:, 0], k[:, 1], k[:, 2] = 127.0, -127.0, 64.0
         slots = torch.tensor([bs, 2 * bs + 3], dtype=torch.int64, device=dev)
-        op(view, k, slots, 128, True, False, False)
-        torch.xpu.synchronize()
+        op(k, view, slots, 128, True, False, False)
+        # 符号重写栈：XPU sync 走 torch.cuda 入口
+        torch.cuda.synchronize()
         page1 = cache[1].reshape(-1)
         page2 = cache[2].reshape(-1)
         ok = (
@@ -287,7 +304,7 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
         k_bf16 = data.to(torch.bfloat16)
         if not k_bf16.is_contiguous():
             k_bf16 = k_bf16.contiguous()
-        iop(_indexer_store_view(cache), k_bf16, dest_arg, 128, True, False, False)
+        iop(k_bf16, _indexer_store_view(cache), dest_arg, 128, True, False, False)
         return
 
     D = data.shape[1]

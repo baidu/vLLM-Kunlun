@@ -143,7 +143,20 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
     @CustomOp.register_oot(name="SparseAttnIndexer")
     class KunlunSparseAttnIndexer(indexer_module.SparseAttnIndexer):
         def forward_oot(self, hidden_states, q_quant, k, weights):
-            """Kunlun-compatible score/top-K for lightning-compressed attention indices."""
+            """Kunlun-compatible score/top-K for lightning-compressed attention indices.
+
+            Decode: I8_paged_mqa_logits over the paged int8 cache (per-block
+            planar [128B values | 4B fp32 scale] rows) followed by the native
+            topk_per_row selection; the q scale is folded into ``weights``
+            (DSV2-style contract: logits[b,n,j] = sum_h w[b,n,h] *
+            <q_int8, k_int8[j]> * k_scale[j]).
+
+            Prefill: torch fallback -- gather each request's compressed K
+            rows into a workspace, topk the range-masked scores. The gather
+            reads the cache in whichever layout the writer maintains: planar
+            for the native store, interleaved for the torch fallback (keyed
+            by ``indexer_cache_planar``), keeping write and read consistent.
+            """
             del k  # written to page-table KV cache earlier by the compressor
 
             num_tokens = hidden_states.shape[0]
@@ -329,6 +342,7 @@ def _install_kunlun_indexer(indexer_module: object) -> List[str]:
                                 gathered_scales.append(
                                     page[scale_base:scale_base + take * 4]
                                     .view(torch.float32)
+                                    .unsqueeze(-1)
                                 )
                             else:
                                 slot_data = kv_cache[safe_blk, :take, :]
