@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig, AWQLinearMeth
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
+from vllm_kunlun.quantization.moe_wna16 import KunlunMoeWNA16Method
 from vllm_kunlun.quantization.utils import _remove_quantization_method
 
 logger = init_logger(__name__)
@@ -64,7 +65,8 @@ class KunlunAWQConfig(AWQConfig):
                 "zero_point": self.zero_point,
                 "lm_head": False,
             }
-            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
+            moe_wna16_config = MoeWNA16Config.from_config(config)
+            return KunlunMoeWNA16Method(moe_wna16_config, layer.moe_config)
 
         return None
 

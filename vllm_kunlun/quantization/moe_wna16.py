@@ -16,204 +16,390 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 
-from typing import Callable, Optional, Union
+from typing import Callable
 
 import torch
-from vllm.distributed import get_tp_group
+import xspeedgate_ops  # noqa: F401
 from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Method
-from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4
+
+SMALL_BATCH_FUSED_MOE_THRESHOLD = 400
+MOE_WNA16_BLOCK_SIZE_M = 16
+_MOE_WNA16_GEMM_PACK_ROWS = 4
+_MOE_WNA16_GEMM_PACK_COLS = 16
+_MOE_WNA16_GEMM_PACK_SIZE = _MOE_WNA16_GEMM_PACK_ROWS * _MOE_WNA16_GEMM_PACK_COLS
+_MOE_WNA16_GEMM_ALIGNED_ATTR = "_kunlun_moe_wna16_gemm_aligned"
 
 
-def convert_awq_tensor_for_kunlun(
-    packed: torch.Tensor,
-    tensor_type: str,
-    num_bits: int = 4,
-    align_type: int = 0,
-):
-    """
-    Convert AWQ-packed int4 weights to Kunlun XPU format.
-    Input: packed[N, K], dtype=int32, saved as AWQ order
-    Output:
-        weight: packed_reordered[N, K*4], dtype=int8, saved as Kunlun order
-        zeros: zeros_reordered[N, K*8], dtype=float16
-    """
-    N, K = packed.shape
-    assert num_bits == 4, "Only int4 supported now"
-    shifts_from_int32 = torch.arange(
-        0, 32, num_bits, device=packed.device, dtype=torch.int32
-    )
-    shifts_back_int8 = torch.arange(
-        0, 8, num_bits, device=packed.device, dtype=torch.int32
+def _align_qweight_to_moe_wna16_gemm(qweight: torch.Tensor) -> torch.Tensor:
+    if qweight.numel() == 0 or qweight.numel() % _MOE_WNA16_GEMM_PACK_SIZE != 0:
+        return qweight.contiguous()
+    return (
+        qweight.reshape(-1, _MOE_WNA16_GEMM_PACK_ROWS, _MOE_WNA16_GEMM_PACK_COLS)
+        .transpose(-1, -2)
+        .reshape_as(qweight)
+        .contiguous()
     )
 
-    if tensor_type == "qweight":  # pack weight
 
-        if align_type == 0:  # normal mode
-            # Unpack AWQ order:[0, 2, 4, 6, 1, 3, 5, 7]
-            unpacked_awq = (packed.unsqueeze(-1) >> shifts_from_int32) & 0xF
-            AWQ_TO_KUNLUN_ORDER_NORMAL = [0, 4, 1, 5, 2, 6, 3, 7]
-            unpacked_kunlun = unpacked_awq[..., AWQ_TO_KUNLUN_ORDER_NORMAL]
-            shifts_back_int8 = shifts_back_int8.repeat(4)
+def _restore_qweight_from_moe_wna16_gemm(qweight: torch.Tensor) -> torch.Tensor:
+    if qweight.numel() == 0 or qweight.numel() % _MOE_WNA16_GEMM_PACK_SIZE != 0:
+        return qweight.contiguous()
+    return (
+        qweight.reshape(-1, _MOE_WNA16_GEMM_PACK_COLS, _MOE_WNA16_GEMM_PACK_ROWS)
+        .transpose(-1, -2)
+        .reshape_as(qweight)
+        .contiguous()
+    )
 
-        elif align_type == 1:  # fast mode
-            # Unpack AWQ order: [0, 2, 4, ..., 123, 125, 127]
-            unpacked_awq = (
-                packed.view(N, K // 16, 16).unsqueeze(-1) >> shifts_from_int32
-            ) & 0xF
-            unpacked_awq = unpacked_awq.reshape(N, K // 16, 128)
-            # Reverse AWQ order and convert to KUNLUN order
-            AWQ_TO_KUNLUN_ORDER_FAST = [
-                j + 8 * i
-                for i in range(8)
-                for j in [0, 64, 4, 68, 1, 65, 5, 69, 2, 66, 6, 70, 3, 67, 7, 71]
-            ]
-            unpacked_kunlun = unpacked_awq[..., AWQ_TO_KUNLUN_ORDER_FAST]
-            shifts_back_int8 = shifts_back_int8.repeat(64)
 
-        else:
-            raise NotImplementedError
+def dequant_awq_moe(
+    qweight: torch.Tensor,
+    scale: torch.Tensor,
+    zp: torch.Tensor | None,
+    group_size: int,
+    qweight_is_gemm_aligned: bool = False,
+) -> torch.Tensor:
+    """Dequantize AWQ MoE weights in xspeedgate layout.
 
-        # Pack to int8, order[1, 0]
-        packed_kunlun = (
-            (unpacked_kunlun << shifts_back_int8)
-            .view(*unpacked_kunlun.shape[:-1], -1, 2)
-            .sum(dim=-1)
-            .to(torch.int8)
-            .reshape(N, -1)
+    Layout:
+        qweight: [E, N, K // 2]
+        scale:   [E, N, K // group_size]
+        zp:      [E, N // 2, K // group_size]
+        output:  [E, N, K]
+    """
+    assert qweight.dim() == 3, f"Expected 3D input for MoE, got {qweight.dim()}D"
+
+    if qweight_is_gemm_aligned:
+        qweight = _restore_qweight_from_moe_wna16_gemm(qweight)
+
+    fpweight = []
+    for expert_idx in range(qweight.shape[0]):
+        expert_weight = torch.empty(
+            qweight.shape[1],
+            qweight.shape[2] * 2,
+            dtype=scale.dtype,
+            device=qweight.device,
         )
-
-    elif tensor_type == "qzeros":  # pack zero points
-        unpacked_awq = (packed.unsqueeze(-1) >> shifts_from_int32) & 0xF
-        AWQ_TO_NORMAL_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
-        unpacked_kunlun = unpacked_awq[..., AWQ_TO_NORMAL_ORDER]
-        shifts_back_int8 = shifts_back_int8.repeat(4)
-        packed_kunlun = (
-            (unpacked_kunlun << shifts_back_int8)
-            .view(*unpacked_kunlun.shape[:-1], -1, 2)
-            .sum(dim=-1)
-            .to(torch.uint8)
-            .reshape(N, -1)
+        torch.ops.xspeedgate_ops.dequant_int4(
+            qweight[expert_idx],
+            expert_weight,
+            scale[expert_idx],
+            zp[expert_idx] if zp is not None else None,
+            group_size,
         )
+        fpweight.append(expert_weight)
 
+    return torch.stack(fpweight, dim=0)
+
+
+def _route_moe(
+    router_logits: torch.Tensor,
+    top_k: int,
+    scoring_func: str,
+    num_expert_group: int | None,
+    topk_group: int | None,
+    e_score_correction_bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = router_logits.shape[0]
+    router_logits = router_logits.to(torch.float)
+
+    normed_score = torch.empty(
+        batch_size,
+        top_k,
+        dtype=torch.float32,
+        device=router_logits.device,
+    )
+    topk_ids = torch.empty(
+        batch_size,
+        top_k,
+        dtype=torch.int32,
+        device=router_logits.device,
+    )
+
+    if scoring_func == "softmax":
+        torch.ops._C.moe_softmax_topk_norm(
+            x=router_logits,
+            normed_score=normed_score,
+            topk_index=topk_ids,
+            block_statistic=None,
+            stable=False,
+        )
+    elif scoring_func == "sigmoid":
+        block_statistic = torch.zeros(
+            12,
+            router_logits.shape[-1],
+            dtype=torch.int32,
+            device=router_logits.device,
+        )
+        torch.ops._C.moe_sigmoid_group_topk_norm(
+            x=router_logits,
+            topk_index=topk_ids,
+            norm_score=normed_score,
+            block_static=block_statistic,
+            bias=e_score_correction_bias,
+            scale=1.0,
+            n_group=num_expert_group,
+            topk_group=topk_group,
+        )
     else:
-        raise NotImplementedError()
+        raise ValueError(f"Unsupported scoring_func: {scoring_func}")
 
-    return packed_kunlun.T.contiguous()
+    return normed_score, topk_ids
+
+
+def _build_small_batch_routing(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    block_size_m: int = MOE_WNA16_BLOCK_SIZE_M,
+)     -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    flat_topk_ids = topk_ids.reshape(-1).to(torch.int32)
+    if flat_topk_ids.numel() == 0:
+        return None
+
+    device = topk_ids.device
+    numel = flat_topk_ids.numel()
+    max_num_tokens_padded = numel + num_local_experts * (block_size_m - 1)
+    max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+
+    sorted_token_idx = torch.empty(
+        max_num_tokens_padded, dtype=torch.int32, device=device
+    )
+    expert_ids = torch.empty(max_num_m_blocks, dtype=torch.int32, device=device)
+    sorted_token_pads = torch.empty(1, dtype=torch.int32, device=device)
+
+    torch.ops._C.moe_align_block_size(
+        flat_topk_ids,
+        num_local_experts,
+        block_size_m,
+        sorted_token_idx,
+        expert_ids,
+        sorted_token_pads,
+    )
+
+    return sorted_token_idx, expert_ids, sorted_token_pads
+
+
+def _moe_wna16_gemm(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    qweight: torch.Tensor,
+    scale: torch.Tensor,
+    zp: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    weight_bits: int,
+) -> None:
+    torch.ops.xspeedgate_ops.moe_wna16_gemm(
+        x,
+        output,
+        qweight,
+        scale,
+        zp,
+        None,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        MOE_WNA16_BLOCK_SIZE_M,
+        0,
+        0,
+        weight_bits,
+    )
+
+
+def fused_moe_wna16(
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    w13_qweight: torch.Tensor,
+    w2_qweight: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_zp: torch.Tensor | None,
+    w2_zp: torch.Tensor | None,
+    group_size: int,
+    weight_bits: int,
+    ep_rank: int,
+    top_k: int,
+    renormalize: bool,
+    use_grouped_topk: bool = False,
+    num_expert_group: int | None = None,
+    topk_group: int | None = None,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert ep_rank == 0, "fused_moe_wna16 expects non-EP execution with ep_rank == 0"
+
+    if x.shape[0] * top_k >= SMALL_BATCH_FUSED_MOE_THRESHOLD:
+        w13_weight = dequant_awq_moe(
+            qweight=w13_qweight,
+            scale=w13_scale,
+            zp=w13_zp,
+            group_size=group_size,
+            qweight_is_gemm_aligned=True,
+        )
+        w2_weight = dequant_awq_moe(
+            qweight=w2_qweight,
+            scale=w2_scale,
+            zp=w2_zp,
+            group_size=group_size,
+            qweight_is_gemm_aligned=True,
+        )
+        return ops.fused_moe(
+            x,
+            w13_weight,
+            w2_weight,
+            router_logits,
+            ep_rank,
+            top_k,
+            renormalize=renormalize,
+            inplace=True,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+    normed_score, topk_ids = _route_moe(
+        router_logits=router_logits,
+        top_k=top_k,
+        scoring_func=scoring_func,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        e_score_correction_bias=e_score_correction_bias,
+    )
+
+    routing = _build_small_batch_routing(
+        topk_ids=topk_ids,
+        num_local_experts=w13_qweight.shape[0],
+        block_size_m=MOE_WNA16_BLOCK_SIZE_M,
+    )
+    if routing is None:
+        return torch.zeros(
+            x.shape[0],
+            w2_qweight.shape[1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = routing
+
+    gate_up = torch.zeros(
+        x.shape[0],
+        top_k,
+        w13_qweight.shape[1],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    _moe_wna16_gemm(
+        x=x,
+        output=gate_up,
+        qweight=w13_qweight,
+        scale=w13_scale,
+        zp=w13_zp,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        top_k=top_k,
+        weight_bits=weight_bits,
+    )
+
+    act = torch.empty(
+        x.shape[0],
+        top_k,
+        w13_qweight.shape[1] // 2,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    torch.ops._C.silu_and_mul(act, gate_up)
+
+    out = torch.zeros(
+        x.shape[0] * top_k,
+        1,
+        w2_qweight.shape[1],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    _moe_wna16_gemm(
+        x=act.reshape(-1, act.shape[-1]),
+        output=out,
+        qweight=w2_qweight,
+        scale=w2_scale,
+        zp=w2_zp,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        top_k=1,
+        weight_bits=weight_bits,
+    )
+
+    return (
+        out.view(x.shape[0], top_k, -1)
+        .mul(normed_score.to(x.dtype).unsqueeze(-1))
+        .sum(dim=1)
+        .to(x.dtype)
+    )
 
 
 class KunlunMoeWNA16Method(MoeWNA16Method):
 
-    def create_weights(
+    @property
+    def is_monolithic(self) -> bool:
+        return True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, _MOE_WNA16_GEMM_ALIGNED_ATTR, False):
+            return
+        with torch.no_grad():
+            layer.w13_qweight = torch.nn.Parameter(
+                _align_qweight_to_moe_wna16_gemm(layer.w13_qweight.data),
+                requires_grad=False,
+            )
+            layer.w2_qweight = torch.nn.Parameter(
+                _align_qweight_to_moe_wna16_gemm(layer.w2_qweight.data),
+                requires_grad=False,
+            )
+        setattr(layer, _MOE_WNA16_GEMM_ALIGNED_ATTR, True)
+
+    def _get_moe_quant_config(self, layer: torch.nn.Module):
+        return self.moe_quant_config or self.get_fused_moe_quant_config(layer)
+
+    def apply_monolithic(
         self,
         layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        quant_config = self._get_moe_quant_config(layer)
+        assert quant_config is not None
+        assert not self.moe.use_ep, "KunlunMoeWNA16Method only supports non-EP mode"
+        assert getattr(layer, "w13_bias", None) is None, "KunlunMoeWNA16Method does not support w13_bias"
+        assert getattr(layer, "w2_bias", None) is None, "KunlunMoeWNA16Method does not support w2_bias"
 
-        super().create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
+        return fused_moe_wna16(
+            x=x,
+            router_logits=router_logits,
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scale=quant_config.w1_scale,
+            w2_scale=quant_config.w2_scale,
+            w13_zp=quant_config.w1_zp,
+            w2_zp=quant_config.w2_zp,
+            group_size=layer.group_size,
+            weight_bits=self.quant_config.weight_bits,
+            ep_rank=self.moe.ep_rank,
+            top_k=layer.moe_config.experts_per_token,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
         )
-
-        wrapped_weight_loader = type(self).get_weight_loader(
-            layer, extra_weight_attrs["weight_loader"]
-        )
-        extra_weight_attrs["weight_loader"] = wrapped_weight_loader
-
-        # Fused gate_up_proj (column parallel)
-        w13_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                2
-                * intermediate_size_per_partition
-                // self.quant_config.bit8_pack_factor,
-                hidden_size,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_qweight", w13_qweight)
-        set_weight_attrs(w13_qweight, extra_weight_attrs)
-
-        # down_proj (row parallel)
-        w2_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts,
-                hidden_size // self.quant_config.bit8_pack_factor,
-                intermediate_size_per_partition,
-                dtype=torch.int8,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_qweight", w2_qweight)
-        set_weight_attrs(w2_qweight, extra_weight_attrs)
-
-    @staticmethod
-    def get_weight_loader(layer, weight_loader):
-
-        def patched_moe_wna16_weight_loader(
-            param, loaded_weight, weight_name, shard_id, expert_id, return_success=False
-        ):
-
-            if "g_idx" in weight_name:
-                return False if return_success else None
-            if not layer.quant_config.has_zp and "qzeros" in weight_name:
-                return False if return_success else None
-
-            device = get_tp_group().device
-            loaded_weight = loaded_weight.to(device)
-
-            orig_method = layer.quant_config.linear_quant_method
-
-            if layer.quant_config.linear_quant_method == "awq":
-                assert layer.quant_config.weight_bits == 4
-
-                if "weight" in weight_name:
-
-                    # TODO(hack): Temporary workaround for a packing conflict between
-                    # dequant_int4 and tensor-parallel (TP) sharding. When align_type=1,
-                    # the weights cannot be packed correctly after TP slicing, leading
-                    # to invalid packed values. This should be revisited once the
-                    # sharding/packing logic is refactored.
-                    layer.align_type = 0
-
-                    loaded_weight = convert_awq_tensor_for_kunlun(
-                        packed=loaded_weight,
-                        tensor_type="qweight",
-                        align_type=layer.align_type,
-                    )
-                elif "zeros" in weight_name:
-                    loaded_weight = convert_awq_tensor_for_kunlun(
-                        packed=loaded_weight, tensor_type="qzeros", align_type=0
-                    )
-                else:
-                    loaded_weight = loaded_weight.T
-
-                layer.quant_config.linear_quant_method = "_patched_awq"
-
-            try:
-                return MoeWNA16Method.get_weight_loader(layer, weight_loader)(
-                    param,
-                    loaded_weight,
-                    weight_name,
-                    shard_id,
-                    expert_id,
-                    return_success=return_success,
-                )
-            finally:
-                layer.quant_config.linear_quant_method = orig_method
-
-        return patched_moe_wna16_weight_loader
 
     def apply(
         self,
@@ -223,67 +409,44 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
         global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
+        expert_map: torch.Tensor | None = None,
+        custom_routing_function: Callable | None = None,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
+        e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        expert_load_view: torch.Tensor | None = None,
+        logical_to_physical_map: torch.Tensor | None = None,
+        logical_replica_count: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        quant_config = self._get_moe_quant_config(layer)
+        assert quant_config is not None
+        assert not self.moe.use_ep, "KunlunMoeWNA16Method only supports non-EP mode"
+        assert getattr(layer, "w13_bias", None) is None, "KunlunMoeWNA16Method does not support w13_bias"
+        assert getattr(layer, "w2_bias", None) is None, "KunlunMoeWNA16Method does not support w2_bias"
 
-        w13_weight = dequant_int4(
-            qweight=layer.w13_qweight,
-            scale=self.moe_quant_config.w1_scale,
-            zp=self.moe_quant_config.w1_zp,
-            int4_signed=False,
-            use_mode_fast=layer.align_type,
+        return fused_moe_wna16(
+            x=x,
+            router_logits=router_logits,
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scale=quant_config.w1_scale,
+            w2_scale=quant_config.w2_scale,
+            w13_zp=quant_config.w1_zp,
+            w2_zp=quant_config.w2_zp,
+            group_size=layer.group_size,
+            weight_bits=self.quant_config.weight_bits,
+            ep_rank=self.moe.ep_rank,
+            top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
         )
-
-        w2_weight = dequant_int4(
-            qweight=layer.w2_qweight,
-            scale=self.moe_quant_config.w2_scale,
-            zp=self.moe_quant_config.w2_zp,
-            int4_signed=False,
-            use_mode_fast=layer.align_type,
-        )
-
-        if self.moe.use_ep:
-            return ops.fused_moe_ep(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
-        else:
-            return ops.fused_moe(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-                w1_bias=getattr(layer, "w13_bias", None),
-                w2_bias=getattr(layer, "w2_bias", None),
-            )
