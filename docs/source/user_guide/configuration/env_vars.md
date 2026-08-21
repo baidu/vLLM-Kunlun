@@ -1,17 +1,37 @@
 # Environment Variables
 
-vllm-kunlun uses the following environment variables to configure the system:
+vLLM Kunlun uses both runtime variables from the Kunlun XPU stack and
+vLLM-Kunlun-specific variables from `vllm_kunlun.platforms.envs`.
 
-| *Environment Variables*                     | ***\*Recommended value\****  | ***\*Function description\****                                           |
-| ---------------------------------------- | ----------------- | ------------------------------------------------------------ |
-| `unset XPU_DUMMY_EVENT`                  |                   | ***\*Unsets\**** `XPU_DUMMY_EVENT` variable, usually done to ensure real XPU events are used for synchronization and performance measurement. |
-| `export XPU_VISIBLE_DEVICES`             | `0,1,2,3,4,5,6,7` | ***\*Specify visible XPU Devices\****. Here, 8 devices (0 to 7) are specified for inference tasks. This is required for multi-card or distributed inference. |
-| `export XPU_USE_MOE_SORTED_THRES`        | `1`               | Enables the Moe Model ***\*Sort Optimization\****.Setting to `1` usually enables this performance optimization. |
-| `export XFT_USE_FAST_SWIGLU`             | `1`               | Enables the ***\*Fast SwiGLU Ops\****. SwiGLU is a common activation function, and enabling this accelerates model inference. |
-| `export XPU_USE_FAST_SWIGLU`             | `1`               | Enables the ***\*Fast SwiGLU Ops\****. Similar to `XFT_USE_FAST_SWIGLU`, this enables the fast SwiGLU calculation in Fused MoE Fusion Ops. |
-| `export XMLIR_CUDNN_ENABLED`             | `1`               | Enables XMLIR (an intermediate representation/compiler) to use the ***\*cuDNN compatible/optimized path\**** (which may map to corresponding XPU optimized libraries in the KunlunCore environment). |
-| `export XPU_USE_DEFAULT_CTX`             | `1`               | Sets the XPU to use the default context. Typically used to simplify environment configuration and ensure runtime consistency. |
-| `export XMLIR_FORCE_USE_XPU_GRAPH`       | `1`               | ***\*Forces the enablement of XPU Graph mode.\****. This can capture and optimize the model execution graph, significantly boosting inference performance. |
-| `export VLLM_HOST_IP`                    | `$(hostname -i)`  | ***\*Sets the host IP address for the vLLM service\****. This uses a shell command to dynamically get the current host's internal IP. It's used for inter-node communication in a distributed environment. |
-| `export XMLIR_ENABLE_MOCK_TORCH_COMPILE` | `false`           | ***\*Disable Mock Torch Compile Function\****. Set to `false` to ensure the actual compilation and optimization flow is used, rather than mock mode. |
-| `FUSED_QK_ROPE_OP`                           | `0`               | ***\*Control whether to use the Fused QK-Norm and RoPE implementation\****. Default is `0` (use original/standard RoPE). Setting to `1` may be used to enable QWEN3. |
+## Runtime Environment
+
+| Environment variable | Recommended value | Description |
+| --- | --- | --- |
+| `XPU_DUMMY_EVENT` | unset | Uses real XPU events for synchronization and performance measurement. |
+| `XPU_VISIBLE_DEVICES` | `0,1,2,3,4,5,6,7` | Selects the visible XPU devices for multi-card inference. |
+| `CUDA_VISIBLE_DEVICES` | `0,1,2,3,4,5,6,7` | Keeps CUDA-compatible device indexing aligned with visible XPUs. |
+| `XPU_USE_MOE_SORTED_THRES` | `1` | Enables MoE sorting optimization in the XPU runtime. |
+| `XFT_USE_FAST_SWIGLU` | `1` | Enables the fast SwiGLU implementation in XFT. |
+| `XPU_USE_FAST_SWIGLU` | `1` | Enables the fast SwiGLU implementation for XPU MoE kernels. |
+| `XMLIR_CUDNN_ENABLED` | `1` | Enables the XMLIR cuDNN-compatible optimized path. |
+| `XPU_USE_DEFAULT_CTX` | `1` | Uses the default XPU context for runtime consistency. |
+| `XMLIR_FORCE_USE_XPU_GRAPH` | `1` | Forces XPU graph mode for graph capture and execution optimization. |
+| `VLLM_HOST_IP` | `$(hostname -i)` | Sets the host IP used by distributed vLLM communication. |
+| `XMLIR_ENABLE_MOCK_TORCH_COMPILE` | `false` | Disables mock torch compile so the real compile path is used. |
+
+## vLLM-Kunlun Variables
+
+These variables are parsed lazily by `vllm_kunlun.platforms.envs`. Boolean
+variables are enabled only when set to `true` or `1`, case-insensitively.
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `VLLM_MULTI_LOGPATH` | `./logs` | Directory used by the multi-log redirection helper. |
+| `ENABLE_VLLM_MULTI_LOG` | `False` | Enables multi-process log redirection for multi-node or multi-card runs. |
+| `ENABLE_VLLM_INFER_HOOK` | `False` | Enables XVLLM inference-stage hook logging. |
+| `ENABLE_VLLM_OPS_HOOK` | `False` | Enables XVLLM operator hook logging. |
+| `ENABLE_VLLM_MODULE_HOOK` | `False` | Enables XVLLM module hook logging. |
+| `ENABLE_VLLM_MOE_FC_SORTED` | `False` | Enables the fused sorted MoE FC path when supported by the active model path. |
+| `ENABLE_CUSTOM_DPSK_SCALING_ROPE` | `False` | Enables the custom DeepSeek scaling RoPE path. |
+| `ENABLE_VLLM_FUSED_QKV_SPLIT_NORM_ROPE` | `False` | Enables fused QKV split, QK norm, and RoPE for supported Qwen3 models. |
+| `VLLM_KUNLUN_ENABLE_INT8_BMM` | `False` | Enables the INT8 BMM path for supported MLA attention code paths. |
