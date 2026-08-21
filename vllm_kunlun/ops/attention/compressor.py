@@ -355,6 +355,11 @@ def _install_slot_mapping(utils_mod: object) -> None:
 
         Returns ``out`` when given (filled in place), else a fresh
         [num_tokens] int64 tensor.
+
+        When num_reqs == num_tokens (pure decode: exactly one query token
+        per request) a reduced per-request path runs instead: it skips the
+        token-to-request expansion and the [num_reqs, num_tokens] broadcast
+        reduction, which at small batch dominate the kernel count.
         """
         device = query_start_loc.device
         if out is None:
@@ -373,6 +378,22 @@ def _install_slot_mapping(utils_mod: object) -> None:
                 "[slot-map] ratio=%d num_reqs=%d num_tokens=%d block_size=%d",
                 compress_ratio, num_reqs, num_tokens, block_size,
             )
+
+        if num_reqs == num_tokens:
+            # 纯 decode（每请求恰 1 个 query token）：token<->请求一一对应，
+            # 跳过通用路径的 token 展开与 broadcast 归约。
+            pos = seq_lens[:num_reqs].long() - 1
+            cpos = pos // compress_ratio
+            block_ids = (cpos // block_size).clamp_(
+                min=0, max=block_table.shape[1] - 1
+            )
+            slots = (
+                block_table.gather(1, block_ids.unsqueeze(1)).squeeze(1).long()
+                * block_size + cpos % block_size
+            )
+            slots.masked_fill_((pos + 1) % compress_ratio != 0, -1)
+            result.copy_(slots)
+            return out if out is not None else result
 
         bounds = query_start_loc[: num_reqs + 1].long()
         req_start = bounds[:-1]
