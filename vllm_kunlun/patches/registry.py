@@ -109,6 +109,11 @@ _STATIC_PATCHES = (
     ("dsv4.kv_unpack.planner", "vllm.v1.core.kv_cache_utils",
      "vllm_kunlun.patches.dsv4_kv_unpack", "_planner_predicate", "_planner_applier",
      "kv_cache_unpack"),
+    # indexer cache dtype int8: XPU index_put_ lacks native uint8 dst support and
+    # round-trips the whole cache view through int8 (see patch docstring).
+    ("dsv4.indexer.int8_cache", "vllm.models.deepseek_v4.attention",
+     "vllm_kunlun.patches.dsv4_kv_unpack", "_dtype_predicate", "_dtype_applier",
+     "indexer_cache_int8"),
     # Community code calls these via torch.ops._C directly; the alias binding
     # is mandatory whenever DSV4 runs, so no feature flag gates it.
     ("dsv4.kv_insert.attention", "vllm.models.deepseek_v4.attention",
