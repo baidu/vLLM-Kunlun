@@ -21,6 +21,7 @@ adapted vLLM is still more useful than one that cannot start at all.
 import builtins
 import logging
 import sys
+import weakref
 from collections.abc import Callable
 from types import ModuleType
 from typing import NamedTuple
@@ -50,6 +51,13 @@ _DISPATCHING = False
 
 # Registered hooks, applied in registration order on every dispatch.
 _HOOKS: list[HookRegistration] = []
+
+# Hooks verified applied, memoized by module object (weakref, index-aligned
+# with _HOOKS). torch emits lazy imports during steady-state decode, and
+# re-running every predicate per import statement is pure overhead. A module
+# re-imported after a reload is a fresh object, so it is re-checked
+# automatically; a module still executing its body is never memoized.
+_APPLIED_REFS: list = []
 
 
 def _chained_predicates(first: HookApplied, second: HookApplied) -> HookApplied:
@@ -83,6 +91,10 @@ def register_hook(target: str, applied: HookApplied, apply: HookApply) -> None:
             _chained_predicates(existing.is_applied, applied),
             _chained_appliers(existing.apply_patch, apply),
         )
+        # The old entry may already be memoized as applied for a loaded
+        # module; drop the memo so the chained predicates are re-evaluated.
+        if len(_APPLIED_REFS) > i:
+            _APPLIED_REFS[i] = None
         return
     _HOOKS.append(HookRegistration(target, applied, apply))
 
@@ -102,13 +114,22 @@ def dispatch_hooks() -> None:
     _DISPATCHING = True
     try:
         logger = logging.getLogger("vllm_kunlun")
-        for hook in _HOOKS:
+        for i, hook in enumerate(_HOOKS):
             module = sys.modules.get(hook.target)
             if module is None:
                 continue
+            while len(_APPLIED_REFS) <= i:
+                _APPLIED_REFS.append(None)
+            ref = _APPLIED_REFS[i]
+            if ref is not None and ref() is module:
+                continue
             try:
-                if not hook.is_applied(module):
-                    hook.apply_patch(module)
+                if hook.is_applied(module):
+                    spec = getattr(module, "__spec__", None)
+                    if spec is None or not getattr(spec, "_initializing", False):
+                        _APPLIED_REFS[i] = weakref.ref(module)
+                    continue
+                hook.apply_patch(module)
             except Exception:
                 logger.exception(
                     "[KunlunPlugin] post-import hook failed for target=%s",
