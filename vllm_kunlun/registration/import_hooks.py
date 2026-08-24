@@ -21,7 +21,6 @@ adapted vLLM is still more useful than one that cannot start at all.
 import builtins
 import logging
 import sys
-import threading
 import weakref
 from collections.abc import Callable
 from types import ModuleType
@@ -59,6 +58,9 @@ _HOOKS: list[HookRegistration] = []
 # re-imported after a reload is a fresh object, so it is re-checked
 # automatically; a module still executing its body is never memoized.
 _APPLIED_REFS: list = []
+
+# Per-hook consecutive failure counters for log throttling only.
+_failures: dict = {}
 
 
 def _chained_predicates(first: HookApplied, second: HookApplied) -> HookApplied:
@@ -132,10 +134,14 @@ def dispatch_hooks() -> None:
                     continue
                 hook.apply_patch(module)
             except Exception:
-                logger.exception(
-                    "[KunlunPlugin] post-import hook failed for target=%s",
-                    hook.target,
-                )
+                _failures[i] = _failures.get(i, 0) + 1
+                if _failures[i] == 1 or _failures[i] % 200 == 0:
+                    logger.exception(
+                        "[KunlunPlugin] post-import hook failed for target=%s"
+                        " (attempt %d)",
+                        hook.target,
+                        _failures[i],
+                    )
     finally:
         _DISPATCHING = False
 
@@ -146,26 +152,17 @@ for _target, _is_applied, _apply_patch in DEFAULT_HOOKS:
     register_hook(_target, _is_applied, _apply_patch)
 
 
-_IMPORT_STATE = threading.local()
-
-
-def _dispatch_at_quiescent_point() -> None:
-    """Run the dispatcher once the import stack of this thread unwound.
-
-    A dispatch between two imports inside a module body sees every module
-    currently on that body's import chain as partially initialized; a hook
-    whose predicate or applier imports anything from that chain (the
-    fused-moe graph circularity above all) then fails and retries in a
-    self-sustaining storm. Deferring to the return of the outermost import
-    guarantees a quiescent state: nothing on the stack is mid-import.
-    """
-    depth = getattr(_IMPORT_STATE, "depth", 0)
-    if depth <= 1:
-        dispatch_hooks()
-
-
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
-    """Intercept absolute imports, then run any newly eligible patches."""
+    """Intercept absolute imports, then run any newly eligible patches.
+
+    Dispatching after every import (nested ones included) is load-bearing:
+    model modules load via importlib and their ``from X import Y`` statements
+    bind Y right here inside _OLD_IMPORT, so a patch to X.Y must land on the
+    completion of X's own import -- before the NEXT module binds Y. Hooks
+    whose predicates/appliers import heavy modules can fail while a cycle is
+    mid-flight; those failures are throttled in dispatch_hooks and the known
+    cyclic entries are guarded upstream of here.
+    """
     # Relative imports (level > 0) can never name an upstream vLLM module
     # directly, so only absolute imports are checked against the redirects.
     if level == 0:
@@ -176,12 +173,8 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             # change vLLM's normal fallback behavior; the upstream module is
             # used as-is in that case.
             pass
-    _IMPORT_STATE.depth = getattr(_IMPORT_STATE, "depth", 0) + 1
-    try:
-        result = _OLD_IMPORT(module_name, globals, locals, fromlist, level)
-    finally:
-        _IMPORT_STATE.depth -= 1
-    _dispatch_at_quiescent_point()
+    result = _OLD_IMPORT(module_name, globals, locals, fromlist, level)
+    dispatch_hooks()
     return result
 
 
