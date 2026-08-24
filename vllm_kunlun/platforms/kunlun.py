@@ -476,10 +476,7 @@ def _install_runtime_patches() -> None:
     """
     import sys
 
-    from vllm_kunlun.registration.import_hooks import (
-        dispatch_hooks,
-        register_hook,
-    )
+    from vllm_kunlun.registration.import_hooks import register_hook
 
     _WIRED = [False]
 
@@ -529,7 +526,22 @@ def _install_runtime_patches() -> None:
 
             register_hook(target, _applied, _apply)
 
-        dispatch_hooks()
+        # Initial sweep for targets imported before this wiring runs. The
+        # dispatcher's re-entrancy guard makes a dispatch_hooks() call here a
+        # no-op (this wiring executes as a hook's apply inside a dispatch), so
+        # sweep the registered targets directly: modules already loaded and
+        # settled get their patches now; anything not yet imported is picked
+        # up by later dispatches.
+        for target, hooks in pending.items():
+            mod = sys.modules.get(target)
+            if mod is None or _module_busy(mod):
+                continue
+            if not all(predicate(mod) for predicate, _ in hooks):
+                for _, applier in hooks:
+                    try:
+                        applier(mod)
+                    except Exception:
+                        logger.exception("patch failed on %s", target)
 
     def _runner_applied(mod) -> bool:
         return _WIRED[0]
