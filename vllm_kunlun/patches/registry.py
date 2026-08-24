@@ -7,26 +7,21 @@ references.  ``_PLATFORM_HOOKS`` is unconditional (every model on Kunlun XPU);
 name means always-on).  Feature modules that cannot be imported eagerly
 (import rings, early platform discovery) are resolved at first dispatch via
 :func:`_lazy_feature`, the equivalent of upstream's import-for-side-effect
-style.  ``populate_platform_hooks()`` / ``populate_hooks()`` wire the tables
-into the registration package's dispatcher; ``populate_eager()`` installs the
-ops adapters whose lazy hooks are drained by ``flush_lazy_hooks()``.
+style; the one early-importing target (``vllm._custom_ops``) uses the same
+settle-guard-and-retry pattern as upstream's OOT registration hook.
+Everything registers through :func:`populate_platform_hooks` /
+:func:`populate_hooks` at platform-import time -- there is no second
+registration window.
 """
 import importlib
 import logging
 import os
 import sys
-from typing import Callable, List, Tuple
+from typing import Callable, Tuple
 
 LOGGER = logging.getLogger("vllm_kunlun.patches.registry")
 
 HookPair = Tuple[Callable[[object], bool], Callable[[object], None]]
-
-# Targets wired lazily through the plugin dispatcher once their host modules
-# are loaded; eager adapters append entries at import time.
-_LAZY_HOOKS: List[Tuple[str, str, Callable[[object], bool], Callable[[object], None]]] = []
-
-_LAZY_DESCRIPTOR = "__dsv4_lazy_applied_sentinel__"
-
 
 def _module_busy(mod: object) -> bool:
     """True while *mod* is still executing its import (partial module)."""
@@ -340,6 +335,104 @@ def _full_cg_apply(mod: object) -> None:
 _DSV4_CACHE_PATCHED = "_kunlun_dsv4_cache_patch_applied"
 
 
+# --- platform policy: wrap KunlunPlatform.check_and_update_config --------
+
+_PLATFORM_POLICY_DONE = "__kunlun_dsv4_platform_policy__"
+
+
+def _platform_policy_applied(mod: object) -> bool:
+    return bool(getattr(mod, _PLATFORM_POLICY_DONE, False))
+
+
+def _platform_policy_apply(mod: object) -> None:
+    """Wrap ``KunlunPlatform.check_and_update_config`` once per process.
+
+    Fires on the gpu_worker import (vLLM core settled, platform resolution
+    finished); the policy module re-checks its own idempotence sentinel on
+    the platform class.
+    """
+    from vllm_kunlun.models import deepseek_v4_policy
+
+    deepseek_v4_policy.apply()
+    setattr(mod, _PLATFORM_POLICY_DONE, True)
+
+
+# --- MoE hash/softplus routing: torch.ops shim + direct router -----------
+# vllm._custom_ops imports early, before the fused-moe graph settles, so the
+# applier guards and retries on a later dispatch (upstream's OOT pattern).
+# The predicates are pure getattr on the target and need no feature import.
+
+def _moe_hash_enabled() -> bool:
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+
+    flags = FeatureFlags()
+    return bool(flags.hash_topk_fused or flags.activation_routing_accel)
+
+
+def _moe_hash_custom_applied(mod: object) -> bool:
+    if not _moe_hash_enabled():
+        return True
+    return getattr(getattr(mod, "topk_hash_softplus_sqrt", None), "_dsv4_wired", False)
+
+
+def _moe_hash_custom_apply(mod: object) -> None:
+    if not _moe_hash_enabled():
+        return
+    if not _fused_moe_graph_settled():
+        return
+    from vllm_kunlun.ops.fused_moe import moe_hash_router
+
+    moe_hash_router._install_custom_ops_shim(mod)
+
+
+def _moe_hash_router_applied(mod: object) -> bool:
+    if not _moe_hash_enabled():
+        return True
+    return getattr(getattr(mod, "vllm_topk_softplus_sqrt", None), "_dsv4_wired", False)
+
+
+def _moe_hash_router_apply(mod: object) -> None:
+    if not _moe_hash_enabled():
+        return
+    if not _fused_moe_graph_settled():
+        return
+    from vllm_kunlun.ops.fused_moe import moe_hash_router
+
+    moe_hash_router._install_direct_router(mod)
+
+
+# --- optional diagnostics (KUNLUN_DSV4_DEBUG=1) ---------------------------
+
+def _debug_enabled() -> bool:
+    return os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1"
+
+
+def _logits_debug_applied(mod: object) -> bool:
+    if not _debug_enabled():
+        return True
+    fn = getattr(getattr(mod, "LogitsProcessor", None), "_gather_logits", None)
+    return bool(getattr(fn, "_kunlun_dsv4_debug", False))
+
+
+def _logits_debug_apply(mod: object) -> None:
+    from vllm_kunlun.patches import dsv4_logits_debug
+
+    dsv4_logits_debug.apply(mod)
+
+
+def _runner_debug_applied(mod: object) -> bool:
+    if not _debug_enabled():
+        return True
+    fn = getattr(getattr(mod, "GPUModelRunner", None), "execute_model", None)
+    return bool(getattr(fn, "_kunlun_dsv4_debug", False))
+
+
+def _runner_debug_apply(mod: object) -> None:
+    from vllm_kunlun.patches import dsv4_runner_debug
+
+    dsv4_runner_debug.apply(mod)
+
+
 def _cache_applied(mod: object) -> bool:
     return bool(getattr(mod, _DSV4_CACHE_PATCHED, False))
 
@@ -503,6 +596,57 @@ _DSV4_HOOKS = (
      "", _cache_applied, _cache_apply),
     ("dsv4.cache.flashmla", "vllm.models.deepseek_v4.nvidia.flashmla",
      "", _cache_applied, _cache_apply),
+    # Compressed-KV pipeline (gate is an OR of two flags, kept inside the
+    # feature module's predicates -- sticky True when both are off).
+    ("dsv4.compressor.slot.compressor_utils",
+     "vllm.v1.attention.backends.mla.compressor_utils", "",
+     *_lazy_feature("vllm_kunlun.ops.attention.compressor",
+                    "_slot_mapping_applied", "_install_slot_mapping")),
+    ("dsv4.compressor.slot.indexer",
+     "vllm.v1.attention.backends.mla.indexer", "",
+     *_lazy_feature("vllm_kunlun.ops.attention.compressor",
+                    "_slot_mapping_applied", "_install_slot_mapping")),
+    ("dsv4.compressor.save_partial_states",
+     "vllm.models.deepseek_v4.common.ops.save_partial_states", "",
+     *_lazy_feature("vllm_kunlun.ops.attention.compressor",
+                    "_sps_applied", "_install_save_partial_states")),
+    ("dsv4.compressor.vect",
+     "vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache", "",
+     *_lazy_feature("vllm_kunlun.ops.attention.compressor",
+                    "_vect_applied", "_install_compress_norm_rope_store_triton")),
+    # Sparse-MLA metadata shims (indexer prefill, c128a, SWA kernels).
+    ("dsv4.flashmla.indexer_prefill",
+     "vllm.v1.attention.backends.mla.indexer", "flashmla_sparse_backend",
+     *_lazy_feature("vllm_kunlun.ops.attention.flashmla_bridge",
+                    "_indexer_prefill_applied", "_install_indexer_prefill_kernel")),
+    ("dsv4.flashmla.c128a", "vllm.models.deepseek_v4.sparse_mla",
+     "flashmla_sparse_backend",
+     *_lazy_feature("vllm_kunlun.ops.attention.flashmla_bridge",
+                    "_c128a_applied", "_install_c128a_metadata")),
+    ("dsv4.flashmla.swa_kernel",
+     "vllm.v1.attention.backends.mla.sparse_swa", "flashmla_sparse_backend",
+     *_lazy_feature("vllm_kunlun.ops.attention.flashmla_bridge",
+                    "_swa_kernel_applied", "_install_swa_kernel")),
+    ("dsv4.flashmla.swa_prefill_lens",
+     "vllm.v1.attention.backends.mla.sparse_swa", "flashmla_sparse_backend",
+     *_lazy_feature("vllm_kunlun.ops.attention.flashmla_bridge",
+                    "_swa_prefill_lens_applied", "_install_prefill_gather_lenses")),
+    # MoE hash/softplus routing (inline pairs: settle-guarded deferred import).
+    ("dsv4.moe_hash.custom_ops", "vllm._custom_ops", "",
+     _moe_hash_custom_applied, _moe_hash_custom_apply),
+    ("dsv4.moe_hash.router",
+     "vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router", "",
+     _moe_hash_router_applied, _moe_hash_router_apply),
+    # Platform config policy wrap (fires at gpu_worker import, like the old
+    # fire-once lazy entry -- but with a real predicate instead of relying
+    # on the memory-pool hook's chain to carry it).
+    ("dsv4.platform_policy", "vllm.v1.worker.gpu_worker", "",
+     _platform_policy_applied, _platform_policy_apply),
+    # Optional low-overhead diagnostics.
+    ("dsv4.logits_debug", "vllm.model_executor.layers.logits_processor", "",
+     _logits_debug_applied, _logits_debug_apply),
+    ("dsv4.runner_debug", "vllm.v1.worker.gpu_model_runner", "",
+     _runner_debug_applied, _runner_debug_apply),
 )
 
 
@@ -571,152 +715,6 @@ def populate_platform_hooks(register_post_import_hook: Callable[..., None]) -> N
     _register_table(_PLATFORM_HOOKS, register_post_import_hook)
 
 
-# ---------------------------------------------------------------------------
-# Lazy hooks (declared here or appended by eager adapters, drained after the
-# eager section -- registering them earlier would re-enter half-initialized
-# ops modules).
-# ---------------------------------------------------------------------------
-
-def _register_lazy(
-    target_module_path: str,
-    applied_test: Callable[[object], bool],
-    applier: Callable[[object], None],
-    *,
-    label: str | None = None,
-) -> None:
-    """Record a hook that should fire when *target_module_path* appears in sys.modules."""
-    effective_label = label or target_module_path
-    _LAZY_HOOKS.append((effective_label, target_module_path, applied_test, applier))
-
-
-def _declare_lazy_hooks() -> None:
-    """Fill _LAZY_HOOKS (declarations only; no heavy imports here)."""
-    # platform_policy must stay lazy: importing KunlunPlatform eagerly would
-    # re-enter platform resolution before current_platform is set.
-    _register_lazy(
-        "vllm.v1.worker.gpu_worker",
-        lambda m: True,  # fire once, platform_policy.apply() is idempotent
-        lambda m: __import__("vllm_kunlun.models.deepseek_v4_policy", fromlist=["apply"]).apply(),
-        label="dsv4.platform_policy",
-    )
-    if os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1":
-        _register_lazy(
-            "vllm.model_executor.layers.logits_processor",
-            lambda m: getattr(m.LogitsProcessor._gather_logits, "_kunlun_dsv4_debug", False),
-            lambda m: __import__(
-                "vllm_kunlun.patches.dsv4_logits_debug", fromlist=["apply"]
-            ).apply(m),
-            label="dsv4.logits_debug",
-        )
-        _register_lazy(
-            "vllm.v1.worker.gpu_model_runner",
-            lambda m: getattr(m.GPUModelRunner.execute_model, "_kunlun_dsv4_debug", False),
-            lambda m: __import__(
-                "vllm_kunlun.patches.dsv4_runner_debug", fromlist=["apply"]
-            ).apply(m),
-            label="dsv4.runner_debug",
-        )
-
-
-def flush_lazy_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
-    """Register pending _LAZY_HOOKS entries; sweep already-imported targets.
-
-    Entries are consumed as they are registered, so a later flush (after the
-    eager adapters appended theirs) only handles the new ones. Targets that
-    finished importing before registration never see a dispatch for their
-    own import, so they are checked and applied here directly.
-    """
-    labels_installed: List[str] = []
-    while _LAZY_HOOKS:
-        descriptor_label, target, pred_fn, applier_fn = _LAZY_HOOKS.pop(0)
-
-        def _applier(mod, inner_app=applier_fn, marker=descriptor_label):
-            try:
-                inner_app(mod)
-                setattr(mod, _LAZY_DESCRIPTOR, marker)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Lazy DSV4 adapter failed for %r", marker)
-
-        register_post_import_hook(target, lambda mod, p=pred_fn: p(mod), _applier)
-        labels_installed.append(f"lazy:{target}")
-
-        mod = sys.modules.get(target)
-        if mod is None:
-            continue
-        spec = getattr(mod, "__spec__", None)
-        busy = spec is not None and getattr(spec, "_initializing", False)
-        if not busy:
-            _applier(mod)
-    return labels_installed
-
-
-def populate_hooks(
-    register_post_import_hook: Callable[..., None],
-    run_eager: bool = True,
-) -> List[str]:
-    """Register every DSV4 hook; optionally run the eager installs.
-
-    Args:
-        register_post_import_hook: callback provided by root package used to
-            queue patches against imported community modules.
-        run_eager: also run the eager installs now. Those import feature-flag
-            and ops modules, which is only safe once vLLM core settled (e.g.
-            ``vllm.utils.torch_utils`` finished importing); callers running
-            during plugin bootstrap pass False and invoke :func:`populate_eager`
-            from a settled point.
-    Returns:
-        Labels of adapters successfully registered on this invocation.
-    """
-    _declare_lazy_hooks()
+def populate_hooks(register_post_import_hook: Callable[..., None]) -> None:
+    """Register every DSV4 hook with the dispatcher (idempotent per process)."""
     _register_table(_DSV4_HOOKS, register_post_import_hook)
-    labels_installed = flush_lazy_hooks(register_post_import_hook)
-    if run_eager:
-        populate_eager(register_post_import_hook)
-    return labels_installed
-
-
-def populate_eager(
-    register_post_import_hook: Callable[..., None] | None = None,
-) -> None:
-    """Run the eager adapter installs; requires settled vLLM core.
-
-    Each adapter registers its own lazy hooks internally; the imports here
-    pull the ops/quantization modules that carry ``apply()`` entry points.
-    """
-    try:
-        from vllm_kunlun.ops.fused_moe.mhc_hyperconnection import apply as _mhc_apply
-        _mhc_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 MHC hyperconnection installation failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.attention.flashmla_bridge import apply as _flashmla_bridge_apply
-        _flashmla_bridge_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 FlashMLA metadata bridge registration failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.attention.compressor import apply as _compressor_apply
-        _compressor_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 compressor adapter registration failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.ops.fused_moe.moe_hash_router import apply as _moe_hash_apply
-        _moe_hash_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 MoE hash/softplus router registration failed (%s)", exc)
-
-    try:
-        from vllm_kunlun.quantization.deepseek_v4 import apply as _moe_int8_apply
-        _moe_int8_apply()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 INT8-W8A8-MoE bridge registration failed (%s)", exc)
-
-    if register_post_import_hook is None:
-        from vllm_kunlun.registration.import_hooks import register_hook as _rk
-
-        def register_post_import_hook(target, applied, apply):  # noqa: F811
-            _rk(target, applied, apply)
-
-    flush_lazy_hooks(register_post_import_hook)

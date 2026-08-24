@@ -12,20 +12,12 @@ LOGGER = logging.getLogger("vllm_kunlun.patches.dsv4")
 _DONE = False
 
 
-def apply_all(
-    register_post_import_hook: Optional[Callable[..., None]] = None,
-    run_eager: bool = True,
-) -> None:
+def apply_all(register_post_import_hook: Optional[Callable[..., None]] = None) -> None:
     """Wire all DSV4 adapters into already- or soon-to-be-imported modules.
 
     Args:
         register_post_import_hook: hook registration callback; when ``None``
             the registration package's ``register_hook`` is used.
-        run_eager: also run the eager installs now. Those import feature-flag
-            and ops modules, which is only safe once vLLM core settled;
-            callers running during platform bootstrap pass False and let the
-            eager triggers invoke :func:`populate_eager` from a settled
-            point.
     """
     global _DONE
     if _DONE:
@@ -43,7 +35,7 @@ def apply_all(
     try:
         from vllm_kunlun.patches.registry import populate_hooks
 
-        populate_hooks(register_post_import_hook, run_eager=run_eager)
+        populate_hooks(register_post_import_hook)
         _DONE = True
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning(

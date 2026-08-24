@@ -471,30 +471,9 @@ def _install_runtime_patches() -> None:
     that resolves the platform -- the kv-cache planner runs in the engine
     core, which never imports the model runner, so gating registration on
     the runner left that process unpatched and the packed-KV layout (with
-    its per-layer copies) came back. Only the eager installs are deferred:
-    this module is imported while ``vllm.utils.torch_utils`` may still be
-    executing, and those imports would re-enter half-initialized modules.
+    its per-layer copies) came back.
     """
-    import sys
-
     from vllm_kunlun.registration.import_hooks import dispatch_hooks, register_hook
-
-    _EAGER_DONE = [False]
-
-    def _module_busy(mod) -> bool:
-        """True while *mod* is still executing its import (partial module)."""
-        spec = getattr(mod, "__spec__", None)
-        return spec is not None and getattr(spec, "_initializing", False)
-
-    def _raw_register(target, applied, apply):
-        """Late registration with a busy-safe predicate (eager section)."""
-
-        def _busy_safe_applied(mod):
-            if _module_busy(mod):
-                return True
-            return applied(mod)
-
-        register_hook(target, _busy_safe_applied, apply)
 
     try:
         from vllm_kunlun.patches.registry import populate_platform_hooks
@@ -506,38 +485,9 @@ def _install_runtime_patches() -> None:
     try:
         from vllm_kunlun.patches.dsv4 import apply_all
 
-        apply_all(register_hook, run_eager=False)
+        apply_all(register_hook)
     except Exception:
         logger.exception("DSV4 adapter pack failed to load")
-
-    def _run_eager(_mod=None) -> None:
-        if _EAGER_DONE[0]:
-            return
-        from vllm_kunlun.patches.registry import populate_eager
-
-        try:
-            populate_eager(_raw_register)
-        except Exception:
-            logger.exception("DSV4 eager adapter installs failed")
-        _EAGER_DONE[0] = True
-
-    # Workers settle at the model runner; the engine core (which computes the
-    # kv-cache plan) settles at the kv-cache manager. Either trigger runs the
-    # eager installs once.
-    register_hook(
-        "vllm.v1.worker.gpu_model_runner",
-        lambda mod: _EAGER_DONE[0],
-        _run_eager,
-    )
-    register_hook(
-        "vllm.v1.core.kv_cache_manager",
-        lambda mod: _EAGER_DONE[0],
-        _run_eager,
-    )
-    for _trigger in ("vllm.v1.worker.gpu_model_runner", "vllm.v1.core.kv_cache_manager"):
-        mod = sys.modules.get(_trigger)
-        if mod is not None and not _module_busy(mod):
-            _run_eager(mod)
 
     # Targets imported before this point never see a dispatch for their own
     # import; sweep them through the dispatcher (the plugin startup stages

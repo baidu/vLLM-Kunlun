@@ -17,7 +17,6 @@ import logging
 from typing import List
 
 from vllm_kunlun.adapter_utils import WarningOnce
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.fused_moe.mhc_hyperconnection")
 _TILELANG_SENTINEL = "_dsv4_mhc_tilelang_wired"
@@ -131,17 +130,3 @@ def _model_applier(mod) -> List[str]:
     return labels
 
 
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Register lazy hooks for DSV4 hyper-connection aliases.
-
-    The native wrappers already contain their own capability-probe/fallback logic,
-    so this adapter only needs to substitute the symbols; no env kill-switch other
-    than KUNLUN_DSV4_PLUGINS_ENABLED and the implementation-local one.
-    """
-    if not master_enabled_check:
-        return []
-
-    for target in _MODULE_TARGETS:
-        _register_lazy(target, _model_applied, _model_applier)
-    _register_lazy(_TILE_TARGET, _tilelang_predicate, _tilelang_applier)
-    return []

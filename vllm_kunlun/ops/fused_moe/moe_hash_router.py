@@ -19,7 +19,6 @@ import torch
 import torch.nn.functional as F
 
 from vllm_kunlun.adapter_utils import WarningOnce
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.fused_moe.moe_hash_router")
 _HASH_TOPK_MODULE = "vllm._custom_ops"
@@ -233,38 +232,4 @@ def _install_direct_router(router_mod):
 
 def _topk_symbol_pretty() -> str:
     return "vllm_topk_softplus_sqrt/_topk_softplus_sqrt_torch"
-
-
-def _predicate_custom(mod):
-    return getattr(getattr(mod, "topk_hash_softplus_sqrt", None), "_dsv4_wired", False)
-
-
-def _predicate_router(mod):
-    return getattr(getattr(mod, "vllm_topk_softplus_sqrt", None), "_dsv4_wired", False)
-
-
 # ---------------------------------------------------------------------------
-def apply(master_enabled_check=True) -> List[str]:
-    """Install DSV4 sqrt-softplus / hash-router acceleration where selected.
-
-    The subsystem requires at least one of the two feature bits -- native
-    act_sqrt_softplus scoring or moe_hash_topk_fused hashing -- to be enabled;
-    disabling both leaves upstream community routing untouched.
-    """
-    if not master_enabled_check:
-        return []
-
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-
-    flags = FeatureFlags()
-    if not (flags.hash_topk_fused or flags.activation_routing_accel):
-        WarningOnce.emit(
-            "dsv4-moe-hash-router-disabled",
-            "Both DSV4 MoE-routing switches are disabled; skipping hash/softplus accelerator patches",
-        )
-        return []
-
-    _register_lazy(_HASH_TOPK_MODULE, _predicate_custom, _install_custom_ops_shim)
-    _register_lazy(_ROUTER_MODULE, _predicate_router, _install_direct_router)
-    LOGGER.debug("Registered DSV4 MOE hash/softplus lazy hooks")
-    return []

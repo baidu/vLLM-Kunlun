@@ -10,7 +10,6 @@ from typing import Any, List, Tuple
 import torch
 
 from vllm_kunlun.adapter_utils import WarningOnce
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.flashmla_bridge")
 _INDEXER_KERNEL_ATTR = "_build_prefill_chunk_metadata_kernel"
@@ -359,45 +358,17 @@ def _flashmla_padded_heads_applier(mod):
     LOGGER.info("Patched DeepseekV4FlashMLAAttention.get_padded_num_q_heads (no padding)")
 
 
-def apply(master_enabled_check: bool = True) -> List[str]:  # type: ignore[name-defined]  -- returns labels via side effects
-    """Register lazy hooks that install flashmla/sparse-attention metadata shims.
+def _indexer_prefill_applied(mod: object) -> bool:
+    return _is_already_wired(getattr(mod, _INDEXER_KERNEL_ATTR, None))
 
-    All four hooks above are lightweight enough to fire lazily once their owning
-    community modules are imported; they never call custom operators themselves,
-    relying instead on deterministic Python CPU loops and explicit H2D copies.
-    """
-    if not master_enabled_check:
-        return []
 
-    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+def _c128a_applied(mod: object) -> bool:
+    return bool(getattr(getattr(mod, _C128A_FN_NAME, None), _DSV4_WIRED_ATTR, False))
 
-    flags = FeatureFlags()
-    if not flags.flashmla_sparse_backend:
-        WarningOnce.emit(
-            "dsv4-flashmla-sparse-disabled",
-            "KUNLUN_DSV4_FLASHMLA_SPARSE_BACKEND disabled; skipping sparse MLA metadata bridges",
-        )
-        return []
 
-    _register_lazy(
-        "vllm.v1.attention.backends.mla.indexer",
-        lambda m: _is_already_wired(getattr(m, _INDEXER_KERNEL_ATTR, None)),
-        _install_indexer_prefill_kernel,
-    )
-    _register_lazy(
-        "vllm.models.deepseek_v4.sparse_mla",
-        lambda m: getattr(getattr(m, _C128A_FN_NAME, None), _DSV4_WIRED_ATTR, False),
-        _install_c128a_metadata,
-    )
-    _register_lazy(
-        "vllm.v1.attention.backends.mla.sparse_swa",
-        lambda m: _is_already_wired(getattr(m, _SWA_KERNEL_ATTR, None)),
-        _install_swa_kernel,
-    )
-    _register_lazy(
-        "vllm.v1.attention.backends.mla.sparse_swa",
-        lambda m: _is_already_wired(getattr(m, _PREFILL_LENS_ATTR, None)),
-        _install_prefill_gather_lenses,
-    )
-    LOGGER.debug("Registered DSV4 FlashMLA metadata lazy hooks")
-    return []
+def _swa_kernel_applied(mod: object) -> bool:
+    return _is_already_wired(getattr(mod, _SWA_KERNEL_ATTR, None))
+
+
+def _swa_prefill_lens_applied(mod: object) -> bool:
+    return _is_already_wired(getattr(mod, _PREFILL_LENS_ATTR, None))

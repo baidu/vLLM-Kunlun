@@ -15,7 +15,6 @@ import os
 import torch
 
 from vllm_kunlun.adapter_utils import WarningOnce, record_wired
-from vllm_kunlun.patches.registry import _register_lazy
 
 LOGGER = logging.getLogger("vllm_kunlun.ops.attention.compressor")
 _APPLIED_SENTINEL = "_dsv4_compressor_applied"
@@ -1113,42 +1112,37 @@ def _install_compress_norm_rope_store_triton(fcqc_module: object) -> None:
     )
 
 
-def apply(master_enabled_check: bool = True) -> List[str]:
-    """Register lazy hooks covering compressor metadata + state save + compress pipeline."""
-    if not master_enabled_check:
-        return []
-
+def _compressor_enabled() -> bool:
+    """True when at least one compressor switch is on (KUNLUN_DSV4_*)."""
     from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
     flags = FeatureFlags()
-    if not (flags.compressor_save_native or flags.compressor_vectorized_fallback):
+    enabled = bool(
+        flags.compressor_save_native or flags.compressor_vectorized_fallback
+    )
+    if not enabled:
         WarningOnce.emit(
             "dsv4-compressor-all-disabled",
             "Both compressor switches are off; skipping V4 compressed-KV hooks",
         )
-        return []
+    return enabled
 
-    for utils_target in _SLOT_TARGETS:
-        _register_lazy(
-            utils_target,
-            lambda m: _is_fn_patched(getattr(m, _SLOT_FN_NAME, None)),
-            _install_slot_mapping,
-        )
 
-    _register_lazy(
-        _SPS_TARGET_MODULE,
-        lambda m: _is_fn_patched(getattr(m, "save_partial_states", None)),
-        _install_save_partial_states,
+def _slot_mapping_applied(mod: object) -> bool:
+    if not _compressor_enabled():
+        return True
+    return _is_fn_patched(getattr(mod, _SLOT_FN_NAME, None))
+
+
+def _sps_applied(mod: object) -> bool:
+    if not _compressor_enabled():
+        return True
+    return _is_fn_patched(getattr(mod, "save_partial_states", None))
+
+
+def _vect_applied(mod: object) -> bool:
+    if not _compressor_enabled():
+        return True
+    return bool(
+        getattr(mod, f"compress_norm_rope_store_triton{_COMPRESSED_FN_ATTR}", False)
     )
-    _register_lazy(
-        _VECT_TARGET_MODULE,
-        lambda m: bool(
-            getattr(
-                m,
-                f"compress_norm_rope_store_triton{_COMPRESSED_FN_ATTR}",
-                False,
-            )
-        ),
-        _install_compress_norm_rope_store_triton,
-    )
-    return []
