@@ -477,7 +477,7 @@ def _install_runtime_patches() -> None:
     """
     import sys
 
-    from vllm_kunlun.registration.import_hooks import register_hook
+    from vllm_kunlun.registration.import_hooks import dispatch_hooks, register_hook
 
     _EAGER_DONE = [False]
 
@@ -486,14 +486,8 @@ def _install_runtime_patches() -> None:
         spec = getattr(mod, "__spec__", None)
         return spec is not None and getattr(spec, "_initializing", False)
 
-    pending: dict = {}
-
-    def register(target, applied, apply):
-        """Queue one feature hook; registration happens once per target."""
-        pending.setdefault(target, []).append((applied, apply))
-
     def _raw_register(target, applied, apply):
-        """Late registration outside the aggregation window."""
+        """Late registration with a busy-safe predicate (eager section)."""
 
         def _busy_safe_applied(mod):
             if _module_busy(mod):
@@ -505,46 +499,16 @@ def _install_runtime_patches() -> None:
     try:
         from vllm_kunlun.patches.registry import populate_platform_hooks
 
-        populate_platform_hooks(register)
+        populate_platform_hooks(register_hook)
     except Exception:
         logger.exception("Kunlun platform patch registration failed")
 
     try:
         from vllm_kunlun.patches.dsv4 import apply_all
 
-        apply_all(register, run_eager=False)
+        apply_all(register_hook, run_eager=False)
     except Exception:
         logger.exception("DSV4 adapter pack failed to load")
-
-    for target, hooks in pending.items():
-        def _applied(mod, _hooks=hooks):
-            if _module_busy(mod):
-                return True
-            return all(predicate(mod) for predicate, _ in _hooks)
-
-        def _apply(mod, _hooks=hooks, _target=target):
-            # Isolate per-feature failures: one bad applier must not block
-            # the remaining features aggregated on this target.
-            for _, applier in _hooks:
-                try:
-                    applier(mod)
-                except Exception:
-                    logger.exception("patch failed on %s", _target)
-
-        register_hook(target, _applied, _apply)
-
-    # Targets imported before this point never see a dispatch for their own
-    # import; sweep them now (the wiring above ran outside any dispatch).
-    for target, hooks in pending.items():
-        mod = sys.modules.get(target)
-        if mod is None or _module_busy(mod):
-            continue
-        if not all(predicate(mod) for predicate, _ in hooks):
-            for _, applier in hooks:
-                try:
-                    applier(mod)
-                except Exception:
-                    logger.exception("patch failed on %s", target)
 
     def _run_eager(_mod=None) -> None:
         if _EAGER_DONE[0]:
@@ -574,6 +538,11 @@ def _install_runtime_patches() -> None:
         mod = sys.modules.get(_trigger)
         if mod is not None and not _module_busy(mod):
             _run_eager(mod)
+
+    # Targets imported before this point never see a dispatch for their own
+    # import; sweep them through the dispatcher (the plugin startup stages
+    # use the same call after install_import_hook()).
+    dispatch_hooks()
 
 
 _install_runtime_patches()

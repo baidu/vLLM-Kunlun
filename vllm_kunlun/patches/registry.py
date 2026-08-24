@@ -531,7 +531,13 @@ def _register_table(
         def _apply(mod, _label=label, _apply=apply, _enabled=_enabled):
             if not _enabled():
                 return
-            _apply(mod)
+            try:
+                # Isolate per-feature failures: one bad applier must not
+                # block the remaining features chained on this target.
+                _apply(mod)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("patch failed: %s", _label)
+                return
             LOGGER.debug("Applied %s to %s", _label, getattr(mod, "__name__", mod))
 
         register_post_import_hook(target, _applied, _apply)
