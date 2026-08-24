@@ -47,6 +47,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -72,7 +73,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
 from vllm_kunlun.models.interfaces import EagleModelMixin, SupportsEagle3
-from vllm_kunlun.ops.rotary_embedding.rope_ext import get_rope
 
 logger = init_logger(__name__)
 

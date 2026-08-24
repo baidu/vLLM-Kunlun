@@ -1,15 +1,18 @@
 [build-system]
-requires = ["hatchling>=1.22"]
-build-backend = "hatchling.build"
+requires = [
+    "setuptools>=80.9.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-kunlun"
-dynamic = ["version"]
+version = "0.25.1.dev0"
 description = "vLLM Kunlun3 backend plugin"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "kunlun"}]
+license = { file = "LICENSE" }
+authors = [{ name = "vLLM-Kunlun team" }]
 dependencies = []
 
 [project.scripts]
@@ -23,13 +26,14 @@ kunlun_model = "vllm_kunlun:register_model"
 kunlun_reasoning_parser = "vllm_kunlun:register_reasoning_parser"
 kunlun_tool_parser = "vllm_kunlun:register_tool_parser"
 
-[tool.hatch.version]
-path = "vllm_kunlun/platforms/version.py"
+[tool.setuptools.packages.find]
+include = ["vllm_kunlun*"]
 
-[tool.hatch.build]
-packages = ["vllm_kunlun"]
-include = ["vllm_kunlun/conf/*", "vllm_kunlun/data/*"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["vllm_kunlun"]
-output-dir = "output/dist"
+[tool.setuptools.package-data]
+vllm_kunlun = [
+    "conf/*",
+    "data/*",
+    "so/*.so",
+    "include/*.h",
+    "_kunlun*.so",
+]

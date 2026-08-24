@@ -1,22 +1,15 @@
+"""Reasoning parser registration module for vLLM Kunlun."""
+
 import importlib
 
 from vllm.reasoning import ReasoningParserManager
 
-"""
-Reasoning parser registration module for vLLM Kunlun.
-"""
-
-
-REASONING_PARSERS = {
-    "qwen3": (".qwen3_reasoning_parser", "Qwen3ReasoningParser"),
-    "gemma4": (".gemma4_reasoning_parser", "Gemma4ReasoningParser"),
-}
+# Map parser name to (relative module path, class name). Add new parsers here.
+REASONING_PARSERS = {}
 
 
 def register_reasoning_parser():
-    """
-    Register all reasoning parsers with the ReasoningParserManager.
-    """
+    """Register all reasoning parsers with the ReasoningParserManager."""
     for name, (module_path, class_name) in REASONING_PARSERS.items():
         module = importlib.import_module(module_path, package=__name__)
         cls = getattr(module, class_name)

@@ -177,8 +177,9 @@ vllm-kunlun/
 │   ├── lora/                  # LoRA / Multi-LoRA support
 │   ├── v1/                    # vLLM V1 engine adaptations (incl. spec decode: MTP, DFlash)
 │   ├── distributed/           # Communicators and distributed helpers
-│   ├── entrypoints/           # OpenAI-compatible serving overrides and tool parsers
-│   ├── reasoning/             # Reasoning parsers (Qwen3, Gemma4)
+│   ├── registration/          # Plugin bootstrap, import hooks, compat patches
+│   ├── reasoning/             # Reasoning parser registration
+│   ├── tool_parsers/          # Tool parser registration
 │   ├── compilation/           # Torch compile wrapper for Kunlun Graph
 │   ├── transformers_utils/    # transformers config/tokenizer adaptations
 │   ├── csrc/                  # C++ extensions (custom kernels)
@@ -232,4 +233,3 @@ We sincerely appreciate the [**KunLunXin**](https://www.kunlunxin.com/) team for
 ## License
 
 Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
-

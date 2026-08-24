@@ -1,7 +1,3 @@
-#
-# setup.py for vllm_kunlun
-#
-
 import os
 import re
 import shutil
@@ -16,14 +12,14 @@ def get_version():
     version_file = os.path.join(ROOT_DIR, "vllm_kunlun", "platforms", "version.py")
     with open(version_file, encoding="utf-8") as f:
         content = f.read()
-    m = re.search(
+    match = re.search(
         r"^__version__\s*=\s*['\"]([^'\"]+)['\"]\s*$",
         content,
         flags=re.MULTILINE,
     )
-    if not m:
+    if not match:
         raise RuntimeError(f"Unable to find __version__ in {version_file}")
-    return m.group(1)
+    return match.group(1)
 
 
 ext_modules = [
@@ -32,9 +28,7 @@ ext_modules = [
         sources=["vllm_kunlun/csrc/utils.cpp"],
         include_dirs=[
             "vllm_kunlun/csrc",
-            "/usr/local/cuda/include",
         ],
-        library_dirs=["/usr/local/cuda/lib64"],
         extra_compile_args=["-O3"],
     )
 ]
@@ -73,14 +67,8 @@ if __name__ == "__main__":
             "vllm.platform_plugins": ["kunlun = vllm_kunlun:register"],
             "vllm.general_plugins": [
                 "kunlun_model = vllm_kunlun:register_model",
-                "kunlun_quant = vllm_kunlun:register_quant_method",
                 "kunlun_reasoning_parser = vllm_kunlun:register_reasoning_parser",
                 "kunlun_tool_parser = vllm_kunlun:register_tool_parser",
             ],
-            # FusedMoE CustomOp OOT
-            "vllm.plugins": [
-                "kunlun_fused_moe = vllm_kunlun.ops.fused_moe:register_kunlun_fused_moe_ops"
-            ],
-            "console_scripts": ["vllm_kunlun = vllm_kunlun.entrypoints.main:main"],
         },
     )

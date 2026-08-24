@@ -36,7 +36,7 @@ model_hosting_container_standards
 xgrammar
 lm-format-enforcer
 ijson
-# vllm 0.18.0 newly required runtime deps (not in 0.15.1)
+# vllm 0.25.1 newly required runtime deps
 anthropic>=0.71.0
 mcp
 depyf==0.20.0
