@@ -506,39 +506,62 @@ _DSV4_HOOKS = (
 )
 
 
+# Per-label consecutive applier failure counters, throttled like the
+# dispatcher's own failure logs (first attempt + every 200th).
+_apply_failures: dict = {}
+
+
+def _flag_on(flag_name: str) -> bool:
+    """Resolve one FeatureFlags property; empty name means always-on."""
+    if not flag_name:
+        return True
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+    return bool(getattr(FeatureFlags(), flag_name))
+
+
+def _try_apply(label: str, applier: Callable[[object], None], mod: object) -> None:
+    """Run one feature applier, isolating and throttling its failures."""
+    try:
+        applier(mod)
+    except Exception:  # noqa: BLE001
+        _apply_failures[label] = n = _apply_failures.get(label, 0) + 1
+        if n == 1 or n % 200 == 0:
+            LOGGER.exception("patch failed: %s (attempt %d)", label, n)
+        return
+    LOGGER.debug("Applied %s to %s", label, getattr(mod, "__name__", mod))
+
+
 def _register_table(
     table: tuple,
     register_post_import_hook: Callable[..., None],
 ) -> None:
-    """Register every table entry with busy/flag wrappers applied uniformly.
+    """Register one aggregated hook per target with the dispatcher.
 
-    ``applied`` reports True while the target module is mid-import or the
-    feature flag is off, so an aggregated batch stays sticky; ``apply`` is a
-    no-op when the flag is off.
+    This layer honors the dispatcher's one-registration-per-target rule:
+    entries sharing a target are composed into a single predicate/applier
+    pair here, so only feature modules and eager adapters registering later
+    stack through the dispatcher's chain-merge.  The aggregated predicate
+    reports True while the target is mid-import or every gated feature is
+    either applied or flag-off (sticky); the applier skips flag-off entries
+    and isolates per-feature failures.
     """
+    groups: dict = {}
     for label, target, flag_name, applied, apply in table:
-        def _enabled(_flag_name=flag_name):
-            if not _flag_name:
-                return True
-            from vllm_kunlun.config.deepseek_v4 import FeatureFlags
-            return bool(getattr(FeatureFlags(), _flag_name))
+        groups.setdefault(target, []).append((label, flag_name, applied, apply))
 
-        def _applied(mod, _applied=applied, _enabled=_enabled):
-            if _module_busy(mod) or not _enabled():
+    for target, entries in groups.items():
+        def _applied(mod, _entries=entries):
+            if _module_busy(mod):
                 return True
-            return bool(_applied(mod))
+            for _label, flag, predicate, _apply in _entries:
+                if _flag_on(flag) and not predicate(mod):
+                    return False
+            return True
 
-        def _apply(mod, _label=label, _apply=apply, _enabled=_enabled):
-            if not _enabled():
-                return
-            try:
-                # Isolate per-feature failures: one bad applier must not
-                # block the remaining features chained on this target.
-                _apply(mod)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("patch failed: %s", _label)
-                return
-            LOGGER.debug("Applied %s to %s", _label, getattr(mod, "__name__", mod))
+        def _apply(mod, _entries=entries):
+            for label, flag, _predicate, applier in _entries:
+                if _flag_on(flag):
+                    _try_apply(label, applier, mod)
 
         register_post_import_hook(target, _applied, _apply)
 

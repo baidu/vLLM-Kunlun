@@ -81,10 +81,13 @@ def _chained_appliers(first: HookApply, second: HookApply) -> HookApply:
 def register_hook(target: str, applied: HookApplied, apply: HookApply) -> None:
     """Register one idempotent patch for an upstream module.
 
-    A later registration for an already-hooked target chains onto the existing
-    entry instead of being rejected: platform-level patches and per-model
-    adapters legitimately stack on the same upstream module, and rejecting one
-    would silently disable it.
+    Registration stays one-per-target *per layer*: the built-in compat
+    patches, the platform wiring, and the eager adapters each register at
+    most one hook for a given target (aggregating their own features before
+    calling this).  A later layer stacking onto an already-hooked target
+    chains onto the existing entry instead of being rejected: platform-level
+    patches and per-model adapters legitimately stack on the same upstream
+    module, and rejecting one would silently disable it.
     """
     for i, existing in enumerate(_HOOKS):
         if existing.target != target:

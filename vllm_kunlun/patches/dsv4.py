@@ -1,81 +1,53 @@
-"""DeepSeek-V4 Kunlun adapter pack entry point.
+"""DeepSeek-V4 Kunlun adapter-pack entry point.
 
 Calling :func:`apply_all` registers every DSV4 adapter (see
 ``vllm_kunlun.patches.registry``) with the post-import dispatcher; adapters
 are gated by the ``KUNLUN_DSV4_*`` feature flags.
 """
-from typing import List, Optional
-import typing
-from vllm_kunlun.config.deepseek_v4 import FeatureFlags
+import logging
+from typing import Callable, Optional
 
-__all__ = ["FeatureFlags", "get_applied_labels", "clear_application_state", "apply_all"]
+LOGGER = logging.getLogger("vllm_kunlun.patches.dsv4")
 
-_APPLIED_LABELS: "list[str]" = []
-_APPLICATION_CLEARED: bool = False  # test hook to allow repeatable imports/tests
-
-
-def get_applied_labels() -> List[str]:
-    """Return labels of adapters installed by :func:`apply_all`."""
-    return list(_APPLIED_LABELS)
-
-
-def clear_application_state() -> None:
-    """Test-only helper allowing repeated application during unit tests."""
-    global _APPLICATION_CLEARED, _APPLIED_LABELS
-    _APPLIED_LABELS.clear()
-    _APPLICATION_CLEARED = True
+_DONE = False
 
 
 def apply_all(
-    register_post_import_hook: Optional["Callable[..., None]"] = None,
+    register_post_import_hook: Optional[Callable[..., None]] = None,
     run_eager: bool = True,
-) -> List[str]:
-    """Wire all DSV4 adapters into already-imported or soon-to-be-imported modules.
+) -> None:
+    """Wire all DSV4 adapters into already- or soon-to-be-imported modules.
 
     Args:
         register_post_import_hook: hook registration callback; when ``None``
-            the root package's ``_register_post_import_hook`` is looked up
-            automatically.
-
-    Returns:
-        Labels newly applied on this invocation.
+            the registration package's ``register_hook`` is used.
+        run_eager: also run the eager installs now. Those import feature-flag
+            and ops modules, which is only safe once vLLM core settled;
+            callers running during platform bootstrap pass False and let the
+            eager triggers invoke :func:`populate_eager` from a settled
+            point.
     """
-    global _APPLIED_LABELS, _APPLICATION_CLEARED
-    if not _APPLICATION_CLEARED and _APPLIED_LABELS:
-        return []
+    global _DONE
+    if _DONE:
+        return
 
-    flags = FeatureFlags()
-    if not flags.enabled(master_default=True):
-        return []
+    from vllm_kunlun.config.deepseek_v4 import FeatureFlags
 
-    labels_installed: "List[str]" = []
+    if not FeatureFlags.enabled(master_default=True):
+        return
+    if register_post_import_hook is None:
+        from vllm_kunlun.registration.import_hooks import register_hook
+
+        register_post_import_hook = register_hook
+
     try:
-        from vllm_kunlun.patches.registry import populate_hooks as _populate_registry_hooks
+        from vllm_kunlun.patches.registry import populate_hooks
 
-        if register_post_import_hook is None:
-            register_post_import_hook = _root_register_callback()
-
-        labels_installed.extend(
-            _populate_registry_hooks(register_post_import_hook, run_eager=run_eager)
-        )
+        populate_hooks(register_post_import_hook, run_eager=run_eager)
+        _DONE = True
     except Exception as exc:  # noqa: BLE001
-        import logging
-
-        logging.getLogger("vllm_kunlun.patches.dsv4").warning(
-            "DSV4 adapter install step failed (%s); continuing without V4-specific patches",
+        LOGGER.warning(
+            "DSV4 adapter install step failed (%s); continuing without "
+            "V4-specific patches",
             exc,
         )
-        return labels_installed
-
-    _APPLICATION_CLEARED = False
-    _APPLIED_LABELS = list(dict.fromkeys(_APPLIED_LABELS + labels_installed))
-    return labels_installed
-
-
-def _root_register_callback() -> Optional["Callable[..., None]"]:
-    """Return the registration package's hook registrar, or None."""
-    try:
-        from vllm_kunlun.registration.import_hooks import register_hook
-    except ImportError:
-        return None
-    return typing.cast("Callable[...,None]", register_hook)
