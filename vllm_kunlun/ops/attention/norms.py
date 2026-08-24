@@ -220,7 +220,18 @@ def _model_apply(mod: object) -> List[str]:
 
 
 def _model_predicate(mod: object) -> bool:
-    return bool(getattr(mod, _APPLIED_MODEL_KEY, False)) and getattr(mod.RMSNorm.forward_native.__globals__.get("rms_norm"), "_dsv4_adapter_label", False)
+    if not getattr(mod, _APPLIED_MODEL_KEY, False):
+        return False
+    cls = getattr(mod, "RMSNorm", None)
+    if cls is None:
+        return True
+    rms = cls.forward_native.__globals__.get("rms_norm")
+    if rms is None:
+        # Upstream forward_native no longer routes through a module-global
+        # rms_norm on this vLLM version: nothing to patch, report done so
+        # the aggregated hook for this target settles.
+        return True
+    return bool(getattr(rms, "_dsv4_adapter_label", False))
 
 
 def _attn_apply(mod: object) -> List[str]:

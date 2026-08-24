@@ -143,5 +143,7 @@ def _alias_applier(mod: object) -> None:
         "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
         bf16_full_cache_insert,
     )
+    if getattr(mod, _ALIAS_FLAG, False):
+        return
     setattr(mod, _ALIAS_FLAG, True)
     LOGGER.info("Wired DSV4 KV-insert aliases onto torch.ops._C")
