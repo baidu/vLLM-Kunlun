@@ -549,13 +549,13 @@ def _install_runtime_patches() -> None:
     def _run_eager(_mod=None) -> None:
         if _EAGER_DONE[0]:
             return
-        _EAGER_DONE[0] = True
         from vllm_kunlun.patches.registry import populate_eager
 
         try:
             populate_eager(_raw_register)
         except Exception:
             logger.exception("DSV4 eager adapter installs failed")
+        _EAGER_DONE[0] = True
 
     # Workers settle at the model runner; the engine core (which computes the
     # kv-cache plan) settles at the kv-cache manager. Either trigger runs the

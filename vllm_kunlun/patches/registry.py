@@ -212,11 +212,19 @@ def _declare_lazy_hooks() -> None:
         )
 
 
-def _register_lazy_hooks(
-    register_post_import_hook: Callable[..., None],
-) -> List[str]:
+def flush_lazy_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
+    """Register pending _LAZY_HOOKS entries; sweep already-imported targets.
+
+    Entries are consumed as they are registered, so a later flush (after the
+    eager adapters appended theirs) only handles the new ones. Targets that
+    finished importing before registration never see a dispatch for their
+    own import, so they are checked and applied here directly.
+    """
+    import sys as _sys
+
     labels_installed: List[str] = []
-    for descriptor_label, target, pred_fn, applier_fn in list(_LAZY_HOOKS):
+    while _LAZY_HOOKS:
+        descriptor_label, target, pred_fn, applier_fn = _LAZY_HOOKS.pop(0)
 
         def _applier(mod, inner_app=applier_fn, marker=descriptor_label):
             try:
@@ -227,6 +235,14 @@ def _register_lazy_hooks(
 
         register_post_import_hook(target, lambda mod, p=pred_fn: p(mod), _applier)
         labels_installed.append(f"lazy:{target}")
+
+        mod = _sys.modules.get(target)
+        if mod is None:
+            continue
+        spec = getattr(mod, "__spec__", None)
+        busy = spec is not None and getattr(spec, "_initializing", False)
+        if not busy:
+            _applier(mod)
     return labels_installed
 
 
@@ -249,7 +265,7 @@ def populate_hooks(
     """
     _declare_lazy_hooks()
     _register_static_patches(register_post_import_hook)
-    labels_installed = _register_lazy_hooks(register_post_import_hook)
+    labels_installed = flush_lazy_hooks(register_post_import_hook)
     if run_eager:
         populate_eager(register_post_import_hook)
     return labels_installed
@@ -300,6 +316,15 @@ def populate_eager(
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("DSV4 cache patch registration failed (%s)", exc)
 
+    # The adapters above appended their lazy hooks; drain and sweep them.
+    if register_post_import_hook is None:
+        from vllm_kunlun.registration.import_hooks import register_hook as _rk
+
+        def register_post_import_hook(target, applied, apply):  # noqa: F811
+            _rk(target, applied, apply)
+
+    flush_lazy_hooks(register_post_import_hook)
+
 
 # Platform-level patches (unconditional; apply to every model on Kunlun XPU).
 def _fp8_kernels_applied(mod: object) -> bool:
@@ -315,7 +340,28 @@ def _fp8_kernels_applied(mod: object) -> bool:
     )
 
 
+def _fused_moe_graph_settled() -> bool:
+    """True once vllm finished importing the fused-moe method module.
+
+    Importing vllm_kunlun.ops (directly or via quantization/fused-moe layers)
+    pulls the upstream fused-moe graph, which is circular through
+    vllm._aiter_ops during early boot; entering it mid-cycle fails and
+    retries forever.
+    """
+    import sys as _sys
+
+    ufmm = _sys.modules.get(
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+    )
+    if ufmm is None:
+        return False
+    spec = getattr(ufmm, "__spec__", None)
+    return spec is None or not getattr(spec, "_initializing", False)
+
+
 def _fp8_kernels_apply(mod: object) -> None:
+    if not _fused_moe_graph_settled():
+        return
     import vllm_kunlun.quantization.kernels  # noqa: F401  (registers on import)
 
 
@@ -326,6 +372,8 @@ def _fp8_moe_method_applied(mod: object) -> bool:
 
 def _fp8_moe_method_apply(mod: object) -> None:
     if not hasattr(mod, "Fp8MoEMethod"):
+        return
+    if not _fused_moe_graph_settled():
         return
     layer_mod = importlib.import_module("vllm_kunlun.ops.fused_moe.layer")
     KunlunFp8MoEMethod = getattr(layer_mod, "KunlunFp8MoEMethod", None)
