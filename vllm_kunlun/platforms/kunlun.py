@@ -507,9 +507,14 @@ def _install_runtime_patches() -> None:
                 return True
             return all(predicate(mod) for predicate, _ in _hooks)
 
-        def _apply(mod, _hooks=hooks):
+        def _apply(mod, _hooks=hooks, _target=target):
+            # Isolate per-feature failures: one bad applier must not block
+            # the remaining features aggregated on the same target module.
             for _, applier in _hooks:
-                applier(mod)
+                try:
+                    applier(mod)
+                except Exception:
+                    logger.exception("patch failed on %s", _target)
 
         register_hook(target, _applied, _apply)
 

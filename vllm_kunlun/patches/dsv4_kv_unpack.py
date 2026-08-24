@@ -31,6 +31,12 @@ _UNPAD_KEY = "_kunlun_indexer_unpad_applied"
 
 
 def _unpad_predicate(mod: object) -> bool:
+    import os
+
+    # Feature off (default): nothing to apply, report done so the dispatcher
+    # stops re-running the batch this predicate is aggregated with.
+    if os.environ.get("KUNLUN_DSV4_INDEXER_UNPAD", "0") != "1":
+        return True
     return bool(getattr(mod, _UNPAD_KEY, False))
 
 
