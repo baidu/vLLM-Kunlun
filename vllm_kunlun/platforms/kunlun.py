@@ -467,58 +467,79 @@ class KunlunPlatform(Platform):
 def _install_runtime_patches() -> None:
     """Register Kunlun platform and DeepSeek-V4 patches with the plugin.
 
-    The plugin protocol loads this module right after vllm_kunlun.register()
-    returns, before any model-executor module is imported, so this is the
-    earliest platform-owned place to queue post-import hooks. Hooks are
-    aggregated per target module: the registration package allows one entry
-    per target, while the patch tables describe independent features that may
-    share a module.
+    This module is imported while ``vllm.utils.torch_utils`` may still be
+    executing (platform resolution sits inside its import chain), so the
+    heavy DSV4 wiring must not run here: its feature-flag and ops imports
+    would re-enter half-initialized modules. The wiring is queued on the
+    model-runner import instead -- by then vLLM core has settled and no
+    model code has run yet.
     """
-    from vllm_kunlun.registration.import_hooks import dispatch_hooks, register_hook
+    import sys
+
+    from vllm_kunlun.registration.import_hooks import (
+        dispatch_hooks,
+        register_hook,
+    )
+
+    _WIRED = [False]
 
     def _module_busy(mod) -> bool:
         """True while *mod* is still executing its import (partial module)."""
         spec = getattr(mod, "__spec__", None)
         return spec is not None and getattr(spec, "_initializing", False)
 
-    pending: dict = {}
+    def _wire_all(_mod=None) -> None:
+        if _WIRED[0]:
+            return
+        _WIRED[0] = True
+        pending: dict = {}
 
-    def register(target, applied, apply):
-        """Queue one feature hook; registration happens once per target."""
-        pending.setdefault(target, []).append((applied, apply))
+        def register(target, applied, apply):
+            """Queue one feature hook; registration happens once per target."""
+            pending.setdefault(target, []).append((applied, apply))
 
-    try:
-        from vllm_kunlun.patches.registry import populate_platform_hooks
+        try:
+            from vllm_kunlun.patches.registry import populate_platform_hooks
 
-        populate_platform_hooks(register)
-    except Exception:
-        logger.exception("Kunlun platform patch registration failed")
+            populate_platform_hooks(register)
+        except Exception:
+            logger.exception("Kunlun platform patch registration failed")
 
-    try:
-        from vllm_kunlun.patches.dsv4 import apply_all
+        try:
+            from vllm_kunlun.patches.dsv4 import apply_all
 
-        apply_all(register)
-    except Exception:
-        logger.exception("DSV4 adapter pack failed to load")
+            apply_all(register)
+        except Exception:
+            logger.exception("DSV4 adapter pack failed to load")
 
-    for target, hooks in pending.items():
-        def _applied(mod, _hooks=hooks):
-            if _module_busy(mod):
-                return True
-            return all(predicate(mod) for predicate, _ in _hooks)
+        for target, hooks in pending.items():
+            def _applied(mod, _hooks=hooks):
+                if _module_busy(mod):
+                    return True
+                return all(predicate(mod) for predicate, _ in _hooks)
 
-        def _apply(mod, _hooks=hooks, _target=target):
-            # Isolate per-feature failures: one bad applier must not block
-            # the remaining features aggregated on the same target module.
-            for _, applier in _hooks:
-                try:
-                    applier(mod)
-                except Exception:
-                    logger.exception("patch failed on %s", _target)
+            def _apply(mod, _hooks=hooks, _target=target):
+                # Isolate per-feature failures: one bad applier must not
+                # block the remaining features aggregated on this target.
+                for _, applier in _hooks:
+                    try:
+                        applier(mod)
+                    except Exception:
+                        logger.exception("patch failed on %s", _target)
 
-        register_hook(target, _applied, _apply)
+            register_hook(target, _applied, _apply)
 
-    dispatch_hooks()
+        dispatch_hooks()
+
+    def _runner_applied(mod) -> bool:
+        return _WIRED[0]
+
+    register_hook("vllm.v1.worker.gpu_model_runner", _runner_applied, _wire_all)
+
+    # Late plugin load: the runner may already be imported.
+    runner = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if runner is not None and not _module_busy(runner):
+        _wire_all(runner)
 
 
 _install_runtime_patches()

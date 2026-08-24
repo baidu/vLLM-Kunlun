@@ -166,16 +166,19 @@ def _oot_registrations_applied(module: ModuleType) -> bool:
 def _apply_oot_registrations(module: ModuleType) -> None:
     """Import Kunlun operators so their registration decorators execute."""
     # The vllm_kunlun.ops package pulls the upstream fused-moe graph, which
-    # imports vllm._aiter_ops circularly. This hook can be dispatched from
-    # between two imports inside _aiter_ops' own body; entering the graph
-    # then re-enters the in-flight _aiter_ops and fails both imports, which
-    # retry forever. Skip while _aiter_ops is mid-import: its chain settles,
-    # and a later dispatch completes this registration.
-    aiter = sys.modules.get("vllm._aiter_ops")
-    if aiter is not None:
-        spec = getattr(aiter, "__spec__", None)
-        if spec is not None and getattr(spec, "_initializing", False):
-            return
+    # is circular through vllm._aiter_ops. This hook dispatches between
+    # imports inside those bodies during early boot; entering the graph then
+    # re-enters an in-flight module and retries forever. Wait until vllm
+    # itself finished importing the fused-moe method module: past that point
+    # every module our chain touches is complete and the import is safe.
+    ufmm = sys.modules.get(
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+    )
+    if ufmm is None:
+        return
+    spec = getattr(ufmm, "__spec__", None)
+    if spec is not None and getattr(spec, "_initializing", False):
+        return
     import vllm_kunlun.ops  # noqa: F401
 
 
