@@ -70,9 +70,9 @@ def apply_all(
 
 
 def _root_register_callback() -> Optional["Callable[..., None]"]:
-    """Return the root package's post-import hook registrar, or None."""
-    import sys
-
-    mod = sys.modules.get("vllm_kunlun")
-    fn = getattr(mod, "_register_post_import_hook", None)
-    return typing.cast("Callable[...,None]", fn) if callable(fn) else None
+    """Return the registration package's hook registrar, or None."""
+    try:
+        from vllm_kunlun.registration.import_hooks import register_hook
+    except ImportError:
+        return None
+    return typing.cast("Callable[...,None]", register_hook)
