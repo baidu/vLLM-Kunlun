@@ -28,6 +28,7 @@ def clear_application_state() -> None:
 
 def apply_all(
     register_post_import_hook: Optional["Callable[..., None]"] = None,
+    run_eager: bool = True,
 ) -> List[str]:
     """Wire all DSV4 adapters into already-imported or soon-to-be-imported modules.
 
@@ -54,7 +55,9 @@ def apply_all(
         if register_post_import_hook is None:
             register_post_import_hook = _root_register_callback()
 
-        labels_installed.extend(_populate_registry_hooks(register_post_import_hook))
+        labels_installed.extend(
+            _populate_registry_hooks(register_post_import_hook, run_eager=run_eager)
+        )
     except Exception as exc:  # noqa: BLE001
         import logging
 

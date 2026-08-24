@@ -183,17 +183,8 @@ def _register_lazy(
     _LAZY_HOOKS.append((effective_label, target_module_path, applied_test, applier))
 
 
-def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
-    """Register every DSV4 hook known so far and eagerly install cheap ones.
-
-    Args:
-        register_post_import_hook: callback provided by root package used to queue
-            patches against imported community modules.
-    Returns:
-        Labels of adapters successfully registered on this invocation.
-    """
-    labels_installed: List[str] = []
-
+def _declare_lazy_hooks() -> None:
+    """Fill _LAZY_HOOKS (declarations only; no heavy imports here)."""
     # platform_policy must stay lazy: importing KunlunPlatform eagerly would
     # re-enter platform resolution before current_platform is set.
     _register_lazy(
@@ -220,8 +211,58 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
             label="dsv4.runner_debug",
         )
 
-    _register_static_patches(register_post_import_hook)
 
+def _register_lazy_hooks(
+    register_post_import_hook: Callable[..., None],
+) -> List[str]:
+    labels_installed: List[str] = []
+    for descriptor_label, target, pred_fn, applier_fn in list(_LAZY_HOOKS):
+
+        def _applier(mod, inner_app=applier_fn, marker=descriptor_label):
+            try:
+                inner_app(mod)
+                setattr(mod, _LAZY_DESCRIPTOR, marker)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Lazy DSV4 adapter failed for %r", marker)
+
+        register_post_import_hook(target, lambda mod, p=pred_fn: p(mod), _applier)
+        labels_installed.append(f"lazy:{target}")
+    return labels_installed
+
+
+def populate_hooks(
+    register_post_import_hook: Callable[..., None],
+    run_eager: bool = True,
+) -> List[str]:
+    """Register every DSV4 hook; optionally run the eager installs.
+
+    Args:
+        register_post_import_hook: callback provided by root package used to
+            queue patches against imported community modules.
+        run_eager: also run the eager installs now. Those import feature-flag
+            and ops modules, which is only safe once vLLM core settled (e.g.
+            ``vllm.utils.torch_utils`` finished importing); callers running
+            during plugin bootstrap pass False and invoke :func:`populate_eager`
+            from a settled point.
+    Returns:
+        Labels of adapters successfully registered on this invocation.
+    """
+    _declare_lazy_hooks()
+    _register_static_patches(register_post_import_hook)
+    labels_installed = _register_lazy_hooks(register_post_import_hook)
+    if run_eager:
+        populate_eager(register_post_import_hook)
+    return labels_installed
+
+
+def populate_eager(
+    register_post_import_hook: Callable[..., None] | None = None,
+) -> None:
+    """Run the eager adapter installs; requires settled vLLM core.
+
+    Each adapter registers its own lazy hooks internally; the imports here
+    pull the ops/quantization modules that carry ``apply()`` entry points.
+    """
     try:
         from vllm_kunlun.ops.fused_moe.mhc_hyperconnection import apply as _mhc_apply
         _mhc_apply()
@@ -252,27 +293,12 @@ def populate_hooks(register_post_import_hook: Callable[..., None]) -> List[str]:
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("DSV4 INT8-W8A8-MoE bridge registration failed (%s)", exc)
 
-    try:
-        from vllm_kunlun.patches.dsv4_cache import register as _cache_register
-        labels_installed.extend(_cache_register(register_post_import_hook))
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("DSV4 cache patch registration failed (%s)", exc)
-
-    # New patches should be declared statically in _STATIC_PATCHES;
-    # _LAZY_HOOKS is reserved for hooks that must not import eagerly.
-    for descriptor_label, target, pred_fn, applier_fn in list(_LAZY_HOOKS):
-
-        def _applier(mod, inner_app=applier_fn, marker=descriptor_label):
-            try:
-                inner_app(mod)
-                setattr(mod, _LAZY_DESCRIPTOR, marker)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Lazy DSV4 adapter failed for %r", marker)
-
-        register_post_import_hook(target, lambda mod, p=pred_fn: p(mod), _applier)
-        labels_installed.append(f"lazy:{target}")
-
-    return labels_installed
+    if register_post_import_hook is not None:
+        try:
+            from vllm_kunlun.patches.dsv4_cache import register as _cache_register
+            _cache_register(register_post_import_hook)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("DSV4 cache patch registration failed (%s)", exc)
 
 
 # Platform-level patches (unconditional; apply to every model on Kunlun XPU).

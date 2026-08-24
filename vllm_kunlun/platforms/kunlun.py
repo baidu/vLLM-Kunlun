@@ -467,91 +467,113 @@ class KunlunPlatform(Platform):
 def _install_runtime_patches() -> None:
     """Register Kunlun platform and DeepSeek-V4 patches with the plugin.
 
-    This module is imported while ``vllm.utils.torch_utils`` may still be
-    executing (platform resolution sits inside its import chain), so the
-    heavy DSV4 wiring must not run here: its feature-flag and ops imports
-    would re-enter half-initialized modules. The wiring is queued on the
-    model-runner import instead -- by then vLLM core has settled and no
-    model code has run yet.
+    Hook registration is cheap closures, so it runs here in every process
+    that resolves the platform -- the kv-cache planner runs in the engine
+    core, which never imports the model runner, so gating registration on
+    the runner left that process unpatched and the packed-KV layout (with
+    its per-layer copies) came back. Only the eager installs are deferred:
+    this module is imported while ``vllm.utils.torch_utils`` may still be
+    executing, and those imports would re-enter half-initialized modules.
     """
     import sys
 
     from vllm_kunlun.registration.import_hooks import register_hook
 
-    _WIRED = [False]
+    _EAGER_DONE = [False]
 
     def _module_busy(mod) -> bool:
         """True while *mod* is still executing its import (partial module)."""
         spec = getattr(mod, "__spec__", None)
         return spec is not None and getattr(spec, "_initializing", False)
 
-    def _wire_all(_mod=None) -> None:
-        if _WIRED[0]:
+    pending: dict = {}
+
+    def register(target, applied, apply):
+        """Queue one feature hook; registration happens once per target."""
+        pending.setdefault(target, []).append((applied, apply))
+
+    def _raw_register(target, applied, apply):
+        """Late registration outside the aggregation window."""
+
+        def _busy_safe_applied(mod):
+            if _module_busy(mod):
+                return True
+            return applied(mod)
+
+        register_hook(target, _busy_safe_applied, apply)
+
+    try:
+        from vllm_kunlun.patches.registry import populate_platform_hooks
+
+        populate_platform_hooks(register)
+    except Exception:
+        logger.exception("Kunlun platform patch registration failed")
+
+    try:
+        from vllm_kunlun.patches.dsv4 import apply_all
+
+        apply_all(register, run_eager=False)
+    except Exception:
+        logger.exception("DSV4 adapter pack failed to load")
+
+    for target, hooks in pending.items():
+        def _applied(mod, _hooks=hooks):
+            if _module_busy(mod):
+                return True
+            return all(predicate(mod) for predicate, _ in _hooks)
+
+        def _apply(mod, _hooks=hooks, _target=target):
+            # Isolate per-feature failures: one bad applier must not block
+            # the remaining features aggregated on this target.
+            for _, applier in _hooks:
+                try:
+                    applier(mod)
+                except Exception:
+                    logger.exception("patch failed on %s", _target)
+
+        register_hook(target, _applied, _apply)
+
+    # Targets imported before this point never see a dispatch for their own
+    # import; sweep them now (the wiring above ran outside any dispatch).
+    for target, hooks in pending.items():
+        mod = sys.modules.get(target)
+        if mod is None or _module_busy(mod):
+            continue
+        if not all(predicate(mod) for predicate, _ in hooks):
+            for _, applier in hooks:
+                try:
+                    applier(mod)
+                except Exception:
+                    logger.exception("patch failed on %s", target)
+
+    def _run_eager(_mod=None) -> None:
+        if _EAGER_DONE[0]:
             return
-        _WIRED[0] = True
-        pending: dict = {}
-
-        def register(target, applied, apply):
-            """Queue one feature hook; registration happens once per target."""
-            pending.setdefault(target, []).append((applied, apply))
+        _EAGER_DONE[0] = True
+        from vllm_kunlun.patches.registry import populate_eager
 
         try:
-            from vllm_kunlun.patches.registry import populate_platform_hooks
-
-            populate_platform_hooks(register)
+            populate_eager(_raw_register)
         except Exception:
-            logger.exception("Kunlun platform patch registration failed")
+            logger.exception("DSV4 eager adapter installs failed")
 
-        try:
-            from vllm_kunlun.patches.dsv4 import apply_all
-
-            apply_all(register)
-        except Exception:
-            logger.exception("DSV4 adapter pack failed to load")
-
-        for target, hooks in pending.items():
-            def _applied(mod, _hooks=hooks):
-                if _module_busy(mod):
-                    return True
-                return all(predicate(mod) for predicate, _ in _hooks)
-
-            def _apply(mod, _hooks=hooks, _target=target):
-                # Isolate per-feature failures: one bad applier must not
-                # block the remaining features aggregated on this target.
-                for _, applier in _hooks:
-                    try:
-                        applier(mod)
-                    except Exception:
-                        logger.exception("patch failed on %s", _target)
-
-            register_hook(target, _applied, _apply)
-
-        # Initial sweep for targets imported before this wiring runs. The
-        # dispatcher's re-entrancy guard makes a dispatch_hooks() call here a
-        # no-op (this wiring executes as a hook's apply inside a dispatch), so
-        # sweep the registered targets directly: modules already loaded and
-        # settled get their patches now; anything not yet imported is picked
-        # up by later dispatches.
-        for target, hooks in pending.items():
-            mod = sys.modules.get(target)
-            if mod is None or _module_busy(mod):
-                continue
-            if not all(predicate(mod) for predicate, _ in hooks):
-                for _, applier in hooks:
-                    try:
-                        applier(mod)
-                    except Exception:
-                        logger.exception("patch failed on %s", target)
-
-    def _runner_applied(mod) -> bool:
-        return _WIRED[0]
-
-    register_hook("vllm.v1.worker.gpu_model_runner", _runner_applied, _wire_all)
-
-    # Late plugin load: the runner may already be imported.
-    runner = sys.modules.get("vllm.v1.worker.gpu_model_runner")
-    if runner is not None and not _module_busy(runner):
-        _wire_all(runner)
+    # Workers settle at the model runner; the engine core (which computes the
+    # kv-cache plan) settles at the kv-cache manager. Either trigger runs the
+    # eager installs once.
+    register_hook(
+        "vllm.v1.worker.gpu_model_runner",
+        lambda mod: _EAGER_DONE[0],
+        _run_eager,
+    )
+    register_hook(
+        "vllm.v1.core.kv_cache_manager",
+        lambda mod: _EAGER_DONE[0],
+        _run_eager,
+    )
+    for _trigger in ("vllm.v1.worker.gpu_model_runner", "vllm.v1.core.kv_cache_manager"):
+        mod = sys.modules.get(_trigger)
+        if mod is not None and not _module_busy(mod):
+            _run_eager(mod)
 
 
 _install_runtime_patches()
