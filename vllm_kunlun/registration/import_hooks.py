@@ -21,6 +21,7 @@ adapted vLLM is still more useful than one that cannot start at all.
 import builtins
 import logging
 import sys
+import threading
 import weakref
 from collections.abc import Callable
 from types import ModuleType
@@ -145,6 +146,24 @@ for _target, _is_applied, _apply_patch in DEFAULT_HOOKS:
     register_hook(_target, _is_applied, _apply_patch)
 
 
+_IMPORT_STATE = threading.local()
+
+
+def _dispatch_at_quiescent_point() -> None:
+    """Run the dispatcher once the import stack of this thread unwound.
+
+    A dispatch between two imports inside a module body sees every module
+    currently on that body's import chain as partially initialized; a hook
+    whose predicate or applier imports anything from that chain (the
+    fused-moe graph circularity above all) then fails and retries in a
+    self-sustaining storm. Deferring to the return of the outermost import
+    guarantees a quiescent state: nothing on the stack is mid-import.
+    """
+    depth = getattr(_IMPORT_STATE, "depth", 0)
+    if depth <= 1:
+        dispatch_hooks()
+
+
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
     """Intercept absolute imports, then run any newly eligible patches."""
     # Relative imports (level > 0) can never name an upstream vLLM module
@@ -157,8 +176,12 @@ def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0)
             # change vLLM's normal fallback behavior; the upstream module is
             # used as-is in that case.
             pass
-    result = _OLD_IMPORT(module_name, globals, locals, fromlist, level)
-    dispatch_hooks()
+    _IMPORT_STATE.depth = getattr(_IMPORT_STATE, "depth", 0) + 1
+    try:
+        result = _OLD_IMPORT(module_name, globals, locals, fromlist, level)
+    finally:
+        _IMPORT_STATE.depth -= 1
+    _dispatch_at_quiescent_point()
     return result
 
 
