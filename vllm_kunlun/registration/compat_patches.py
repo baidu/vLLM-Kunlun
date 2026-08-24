@@ -196,6 +196,33 @@ def _apply_int8_moe_patch(module: ModuleType) -> None:
     module._kunlun_select_int8_patched = True
 
 
+# --- vllm.model_executor.models.deepseek_v2: Indexer attention backend ----
+
+
+def _indexer_backend_applied(module: ModuleType) -> bool:
+    """Return whether ``DeepseekV32IndexerCache`` is absent or already patched."""
+    cls = getattr(module, "DeepseekV32IndexerCache", None)
+    fn = getattr(cls, "get_attn_backend", None) if cls is not None else None
+    return cls is None or (
+        fn is not None and getattr(fn, "_kunlun_patched", False)
+    )
+
+
+def _apply_indexer_backend_patch(module: ModuleType) -> None:
+    """Replace vLLM's DeepseekV32IndexerCache.get_attn_backend() which always 
+    returns DeepseekV32IndexerBackend with the Kunlun fallback."""
+    cls = getattr(module, "DeepseekV32IndexerCache", None)
+    if cls is None:
+        return
+    from vllm_kunlun.v1.attention.backends.mla.indexer import (
+        KunlunDeepseekV32IndexerBackend,
+    )
+    def get_attn_backend(self):
+        return KunlunDeepseekV32IndexerBackend
+    get_attn_backend._kunlun_patched = True
+    cls.get_attn_backend = get_attn_backend
+
+
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.v1.worker.utils", _kv_block_zeroer_applied, _apply_kv_block_zeroer),
@@ -226,5 +253,10 @@ DEFAULT_HOOKS = (
         "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8",
         _int8_moe_applied,
         _apply_int8_moe_patch,
+    ),
+    (
+        "vllm.model_executor.models.deepseek_v2",
+        _indexer_backend_applied,
+        _apply_indexer_backend_patch,
     ),
 )
