@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from transformers import GptOssConfig
-from vllm.attention import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (

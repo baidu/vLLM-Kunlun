@@ -29,7 +29,7 @@ from itertools import islice
 import torch
 from torch import nn
 from transformers import PretrainedConfig as SeedOssConfig
-from vllm.attention import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size

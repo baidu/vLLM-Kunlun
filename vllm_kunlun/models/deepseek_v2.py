@@ -33,7 +33,7 @@ import torch
 from torch import nn
 from torch.library import custom_op
 from transformers import DeepseekV2Config, DeepseekV3Config
-from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (

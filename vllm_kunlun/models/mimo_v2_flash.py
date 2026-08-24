@@ -5,7 +5,7 @@ from itertools import islice
 
 import torch
 from torch import nn
-from vllm.attention.backends.abstract import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
