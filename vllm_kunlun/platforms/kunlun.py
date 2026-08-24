@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING, Optional
 
+import os
 import psutil
 import torch
 import vllm.envs as envs
@@ -179,6 +180,26 @@ class KunlunPlatform(Platform):
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
+    def _default_collective_algo(cls) -> None:
+        """Default to BKCL's mesh all-reduce for run-to-run determinism.
+
+        Ring all-reduce chunks the buffer and rotates the starting rank, so a
+        row's result depends on its offset in the buffer; bit-identical rows
+        can come back one bf16 ULP apart and logits drift with batch width.
+        Mesh sums every element in the same rank order, giving bit-identical
+        logits across repeats (buffers above ~512x4096 bf16 fall back to ring
+        regardless). Set ``XCCL_MESH_ALGO=0`` to keep ring.
+        """
+        if "XCCL_MESH_ALGO" in os.environ:
+            return
+        os.environ["XCCL_MESH_ALGO"] = "1"
+        logger.info(
+            "Defaulting XCCL_MESH_ALGO=1 so BKCL all-reduce results do not "
+            "depend on a row's offset in the buffer; set XCCL_MESH_ALGO=0 to "
+            "restore the ring algorithm."
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         """
         TODO Update here for v0.15.1
@@ -210,6 +231,8 @@ class KunlunPlatform(Platform):
         Returns:
             None.
         """
+        cls._default_collective_algo()
+
         parallel_config = vllm_config.parallel_config  # Not use scheduler_config
         # scheduler_config = vllm_config.scheduler_config
         model_config = vllm_config.model_config
@@ -232,24 +255,34 @@ class KunlunPlatform(Platform):
             # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
-            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+            attention_backend = os.getenv("VLLM_ATTENTION_BACKEND")
+            # DSV4-specific: DeepseekV4 uses a 256 MLA block size.
+            hf_config = vllm_config.model_config.hf_config
+            use_sparse = hasattr(hf_config, "index_topk")
+            architectures = getattr(hf_config, "architectures", ()) or ()
+            is_deepseek_v4 = "DeepseekV4ForCausalLM" in architectures
+            mla_block_size = 256 if is_deepseek_v4 else 64
             use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+                attention_backend is None
+                or attention_backend == "FLASHMLA"
             )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            from vllm_kunlun.ops.attention.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
                 and is_flashmla_supported()[0]
-                and cache_config.block_size != 64
+                and cache_config.block_size != mla_block_size
             ):
-                cache_config.block_size = 64
-                logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
-            if use_sparse and cache_config.block_size != 64:
-                cache_config.block_size = 64
+                cache_config.block_size = mla_block_size
                 logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
+                    "Forcing kv cache block size to %d for FlashMLA backend.",
+                    mla_block_size,
+                )
+            if use_sparse and cache_config.block_size != mla_block_size:
+                cache_config.block_size = mla_block_size
+                logger.info(
+                    "Forcing kv cache block size to %d for FlashMLASparse backend.",
+                    mla_block_size,
                 )
 
         from vllm.config import CUDAGraphMode
@@ -429,3 +462,58 @@ class KunlunPlatform(Platform):
         from vllm_kunlun.quantization.gptq import KunlunGPTQConfig  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_INT8_KERNELS  # noqa
         from vllm_kunlun.quantization.kernels import _POSSIBLE_KERNELS  # noqa
+
+
+def _install_runtime_patches() -> None:
+    """Register Kunlun platform and DeepSeek-V4 patches with the plugin.
+
+    The plugin protocol loads this module right after vllm_kunlun.register()
+    returns, before any model-executor module is imported, so this is the
+    earliest platform-owned place to queue post-import hooks. Hooks are
+    aggregated per target module: the registration package allows one entry
+    per target, while the patch tables describe independent features that may
+    share a module.
+    """
+    from vllm_kunlun.registration.import_hooks import dispatch_hooks, register_hook
+
+    def _module_busy(mod) -> bool:
+        """True while *mod* is still executing its import (partial module)."""
+        spec = getattr(mod, "__spec__", None)
+        return spec is not None and getattr(spec, "_initializing", False)
+
+    pending: dict = {}
+
+    def register(target, applied, apply):
+        """Queue one feature hook; registration happens once per target."""
+        pending.setdefault(target, []).append((applied, apply))
+
+    try:
+        from vllm_kunlun.patches.registry import populate_platform_hooks
+
+        populate_platform_hooks(register)
+    except Exception:
+        logger.exception("Kunlun platform patch registration failed")
+
+    try:
+        from vllm_kunlun.patches.dsv4 import apply_all
+
+        apply_all(register)
+    except Exception:
+        logger.exception("DSV4 adapter pack failed to load")
+
+    for target, hooks in pending.items():
+        def _applied(mod, _hooks=hooks):
+            if _module_busy(mod):
+                return True
+            return all(predicate(mod) for predicate, _ in _hooks)
+
+        def _apply(mod, _hooks=hooks):
+            for _, applier in _hooks:
+                applier(mod)
+
+        register_hook(target, _applied, _apply)
+
+    dispatch_hooks()
+
+
+_install_runtime_patches()

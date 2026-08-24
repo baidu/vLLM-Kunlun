@@ -50,19 +50,40 @@ _DISPATCHING = False
 
 # Registered hooks, applied in registration order on every dispatch.
 _HOOKS: list[HookRegistration] = []
-_HOOK_TARGETS: set[str] = set()
+
+
+def _chained_predicates(first: HookApplied, second: HookApplied) -> HookApplied:
+    def applied(module: ModuleType) -> bool:
+        return first(module) and second(module)
+
+    return applied
+
+
+def _chained_appliers(first: HookApply, second: HookApply) -> HookApply:
+    def apply_patch(module: ModuleType) -> None:
+        first(module)
+        second(module)
+
+    return apply_patch
 
 
 def register_hook(target: str, applied: HookApplied, apply: HookApply) -> None:
     """Register one idempotent patch for an upstream module.
 
-    A target may have only one registration.  Rejecting duplicates here keeps
-    patch order deterministic and catches accidental double registration at
-    startup rather than during a later import.
+    A later registration for an already-hooked target chains onto the existing
+    entry instead of being rejected: platform-level patches and per-model
+    adapters legitimately stack on the same upstream module, and rejecting one
+    would silently disable it.
     """
-    if target in _HOOK_TARGETS:
-        raise ValueError(f"Duplicate import hook target: {target}")
-    _HOOK_TARGETS.add(target)
+    for i, existing in enumerate(_HOOKS):
+        if existing.target != target:
+            continue
+        _HOOKS[i] = HookRegistration(
+            target,
+            _chained_predicates(existing.is_applied, applied),
+            _chained_appliers(existing.apply_patch, apply),
+        )
+        return
     _HOOKS.append(HookRegistration(target, applied, apply))
 
 
