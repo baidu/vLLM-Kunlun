@@ -90,10 +90,11 @@ def _find_paged_store_op():
 def _paged_store_usable(cache, data, col_start) -> bool:
     """Whether ``set_k_and_s_v4`` can express this write.
 
-    3D mode addresses ``[num_pages, page_size, k_dim]`` with the page stride
-    taken from ``stride(0)``, so pages may be spaced apart (the compressor
-    caches are strided views into the shared KV pool) but rows must be dense
-    and the write must cover a full row of a BF16/FP16 cache.
+    The stock (unpatched) wrapper only accepts a contiguous 2D buf, so the
+    native path requires the 3D cache ``[num_pages, page_size, k_dim]`` to be
+    fully contiguous; it is then passed as a zero-copy 2D view
+    ``[num_pages, page_size * k_dim]`` with an identical linear layout.
+    Strided views into a shared pool (gaps between pages) use torch scatter.
     """
     return (
         col_start == 0
@@ -103,7 +104,7 @@ def _paged_store_usable(cache, data, col_start) -> bool:
         and data.shape[1] == cache.shape[2]
         and cache.stride(2) == 1
         and cache.stride(1) == cache.shape[2]
-        and cache.stride(0) >= cache.shape[1] * cache.shape[2]
+        and cache.stride(0) == cache.shape[1] * cache.shape[2]
     )
 
 
@@ -124,7 +125,7 @@ def _warm_paged_store_once(cache) -> None:
             _paged_store_warm.add(key)
             device = cache.device
             op(
-                cache,
+                cache.view(cache.shape[0], -1),
                 torch.zeros(1, dtype=torch.int64, device=device),
                 torch.zeros((1, cache.shape[2]), dtype=cache.dtype, device=device),
                 cache.shape[1],
@@ -295,7 +296,7 @@ def _masked_paged_write(cache, dest, write_ok, data, col_start=0):
         if data_ok.data_ptr() == data.data_ptr():
             data_ok = data_ok.clone()
         data_ok.mul_(write_ok.unsqueeze(-1))
-        op(cache, dest_safe, data_ok, cache.shape[1])
+        op(cache.view(cache.shape[0], -1), dest_safe, data_ok, cache.shape[1])
         return
     if ifast:
         # Fused quant + planar store; the kernel skips negative slots itself.
