@@ -179,7 +179,12 @@ def _apply_oot_registrations(module: ModuleType) -> None:
     spec = getattr(ufmm, "__spec__", None)
     if spec is not None and getattr(spec, "_initializing", False):
         return
-    import vllm_kunlun.ops  # noqa: F401
+    try:
+        import vllm_kunlun.ops  # noqa: F401
+    except ImportError:
+        # Still mid-cycle through another in-flight module; the predicate
+        # stays False and a later dispatch retries quietly.
+        return
 
 
 # --- compressed_tensors int8 MoE: disable the CUDA backend selector --------

@@ -34,14 +34,21 @@ def _lazy_feature(module_path: str, predicate_name: str, apply_name: str) -> Hoo
 
     The feature module is imported only when the dispatcher asks, keeping
     registration itself free of heavy imports (the fused-moe graph and the
-    ops package are not safe to enter during platform discovery).
+    ops package are not safe to enter during platform discovery).  While the
+    fused-moe import graph has not settled the pair answers "not yet"
+    without importing, so the boot-time import ring produces quiet retries
+    instead of error-storm logs.
     """
 
     def applied(mod: object) -> bool:
+        if not _fused_moe_graph_settled():
+            return False
         feature = importlib.import_module(module_path)
         return bool(getattr(feature, predicate_name)(mod))
 
     def do_apply(mod: object) -> None:
+        if not _fused_moe_graph_settled():
+            return
         feature = importlib.import_module(module_path)
         getattr(feature, apply_name)(mod)
 
@@ -85,7 +92,10 @@ def _fused_moe_graph_settled() -> bool:
 def _fp8_kernels_apply(mod: object) -> None:
     if not _fused_moe_graph_settled():
         return
-    import vllm_kunlun.quantization.kernels  # noqa: F401  (registers on import)
+    try:
+        import vllm_kunlun.quantization.kernels  # noqa: F401  (registers on import)
+    except ImportError:
+        return  # mid-cycle through another edge; a later dispatch retries
 
 
 def _fp8_moe_method_applied(mod: object) -> bool:
@@ -98,7 +108,10 @@ def _fp8_moe_method_apply(mod: object) -> None:
         return
     if not _fused_moe_graph_settled():
         return
-    layer_mod = importlib.import_module("vllm_kunlun.ops.fused_moe.layer")
+    try:
+        layer_mod = importlib.import_module("vllm_kunlun.ops.fused_moe.layer")
+    except ImportError:
+        return  # mid-cycle through another edge; a later dispatch retries
     KunlunFp8MoEMethod = getattr(layer_mod, "KunlunFp8MoEMethod", None)
     if KunlunFp8MoEMethod is None:
         LOGGER.warning("KunlunFp8MoEMethod not available yet (deferred)")
@@ -380,8 +393,10 @@ def _moe_hash_custom_apply(mod: object) -> None:
         return
     if not _fused_moe_graph_settled():
         return
-    from vllm_kunlun.ops.fused_moe import moe_hash_router
-
+    try:
+        from vllm_kunlun.ops.fused_moe import moe_hash_router
+    except ImportError:
+        return  # mid-cycle through another edge; a later dispatch retries
     moe_hash_router._install_custom_ops_shim(mod)
 
 
@@ -396,8 +411,10 @@ def _moe_hash_router_apply(mod: object) -> None:
         return
     if not _fused_moe_graph_settled():
         return
-    from vllm_kunlun.ops.fused_moe import moe_hash_router
-
+    try:
+        from vllm_kunlun.ops.fused_moe import moe_hash_router
+    except ImportError:
+        return  # mid-cycle through another edge; a later dispatch retries
     moe_hash_router._install_direct_router(mod)
 
 
