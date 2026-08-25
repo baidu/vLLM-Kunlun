@@ -3030,9 +3030,38 @@ def gather_and_maybe_dequant_cache(
     scale: torch.Tensor,
     seq_starts: Optional[torch.Tensor] = None,
 ) -> None:
+    # The xspeedgate kernel is dispatched by
+    # REGISTER_PYTORCH_2TYPES(src_cache, dst, kFloat16, kFloat16, ...) and its
+    # wrapper has NO trailing XCHECK
+    # (XSpeedGate/wrapper/src/cache/gather_and_maybe_dequant_cache.cpp:95-100),
+    # so any other dtype combination falls through and the op RETURNS WITHOUT
+    # WRITING dst. For a bf16 model that left the MLA chunked-prefill workspace
+    # uninitialized: the context attention then saw garbage K/V, returned
+    # LSE == -FLT_MAX with NaN output, and every prefill split into more than
+    # one chunk produced garbage tokens.
+    #
+    # With kv_cache_dtype == "auto" the op is pure data movement and the fp16
+    # kernel is a bit-exact 16-bit copy (verified on P800 with arbitrary bit
+    # patterns), so reinterpret same-width dtypes as fp16 instead. Anything the
+    # kernel genuinely cannot do now fails loudly rather than silently.
+    src, out = src_cache, dst
+    if src.dtype != torch.float16 or dst.dtype != torch.float16:
+        if (
+            kv_cache_dtype == "auto"
+            and src.dtype == dst.dtype
+            and src.element_size() == 2
+        ):
+            src = src.view(torch.float16)
+            out = dst.view(torch.float16)
+        else:
+            raise NotImplementedError(
+                "[KUNLUN] gather_and_maybe_dequant_cache supports fp16 or a "
+                "same-width unquantized copy; got src_cache="
+                f"{src.dtype}, dst={dst.dtype}, kv_cache_dtype={kv_cache_dtype}"
+            )
     torch.ops.xspeedgate_ops.gather_and_maybe_dequant_cache(
-        src_cache=src_cache,
-        dst=dst,
+        src_cache=src,
+        dst=out,
         block_table=block_table,
         cu_seq_lens=cu_seq_lens,
         batch_size=block_table.size(0),

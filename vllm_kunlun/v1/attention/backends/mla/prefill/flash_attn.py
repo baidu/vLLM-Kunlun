@@ -141,11 +141,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             # For new-token self-attention they are identical, so kvlen is left
             # None. For the context chunk (cross-attention) K/V length differs
             # from Q length, so the caller passes the context cu_seq_lens here;
-            # omitting it makes the kernel read K/V with the query LOD and hang.
+            # omitting it makes the kernel segment K/V by the query LOD and
+            # return garbage for every chunked-prefill continuation.
             context_seq_lod_cpu=context_seq_lod_cpu,
             context_seq_lod_xpu=context_seq_lod_xpu,
             slot_mapping_cpu=None,
             slot_mapping_xpu=None,
+            context_kvlen_lod_cpu=context_kvlen_lod_cpu,
+            context_kvlen_lod_xpu=context_kvlen_lod_xpu,
             v_trans=False,
             v_trans_threshold=0,
             alpha=_DS_ALPHA,
