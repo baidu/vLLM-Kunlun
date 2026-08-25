@@ -43,13 +43,21 @@ def _lazy_feature(module_path: str, predicate_name: str, apply_name: str) -> Hoo
     def applied(mod: object) -> bool:
         if not _fused_moe_graph_settled():
             return False
-        feature = importlib.import_module(module_path)
+        try:
+            feature = importlib.import_module(module_path)
+        except ImportError:
+            # Mid-cycle through any in-flight vllm module; a later dispatch
+            # retries, so this stays quiet instead of logging an error.
+            return False
         return bool(getattr(feature, predicate_name)(mod))
 
     def do_apply(mod: object) -> None:
         if not _fused_moe_graph_settled():
             return
-        feature = importlib.import_module(module_path)
+        try:
+            feature = importlib.import_module(module_path)
+        except ImportError:
+            return
         getattr(feature, apply_name)(mod)
 
     return applied, do_apply
