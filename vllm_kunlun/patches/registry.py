@@ -426,38 +426,6 @@ def _moe_hash_router_apply(mod: object) -> None:
     moe_hash_router._install_direct_router(mod)
 
 
-# --- optional diagnostics (KUNLUN_DSV4_DEBUG=1) ---------------------------
-
-def _debug_enabled() -> bool:
-    return os.getenv("KUNLUN_DSV4_DEBUG", "0") == "1"
-
-
-def _logits_debug_applied(mod: object) -> bool:
-    if not _debug_enabled():
-        return True
-    fn = getattr(getattr(mod, "LogitsProcessor", None), "_gather_logits", None)
-    return bool(getattr(fn, "_kunlun_dsv4_debug", False))
-
-
-def _logits_debug_apply(mod: object) -> None:
-    from vllm_kunlun.patches import dsv4_logits_debug
-
-    dsv4_logits_debug.apply(mod)
-
-
-def _runner_debug_applied(mod: object) -> bool:
-    if not _debug_enabled():
-        return True
-    fn = getattr(getattr(mod, "GPUModelRunner", None), "execute_model", None)
-    return bool(getattr(fn, "_kunlun_dsv4_debug", False))
-
-
-def _runner_debug_apply(mod: object) -> None:
-    from vllm_kunlun.patches import dsv4_runner_debug
-
-    dsv4_runner_debug.apply(mod)
-
-
 def _cache_applied(mod: object) -> bool:
     return bool(getattr(mod, _DSV4_CACHE_PATCHED, False))
 
@@ -667,11 +635,6 @@ _DSV4_HOOKS = (
     # on the memory-pool hook's chain to carry it).
     ("dsv4.platform_policy", "vllm.v1.worker.gpu_worker", "",
      _platform_policy_applied, _platform_policy_apply),
-    # Optional low-overhead diagnostics.
-    ("dsv4.logits_debug", "vllm.model_executor.layers.logits_processor", "",
-     _logits_debug_applied, _logits_debug_apply),
-    ("dsv4.runner_debug", "vllm.v1.worker.gpu_model_runner", "",
-     _runner_debug_applied, _runner_debug_apply),
 )
 
 
