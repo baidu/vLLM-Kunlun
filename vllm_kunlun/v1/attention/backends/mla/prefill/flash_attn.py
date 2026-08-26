@@ -29,9 +29,19 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
 
-# [KUNLUN][VERIFY] DeepSeek/Kimi MLA softmax scale (mscale-adjusted); must match
-# the value used by the inline prefill in kimi_k3/nvidia/mla.py.
-_DS_ALPHA = 1.8738542070926265
+# ``kunlun_ops.attention`` divides QK^T by sqrt(q.shape[-1]) internally, so its
+# ``alpha`` is an ADDITIONAL multiplier: effective_scale = alpha / sqrt(d). vLLM
+# hands the intended multiplier to the backend as the layer's ``scale``
+# (head_size**-0.5, times mscale**2 when the model uses yarn rope scaling), so
+# ``alpha`` has to give sqrt(d) back. Deriving it stays correct for every model:
+# with yarn the formula reproduces mscale**2, without it alpha == 1. A hardcoded
+# value cannot, and an inflated alpha does double damage -- it sharpens the
+# softmax AND inflates the returned LSE, which then skews the log-sum-exp merge
+# against the correctly scaled branch. Against an fp32 torch reference the
+# derived value matches to 7.7e-05 (out) / 1.5e-04 (lse).
+def _kernel_alpha(softmax_scale: float, qk_head_dim: int) -> float:
+    return softmax_scale * (qk_head_dim**0.5)
+
 
 class FlashAttnPrefillBackend(MLAPrefillBackend):
     """kunlun_ops-backed MLA prefill backend."""
@@ -126,6 +136,9 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             dtype=torch.float32,
             device=q.device,
         )
+        alpha = _kernel_alpha(
+            self.scale if softmax_scale is None else softmax_scale, q.shape[-1]
+        )
         kunlun_ops.attention(
             q=q,
             k_cache=k,
@@ -151,7 +164,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             context_kvlen_lod_xpu=context_kvlen_lod_xpu,
             v_trans=False,
             v_trans_threshold=0,
-            alpha=_DS_ALPHA,
+            alpha=alpha,
             softmax_lse=softmax_lse,
             unpadded_lse=True,
         )

@@ -847,14 +847,16 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         #     ),
         # )
         # --- naive begin ---
-        _ds_alpha = 1.8738542070926265  # [KUNLUN][VERIFY] matches old common.py
+        # `kunlun_ops.attention` divides QK^T by sqrt(qk_head_dim) internally, so
+        # `alpha` is an ADDITIONAL multiplier and has to give sqrt(d) back on top
+        # of the layer's softmax scale. Deriving it from `self.scale` keeps this
+        # prefill consistent with the decode path, which passes `self.scale`
+        # straight through, and reproduces mscale**2 for yarn-scaled models.
+        _ds_alpha = self.scale * (q.shape[-1] ** 0.5)
         maybe_padded_v = torch.nn.functional.pad(
             v, [0, q.shape[-1] - v.shape[-1]], value=0
         )
         attn_out = torch.empty_like(q)
-        softmax_lse = torch.zeros(
-            q.size(1), q.size(0), dtype=torch.float32, device=q.device
-        )
         tp_q_head_num=q.size(1)
         softmax_lse = torch.full((tp_q_head_num, q.size(0)), float('-inf'), dtype=torch.float32, device=q.device)
         kunlun_ops.attention(
