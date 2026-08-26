@@ -813,12 +813,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        q_conv_weight, k_conv_weight, v_conv_weight = conv_weights.split(
-            self.local_projection_size, dim=0
-        )
-        q_conv_state, k_conv_state, v_conv_state = conv_state.split(
-            self.local_projection_size, dim=-2
-        )
 
         # Separate multi-query speculative tokens from prefill/plain decode.
         if has_spec_decode:
@@ -891,32 +885,30 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
             if m.num_prefills > 0:
-                q_ns, k_ns, v_ns = mixed_qkv_ns.split(
+                # One call over the packed q/k/v dim, exactly like the decode
+                # path. The conv kernels honour the slot stride but address the
+                # bytes WITHIN a slot as if the view were contiguous, so handing
+                # them a cache sub-view (`conv_state.split(dim=-2)`) is a silent
+                # reinterpretation: each part's state lands at the sub-view's
+                # element offset while the kernel expects the packed offset, so
+                # the parts overlap each other. Split the OUTPUT instead -- that
+                # is a plain tensor split and touches no cache. Measured against a
+                # torch conv: max|err| 2.2 (|ref|max 2.9) with three calls,
+                # 7.8e-4 with one.
+                conv_out = causal_conv1d_fn(
+                    mixed_qkv_ns.transpose(0, 1),
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation="silu",
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=m,
+                ).transpose(0, 1)
+                q_ns, k_ns, v_ns = conv_out.split(
                     self.local_projection_size, dim=-1
                 )
-
-                # Separate convolution calls accept row-strided packed inputs
-                # and produce dense Q/K/V without an additional V copy.
-                def _prefill_conv(
-                    x: torch.Tensor,
-                    state: torch.Tensor,
-                    weight: torch.Tensor,
-                ) -> torch.Tensor:
-                    return causal_conv1d_fn(
-                        x.transpose(0, 1),
-                        weight,
-                        None,
-                        activation="silu",
-                        conv_states=state,
-                        has_initial_state=has_initial_state,
-                        cache_indices=non_spec_state_indices_tensor,
-                        query_start_loc=non_spec_query_start_loc,
-                        metadata=m,
-                    ).transpose(0, 1)
-
-                q_ns = _prefill_conv(q_ns, q_conv_state, q_conv_weight)
-                k_ns = _prefill_conv(k_ns, k_conv_state, k_conv_weight)
-                v_ns = _prefill_conv(v_ns, v_conv_state, v_conv_weight)
                 q_ns, k_ns, v_ns = (
                     rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
                     for x in (q_ns, k_ns, v_ns)
