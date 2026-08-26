@@ -210,6 +210,54 @@ def causal_conv1d_update(
     if indices.dtype != torch.int32:
         indices = indices.to(torch.int32)
 
+    # The kernel addresses slot s at `s * dim * state_len`, i.e. it assumes the
+    # slots are tightly packed. vLLM pads the mamba page (a slot's page also
+    # holds this layer's recurrent state, then alignment padding), so the real
+    # slot stride is larger -- 32x on K3. Every slot but 0 then lands inside a
+    # LOWER slot's page: reading fp32 recurrent bytes as fp16 yields canonical
+    # NaN (0x7e00), and the state write-back scribbles over another request's
+    # recurrent state. Hand the kernel the referenced slots tightly packed
+    # instead, copying whole slots so their bytes -- and therefore the byte
+    # convention shared with causal_conv1d_fwd -- are untouched.
+    slot_stride = conv_state.stride(0)
+    slot_elems = conv_state.shape[1] * conv_state.shape[2]
+    if slot_stride != slot_elems:
+        # `native` is the layout the cache was allocated in, where each slot is
+        # internally contiguous; gathering on the transposed view instead would
+        # reorder bytes into a different convention than the prefill writes.
+        native = (
+            conv_state
+            if conv_state.stride(-1) == 1
+            else conv_state.transpose(-1, -2)
+        )
+        # Padded decode lanes carry NULL_BLOCK_ID (0), a block the pool never
+        # hands out, so packing them along with the real slots only scribbles on
+        # that reserved slot. `clamp` keeps a -1 convention harmless too, and
+        # neither form syncs with the device -- `nonzero()` here would, once per
+        # layer per step.
+        sel = indices.clamp(min=0).long()
+        if sel.numel() < x.shape[0]:
+            # One index per fed row: a short index tensor would make the kernel
+            # read past the scratch instead of past the paged cache.
+            sel = torch.cat([sel, sel.new_zeros(x.shape[0] - sel.numel())])
+        scratch = native.index_select(0, sel)
+        packed = scratch if conv_state.stride(-1) == 1 else scratch.transpose(-1, -2)
+        kunlun_ops.causal_conv1d_update(
+            buf.unsqueeze(-1),
+            packed,
+            weight,
+            bias=b,
+            silu_activation=activation is not None,
+            cache_seqlens=None,
+            conv_state_indices=torch.arange(
+                x.shape[0], device=x.device, dtype=torch.int32
+            ),
+            is_ncw=True,
+            pad_slot_id=-1,
+        )
+        native.index_copy_(0, sel, scratch)
+        return buf
+
     kunlun_ops.causal_conv1d_update(
         buf.unsqueeze(-1),
         conv_state,
@@ -863,7 +911,7 @@ def fused_recurrent_kda(
                 qf, kf, vf, decay, beta, state, t, t + 1, result
             )
             slot = index_rows[i][t - begin]
-            if slot > 0:
+            if slot > 0:  # 0 is NULL_BLOCK_ID, where padded lanes are parked
                 initial_state[slot] = state.to(initial_state.dtype)
     if out is not None:
         out[0] = result.to(out.dtype)
