@@ -40,8 +40,7 @@ _MODULE_MAPPINGS = {
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
     "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
-    # "vllm.model_executor.models.config": "vllm_kunlun.models.config",
-    # "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
     # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
 }
 
@@ -200,6 +199,113 @@ def _activation_apply(mod):
 
 _register_post_import_hook(
     "vllm.model_executor.layers.activation", _activation_applied, _activation_apply
+)
+
+
+# --- hook 6: EagleProposer padded-batch helpers ---------------------------
+# EagleProposer 的 prepare_next_token_ids_padded / prepare_inputs_padded /
+# _update_positions_dependent_metadata
+def _eagle_applied(mod):
+    cls = getattr(mod, "EagleProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "prepare_next_token_ids_padded", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _eagle_apply(mod):
+    if not hasattr(mod, "EagleProposer"):
+        return
+    import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401  (self-applies on import)
+
+
+_register_post_import_hook("vllm.v1.spec_decode.eagle", _eagle_applied, _eagle_apply)
+
+
+# --- hook 7: SuffixDecodingProposer draft padding -------------------------
+# Suffix decoding proposes a dynamic number of draft tokens, which keeps the
+# verify batch non-uniform and therefore off the FULL cudagraph path. The
+# patch pads each draft to the speculation budget (enabled by default; disable
+# via VLLM_KUNLUN_SUFFIX_PAD_DRAFT=0). See
+# ``vllm_kunlun/v1/sample/spec_decode/suffix_decoding.py``.
+def _suffix_decoding_applied(mod):
+    cls = getattr(mod, "SuffixDecodingProposer", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "propose", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _suffix_decoding_apply(mod):
+    if not hasattr(mod, "SuffixDecodingProposer"):
+        return
+    import vllm_kunlun.v1.sample.spec_decode.suffix_decoding  # noqa: F401
+
+
+_register_post_import_hook(
+    "vllm.v1.spec_decode.suffix_decoding",
+    _suffix_decoding_applied,
+    _suffix_decoding_apply,
+)
+
+
+# --- hook 8: speculative Mamba state re-anchor ----------------------------
+# Use worker consumers as triggers instead of gpu_model_runner itself. A hook
+# targeting gpu_model_runner can run while that module is still being defined,
+# allowing its later class body to overwrite the patched method.
+def _gpu_model_runner_applied(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    cls = getattr(runner_mod, "GPUModelRunner", None)
+    if cls is None:
+        return False
+    fn = getattr(cls, "_prepare_inputs", None)
+    return fn is not None and getattr(fn, "_kunlun_spec_reanchor_patched", False)
+
+
+def _gpu_model_runner_apply(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if runner_mod is None or not hasattr(runner_mod, "GPUModelRunner"):
+        return
+    from vllm_kunlun.v1.worker.mamba_utils import patch_gpu_model_runner
+
+    patch_gpu_model_runner(runner_mod)
+
+
+for _runner_consumer in (
+    "vllm.v1.worker.gpu_worker",
+    "vllm.v1.worker.xpu_model_runner",
+):
+    _register_post_import_hook(
+        _runner_consumer,
+        _gpu_model_runner_applied,
+        _gpu_model_runner_apply,
+    )
+
+
+# --- hook 9: keep mamba groups out of EAGLE's extend-and-pop ----------------
+# The coordinator hands every "eagle group" one extra block of hit-search budget
+# expecting the manager to pop it; mamba groups cannot pop (popping removes the
+# GDN state block), and cancelling the extension inside the manager over-corrects
+# whenever the extension was clipped -- which is why a fixed correction helps one
+# model and breaks another. See vllm_kunlun/v1/core/mamba_prefix_hit.py.
+def _mamba_prefix_hit_applied(mod):
+    cls = getattr(mod, "KVCacheCoordinator", None)
+    if cls is None:
+        return True
+    fn = getattr(cls, "__init__", None)
+    return fn is not None and getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _mamba_prefix_hit_apply(mod):
+    if not hasattr(mod, "KVCacheCoordinator"):
+        return
+    import vllm_kunlun.v1.core.mamba_prefix_hit  # noqa: F401  (self-applies)
+
+
+_register_post_import_hook(
+    "vllm.v1.core.kv_cache_coordinator",
+    _mamba_prefix_hit_applied,
+    _mamba_prefix_hit_apply,
 )
 
 

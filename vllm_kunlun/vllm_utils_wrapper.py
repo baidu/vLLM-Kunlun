@@ -1,19 +1,20 @@
 """vllm_utils_wrapper.py"""
 
 import socket
+import sys
 from types import SimpleNamespace
-from typing import Any, Union
+from typing import Any
 
 import torch
-import vllm.distributed.parallel_state as parallel_state
-import vllm.envs as envs
 import vllm.utils as _orig
+from vllm import envs
+from vllm.distributed import parallel_state
 
 try:
     import vllm_kunlun._kunlun  # noqa: F401
 except ImportError as e:
     try:
-        from . import _kunlun  # noqa: F401, F403
+        from . import _kunlun  # noqa: F401
     except ImportError:
         print(f"Warning: Failed to load vllm_kunlun native extension: {e}")
 
@@ -32,8 +33,8 @@ def vllm_kunlun_weak_ref_tensor(tensor: Any) -> Any:
 
 
 def vllm_kunlun_weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]],
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
+    tensors: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor],
+) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
     for single tensor, list of tensors or tuple of tensors.
@@ -69,8 +70,6 @@ _wrapped.weak_ref_tensor = vllm_kunlun_weak_ref_tensor
 _wrapped.weak_ref_tensors = vllm_kunlun_weak_ref_tensors
 _wrapped._get_open_port = _get_open_port
 
-import sys  # noqa: E402
-
 sys.modules["vllm.utils"] = _wrapped
 
 _original_all_reduce = parallel_state.GroupCoordinator.all_reduce
@@ -104,9 +103,10 @@ def vllm_kunlun_all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.T
     output_tensor = torch.empty(
         (world_size,) + input_size, dtype=input_.dtype, device=input_.device
     )
+    cast_output_tensor = output_tensor.view(-1, input_.shape[-1])  # for cudagraph
     # All-gather.
     torch.distributed.all_gather_into_tensor(
-        output_tensor, input_, group=self.device_group
+        cast_output_tensor, input_, group=self.device_group
     )
     # Reshape
     output_tensor = output_tensor.movedim(0, dim)

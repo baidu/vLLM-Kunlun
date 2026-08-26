@@ -12,10 +12,45 @@ hook is installed, ensuring upstream is loaded first.
 """
 
 import logging
+import sys
+from collections import defaultdict
 
+import vllm.v1.worker.utils as _upstream_utils
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.worker.utils import KVBlockZeroer as _upstream_cls
 
 logger = logging.getLogger("vllm_kunlun")
+
+
+def _bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module=1):
+    """Kunlun replacement for ``vllm.v1.worker.utils.bind_kv_cache``.
+
+    Identical to upstream except the multi-layer-per-index branch does not
+    raise on Kunlun (OOT platform). Upstream only ``pass``es this branch for
+    cuda/xpu/cpu because ``runner_kv_caches`` is not consumed in a way that
+    is impacted by the ordering. Kunlun's GPU-style runner has the same
+    property, so raising ``NotImplementedError`` here is spurious.
+
+    This branch is hit by hybrid + MTP models (e.g. Qwen3.5): a target
+    ``linear_attn`` layer and the MTP draft ``self_attn`` layer can share the
+    same ``extract_layer_index`` value (both 0).
+    """
+    assert len(runner_kv_caches) == 0
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        layer_names = index2name[layer_index]
+        # NOTE(kunlun): upstream raises NotImplementedError here for non
+        # cuda/xpu/cpu platforms. Kunlun's runner is unaffected by the
+        # multi-name-per-index case, so we simply keep all of them.
+        for layer_name in layer_names:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
 
 
 def _init_meta(
@@ -135,4 +170,30 @@ if not getattr(_upstream_cls, "_kunlun_patched", False):
     _upstream_cls._kunlun_patched = True
     logger.info(
         "[KunlunPlugin] KVBlockZeroer patched in vllm_kunlun/v1/worker/utils.py"
+    )
+
+
+# Patch bind_kv_cache. It is imported by-name at the top of
+# ``vllm.v1.worker.gpu_model_runner`` (``from ... import bind_kv_cache``), so
+# patching the upstream module attribute alone is not enough -- we must also
+# rebind the name in every already-imported consumer module.
+if not getattr(_upstream_utils.bind_kv_cache, "_kunlun_patched", False):
+    _original_bind = _upstream_utils.bind_kv_cache
+    _bind_kv_cache._kunlun_patched = True  # type: ignore[attr-defined]
+    _upstream_utils.bind_kv_cache = _bind_kv_cache
+
+    rebind_count = 0
+    for module in list(sys.modules.values()):
+        if module is None or module is _upstream_utils:
+            continue
+        if getattr(module, "bind_kv_cache", None) is _original_bind:
+            try:
+                module.bind_kv_cache = _bind_kv_cache
+                rebind_count += 1
+            except Exception:
+                pass
+    logger.info(
+        "[KunlunPlugin] bind_kv_cache patched in "
+        "vllm_kunlun/v1/worker/utils.py, rebound=%s",
+        rebind_count,
     )

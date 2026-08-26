@@ -5,7 +5,7 @@ def register_model():
 
     # TODO Remove all of models registration below
 
-    # from .demo_model import DemoModel  # noqa: F401
+    # from .demo_model import DemoModel
 
     # ModelRegistry.register_model(
     #     "DemoModel",
@@ -110,6 +110,16 @@ def register_model():
     ModelRegistry.register_model(
         "Gemma4ForConditionalGeneration",
         "vllm_kunlun.models.gemma4_mm:Gemma4ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MTP",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen3_5MoeMTP",
+        "vllm_kunlun.models.qwen3_5_mtp:Qwen3_5MoeMTP",
     )
 
 

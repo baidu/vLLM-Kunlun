@@ -67,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
@@ -106,7 +107,6 @@ from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
-
 
 
 @torch.compile(dynamic=True, backend="aot_eager")
@@ -266,7 +266,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype, self.cache_config.mamba_ssm_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -562,7 +564,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         if attn_metadata is None:
             # V1 profile run
             return
-
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -572,11 +573,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
-        spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
+        spec_conv_state_indices_tensor = attn_metadata.spec_conv_state_indices_tensor
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
         non_spec_state_indices_tensor_cpu = (
             attn_metadata.non_spec_state_indices_tensor_cpu
         )
@@ -585,7 +586,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
-
+        spec_pad_gather_idx = attn_metadata.spec_pad_gather_idx
+        spec_unpad_idx = attn_metadata.spec_unpad_idx
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
@@ -600,41 +602,45 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
             else:
-                mixed_qkv_spec = mixed_qkv[spec_token_masks]
-                mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
+                # mixed_qkv_spec = mixed_qkv[spec_token_masks]
+                # mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            assert spec_state_indices_tensor is not None
+            actual_num = attn_metadata.num_spec_decodes * spec_state_indices_tensor.size(-1)
+            if spec_pad_gather_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_pad_gather_idx)
             mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
+                mixed_qkv_spec[:actual_num],
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
-                    : attn_metadata.num_spec_decodes
+                conv_state_indices=spec_conv_state_indices_tensor[
+                    :attn_metadata.num_spec_decodes
                 ],
-                num_accepted_tokens=num_accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens[:attn_metadata.num_spec_decodes],
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
-
-        # 1.2: Process the remaining part
+            if spec_unpad_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_unpad_idx)
         if attn_metadata.num_prefills > 0:
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "state_indices_tensor"
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec,
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
                 conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                has_initial_state_cpu=has_initial_state_cpu,
+                has_initial_state=has_initial_state.to(torch.int32),
+                has_initial_state_cpu=has_initial_state_cpu.to(torch.int32),
                 cache_indices=non_spec_state_indices_tensor,
                 cache_indices_cpu=non_spec_state_indices_tensor_cpu,
                 query_start_loc=non_spec_query_start_loc,
@@ -649,10 +655,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_decodes
+                    : attn_metadata.num_actual_tokens
                 ],
                 conv_state_indices_cpu=non_spec_state_indices_tensor_cpu[
-                    : attn_metadata.num_decodes
+                    : attn_metadata.num_actual_tokens
                 ],
                 validate_data=True,
             )
@@ -676,10 +682,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 g_non_spec = None
                 beta_non_spec = None
             else:
-                g_spec = g[:, spec_token_masks]
-                beta_spec = beta[:, spec_token_masks]
-                g_non_spec = g[:, ~spec_token_masks]
-                beta_non_spec = beta[:, ~spec_token_masks]
+                # g_spec = g[:, spec_token_masks]
+                # beta_spec = beta[:, spec_token_masks]
+                # g_non_spec = g[:, ~spec_token_masks]
+                # beta_non_spec = beta[:, ~spec_token_masks]
+                g_spec = g.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                g_non_spec = g.index_select(1, non_spec_token_indx)
+                beta_non_spec = beta.index_select(1, non_spec_token_indx)
         else:
             g_spec = None
             beta_spec = None
@@ -690,18 +700,28 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                q=query_spec,
-                k=key_spec,
-                v=value_spec,
-                g=g_spec,
-                beta=beta_spec,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                ssm_state_indices=spec_state_indices_tensor,
-                num_accepted_tokens=num_accepted_tokens,
-                use_qk_l2norm_in_kernel=True,
+            spec_len = (
+                attn_metadata.num_spec_decode_tokens
+                if spec_unpad_idx is not None
+                else actual_num
+            )
+            core_attn_out_spec, last_recurrent_state = (
+                fused_recurrent_gated_delta_rule(
+                    q=query_spec[:, :spec_len],
+                    k=key_spec[:, :spec_len],
+                    v=value_spec[:, :spec_len],
+                    g=g_spec[:, :spec_len],
+                    beta=beta_spec[:, :spec_len],
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_spec_decodes
+                        + 1  # type: ignore[attr-defined]
+                    ],
+                    ssm_state_indices=spec_state_indices_tensor[:attn_metadata.num_spec_decodes],
+                    num_accepted_tokens=num_accepted_tokens[:attn_metadata.num_spec_decodes],
+                    use_qk_l2norm_in_kernel=True,
+                )
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
@@ -711,36 +731,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             # initial_state = ssm_state[non_spec_state_indices_tensor]
             # initial_state[~has_initial_state] = 0
             # initial_state = initial_state.transpose(-1, -2).contiguous()
-            slot_mapping = torch.full(
-                (ssm_state.shape[0],), -1, dtype=torch.int32, device=ssm_state.device,
-            )
-            slot_mapping[non_spec_state_indices_tensor] = torch.arange(
-                len(non_spec_state_indices_tensor), dtype=torch.int32, device=ssm_state.device,
-            )
 
-            initial_state_shape = (
-                non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
-            )
-            initial_state = torch.empty(
-                initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
-            )
-            initial_state = initial_state.view(
-                initial_state.shape[0], 1, -1, initial_state.shape[-1]
-            )
-            cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
+            initial_state_shape = non_spec_state_indices_tensor.shape + ssm_state.shape[1: ]
+            initial_state = torch.zeros(initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device)
+            grep_non_spec_state_indices_tensor = non_spec_state_indices_tensor[has_initial_state]
+            if grep_non_spec_state_indices_tensor.shape[0] != 0:
+                slot_mapping = torch.full((ssm_state.shape[0],), -1, dtype=torch.int32, device="cuda")
+                slot_mapping[grep_non_spec_state_indices_tensor] = torch.arange(len(grep_non_spec_state_indices_tensor),dtype=torch.int32,device="cuda")
+                initial_state = initial_state.view(initial_state.shape[0], 1, -1, initial_state.shape[-1])
+                cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
+                kunlun_ops.reshape_and_cache_flash(
+                                    cast_ssm_state,
+                                    cast_ssm_state,
+                                    initial_state,
+                                    initial_state,
+                                    slot_mapping)
+                initial_state = initial_state.view(initial_state_shape)
 
-            kunlun_ops.reshape_and_cache_flash(
-                cast_ssm_state,
-                cast_ssm_state,
-                initial_state,
-                initial_state,
-                slot_mapping,
-            )
-            initial_state = initial_state.view(initial_state_shape)
-
-            initial_state = initial_state * has_initial_state.view(
-                has_initial_state.shape[0], 1, 1, 1
-            )
             initial_state = initial_state.transpose(-1, -2).contiguous()
 
             (
@@ -756,6 +763,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens_cpu=non_spec_query_start_loc_cpu,
             )
             # Init cache
             # ssm_state[non_spec_state_indices_tensor] = (
@@ -811,7 +819,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            spec_out = core_attn_out_spec.squeeze(0)
+            core_attn_out[: spec_out.shape[0]] = spec_out
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
@@ -1124,7 +1133,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextModel(nn.Module):
+class Qwen3NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1171,7 +1180,7 @@ class Qwen3NextModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1183,11 +1192,18 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -1195,6 +1211,8 @@ class Qwen3NextModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1420,7 +1438,9 @@ class Qwen3NextForCausalLM(
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod

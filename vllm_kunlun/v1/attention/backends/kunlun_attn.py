@@ -16,22 +16,14 @@
 #
 import copy
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-    Type,
-    TypeVar,
-)
+from itertools import accumulate  # noqa: F401  (kept: used elsewhere in file)
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, TypeVar
 
 import kunlun_ops
 import numpy as np
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -54,6 +46,8 @@ import inspect
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
 
 
 class KunlunAttentionBackend(AttentionBackend):
@@ -79,17 +73,17 @@ class KunlunAttentionBackend(AttentionBackend):
         return "CUSTOM"
 
     @staticmethod
-    def get_impl_cls() -> Type["KunlunAttentionImpl"]:
+    def get_impl_cls() -> type["KunlunAttentionImpl"]:
         """get_impl_cls"""
         return KunlunAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> Type["KunlunMetadata"]:
+    def get_metadata_cls() -> type["KunlunMetadata"]:
         """get_metadata_cls"""
         return KunlunMetadata
 
     @staticmethod
-    def get_builder_cls() -> Type["KunlunAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type["KunlunAttentionMetadataBuilder"]:
         """get_builder_cls"""
         return KunlunAttentionMetadataBuilder
 
@@ -100,7 +94,7 @@ class KunlunAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
         cache_dtype_str: str = "auto",
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         """get_kv_cache_shape"""
         # return (2, num_blocks, block_size, num_kv_heads * head_size)
         return PagedAttention.get_kv_cache_shape(
@@ -109,8 +103,8 @@ class KunlunAttentionBackend(AttentionBackend):
 
     @staticmethod
     def swap_blocks(
-        src_kv_cache: List[torch.Tensor],
-        dst_kv_cache: List[torch.Tensor],
+        src_kv_cache: list[torch.Tensor],
+        dst_kv_cache: list[torch.Tensor],
         src_to_dst: torch.Tensor,
     ) -> None:
         """swap_blocks"""
@@ -118,7 +112,7 @@ class KunlunAttentionBackend(AttentionBackend):
 
     @staticmethod
     def copy_blocks(
-        kv_caches: List[torch.Tensor],
+        kv_caches: list[torch.Tensor],
         src_to_dists: torch.Tensor,
     ) -> None:
         """copy_blocks"""
@@ -137,7 +131,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     #                                   |-- query_len ---|
 
     # seq_lens stored as a tensor.
-    seq_lens_tensor: Optional[torch.Tensor]
+    seq_lens_tensor: torch.Tensor | None
 
     # FIXME: It is for flash attn.
     # Maximum sequence length among prefill batch. 0 if there are decoding
@@ -155,42 +149,42 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     slot_mapping: torch.Tensor
     block_tables: torch.Tensor
 
-    multi_modal_placeholder_index_maps: Optional[torch.Tensor] = None
+    multi_modal_placeholder_index_maps: torch.Tensor | None = None
     # (batch_size,). The sequence length per sequence. Sequence length means
     # the computed tokens + new tokens None if it is a decoding.
-    seq_lens: Optional[List[int]] = None
+    seq_lens: list[int] | None = None
 
     # FIXME: It is for flash attn.
     # (batch_size + 1,). The cumulative sequence lengths of the sequences in
     # the batch, used to index into sequence. E.g., if the sequence length is
     # [4, 6], it is [0, 4, 10].
-    seq_start_loc: Optional[torch.Tensor] = None
+    seq_start_loc: torch.Tensor | None = None
 
     # Prefix cache loc
-    kv_lod_cpu: Optional[torch.Tensor] = None
-    kv_lod_xpu: Optional[torch.Tensor] = None
+    kv_lod_cpu: torch.Tensor | None = None
+    kv_lod_xpu: torch.Tensor | None = None
 
     # (batch_size,) A tensor of context lengths (tokens that are computed
     # so far).
-    context_lens_tensor: Optional[torch.Tensor] = None
+    context_lens_tensor: torch.Tensor | None = None
 
     # Maximum query length in the batch. None for decoding.
-    max_query_len: Optional[int] = None
+    max_query_len: int | None = None
 
     # Max number of key/value length in the batch, especially for prefix cache
-    max_kv_len: Optional[int] = None
+    max_kv_len: int | None = None
 
     # Max number of query tokens among request in the batch.
-    max_decode_query_len: Optional[int] = None
+    max_decode_query_len: int | None = None
 
     # (batch_size + 1,). The cumulative subquery lengths of the sequences in
     # the batch, used to index into subquery. E.g., if the subquery length
     # is [4, 6], it is [0, 4, 10].
-    query_start_loc: Optional[torch.Tensor] = None
-    query_start_loc_host: Optional[torch.Tensor] = None
+    query_start_loc: torch.Tensor | None = None
+    query_start_loc_host: torch.Tensor | None = None
     # serve only for prefix cache
-    kv_prefix_start_loc_host: Optional[torch.Tensor] = None
-    kv_prefix_start_loc: Optional[torch.Tensor] = None
+    kv_prefix_start_loc_host: torch.Tensor | None = None
+    kv_prefix_start_loc: torch.Tensor | None = None
 
     # Self-attention prefill/decode metadata cache
     _cached_prefill_metadata: Optional["KunlunMetadata"] = None
@@ -199,41 +193,41 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     # Begin encoder attn & enc/dec cross-attn fields...
 
     # Encoder sequence lengths representation
-    encoder_seq_lens: Optional[List[int]] = None
-    encoder_seq_lens_tensor: Optional[torch.Tensor] = None
+    encoder_seq_lens: list[int] | None = None
+    encoder_seq_lens_tensor: torch.Tensor | None = None
 
     # Maximum sequence length among encoder sequences
-    max_encoder_seq_len: Optional[int] = None
+    max_encoder_seq_len: int | None = None
 
     # Number of tokens input to encoder
-    num_encoder_tokens: Optional[int] = None
+    num_encoder_tokens: int | None = None
 
-    enable_kv_scales_calculation: Optional[bool] = False
+    enable_kv_scales_calculation: bool | None = False
     # Cross-attention memory-mapping data structures: slot mapping
     # and block tables
-    cross_slot_mapping: Optional[torch.Tensor] = None
-    cross_block_tables: Optional[torch.Tensor] = None
+    cross_slot_mapping: torch.Tensor | None = None
+    cross_block_tables: torch.Tensor | None = None
 
     # Input positions for rotrary embeddings since for MLA the rotary
     # position embeddings are applied inside the attention backend
-    input_positions: Optional[torch.Tensor] = None
+    input_positions: torch.Tensor | None = None
 
-    use_cascade: Optional[bool] = False
+    use_cascade: bool | None = False
 
-    seq_lens_tensor_cpu: Optional[torch.Tensor] = None
+    seq_lens_tensor_cpu: torch.Tensor | None = None
 
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
     num_decodes: int = 0
-    is_speculative: Optional[bool] = False
+    is_speculative: bool | None = False
     max_model_len: int = 0
 
     def __post_init__(self):
         """__post_init__"""
-        self.attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
-        self.encoder_attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
-        self.cross_attn_bias: Optional[List["AttentionBias"]] = None  # noqa: F821
+        self.attn_bias: list[AttentionBias] | None = None  # noqa: F821
+        self.encoder_attn_bias: list[AttentionBias] | None = None  # noqa: F821
+        self.cross_attn_bias: list[AttentionBias] | None = None  # noqa: F821
 
     @property
     def is_all_encoder_attn_metadata_set(self):
@@ -448,7 +442,7 @@ class KunlunAttentionMetadataBuilder:
     """KunlunAttentionMetadataBuilder"""
 
     # _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-    reorder_batch_threshold: ClassVar[Optional[int]] = 1
+    reorder_batch_threshold: ClassVar[int | None] = 1
     _cudagraph_support = (
         AttentionCGSupport.ALWAYS
         if get_flash_attn_version() == 3
@@ -478,6 +472,47 @@ class KunlunAttentionMetadataBuilder:
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+
+        # [Kunlun] Persistent per-step metadata buffers.
+        #
+        # ``build()`` used to allocate every tensor it hands to the kernel on
+        # each call. At batch 1 those allocations + H2D copies are the whole
+        # cost: profiling one MTP step showed this builder issuing 135 eager op
+        # dispatches (~1.6ms) while doing no GPU compute at all, and it runs
+        # once per attention group per forward (target *and* each draft step).
+        # Reusing buffers also makes the metadata addresses stable, which is a
+        # prerequisite for ever capturing the drafter in a cudagraph.
+        self._max_reqs = vllm_config.scheduler_config.max_num_seqs
+        self._buf_cache: dict[tuple[str, torch.dtype, str], torch.Tensor] = {}
+
+    def _staged(
+        self,
+        key: str,
+        src: torch.Tensor,
+        num: int,
+        device: torch.device | str,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Copy ``src[:num]`` into a persistent buffer and return the view.
+
+        Grows on demand; keyed by (name, dtype, device) so a dtype change cannot
+        silently truncate values. Pass ``dtype`` when the *source* dtype is not
+        stable across callers, otherwise one field gets two buffers and two
+        addresses: the drafter's ``query_start_loc_cpu`` is int32 on the first
+        pass (the runner's CpuGpuBuffer) but int64 inside the draft loop, where
+        upstream rebuilds it from an unannotated ``np.arange``
+        (llm_base_proposer.py). ``copy_`` casts, so fixing the dtype here also
+        normalizes what the kernels receive -- they document these lods as int32.
+        """
+        dtype = dtype or src.dtype
+        ck = (key, dtype, str(device))
+        buf = self._buf_cache.get(ck)
+        if buf is None or buf.numel() < num:
+            buf = torch.empty(max(num, self._max_reqs + 1), dtype=dtype, device=device)
+            self._buf_cache[ck] = buf
+        out = buf[:num]
+        out.copy_(src[:num], non_blocking=True)
+        return out
 
     def _init_reorder_batch_threshold(
         self,
@@ -584,6 +619,20 @@ class KunlunAttentionMetadataBuilder:
             common_attn_metadata=common_attn_metadata,
         )
 
+    def _staged_kv_lod(self, seq_lens_cpu: torch.Tensor, num_reqs: int) -> torch.Tensor:
+        """``[0, cumsum(seq_lens)]`` on the host, in a persistent int32 buffer."""
+        ck = ("kv_lod_cpu", torch.int32, "cpu")
+        buf = self._buf_cache.get(ck)
+        if buf is None or buf.numel() < num_reqs + 1:
+            buf = torch.zeros(
+                max(num_reqs + 1, self._max_reqs + 1), dtype=torch.int32, device="cpu"
+            )
+            self._buf_cache[ck] = buf
+        out = buf[: num_reqs + 1]
+        out[0] = 0
+        torch.cumsum(seq_lens_cpu[:num_reqs].to(torch.int32), dim=0, out=out[1:])
+        return out
+
     def build(
         self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -595,17 +644,46 @@ class KunlunAttentionMetadataBuilder:
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
+        # The host mirrors go through persistent buffers as well, not just the
+        # device copies: upstream hands the drafter a freshly ``clone()``d
+        # ``query_start_loc_cpu`` on every step (llm_base_proposer.py) and
+        # ``seq_lens_cpu`` is a lazy property that redoes the D2H allocation
+        # whenever ``_seq_lens_cpu`` is None, so both moved every step. The
+        # kernels read these host mirrors directly (``context_qlen_lod_cpu`` /
+        # ``context_lens_cpu``), and stable addresses are a prerequisite for
+        # capturing the drafter in a cudagraph.
+        query_start_loc_host = self._staged(
+            "query_start_loc_host",
+            common_attn_metadata.query_start_loc_cpu,
+            num_reqs + 1,
+            "cpu",
+            torch.int32,
+        )
+        query_start_loc = self._staged(
+            "query_start_loc",
+            query_start_loc_host,
+            num_reqs + 1,
+            self.device,
+            torch.int32,
         )
 
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        seq_lens_cpu = self._staged(
+            "seq_lens_cpu",
+            common_attn_metadata.seq_lens_cpu,
+            num_reqs,
+            "cpu",
+            torch.int32,
+        )
 
-        kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
-        kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-        kv_lod_xpu = kv_lod_cpu.to(self.device)
+        # NOTE: a ``list(accumulate(seq_lens, ...))`` used to be computed here and
+        # dropped on the floor -- ``seq_start_loc`` is not a field this builder
+        # passes to KunlunMetadata. Iterating ``seq_lens`` (a *device* tensor) in
+        # Python cost one device sync per request, so it was the most expensive
+        # line in the builder while producing nothing. kv_lod below is the same
+        # prefix sum, computed on the host mirror.
+        kv_lod_cpu = self._staged_kv_lod(seq_lens_cpu, num_reqs)
+        kv_lod_xpu = self._staged("kv_lod_xpu", kv_lod_cpu, num_reqs + 1, self.device)
 
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -616,9 +694,7 @@ class KunlunAttentionMetadataBuilder:
             )
         )
 
-        num_scheduled_tokens = np.diff(
-            common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        )
+        num_scheduled_tokens = np.diff(query_start_loc_host)
         tmp_decode_scheduled_tokens = num_scheduled_tokens[:num_decodes]
 
         if num_decode_tokens == 0:
@@ -689,22 +765,42 @@ class KunlunAttentionMetadataBuilder:
 class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
     """KunlunAttentionImpl"""
 
+    @staticmethod
+    def _get_block_table_scale(key_cache: torch.Tensor) -> int:
+        contiguous_block_stride = (
+            key_cache.shape[1] * key_cache.shape[2] * key_cache.shape[3]
+        )
+        actual_block_stride = key_cache.stride(0)
+        if actual_block_stride == contiguous_block_stride:
+            return 1
+        if actual_block_stride % contiguous_block_stride != 0:
+            logger.warning(
+                "[KunlunAttention] unexpected KV cache block stride: "
+                "actual=%s contiguous=%s shape=%s stride=%s",
+                actual_block_stride,
+                contiguous_block_stride,
+                tuple(key_cache.shape),
+                tuple(key_cache.stride()),
+            )
+            return 1
+        return actual_block_stride // contiguous_block_stride
+
     def __init__(
         self,
         num_heads: int,
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        alibi_slopes: Optional[List[float]],
-        sliding_window: Optional[int],
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
         kv_cache_dtype: str,
-        blocksparse_params: Optional[Dict[str, Any]] = None,
-        logits_soft_cap: Optional[float] = None,
-        kv_sharing_target_layer_name: Optional[str] = None,
+        blocksparse_params: dict[str, Any] | None = None,
+        logits_soft_cap: float | None = None,
+        kv_sharing_target_layer_name: str | None = None,
         attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
-        sinks: Optional[torch.Tensor] = None,
-        multi_modal_placeholder_index_maps: Optional[torch.Tensor] = None,
+        sinks: torch.Tensor | None = None,
+        multi_modal_placeholder_index_maps: torch.Tensor | None = None,
     ) -> None:
         """__init__"""
         if blocksparse_params is not None:
@@ -745,16 +841,16 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         self,
         layer: AttentionLayer,
         query: torch.Tensor,
-        key: Optional[torch.Tensor],
-        value: Optional[torch.Tensor],
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         kv_cache: torch.Tensor,
-        attn_metadata: Optional[KunlunMetadata],
+        attn_metadata: KunlunMetadata | None,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         attn_type: AttentionType = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
-        output_scale: Optional[torch.Tensor] = None,
-        output_block_scale: Optional[torch.Tensor] = None,
+        output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """forward"""
         query = query.view(-1, self.num_heads, self.head_size)
@@ -794,7 +890,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     # and value tensors are not cached. This happens during
                     # the initial memory
                     value = value.contiguous()
-                    key = key.contiguous()
                     kunlun_ops.reshape_and_cache_flash(
                         key[: attn_metadata.num_actual_tokens],
                         value[: attn_metadata.num_actual_tokens],
@@ -822,23 +917,18 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             #   score = Q @ K^T * (1/sqrt(d)) * alpha
             # We want: score = Q @ K^T * self.scale
             # So: alpha = self.scale * sqrt(d) = self.scale / (1/sqrt(d))
-            import math
+            # import math
 
-            _prefill_alpha = self.scale * math.sqrt(self.head_size)
+            # _prefill_alpha = self.scale * math.sqrt(self.head_size)
 
-            # For hybrid Attention (Qwen3-Next.)
-            if key_cache.is_contiguous():
-                tmp_block_tables = prefill_meta.block_tables
-            else:
-                # For hybrid Attention (Qwen3-Next)
-                tmp_block_tables = prefill_meta.block_tables * 2
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = prefill_meta.block_tables * block_table_scale
 
             # Prefix cache or KV sharing layers (must read K/V from cache)
-            is_kv_sharing = self.kv_sharing_target_layer_name is not None
-            if (
-                is_kv_sharing
-                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
-            ):
+            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=key_cache,  # Key Cache [block_num, head, block_size, dim]
@@ -846,7 +936,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     is_prefix_cache=True,
-                    alpha=_prefill_alpha,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -869,7 +958,6 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
-                    alpha=_prefill_alpha,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -889,13 +977,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             ), "Encoder-only models should not have decode metadata."
             decode_query = query[:num_decode_tokens]
 
-            # For hybrid Attention (Qwen3-Next
-            if key_cache.is_contiguous():
-                tmp_block_tables = decode_meta.block_tables
-            else:
-                tmp_block_tables = (
-                    decode_meta.block_tables * 2
-                )  # only test in Qwen3-Next
+            # For hybrid/packed attention, Kunlun kernels assume contiguous
+            # block stride. Scale logical block ids to match the actual
+            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            block_table_scale = self._get_block_table_scale(key_cache)
+            tmp_block_tables = decode_meta.block_tables * block_table_scale
 
             has_max_window_size = getattr(self, "_spec_attn_has_max_window_size", None)
             if has_max_window_size is None:
@@ -903,36 +989,80 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     "max_window_size"
                     in inspect.signature(kunlun_ops.speculative_attention).parameters
                 )
-                setattr(self, "_spec_attn_has_max_window_size", has_max_window_size)
+                self._spec_attn_has_max_window_size = has_max_window_size
+
+            # NOTE: use the cached flag. ``inspect.signature`` on this op costs
+            # ~47us and used to run here on every decode forward of every layer
+            # (the cache above was computed and then ignored), i.e. ~1.3ms per
+            # step at 28 layers, all of it pure host overhead.
             if has_max_window_size:
-                # kunlun_ops.speculative_attention is not support max_window_size parameter in torch29
-                kunlun_ops.speculative_attention(
-                    out=output[:num_decode_tokens],
-                    # Only MLA support q len > 1 right now
-                    q=decode_query.unsqueeze(0),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                    context_lens_xpu=decode_meta.seq_lens_tensor,
-                    batch_num=decode_meta.block_tables.shape[0],
-                    # TODO (@xyDong23): Support MTP(q lens >1)
-                    qlen=1,
-                    # TODO (@xyDong23): Support max_context_len to (262144)
-                    max_context_len=decode_meta.max_model_len,
-                    head_num=self.num_heads,
-                    head_dim=self.head_size,
-                    scale=self.scale,
-                    kv_head_num=self.num_kv_heads,
-                    block_size=key_cache.shape[2],
-                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
-                    max_window_size=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    block_tables=tmp_block_tables,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
-                )
+                batch_size = attn_metadata.num_decodes
+                query_seq_len, head_num, head_dim = decode_query.shape
+                if (
+                    not attn_metadata.is_speculative
+                    or batch_size == 0
+                    or query_seq_len == batch_size
+                ):
+                    kunlun_ops.speculative_attention(
+                        out=output[:num_decode_tokens],
+                        q=decode_query.unsqueeze(0),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        batch_num=decode_meta.block_tables.shape[0],
+                        qlen=1,
+                        max_context_len=decode_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=0.0,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                        max_window_size=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        block_tables=tmp_block_tables,
+                        sink=(
+                            self.sinks.to(torch.float32)
+                            if self.sinks is not None
+                            else None
+                        ),
+                    )
+                else:
+                    assert query_seq_len % batch_size == 0
+                    qlen = query_seq_len // batch_size
+                    out = output[:num_decode_tokens]
+                    kunlun_ops.speculative_attention(
+                        out=out.view(batch_size, qlen, head_num, self.head_size),
+                        q=decode_query.view(batch_size, qlen, head_num, head_dim),
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                        context_lens_xpu=decode_meta.seq_lens_tensor,
+                        batch_num=batch_size,
+                        qlen=qlen,
+                        max_context_len=decode_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=0.0,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                        max_window_size=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        block_tables=tmp_block_tables,
+                        sink=(
+                            self.sinks.to(torch.float32)
+                            if self.sinks is not None
+                            else None
+                        ),
+                    )
             elif not attn_metadata.is_speculative:
                 kunlun_ops.paged_attention(
                     x=decode_query,
@@ -972,6 +1102,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
                     block_tables=tmp_block_tables,
                 )
+
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
