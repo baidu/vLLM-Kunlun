@@ -722,48 +722,15 @@ class KunlunOps:
             M * moe_top_k, dtype=torch.int32, device=hidden_states.device
         )
 
-        if global_num_experts <= 512:
-            torch.ops._C.moe_pre_sorted(
-                x=hidden_states,
-                topk_index=topk_ids,
-                block_statistic=block_statistic,
-                moe_expand=moe_expand,
-                moe_index=sorted_tokens_idx,
-                expert_m=expert_m,
-                sorted_tokens_num_lod=sorted_tokens_num_lod,
-            )
-        else:
-            # The `moe_pre_sorted` (moe_ffn_pre_sorted) XPU kernel also only
-            # supports up to 512 experts (fails with ret=2 otherwise). Replicate
-            # its "sort token-expert assignments by expert id" behavior in torch.
-            # Verified bit-exact against the kernel for E<=512.
-            _flat_expert = topk_ids.reshape(-1).to(torch.int64)  # [M*moe_top_k]
-            _order = torch.argsort(_flat_expert, stable=True)    # sorted pos -> flat id
-            _tok = _order // moe_top_k
-            moe_expand.copy_(hidden_states.index_select(0, _tok))
-            # moe_index is the inverse permutation: flat id -> sorted position
-            _inv = torch.empty_like(_order)
-            _inv[_order] = torch.arange(_order.numel(), device=_order.device)
-            sorted_tokens_idx.copy_(_inv.to(sorted_tokens_idx.dtype))
-            # ``torch.bincount`` is unusable here: inside the XCCL/TP context it
-            # aborts with a bogus "tried to allocate more than 1EB" OOM even for
-            # small, in-range inputs (probed: min=26 max=869 for E=896).
-            # ``scatter_add_`` is equivalent when every index is within [0, E),
-            # which topk guarantees, and needs no max-scan or dynamic allocation.
-            _cnt = torch.zeros(
-                global_num_experts, dtype=torch.int64, device=_flat_expert.device
-            )
-            _cnt.scatter_add_(0, _flat_expert, torch.ones_like(_flat_expert))
-            _cnt = _cnt.to(torch.int32)
-            expert_m.copy_(_cnt)
-            sorted_tokens_num_lod.copy_(
-                torch.cat(
-                    [
-                        torch.zeros(1, dtype=torch.int32, device=_cnt.device),
-                        torch.cumsum(_cnt, 0, dtype=torch.int32),
-                    ]
-                )
-            )
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
         del expert_m, block_statistic  # Release after moe_pre_sorted
 
         # First FC layer (w13) - use preprocessed weights directly
