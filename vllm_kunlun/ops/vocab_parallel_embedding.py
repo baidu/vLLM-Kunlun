@@ -106,29 +106,47 @@ class KunlunVocabParallelEmbedding(VocabParallelEmbedding):
         forward_native/forward_oot dispatch (that mechanism only exists on
         CustomOp). forward() must be overridden directly, or this
         implementation is never invoked.
+
+        xspeedgate_ops.get_masked_input_and_mask only accepts a 1D int32
+        tensor, while callers may pass any shape and int64 ids, so normalize
+        on the way in and restore shape/dtype on the way out.
         """
+        orig_shape = input_.shape
+        flat_input = input_ if input_.dim() == 1 else input_.reshape(-1)
+
+        input_mask = None
         if self.tp_size > 1:
+            op_input = (
+                flat_input
+                if flat_input.dtype == torch.int32
+                else flat_input.to(torch.int32)
+            )
             # Build the mask using compiled function
             masked_input, input_mask = get_masked_input_and_mask(
-                input_,
+                op_input,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
                 self.shard_indices.num_org_vocab_padding,
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
+            if masked_input.dtype != flat_input.dtype:
+                masked_input = masked_input.to(flat_input.dtype)
         else:
-            masked_input = input_
+            masked_input = flat_input
 
         # Get the embeddings
         output_parallel = self.quant_method.embedding(self, masked_input)
 
         # Mask the output embedding
-        if self.tp_size > 1:
+        if input_mask is not None:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
 
         # Reduce across all the model parallel GPUs
         output = tensor_model_parallel_all_reduce(output_parallel)
+
+        if len(orig_shape) != 1:
+            output = output.reshape(*orig_shape, output.shape[-1])
         return output
 
 
