@@ -8,4 +8,5 @@ This section provides a detailed usage guide of vLLM Kunlun features.
 graph_mode
 quantization
 lora
+sleep_mode
 :::
