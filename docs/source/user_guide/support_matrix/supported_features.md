@@ -12,3 +12,4 @@ You can check the [support status of vLLM V1 Engine][v1_user_guide]. Below is th
 |Graph Mode|🟢 Functional||
 |Quantization| 🟢 Functional||
 |LoRA|⚠️ Need Test|Only LLM models|
+|Sleep Mode|🟢 Functional|Level 1 and level 2, see [Sleep Mode Guide](../feature_guide/sleep_mode.md)|

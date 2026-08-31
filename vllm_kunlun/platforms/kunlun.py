@@ -105,7 +105,7 @@ class KunlunPlatform(Platform):
 
     def is_sleep_mode_available(self) -> bool:
         """is_sleep_mode_available"""
-        return self._enum == PlatformEnum.CUDA
+        return self._enum == PlatformEnum.OOT
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

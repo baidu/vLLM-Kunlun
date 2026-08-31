@@ -309,6 +309,66 @@ _register_post_import_hook(
 )
 
 
+# --- hook 10: sleep-mode driver copies in vllm.device_allocator.cumem -------
+# CuMemAllocator.sleep()/wake_up() offload through the CUDA *runtime*
+# cudaMemcpy, which segfaults on the VMM addresses the cumem allocator hands
+# out. Wrap both to route the copy through the driver API. See
+# vllm_kunlun/device_allocator/cumem.py.
+#
+# ``applied`` deliberately returns False while CuMemAllocator is missing: that
+# means cumem's own module body is still executing (one of its inner imports
+# re-entered the dispatcher), and ``apply`` no-ops so the hook is retried on
+# the next import, once the class exists.
+def _cumem_applied(mod):
+    cls = getattr(mod, "CuMemAllocator", None)
+    return cls is not None and getattr(cls, "_kunlun_sleep_patched", False)
+
+
+def _cumem_apply(mod):
+    if not hasattr(mod, "CuMemAllocator"):
+        return
+    from vllm_kunlun.device_allocator.cumem import patch_cumem
+
+    patch_cumem(mod)
+
+
+_register_post_import_hook("vllm.device_allocator.cumem", _cumem_applied, _cumem_apply)
+
+
+# --- hook 11: GPUModelRunner.reload_weights after a level-2 sleep -----------
+# A standalone reload_weights() (no wake_up(tags=["weights"]) first) would load
+# into weight tensors whose VMM pool sleep() discarded -> XPU error -707. Same
+# consumer-trigger pattern as hook 8: a hook targeting gpu_model_runner itself
+# can run while that module is still being defined.
+def _reload_weights_applied(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    cls = getattr(runner_mod, "GPUModelRunner", None)
+    if cls is None:
+        return False
+    fn = getattr(cls, "reload_weights", None)
+    return fn is not None and getattr(fn, "_kunlun_reload_weights_patched", False)
+
+
+def _reload_weights_apply(_consumer_mod):
+    runner_mod = sys.modules.get("vllm.v1.worker.gpu_model_runner")
+    if runner_mod is None or not hasattr(runner_mod, "GPUModelRunner"):
+        return
+    from vllm_kunlun.device_allocator.cumem import patch_reload_weights
+
+    patch_reload_weights(runner_mod)
+
+
+for _reload_consumer in (
+    "vllm.v1.worker.gpu_worker",
+    "vllm.v1.worker.xpu_model_runner",
+):
+    _register_post_import_hook(
+        _reload_consumer,
+        _reload_weights_applied,
+        _reload_weights_apply,
+    )
+
+
 def _preload_mapped(full_name):
     """Load the kunlun replacement for ``full_name`` into sys.modules."""
     if full_name in sys.modules:
