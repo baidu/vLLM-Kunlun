@@ -207,12 +207,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if spec_sequence_masks is None:
-            (
-                num_decodes,
-                num_prefills,
-                num_decode_tokens,
-                num_prefill_tokens,
-            ) = split_decodes_and_prefills(m, decode_threshold=1)
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(m, decode_threshold=1)
+            )
             num_spec_decode_tokens = 0
             spec_token_indx = None
             spec_token_masks = None
@@ -358,13 +355,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            (
-                nums_dict,
-                batch_ptr,
-                token_chunk_offset_ptr,
-            ) = compute_causal_conv1d_metadata(
-                non_spec_query_start_loc_cpu,
-                device=query_start_loc.device,
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc_cpu,
+                    device=query_start_loc.device,
+                )
             )
         else:
             has_initial_state = None
@@ -456,9 +451,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=has_initial_state,
             has_initial_state_cpu=(
-                has_initial_state.to("cpu", non_blocking=True)
-                if has_initial_state is not None
-                else None
+                has_initial_state.cpu() if has_initial_state is not None else None
             ),
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
@@ -468,7 +461,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_tensor_cpu=(
-                non_spec_state_indices_tensor.to("cpu", non_blocking=True)
+                non_spec_state_indices_tensor.cpu()
                 if non_spec_state_indices_tensor is not None
                 else None
             ),

@@ -1,62 +1,50 @@
-#
 # Copyright (c) 2025 Baidu, Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
-#
+# Licensed under the Apache License, Version 2.0.
+"""Unified registration entry point for Kunlun-optimized operators.
+
+This package initializer performs two kinds of registration when the vLLM
+Kunlun plugin is loaded:
+
+* It ensures that the ``torch.library`` module defining custom operators has
+  been loaded.
+* It imports Python modules containing ``CustomOp.register_oot`` decorators,
+  adding Kunlun implementations to vLLM's out-of-tree (OOT) registry.
+
+These imports have registration side effects; the imported module names are
+only retained to satisfy unused-import checks. The initializer is kept small
+because every ``vllm_kunlun.ops.<submodule>`` import executes it first. Adding
+unrelated imports here could introduce circular dependencies and unnecessary
+startup work, so only modules containing registration logic are imported.
+"""
 
 import sys
 
-# ``_custom_ops`` registers torch custom ops via ``@custom_op`` decorators.
-# Each decorator may be executed at most ONCE per process. The plugin's
-# ``register()`` already loads ``_custom_ops.py`` directly via
-# ``spec_from_file_location`` (under a private module name) BEFORE this
-# package's ``__init__.py`` is reached, in order to avoid a circular
-# import chain through ``vllm.model_executor.layers.fused_moe.*``.
-# Skip the second registration when that has already happened.
+# The plugin startup path normally loads the registration module directly
+# before importing this package. This fallback handles direct
+# ``import vllm_kunlun.ops`` calls and ensures that custom operator schemas
+# and implementations are available. The sys.modules check prevents them
+# from being registered more than once.
 if "_vllm_kunlun_custom_ops_registration" not in sys.modules:
-    import vllm_kunlun.ops._custom_ops  # noqa: F401
+    from . import _custom_ops as _custom_ops  # noqa: F401
 
-import vllm_kunlun.ops.fused_moe.layer  # noqa: E402,F401
+# These imports execute the OOT registration decorators in each module,
+# registering Kunlun implementations for fused MoE, LayerNorm, Linear,
+# Rotary Embedding, and vocabulary-parallel Embedding. The aliases are
+# intentionally private because this package exposes the registration
+# results rather than the module objects themselves.
+from . import activation as _activation  # noqa: E402,F401
+from . import fused_moe as _fused_moe  # noqa: F401
+from . import layernorm as _layernorm  # noqa: E402,F401
+from . import linear as _linear  # noqa: E402,F401
+from . import rotary_embedding as _rotary_embedding  # noqa: E402,F401
+from . import vocab_parallel_embedding as _vocab_parallel_embedding  # noqa: E402,F401
 
-# base layers
-import vllm_kunlun.ops.layernorm
-import vllm_kunlun.ops.linear
+# Set only after every registration module has finished importing. The plugin
+# import hook uses this sentinel to distinguish a complete package from a
+# partially initialized module in sys.modules.
+_KUNLUN_OOT_REGISTRATIONS_LOADED = True
 
-# embedding
-import vllm_kunlun.ops.rotary_embedding
-import vllm_kunlun.ops.vocab_parallel_embedding
-
-# Spec-decode helpers (eagle / dflash) import upstream symbols that may not
-# exist on every vllm version (e.g. ``vllm.v1.attention.backends.tree_attn``
-# was removed in 0.18.0). They are only used when speculative decoding is
-# enabled, so make their import optional.
-try:
-    import vllm_kunlun.v1.sample.spec_decode.dflash  # noqa: F401
-except ImportError as _e:
-    import logging as _logging
-
-    _logging.getLogger("vllm_kunlun").debug(
-        "[KunlunPlugin] spec_decode.dflash unavailable: %s", _e
-    )
-try:
-    import vllm_kunlun.v1.sample.spec_decode.eagle  # noqa: F401
-except ImportError as _e:
-    import logging as _logging
-
-    _logging.getLogger("vllm_kunlun").debug(
-        "[KunlunPlugin] spec_decode.eagle unavailable: %s", _e
-    )
-
-# TODO @xyDong0223 remove v0.16.0
-# import vllm_kunlun.ops.mla
+# No public names need to be exposed through
+# ``from vllm_kunlun.ops import *``; operators and OOT implementations are
+# looked up by name in their respective registries.
+__all__ = []

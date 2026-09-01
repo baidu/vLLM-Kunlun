@@ -219,3 +219,35 @@ def flashinfer_sample(
         )
 
     return next_token_ids.view(-1)
+
+
+def empty_exponential_noise_like(
+    probs: torch.Tensor,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    """Return a tensor of exponential noise with the same shape as probs.
+
+    Used by vllm.v1.spec_decode.llm_base_proposer for speculative decoding.
+    """
+    if use_fp64_gumbel:
+        noise = torch.empty_like(probs, dtype=torch.float64)
+    else:
+        noise = torch.empty_like(probs)
+    noise.exponential_()
+    return noise
+
+
+def sample_with_exponential_noise(
+    probs: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    """Sample from probs using exponential noise q (Gumbel-max trick).
+
+    Used by vllm.v1.spec_decode.llm_base_proposer for speculative decoding.
+    """
+    if q.dtype == probs.dtype:
+        scores = probs.div_(q)
+    else:
+        scores = q.reciprocal_()
+        scores.mul_(probs)
+    return scores.argmax(dim=-1).view(-1)

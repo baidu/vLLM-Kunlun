@@ -77,7 +77,8 @@ uv pip install vllm==|pip_vllm_version| --no-build-isolation --no-deps
 ```
 
 ### Build and Install
-Navigate to the vllm-kunlun directory and build the package:
+Navigate to the vllm-kunlun directory and install the package. This builds the
+native `_kunlun` extension during installation:
 
 ```{code-block} bash
 :substitutions:
@@ -89,10 +90,7 @@ cd vLLM-Kunlun
 git checkout |vllm_kunlun_version|
 
 uv pip install -r requirements.txt
-
-python setup.py build
-
-python setup.py install
+uv pip install --no-build-isolation --no-deps .
 ```
 
 ### Replace eval_frame.py
@@ -116,12 +114,6 @@ cp vllm_kunlun/quantization/__init__.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/pyth
 wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-customer.su.bcebos.com/aiak/qwen3_next/20260226/xpytorch-cp310-torch251-ubuntu2004-x64.run
 bash xpytorch-cp310-torch251-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
 sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
-```
-
-## Applying PyTorch patches
-
-```
-python vllm_kunlun/patches/patch_torch251.py
 ```
 
 ## Install Kunlun-related packages

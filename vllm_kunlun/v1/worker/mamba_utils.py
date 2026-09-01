@@ -7,7 +7,6 @@ from math import prod
 from typing import Any
 
 import torch
-import xspeedgate_ops  # noqa
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
 from vllm.triton_utils import tl, triton

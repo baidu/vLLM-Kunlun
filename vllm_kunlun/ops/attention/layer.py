@@ -21,6 +21,12 @@ from vllm.platforms import _Backend
 from vllm.v1.attention.backend import AttentionType
 
 
+# Backend selection starts in
+# vllm_kunlun/platforms/kunlun.py::KunlunPlatform.get_attn_backend_cls(), which
+# returns the backend class path for the active attention configuration. vLLM
+# then instantiates that backend through its Attention base class. This wrapper
+# reuses vLLM's KV-cache and metadata handling and forwards each call to the
+# selected backend or a Kunlun custom operator.
 class Attention(VllmAttention):
     """Attention"""
 

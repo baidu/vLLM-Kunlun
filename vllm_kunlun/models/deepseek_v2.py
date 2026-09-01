@@ -33,7 +33,7 @@ import torch
 from torch import nn
 from torch.library import custom_op
 from transformers import DeepseekV2Config, DeepseekV3Config
-from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.distributed import (
@@ -45,6 +45,8 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -81,8 +83,6 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
-from vllm_kunlun.ops.activation import SiluAndMul
-from vllm_kunlun.ops.attention.layer import Attention
 from vllm_kunlun.ops.deep_gemm import int8_mqa_logits, int8_paged_mqa_logits
 from vllm_kunlun.ops.linear import ReplicatedLinear
 from vllm_kunlun.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata

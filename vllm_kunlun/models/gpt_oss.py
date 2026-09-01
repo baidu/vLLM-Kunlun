@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from transformers import GptOssConfig
-from vllm.attention import AttentionType
+from vllm.v1.attention.backend import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -41,8 +42,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
-
-from vllm_kunlun.ops.attention.layer import Attention
 
 
 class OAIAttention(nn.Module):
