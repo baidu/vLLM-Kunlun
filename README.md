@@ -160,6 +160,54 @@ curl http://localhost:8356/v1/chat/completions \
 
 ---
 
+## Quick Start (vllm 0.25.1)
+
+### Environment Variables
+
+```bash
+export XPU_VISIBLE_DEVICES=0,1          # physical XPU cards to use
+export CUDA_VISIBLE_DEVICES=0,1         # logical CUDA device mapping
+export XFT_USE_FAST_SWIGLU=1
+export XMLIR_CUDNN_ENABLED=1
+export XMLIR_ENABLE_FAST_FC=true
+export XPUAPI_SDNN_BF16_ROUND_MODE=3
+export XPU_USE_MOE_SORTED_THRES=1
+export XPU_USE_DEFAULT_CTX=1
+export XMLIR_FORCE_USE_XPU_GRAPH=1
+export XPU_USE_FAST_SWIGLU=1
+export XPU_FLASH_ATTENTION_DECODER_USE_NEW_IMPL=1
+export XPU_SET_RECURRENT_GATED_DELTA_RULE_FWDV2_FP16_FAST_OPT=3
+```
+
+### Serve a Mamba-hybrid Model (e.g. Qwen3.6-35B-A3B)
+
+```bash
+vllm serve /path/to/Qwen3.6-35B-A3B \
+    --dtype float16 \
+    --tensor-parallel-size 2 \
+    --trust-remote-code \
+    --max-model-len 65536 \
+    --max-num-seqs 128 \
+    --max-num-batched-tokens 65536 \
+    --block-size 128 \
+    --distributed-executor-backend mp \
+    --port 8999 \
+    --host 0.0.0.0 \
+    --served-model-name Qwen3.6-35B-A3B \
+    --gpu-memory-utilization 0.9 \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --enable-force-include-usage \
+    --mamba-ssm-cache-dtype float16
+```
+
+> **Note**: `--mamba-ssm-cache-dtype float16` is required for Mamba-hybrid
+> models (e.g. Qwen3.6-35B-A3B). Adjust `--tensor-parallel-size` and
+> `XPU_VISIBLE_DEVICES` according to the number of available XPU cards.
+
+---
+
 ## Architecture
 
 ```
