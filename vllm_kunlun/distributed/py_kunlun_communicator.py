@@ -30,11 +30,11 @@ _FORCE_FLAT = os.environ.get("XCCL_FORCE_FLAT_PG", "0") == "1"
 
 
 class PyKunlunCommunicator:
-    """Drop-in replacement for ``PyNcclCommunicator`` on KunLun XPU.
-    """
+    """Drop-in replacement for ``PyNcclCommunicator`` on KunLun XPU."""
 
-    def __init__(self, group: "StatelessProcessGroup",
-                 device: Union[int, str, torch.device]):
+    def __init__(
+        self, group: "StatelessProcessGroup", device: Union[int, str, torch.device]
+    ):
         self.group = group
         self.rank = group.rank
         self.world_size = group.world_size
@@ -47,9 +47,9 @@ class PyKunlunCommunicator:
         self.device = device
 
         self.use_xccl = _XCCL_ENABLED
-        self.pg = None            # flat group (single host, or forced flat)
-        self._inter = None        # one leader per host
-        self._intra = None        # the ranks of this host
+        self.pg = None  # flat group (single host, or forced flat)
+        self._inter = None  # one leader per host
+        self._intra = None  # the ranks of this host
         self._backends = []
         self._ready = False
 
@@ -65,6 +65,7 @@ class PyKunlunCommunicator:
         atexit.register(self._atexit_shutdown)
 
         # NOTE: nothing is built here on purpose -- see _ensure_ready().
+
     def _build_pg(self, name: str, ranks: list):
         """Assemble a stateless ProcessGroupXCCL over ``ranks`` (global ids).
 
@@ -92,8 +93,7 @@ class PyKunlunCommunicator:
         return pg
 
     def _ensure_ready(self):
-        """Build the XCCL group(s) on first use, not in ``__init__``.
-        """
+        """Build the XCCL group(s) on first use, not in ``__init__``."""
         if self._ready:
             return
         if not self.use_xccl:
@@ -107,23 +107,23 @@ class PyKunlunCommunicator:
                 order.append(h)
         self._hosts = hosts
         self._order = order
-        self._members = {h: [r for r in range(self.world_size)
-                             if hosts[r] == h] for h in order}
+        self._members = {
+            h: [r for r in range(self.world_size) if hosts[r] == h] for h in order
+        }
         self._leaders = [self._members[h][0] for h in order]
         self._my_host = hosts[self.rank]
         self._my_members = self._members[self._my_host]
 
         if len(order) == 1 or _FORCE_FLAT:
-            self.pg = self._build_pg("kunlun_weight_sync",
-                                     list(range(self.world_size)))
+            self.pg = self._build_pg("kunlun_weight_sync", list(range(self.world_size)))
         else:
             # Same construction order on every rank: inter, then intra.
             if self.rank in self._leaders:
                 self._inter = self._build_pg("kunlun_ws_inter", self._leaders)
             if len(self._my_members) > 1:
                 self._intra = self._build_pg(
-                    f"kunlun_ws_intra_{order.index(self._my_host)}",
-                    self._my_members)
+                    f"kunlun_ws_intra_{order.index(self._my_host)}", self._my_members
+                )
         self._ready = True
 
     def _prepare(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -135,8 +135,7 @@ class PyKunlunCommunicator:
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
-        """Broadcast ``tensor`` from rank ``src`` to every rank in the group.
-        """
+        """Broadcast ``tensor`` from rank ``src`` to every rank in the group."""
         if self.disabled:
             return
         self._ensure_ready()
@@ -149,13 +148,14 @@ class PyKunlunCommunicator:
             self.pg.broadcast(work, src).wait()
         else:
             src_leader = self._members[self._hosts[src]][0]
-            if (src != src_leader and self._my_host == self._hosts[src]
-                    and self._intra is not None):
-                self._intra.broadcast(work,
-                                      self._my_members.index(src)).wait()
+            if (
+                src != src_leader
+                and self._my_host == self._hosts[src]
+                and self._intra is not None
+            ):
+                self._intra.broadcast(work, self._my_members.index(src)).wait()
             if self._inter is not None:
-                self._inter.broadcast(work,
-                                      self._leaders.index(src_leader)).wait()
+                self._inter.broadcast(work, self._leaders.index(src_leader)).wait()
             if self._intra is not None:
                 self._intra.broadcast(work, 0).wait()
         if work is not tensor:
@@ -172,8 +172,9 @@ class PyKunlunCommunicator:
                     self.group.send_obj(data, dst=dst)
         else:
             data = self.group.recv_obj(src=src)
-            tensor.copy_(torch.load(io.BytesIO(data),
-                                    weights_only=False).to(self.device))
+            tensor.copy_(
+                torch.load(io.BytesIO(data), weights_only=False).to(self.device)
+            )
 
     @staticmethod
     def _allreduce(pg, tensor: torch.Tensor, op):
@@ -181,24 +182,24 @@ class PyKunlunCommunicator:
             pg.allreduce([tensor]).wait()
             return
         from torch._C._distributed_c10d import AllreduceOptions
+
         opts = AllreduceOptions()
         opts.reduceOp = op
         pg.allreduce([tensor], opts).wait()
 
     def all_reduce(self, tensor: torch.Tensor, op=None, stream=None):
-        """Real reduction (the original implementation was ``return tensor``).
-        """
+        """Real reduction (the original implementation was ``return tensor``)."""
         if self.disabled:
             return tensor
         self._ensure_ready()
         if not self.use_xccl:
-            raise RuntimeError(
-                "all_reduce requires XCCL; unset XCCL_WEIGHT_SYNC=0")
+            raise RuntimeError("all_reduce requires XCCL; unset XCCL_WEIGHT_SYNC=0")
 
         want_avg = False
         if op is not None:
             try:
                 from torch.distributed import ReduceOp
+
                 if op == ReduceOp.AVG:
                     op, want_avg = ReduceOp.SUM, True
             except Exception:
@@ -254,8 +255,9 @@ class PyKunlunCommunicator:
         pg, peer = self._pair_pg(src) if self.use_xccl else (None, None)
         if pg is None:
             data = self.group.recv_obj(src=src)
-            tensor.copy_(torch.load(io.BytesIO(data),
-                                    weights_only=False).to(self.device))
+            tensor.copy_(
+                torch.load(io.BytesIO(data), weights_only=False).to(self.device)
+            )
             return
         if tensor.device == self.device and tensor.is_contiguous():
             pg.recv([tensor], peer, 0).wait()
@@ -279,8 +281,7 @@ class PyKunlunCommunicator:
         self.disabled = True
 
     def _atexit_shutdown(self):
-        """atexit hook: tear XCCL down before the store goes away.
-        """
+        """atexit hook: tear XCCL down before the store goes away."""
         try:
             self.destroy()
         except Exception:
