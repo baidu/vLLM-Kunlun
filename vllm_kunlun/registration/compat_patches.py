@@ -64,22 +64,26 @@ def _apply_qwen3_vl_patch(module: ModuleType) -> None:
 
 
 def _minimax_rms_norm_tp_applied(module: ModuleType) -> bool:
-    """Return whether Triton has already been disabled for MiniMax QK norm."""
-    return not getattr(module, "HAS_TRITON", False)
+    """Return whether MiniMax's unsupported CUDA and Triton paths are disabled."""
+    return (
+        not getattr(module, "HAS_TRITON", False)
+        and getattr(module, "_MINIMAX_FUSED_AR_RMS_QK", None) is None
+    )
 
 
 def _apply_minimax_rms_norm_tp_patch(module: ModuleType) -> None:
-    """Force the pure-torch QK-RMSNorm path for MiniMax M2 under TP > 1.
+    """Disable MiniMax CUDA fusion and use the eager QK-RMSNorm fallback.
 
-    ``_minimax_qk_norm_tp_fallback`` only falls back to
-    ``_minimax_qk_norm_tp_eager`` when ``HAS_TRITON`` is false.  On Kunlun the
-    ``triton`` package imports and its CUDA driver reports active (xpytorch
-    fakes CUDA), so ``HAS_TRITON`` stays true and the Triton kernel launch
-    fails with ``CUDA_ERROR_NOT_SUPPORTED``.
+    MiniMax selects the fused CUDA all-reduce/RMSNorm custom operator when
+    ``_MINIMAX_FUSED_AR_RMS_QK`` is available.  Otherwise its fallback uses
+    Triton when ``HAS_TRITON`` is true.  Kunlun supports neither path, so both
+    gates must be disabled to reach the eager all-reduce plus RMSNorm path.
     """
     module.HAS_TRITON = False
+    if hasattr(module, "_MINIMAX_FUSED_AR_RMS_QK"):
+        module._MINIMAX_FUSED_AR_RMS_QK = None
     logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] minimax rms_norm_tp HAS_TRITON forced to False"
+        "[KunlunPlugin] disabled MiniMax RMSNorm Triton and fused CUDA paths"
     )
 
 
