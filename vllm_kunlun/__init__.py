@@ -396,6 +396,87 @@ _register_post_import_hook(
 )
 
 
+# --- hook: precompute non_spec_query_start_loc_cpu at KDA metadata build -----
+# kunlun_ops.causal_conv1d_fwd takes query_start_loc as a python list, so
+# vllm_kunlun.ops.kda.causal_conv1d_fn needs a host copy every KDA layer.
+# KimiK3KDAMetadataBuilder.build already derives non_spec_query_start_loc_cpu
+# with CPU-only ops, but discards it: GDNAttentionMetadata declares no such
+# field and the constructor call never passes it. The consumer therefore falls
+# back to query_start_loc.tolist() -- one device sync per KDA layer in the hot
+# path, and the place where an unrelated async XPU kernel fault surfaces as
+# "wait for noc idle timeout".
+# Re-derive it here from CPU tensors only, keyed off the same branch condition
+# the builder uses (num_spec_decodes == 0), and validate the length against the
+# device tensor before attaching. On mismatch we leave it unset so ops/kda.py
+# keeps its fallback.
+def _kda_qsl_cpu_applied(mod):
+    cls = getattr(mod, "KimiK3KDAMetadataBuilder", None)
+    return cls is None or getattr(cls.build, "_kunlun_qsl_cpu", False)
+
+
+def _kda_qsl_cpu_apply(mod):
+    import torch
+
+    cls = getattr(mod, "KimiK3KDAMetadataBuilder", None)
+    if cls is None:
+        return
+    _orig_build = cls.build
+
+    def _derive(md, common_attn_metadata, num_decode_draft_tokens_cpu, dev):
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        if md.num_spec_decodes == 0:
+            # Builder reuses query_start_loc verbatim for the whole batch.
+            out = qsl_cpu.to(torch.int32)
+        elif num_decode_draft_tokens_cpu is None:
+            return None
+        else:
+            # Spec path: cumsum over the active (non-spec, non-empty) requests.
+            spec_mask = num_decode_draft_tokens_cpu >= 0
+            query_lens_cpu = qsl_cpu.diff()
+            active = (~spec_mask) & (query_lens_cpu > 0)
+            lens = query_lens_cpu[active]
+            out = torch.zeros(lens.numel() + 1, dtype=torch.int32)
+            torch.cumsum(lens, dim=0, out=out[1:])
+        return out if out.numel() == dev.numel() else None
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        num_accepted_tokens=None,
+        num_decode_draft_tokens_cpu=None,
+        fast_build=False,
+    ):
+        md = _orig_build(
+            self,
+            common_prefix_len,
+            common_attn_metadata,
+            num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+            fast_build,
+        )
+        dev = getattr(md, "non_spec_query_start_loc", None)
+        if dev is not None and getattr(md, "non_spec_query_start_loc_cpu", None) is None:
+            cpu = _derive(md, common_attn_metadata, num_decode_draft_tokens_cpu, dev)
+            if cpu is not None:
+                md.non_spec_query_start_loc_cpu = cpu
+        return md
+
+    build._kunlun_qsl_cpu = True
+    cls.build = build
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched KimiK3KDAMetadataBuilder.build to attach "
+        "non_spec_query_start_loc_cpu"
+    )
+
+
+_register_post_import_hook(
+    "vllm.models.kimi_k3.nvidia.kda_metadata",
+    _kda_qsl_cpu_applied,
+    _kda_qsl_cpu_apply,
+)
+
+
 # --- hook: precompute prefill.query_start_loc_cpu at metadata build ---------
 # MLACommonPrefillMetadata carries only query_start_loc (device); the Kunlun MLA
 # prefill backend needs a CPU copy for kunlun_ops.attention's context_seq_lod_cpu.
