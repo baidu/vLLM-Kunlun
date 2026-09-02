@@ -138,7 +138,29 @@ _register_post_import_hook(
 )
 
 
-# --- hook 3: BlockTable.compute_slot_mapping ------------------------------
+# --- hook 3: MiniMax TP QK-RMSNorm -----------------------------------------
+# The upstream Triton path is selected when the CUDA-compatible runtime reports
+# an available driver. That kernel cannot launch on Kunlun XPU, so force the
+# existing eager fallback for tensor-parallel MiniMax models.
+def _minimax_rms_norm_tp_applied(mod):
+    return not getattr(mod, "HAS_TRITON", False)
+
+
+def _minimax_rms_norm_tp_apply(mod):
+    mod.HAS_TRITON = False
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] minimax rms_norm_tp HAS_TRITON forced to False"
+    )
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp",
+    _minimax_rms_norm_tp_applied,
+    _minimax_rms_norm_tp_apply,
+)
+
+
+# --- hook 4: BlockTable.compute_slot_mapping ------------------------------
 # Replace the upstream Triton kernel with a torch-native version.
 def _block_table_applied(mod):
     cls = getattr(mod, "BlockTable", None)
@@ -154,7 +176,7 @@ _register_post_import_hook(
 )
 
 
-# --- hook 4: apply_grammar_bitmask in vllm.v1.structured_output.utils -----
+# --- hook 5: apply_grammar_bitmask in vllm.v1.structured_output.utils -----
 # Replace the upstream xgrammar auto backend with torch_native on Kunlun XPU.
 def _grammar_bitmask_applied(mod):
     fn = getattr(mod, "apply_grammar_bitmask", None)
@@ -172,7 +194,7 @@ _register_post_import_hook(
 )
 
 
-# --- hook 5: Worker._maybe_get_memory_pool_context -----------------------
+# --- hook 6: Worker._maybe_get_memory_pool_context -----------------------
 # vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
 # is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
 # fall through to get_mem_allocator_instance() which raises RuntimeError.
@@ -206,7 +228,7 @@ _register_post_import_hook(
 )
 
 
-# --- hook 6: skip qwen_triton_warmup on Kunlun XPU ---
+# --- hook 7: skip qwen_triton_warmup on Kunlun XPU ---
 def _qwen_triton_warmup_applied(mod):
     fn = getattr(mod, "qwen_triton_warmup", None)
     return fn is not None and getattr(fn, "_kunlun_patched", False)
@@ -233,6 +255,55 @@ _register_post_import_hook(
     "vllm.model_executor.warmup.kernel_warmup",
     _qwen_triton_warmup_applied,
     _qwen_triton_warmup_apply,
+)
+
+
+# --- hook 8: out-of-tree custom-op registrations --------------------------
+# vLLM 0.25.1 discovers OOT pluggable layers only after custom_op is imported.
+# Import the Kunlun operators at that point so their decorators are registered.
+def _oot_registrations_applied(mod):
+    if not hasattr(mod, "CustomOp") or not hasattr(mod, "PluggableLayer"):
+        return True
+    ops_module = sys.modules.get("vllm_kunlun.ops")
+    return bool(getattr(ops_module, "_KUNLUN_OOT_REGISTRATIONS_LOADED", False))
+
+
+def _oot_registrations_apply(mod):
+    import vllm_kunlun.ops  # noqa: F401
+
+
+_register_post_import_hook(
+    "vllm.model_executor.custom_op",
+    _oot_registrations_applied,
+    _oot_registrations_apply,
+)
+
+
+# --- hook 9: compressed-tensors INT8 MoE backend selector -----------------
+# compressed-tensors 0.17.0 asks vLLM to choose a CUDA-specific INT8 MoE
+# backend. Return the generic path so Kunlun's implementation handles it.
+def _int8_moe_applied(mod):
+    if not hasattr(mod, "select_int8_moe_backend"):
+        return False
+    return getattr(mod, "_kunlun_select_int8_patched", False)
+
+
+def _select_int8_moe_backend(config, weight_key=None, activation_key=None):
+    return None, None
+
+
+def _int8_moe_apply(mod):
+    if not hasattr(mod, "select_int8_moe_backend"):
+        return
+    mod.select_int8_moe_backend = _select_int8_moe_backend
+    mod._kunlun_select_int8_patched = True
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.quantization.compressed_tensors."
+    "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8",
+    _int8_moe_applied,
+    _int8_moe_apply,
 )
 
 

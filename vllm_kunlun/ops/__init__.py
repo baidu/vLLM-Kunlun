@@ -60,3 +60,8 @@ except ImportError as _e:
 
 # TODO @xyDong0223 remove v0.16.0
 # import vllm_kunlun.ops.mla
+
+# This marker is consumed by the post-import hook in ``vllm_kunlun``.
+# It confirms that all OOT pluggable-layer registration decorators above have
+# run, preventing repeated import attempts on subsequent upstream imports.
+_KUNLUN_OOT_REGISTRATIONS_LOADED = True
