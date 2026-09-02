@@ -94,7 +94,7 @@ jobs:
 
             const rules = [
               { label: 'bug', patterns: [/\bbug\b/, /error/, /exception/, /crash/, /fail/, /regression/] },
-              { label: 'documentation', patterns: [/\bdocs?\b/, /documentation/, /readme/, /tutorial/] },
+              { label: 'area: documentation', patterns: [/\bdocs?\b/, /documentation/, /readme/, /tutorial/] },
               { label: 'feature request', patterns: [/feature request/, /propose a new feature/, /new feature/] },
               { label: 'enhancement', patterns: [/feature/, /enhancement/, /support .*model/, /add .*support/] },
               { label: 'question', patterns: [/\bquestion\b/, /how do i/, /how can i/, /请问/, /咨询/] },
