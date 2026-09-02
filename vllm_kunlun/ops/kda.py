@@ -37,6 +37,9 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Set once the conv1d query_start_loc host copy has to fall back to a sync.
+_WARNED_CONV1D_QSL_SYNC = False
+
 _SOFTPLUS_THRESHOLD = 20.0
 
 FLA_CHUNK_SIZE = 64
@@ -107,13 +110,41 @@ def _conv1d_query_start_loc_cpu(
 ) -> list[int]:
     """Host copy of ``query_start_loc``; kunlun_ops requires a python list.
 
-    The GDN metadata already keeps a CPU mirror, so prefer it over ``.tolist()``
-    to avoid a device sync on every layer.
+    The GDN metadata carries a CPU mirror (attached by the
+    ``KimiK3KDAMetadataBuilder.build`` hook in ``vllm_kunlun/__init__.py``), so
+    prefer it over ``.tolist()`` to avoid a device sync on every layer.
+
+    If the mirror is missing, cache the synced list on the metadata object: the
+    same metadata is shared by every KDA layer of one forward, so the fallback
+    costs one sync per step instead of one per layer.
     """
     mirror = getattr(metadata, "non_spec_query_start_loc_cpu", None)
     if mirror is not None and mirror.numel() >= query_start_loc.numel():
         return mirror[: query_start_loc.numel()].tolist()
-    return query_start_loc.tolist()
+
+    n = query_start_loc.numel()
+    cached = getattr(metadata, "_kunlun_conv1d_qsl_list", None)
+    if cached is not None and len(cached) == n:
+        return cached
+
+    global _WARNED_CONV1D_QSL_SYNC
+    if not _WARNED_CONV1D_QSL_SYNC:
+        _WARNED_CONV1D_QSL_SYNC = True
+        logger.warning(
+            "[KUNLUN] non_spec_query_start_loc_cpu missing on %s; falling back to "
+            "a device sync per forward. Check the KimiK3KDAMetadataBuilder.build "
+            "hook in vllm_kunlun/__init__.py.",
+            type(metadata).__name__,
+        )
+
+    out = query_start_loc.tolist()
+    if metadata is not None:
+        try:
+            metadata._kunlun_conv1d_qsl_list = out
+        except (AttributeError, TypeError):
+            # Frozen/slotted metadata: nothing to cache on, just return.
+            pass
+    return out
 
 
 def causal_conv1d_fn(
