@@ -60,6 +60,29 @@ def _apply_qwen3_vl_patch(module: ModuleType) -> None:
     )
 
 
+# --- vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp: no Triton ---
+
+
+def _minimax_rms_norm_tp_applied(module: ModuleType) -> bool:
+    """Return whether Triton has already been disabled for MiniMax QK norm."""
+    return not getattr(module, "HAS_TRITON", False)
+
+
+def _apply_minimax_rms_norm_tp_patch(module: ModuleType) -> None:
+    """Force the pure-torch QK-RMSNorm path for MiniMax M2 under TP > 1.
+
+    ``_minimax_qk_norm_tp_fallback`` only falls back to
+    ``_minimax_qk_norm_tp_eager`` when ``HAS_TRITON`` is false.  On Kunlun the
+    ``triton`` package imports and its CUDA driver reports active (xpytorch
+    fakes CUDA), so ``HAS_TRITON`` stays true and the Triton kernel launch
+    fails with ``CUDA_ERROR_NOT_SUPPORTED``.
+    """
+    module.HAS_TRITON = False
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] minimax rms_norm_tp HAS_TRITON forced to False"
+    )
+
+
 # --- vllm.v1.worker.block_table: patch slot-mapping computation -----------
 
 
@@ -203,6 +226,11 @@ DEFAULT_HOOKS = (
         "vllm.model_executor.models.qwen3_vl",
         _qwen3_vl_applied,
         _apply_qwen3_vl_patch,
+    ),
+    (
+        "vllm.model_executor.layers.minimax_rms_norm.rms_norm_tp",
+        _minimax_rms_norm_tp_applied,
+        _apply_minimax_rms_norm_tp_patch,
     ),
     ("vllm.v1.worker.block_table", _block_table_applied, _apply_block_table_patch),
     (
