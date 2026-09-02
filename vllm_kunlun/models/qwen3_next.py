@@ -94,7 +94,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
 
-# from vllm_kunlun.ops.attention.layer import Attention
 from vllm_kunlun.ops.fla import (
     RMSNormGated,
     chunk_gated_delta_rule,

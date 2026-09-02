@@ -404,9 +404,10 @@ class KunlunPlatform(Platform):
                 "Supported dtypes are: fp32, fp16, bf16, int8."
             )
 
+    @classmethod
     def opaque_attention_op(cls) -> bool:
         """
-        Ensure that V1 Graph uses `vllm.unified_attention_with_output_kunlun` as the split op on the Kunlun3 platform.
+        Ensure that V1 Graph uses `vllm::unified_attention_with_output` as the split op on the Kunlun3 platform.
         """
         return True
 
