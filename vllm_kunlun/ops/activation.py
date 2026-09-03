@@ -31,3 +31,36 @@ class KunlunSiluAndMul(SiluAndMul):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         torch.ops._C.silu_and_mul(out, x)
         return out
+
+
+def swiglu(x: torch.Tensor, limit: float | None = None) -> torch.Tensor:
+    """SwiGLU over a concatenated ``[gate, up]`` tensor, with an optional limit.
+
+    ``limit`` reproduces upstream ``SiluAndMulWithClamp``:
+
+        gate = clamp(x[..., :d], max=limit)
+        up   = clamp(x[..., d:], -limit, limit)
+        out  = gate * sigmoid(gate) * up
+
+    DeepSeek-V4 sets ``swiglu_limit=10.0``, and dropping it costs far more than
+    the clamped element count suggests: the down projection turns a handful of
+    saturated intermediates into a large error on the token that produced them.
+    Measured on layer 26 against an fp64 CPU golden, four clamped elements out
+    of ~74k moved that layer's output by rel_l2 0.6 -- all of it on the
+    position-0 sink token, the only one whose activations reach the limit.
+
+    Neither ``torch.ops._C.silu_and_mul`` nor any ``kunlun_ops`` SwiGLU variant
+    takes a limit, so the clamped form is elementwise torch. It runs on a
+    ``[tokens * topk, intermediate]`` tensor, negligible next to the two
+    grouped GEMMs around it.
+    """
+    d = x.shape[-1] // 2
+    if limit is None:
+        out = torch.empty((*x.shape[:-1], d), dtype=x.dtype, device=x.device)
+        torch.ops._C.silu_and_mul(out, x)
+        return out
+    gate = x[..., :d].clamp(max=limit)
+    up = x[..., d:].clamp(-limit, limit)
+    return gate * torch.sigmoid(gate) * up
+
+

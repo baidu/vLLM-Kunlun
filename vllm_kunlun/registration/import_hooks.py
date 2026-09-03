@@ -21,6 +21,7 @@ adapted vLLM is still more useful than one that cannot start at all.
 import builtins
 import logging
 import sys
+import weakref
 from collections.abc import Callable
 from types import ModuleType
 from typing import NamedTuple
@@ -50,19 +51,57 @@ _DISPATCHING = False
 
 # Registered hooks, applied in registration order on every dispatch.
 _HOOKS: list[HookRegistration] = []
-_HOOK_TARGETS: set[str] = set()
+
+# Hooks verified applied, memoized by module object (weakref, index-aligned
+# with _HOOKS). torch emits lazy imports during steady-state decode, and
+# re-running every predicate per import statement is pure overhead. A module
+# re-imported after a reload is a fresh object, so it is re-checked
+# automatically; a module still executing its body is never memoized.
+_APPLIED_REFS: list = []
+
+# Per-hook consecutive failure counters for log throttling only.
+_failures: dict = {}
+
+
+def _chained_predicates(first: HookApplied, second: HookApplied) -> HookApplied:
+    def applied(module: ModuleType) -> bool:
+        return first(module) and second(module)
+
+    return applied
+
+
+def _chained_appliers(first: HookApply, second: HookApply) -> HookApply:
+    def apply_patch(module: ModuleType) -> None:
+        first(module)
+        second(module)
+
+    return apply_patch
 
 
 def register_hook(target: str, applied: HookApplied, apply: HookApply) -> None:
     """Register one idempotent patch for an upstream module.
 
-    A target may have only one registration.  Rejecting duplicates here keeps
-    patch order deterministic and catches accidental double registration at
-    startup rather than during a later import.
+    Registration stays one-per-target *per layer*: the built-in compat
+    patches, the platform wiring, and the eager adapters each register at
+    most one hook for a given target (aggregating their own features before
+    calling this).  A later layer stacking onto an already-hooked target
+    chains onto the existing entry instead of being rejected: platform-level
+    patches and per-model adapters legitimately stack on the same upstream
+    module, and rejecting one would silently disable it.
     """
-    if target in _HOOK_TARGETS:
-        raise ValueError(f"Duplicate import hook target: {target}")
-    _HOOK_TARGETS.add(target)
+    for i, existing in enumerate(_HOOKS):
+        if existing.target != target:
+            continue
+        _HOOKS[i] = HookRegistration(
+            target,
+            _chained_predicates(existing.is_applied, applied),
+            _chained_appliers(existing.apply_patch, apply),
+        )
+        # The old entry may already be memoized as applied for a loaded
+        # module; drop the memo so the chained predicates are re-evaluated.
+        if len(_APPLIED_REFS) > i:
+            _APPLIED_REFS[i] = None
+        return
     _HOOKS.append(HookRegistration(target, applied, apply))
 
 
@@ -81,18 +120,31 @@ def dispatch_hooks() -> None:
     _DISPATCHING = True
     try:
         logger = logging.getLogger("vllm_kunlun")
-        for hook in _HOOKS:
+        for i, hook in enumerate(_HOOKS):
             module = sys.modules.get(hook.target)
             if module is None:
                 continue
+            while len(_APPLIED_REFS) <= i:
+                _APPLIED_REFS.append(None)
+            ref = _APPLIED_REFS[i]
+            if ref is not None and ref() is module:
+                continue
             try:
-                if not hook.is_applied(module):
-                    hook.apply_patch(module)
+                if hook.is_applied(module):
+                    spec = getattr(module, "__spec__", None)
+                    if spec is None or not getattr(spec, "_initializing", False):
+                        _APPLIED_REFS[i] = weakref.ref(module)
+                    continue
+                hook.apply_patch(module)
             except Exception:
-                logger.exception(
-                    "[KunlunPlugin] post-import hook failed for target=%s",
-                    hook.target,
-                )
+                _failures[i] = _failures.get(i, 0) + 1
+                if _failures[i] == 1 or _failures[i] % 200 == 0:
+                    logger.exception(
+                        "[KunlunPlugin] post-import hook failed for target=%s"
+                        " (attempt %d)",
+                        hook.target,
+                        _failures[i],
+                    )
     finally:
         _DISPATCHING = False
 
@@ -104,7 +156,16 @@ for _target, _is_applied, _apply_patch in DEFAULT_HOOKS:
 
 
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
-    """Intercept absolute imports, then run any newly eligible patches."""
+    """Intercept absolute imports, then run any newly eligible patches.
+
+    Dispatching after every import (nested ones included) is load-bearing:
+    model modules load via importlib and their ``from X import Y`` statements
+    bind Y right here inside _OLD_IMPORT, so a patch to X.Y must land on the
+    completion of X's own import -- before the NEXT module binds Y. Hooks
+    whose predicates/appliers import heavy modules can fail while a cycle is
+    mid-flight; those failures are throttled in dispatch_hooks and the known
+    cyclic entries are guarded upstream of here.
+    """
     # Relative imports (level > 0) can never name an upstream vLLM module
     # directly, so only absolute imports are checked against the redirects.
     if level == 0:

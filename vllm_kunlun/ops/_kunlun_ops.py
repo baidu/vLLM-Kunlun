@@ -429,6 +429,25 @@ class KunlunOps:
                 n_group=num_expert_group,
                 topk_group=topk_group,
             )
+        else:
+            # No branch ran, so `normed_score` / `topk_ids` are still the
+            # uninitialized torch.empty allocated above. Feeding those into
+            # gen_block_statistic / moe_pre_sorted below produces silent
+            # garbage (and out-of-range expert ids), so refuse instead.
+            #
+            # DeepSeek-V4 uses scoring_func="sqrtsoftplus" together with hash
+            # routing. kunlun_ops.moe_topk_softplus_sqrt implements exactly
+            # that, including the hash mode (input_tokens + hash_indices_table),
+            # but this monolithic entry point never receives input_ids, so
+            # wiring it here would also need the caller to forward the hash
+            # table.
+            raise NotImplementedError(
+                "KunlunOps.fused_moe: unsupported scoring_func "
+                f"{scoring_func!r} (only 'softmax' and 'sigmoid' are "
+                "implemented). For DeepSeek-V4 'sqrtsoftplus' use a "
+                "non-monolithic MoE method, or wire "
+                "kunlun_ops.moe_topk_softplus_sqrt here."
+            )
 
         if w1_bias is not None or w2_bias is not None:
             # Rignt now this branch is for gpt oss

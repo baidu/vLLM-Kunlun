@@ -192,7 +192,26 @@ def _oot_registrations_applied(module: ModuleType) -> bool:
 
 def _apply_oot_registrations(module: ModuleType) -> None:
     """Import Kunlun operators so their registration decorators execute."""
-    import vllm_kunlun.ops  # noqa: F401
+    # The vllm_kunlun.ops package pulls the upstream fused-moe graph, which
+    # is circular through vllm._aiter_ops. This hook dispatches between
+    # imports inside those bodies during early boot; entering the graph then
+    # re-enters an in-flight module and retries forever. Wait until vllm
+    # itself finished importing the fused-moe method module: past that point
+    # every module our chain touches is complete and the import is safe.
+    ufmm = sys.modules.get(
+        "vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method"
+    )
+    if ufmm is None:
+        return
+    spec = getattr(ufmm, "__spec__", None)
+    if spec is not None and getattr(spec, "_initializing", False):
+        return
+    try:
+        import vllm_kunlun.ops  # noqa: F401
+    except ImportError:
+        # Still mid-cycle through another in-flight module; the predicate
+        # stays False and a later dispatch retries quietly.
+        return
 
 
 # --- compressed_tensors int8 MoE: disable the CUDA backend selector --------

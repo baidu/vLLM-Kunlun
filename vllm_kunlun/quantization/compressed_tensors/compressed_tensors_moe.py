@@ -19,7 +19,9 @@
 from typing import Callable, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors import CompressionFormat
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -37,9 +39,31 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+from vllm_kunlun.ops.activation import swiglu
 from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
+from vllm_kunlun.quantization.deepseek_v4 import (
+    create_modular_v4_method as _dsv4_create_v4_i8_method,
+    int8_w8a8_route_native_enabled as _dsv4_i8_native_enabled,
+)
+
 logger = init_logger(__name__)
+
+
+
+# 常量 1.0 缩放表：值恒为 1，按 (device, top_k) 常驻复用，免去每 MoE 层每步的 ones fill。
+_DEQUANT_SCALE_ONES: dict = {}
+
+
+def _dequant_scale_buf(device, top_k: int) -> torch.Tensor:
+    """[max_tokens, top_k] 全 1 fp32 表；只切 dim0 保持连续性合同不变。"""
+    key = (device, top_k)
+    buf = _DEQUANT_SCALE_ONES.get(key)
+    if buf is None:
+        # 8192 = max_num_batched_tokens 上界
+        buf = torch.ones((8192, top_k), dtype=torch.float32, device=device)
+        _DEQUANT_SCALE_ONES[key] = buf
+    return buf
 
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
@@ -103,6 +127,15 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant, input_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
+            scoring_func = getattr(layer, "scoring_func", "softmax")
+            if scoring_func == "sqrtsoftplus":
+                logger.info_once(
+                    "Using KunlunCompressedTensorsW8A8Int8MoEMethodV4 "
+                    "(modular, scoring_func=sqrtsoftplus)"
+                )
+                return _dsv4_create_v4_i8_method(
+                    weight_quant, input_quant, layer
+                )
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
@@ -305,7 +338,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         )
         del x_q, x_scale, sorted_tokens_num_lod
 
-        dequant_scale = torch.ones([M, top_k], dtype=torch.float32, device=out.device)
+        dequant_scale = _dequant_scale_buf(out.device, top_k)[:M]
         output = torch.empty(
             [M, N], dtype=hidden_states.dtype, device=hidden_states.device
         )
@@ -319,6 +352,312 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
             y=output,
         )
         return output
+
+
+class KunlunCompressedTensorsW8A8Int8MoEMethodV4(CompressedTensorsW8A8Int8MoEMethod):
+    """DeepSeek-V4 W8A8 INT8 MoE method for Kunlun (modular, native INT8 pipeline).
+
+    V4's routing uses sqrtsoftplus scoring plus a per-layer hash table, which
+    is computed by the community router before this method is invoked. That
+    means this method sees pre-computed ``topk_weights`` and ``topk_ids``
+    (modular path, ``is_monolithic=False``), unlike the sibling
+    ``KunlunCompressedTensorsW8A8Int8MoEMethod`` which expects raw
+    ``router_logits`` and drives softmax/sigmoid routing inside the kernel.
+
+    Default (KUNLUN_INT8_MOE_NATIVE=1): native grouped-GEMM pipeline
+    (moe_pre_sorted -> quant2d -> INT8 moe_fc -> silu_and_mul -> quant2d ->
+    INT8 moe_fc -> moe_post). Set KUNLUN_INT8_MOE_NATIVE=0 to force a torch
+    per-expert loop fallback (W8A16, significantly slower).
+    """
+
+    _kunlun_int8_moe_v4 = True
+
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+        moe,
+        layer_name: Optional[str] = None,
+    ):
+        # Deliberately bypass CompressedTensorsW8A8Int8MoEMethod.__init__: it
+        # runs the community int8 oracle (select_int8_moe_backend), which has
+        # no OOT backend and raises NotImplementedError for the V4 deployment
+        # config. Same escape hatch as KunlunFp8MoEMethod.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        per_channel = (
+            weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel or not input_quant.dynamic:
+            raise ValueError(
+                "Kunlun V4 INT8 MoE requires channelwise weights with dynamic "
+                f"per-token activations, got {weight_quant}, {input_quant}"
+            )
+        self.static_input_scales = False
+        # Unused: this method supplies its own apply() instead of a kernel
+        # selected by the oracle. moe_kernel stays None (set by
+        # FusedMoEMethodBase.__init__) so the framework treats this method as
+        # non-modular.
+        self.int8_backend = None
+        self.experts_cls = None
+
+    @property
+    def is_monolithic(self) -> bool:
+        return False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Native path (KUNLUN_INT8_MOE_NATIVE=1): kunlun native ``moe_fc``
+        # expects per-channel abs-max, not the per-channel scale stored by
+        # compressed-tensors (max/127). Match the monolithic INT8 method:
+        # multiply the scales in place once, at load time. This method is
+        # only invoked once per layer by the vLLM loader, so the in-place
+        # ``mul_`` is safe; do NOT call it twice or scales become 127^2 x.
+        # Torch fallback path (KUNLUN_INT8_MOE_NATIVE=0): keep weights as
+        # loaded so ``_dequant_expert`` produces the correct bf16 tensor.
+        if _dsv4_i8_native_enabled():
+            with torch.no_grad():
+                layer.w13_weight_scale.mul_(127.0)
+                layer.w2_weight_scale.mul_(127.0)
+
+    def maybe_make_prepare_finalize(self, routing_tables=None):
+        return None
+
+    def _dequant_expert(self, layer: torch.nn.Module, expert_id: int):
+        """Dequantize a single expert's INT8 weights to BF16 (per-channel).
+
+        w13: [2I, H] int8 * [2I, 1] fp32 -> [2I, H] bf16
+        w2:  [H, I]  int8 * [H, 1]  fp32 -> [H, I]  bf16
+
+        Fp32 intermediate: scales are loaded as fp32 params, so casting them
+        to bf16 for the multiply loses precision on some checkpoints. This
+        method is only used by the torch fallback path
+        (KUNLUN_INT8_MOE_NATIVE=0); the native pipeline consumes the raw INT8
+        tensors and per-channel abs-max scale directly via ``moe_fc``.
+        """
+        w13_scale = layer.w13_weight_scale[expert_id].to(torch.float32)
+        w2_scale = layer.w2_weight_scale[expert_id].to(torch.float32)
+        w13 = (
+            layer.w13_weight[expert_id].to(torch.float32) * w13_scale
+        ).to(torch.bfloat16)
+        w2 = (
+            layer.w2_weight[expert_id].to(torch.float32) * w2_scale
+        ).to(torch.bfloat16)
+        return w13, w2
+
+    def _apply_torch_fallback(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+    ):
+        """Correctness fallback: Python per-expert dequant + F.linear."""
+        x_flat = x.reshape(-1, x.shape[-1])
+        # Route metadata is small (M * top_k ints); CPU sync is unavoidable
+        # for the per-expert gather anyway and matches the FP8 fallback.
+        weights_cpu = topk_weights.reshape(-1, topk_weights.shape[-1]).cpu()
+        ids_cpu = topk_ids.reshape(-1, topk_ids.shape[-1]).cpu()
+        output = torch.zeros_like(x_flat)
+        for expert_id in torch.unique(ids_cpu).tolist():
+            token_rows_cpu, choices_cpu = torch.where(ids_cpu == expert_id)
+            token_rows = token_rows_cpu.to(x_flat.device)
+            expert_x = x_flat[token_rows].to(torch.bfloat16)
+            w13, w2 = self._dequant_expert(layer, expert_id)
+            gate, up = F.linear(expert_x, w13).chunk(2, dim=-1)
+            limit = getattr(layer, "swiglu_limit", None)
+            if limit is not None:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(-limit, limit)
+            expert_y = F.linear(F.silu(gate) * up, w2)
+            expert_weights = (
+                weights_cpu[token_rows_cpu, choices_cpu]
+                .to(expert_y.dtype)
+                .to(expert_y.device)
+            )
+            expert_y = expert_y * expert_weights.unsqueeze(-1)
+            output.index_add_(0, token_rows, expert_y.to(output.dtype))
+        return output.view_as(x)
+
+    def _apply_native_int8_grouped(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+    ):
+        """Native INT8 grouped-GEMM pipeline (modular).
+
+        Mirrors the monolithic ``apply_monolithic`` of the sibling INT8 method
+        but skips the in-kernel routing step: routing is done upstream by the
+        community sqrtsoftplus + hash router, so we consume ``topk_ids`` /
+        ``topk_weights`` directly. Pipeline: ``gen_block_statistic`` ->
+        ``moe_pre_sorted`` -> ``quant2d`` -> INT8 ``moe_fc`` (gate+up) ->
+        ``silu_and_mul`` -> ``quant2d`` -> INT8 ``moe_fc`` (down) ->
+        ``moe_post``.
+        """
+        hidden_states = x.reshape(-1, x.shape[-1]).contiguous()
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+        M, N = hidden_states.shape
+        dev = hidden_states.device
+        E, up_gate_size, _ = layer.w13_weight.shape  # [E, 2I, H]
+        hidden_dim = layer.w2_weight.shape[1]         # H
+        top_k = topk_ids.shape[-1]
+
+        topk_ids_i32 = (
+            topk_ids.reshape(M, top_k).contiguous().to(torch.int32)
+        )
+        topk_w_f32 = (
+            topk_weights.reshape(M, top_k).contiguous().to(torch.float32)
+        )
+
+        # num_blocks=12 mirrors ``apply_monolithic`` above; it is the
+        # per-XPU-cluster block count used by ``gen_block_statistic`` /
+        # ``moe_pre_sorted`` on this kunlun target.
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks, E, dtype=torch.int32, device=dev
+        )
+        torch.ops._C.gen_block_statistic(topk_ids_i32, block_statistic)
+
+        moe_expand = torch.empty(
+            M * top_k, N, dtype=hidden_states.dtype, device=dev
+        )
+        expert_m = torch.zeros(E, dtype=torch.int32, device=dev)
+        sorted_tokens_num_lod = torch.zeros(
+            E + 1, dtype=torch.int32, device=dev
+        )
+        sorted_tokens_idx = torch.zeros(
+            M * top_k, dtype=torch.int32, device=dev
+        )
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids_i32,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
+        del expert_m, block_statistic
+
+        # INT8 GEMM 1: gate + up.
+        x_q = torch.empty(
+            M * top_k, N, dtype=torch.int8, device=dev
+        )
+        x_scale = torch.empty(
+            (M * top_k, 1), dtype=torch.float32, device=dev
+        )
+        torch.ops._C.quant2d(moe_expand, x_q, x_scale, force_sdnn=True)
+        del moe_expand
+
+        y = torch.empty(
+            M, top_k, up_gate_size,
+            dtype=hidden_states.dtype, device=dev,
+        )
+        torch.ops._C.moe_fc(
+            x=x_q,
+            x_perchannel_max=x_scale,
+            weight=layer.w13_weight,
+            w_perchannel_max=layer.w13_weight_scale,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=top_k,
+            y=y,
+            topk_ids=topk_ids_i32,
+            act=None,
+        )
+        del x_q, x_scale
+
+        # SwiGLU activation. `swiglu_limit` (10.0 for DeepSeek-V4) must be
+        # honoured here: without it the position-0 sink token's intermediates
+        # saturate and the layer output is inflated (rel_l2 0.6 on L26 against
+        # an fp64 golden).
+        d = y.shape[-1] // 2
+        out1 = swiglu(y, getattr(layer, "swiglu_limit", None))
+        del y
+        out1 = out1.reshape(-1, d)
+
+        # INT8 GEMM 2: down.
+        x_q2 = torch.empty(out1.shape, dtype=torch.int8, device=dev)
+        x_scale2 = torch.empty(
+            (out1.shape[0], 1), dtype=torch.float32, device=dev,
+        )
+        torch.ops._C.quant2d(out1, x_q2, x_scale2, force_sdnn=True)
+        del out1
+
+        out = torch.empty(
+            M, top_k, hidden_dim,
+            dtype=hidden_states.dtype, device=dev,
+        )
+        torch.ops._C.moe_fc(
+            x=x_q2,
+            x_perchannel_max=x_scale2,
+            weight=layer.w2_weight,
+            w_perchannel_max=layer.w2_weight_scale,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=top_k,
+            y=out,
+            topk_ids=topk_ids_i32,
+            act=None,
+        )
+        del x_q2, x_scale2, sorted_tokens_num_lod
+
+        # Weighted scatter-back. topk_weights already carry the routing
+        # weight (community sqrtsoftplus router normalises upstream), so
+        # dequant_scale is a no-op.
+        dequant_scale = torch.ones(
+            [M, top_k], dtype=torch.float32, device=dev
+        )
+        output = torch.empty(
+            [M, N], dtype=hidden_states.dtype, device=dev
+        )
+        torch.ops._C.moe_post(
+            x=out,
+            moe_index=sorted_tokens_idx.view(M, top_k),
+            normed_scale=topk_w_f32,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+        return output.view_as(x)
+
+    # Log the native->fallback transition at most once per method instance
+    # (matches the FP8 path). Persistent failures then stay silent instead
+    # of flooding the log every forward step.
+    _native_fallback_warned = False
+
+    def apply(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts,
+        shared_experts_input,
+    ):
+        # Shared experts are executed separately by FusedMoERunner for this
+        # non-modular method (mirrors the FP8 path).
+        del shared_experts, shared_experts_input
+        if _dsv4_i8_native_enabled():
+            try:
+                return self._apply_native_int8_grouped(
+                    layer, x, topk_weights, topk_ids
+                )
+            except Exception as ex:
+                if not type(self)._native_fallback_warned:
+                    type(self)._native_fallback_warned = True
+                    logger.warning(
+                        "Native INT8 MoE path failed (%r); falling back to "
+                        "torch per-expert loop. Subsequent failures will be "
+                        "silent.",
+                        ex,
+                    )
+        return self._apply_torch_fallback(
+            layer, x, topk_weights, topk_ids
+        )
 
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):

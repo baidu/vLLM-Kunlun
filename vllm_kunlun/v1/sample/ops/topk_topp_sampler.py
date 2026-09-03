@@ -164,7 +164,9 @@ def random_sample(
             q = -torch.log(q)
             q = q.clamp(min=1e-12)
         else:
-            q.exponential_()
+            # aten exponential_ on XPU hits a blocking D2H roundtrip (~ms/step
+            # at bs=1); the XSG op below is the async native kernel.
+            torch.ops.xspeedgate_ops.inplace_exponential(q)
     if generators:
         # TODO(woosuk): This can be slow because we handle each request
         # one by one. Optimize this.
