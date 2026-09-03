@@ -1,7 +1,3 @@
-# Keep broad refactors from accumulating noisy component labels.
-changed-files-labels-limit: 4
-max-files-changed: 150
-
 "area: kunlun-xpu":
   - changed-files:
       - any-glob-to-any-file:
