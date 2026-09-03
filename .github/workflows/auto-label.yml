@@ -4,7 +4,7 @@ on:
   issues:
     types: [opened, edited, reopened]
   pull_request_target:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
 
 permissions:
   contents: read
@@ -44,9 +44,20 @@ jobs:
             if (!item) return;
 
             const title = (item.title || '').toLowerCase();
-            const body = (item.body || '').toLowerCase();
+            const rawBody = item.body || '';
+            // Pull-request templates contain classifier keywords such as "bug",
+            // "feature", "CI", and "tests". Only the contributor-authored
+            // description above the first template separator is eligible for
+            // content labeling; Issue bodies are analyzed in full.
+            const body = (event === 'pull_request_target'
+              ? rawBody
+                  .replace(/<!--[\s\S]*?-->/g, '')
+                  .split(/\n---\s*\n/, 1)[0]
+              : rawBody
+            ).toLowerCase();
             const labels = new Set((item.labels || []).map(label => label.name));
             const add = [];
+            const remove = [];
 
             const labelDefinitions = [
               { name: 'bug', color: 'd73a4a', description: 'Something is not working' },
@@ -118,8 +129,24 @@ jobs:
               }
             }
 
-            if (event === 'pull_request_target' && !labels.has('needs review')) {
-              add.push('needs review');
+            if (event === 'pull_request_target') {
+              if (!item.draft && !labels.has('needs review')) {
+                add.push('needs review');
+              }
+              if (item.draft && labels.has('needs review')) {
+                remove.push('needs review');
+              }
+            }
+
+            if (remove.length > 0) {
+              for (const label of remove) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: item.number,
+                  name: label
+                });
+              }
             }
 
             if (add.length > 0) {
