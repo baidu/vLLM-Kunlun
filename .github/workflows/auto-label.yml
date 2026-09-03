@@ -67,14 +67,13 @@ jobs:
               { name: 'question', color: 'd876e3', description: 'Further information is requested' },
               { name: 'feature request', color: '0e8a16', description: 'New feature proposal submitted through the issue form' },
               { name: 'needs review', color: 'fbca04', description: 'Issue or pull request is ready for maintainer review' },
-              // Area labels use a distinct, high-contrast palette to make review queues easy to scan.
-              { name: 'area: kunlun-xpu', color: '6f42c1', description: 'Kunlun XPU runtime, build, or integration code' },
-              { name: 'area: ci', color: '0969da', description: 'Continuous integration and repository automation' },
-              { name: 'area: documentation', color: '1a7f37', description: 'Documentation, tutorials, or README changes' },
-              { name: 'area: tests', color: 'bf8700', description: 'Unit, integration, or end-to-end tests' },
-              { name: 'area: dependencies', color: '8250df', description: 'Packaging, dependencies, or installation changes' },
-              { name: 'area: performance', color: 'cf222e', description: 'Performance, benchmark, latency, or throughput changes' },
-              { name: 'area: examples', color: '8c959f', description: 'Examples, demos, or community utilities' }
+              // Flat component labels mirror the project's concise label taxonomy.
+              { name: 'kunlun-xpu', color: '6f42c1', description: 'Kunlun XPU runtime, build, or integration code' },
+              { name: 'ci', color: '0969da', description: 'Continuous integration and repository automation' },
+              { name: 'tests', color: 'bf8700', description: 'Unit, integration, or end-to-end tests' },
+              { name: 'dependencies', color: '8250df', description: 'Packaging, dependencies, or installation changes' },
+              { name: 'performance', color: 'cf222e', description: 'Performance, benchmark, latency, or throughput changes' },
+              { name: 'examples', color: '8c959f', description: 'Examples, demos, or community utilities' }
             ];
 
             // Read the repository labels once per event rather than issuing one
@@ -123,11 +122,11 @@ jobs:
               { label: 'feature request', patterns: [/feature request/, /propose a new feature/, /new feature/] },
               { label: 'enhancement', patterns: [/\benhancement\b/, /\bimprov(e|ement)\b/, /\boptimi[sz](e|ation)\b/, /改进/, /优化/, /support .*model/, /add .*support/] },
               { label: 'question', patterns: [/\bquestion\b/, /how do i/, /how can i/, /请问/, /咨询/] },
-              { label: 'area: performance', patterns: [/performance/, /benchmark/, /latency/, /throughput/, /speedup/, /性能/, /延迟/] },
-              { label: 'area: dependencies', patterns: [/dependenc/, /requirements/, /install/, /package/, /版本/] },
-              { label: 'area: ci', patterns: [/\bci\b/, /continuous integration/, /github actions/, /workflow/, /测试流水线/] },
-              { label: 'area: tests', patterns: [/\btest\b/, /pytest/, /unit test/, /integration test/, /e2e/, /测试/] },
-              { label: 'area: kunlun-xpu', patterns: [/kunlun/, /xpu/, /p800/, /mlu/, /昆仑/] }
+              { label: 'performance', patterns: [/performance/, /benchmark/, /latency/, /throughput/, /speedup/, /性能/, /延迟/] },
+              { label: 'dependencies', patterns: [/dependenc/, /requirements/, /install/, /package/, /版本/] },
+              { label: 'ci', patterns: [/\bci\b/, /continuous integration/, /github actions/, /workflow/, /测试流水线/] },
+              { label: 'tests', patterns: [/\btest\b/, /pytest/, /unit test/, /integration test/, /e2e/, /测试/] },
+              { label: 'kunlun-xpu', patterns: [/kunlun/, /xpu/, /p800/, /mlu/, /昆仑/] }
             ];
 
             for (const rule of rules) {

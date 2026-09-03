@@ -1,32 +1,32 @@
-"area: kunlun-xpu":
+"kunlun-xpu":
   - changed-files:
       - any-glob-to-any-file:
           - "vllm_kunlun/**"
           - "build.sh"
           - "setup_env.sh"
 
-"area: ci":
+"ci":
   - changed-files:
       - any-glob-to-any-file:
           - ".github/**"
           - "ci.yml"
           - ".pre-commit-config.yaml"
 
-"area: documentation":
+"documentation":
   - changed-files:
       - any-glob-to-any-file:
           - "**/*.md"
           - "docs/**"
           - ".readthedocs.yaml"
 
-"area: tests":
+"tests":
   - changed-files:
       - any-glob-to-any-file:
           - "tests/**"
           - "**/test_*.py"
           - "**/*_test.py"
 
-"area: dependencies":
+"dependencies":
   - changed-files:
       - any-glob-to-any-file:
           - "requirements*.txt"
@@ -35,14 +35,14 @@
           - "setup.cfg"
           - "uv.lock"
 
-"area: performance":
+"performance":
   - changed-files:
       - any-glob-to-any-file:
           - "benchmarks/**"
           - "benchmark/**"
           - "**/benchmark*.py"
 
-"area: examples":
+"examples":
   - changed-files:
       - any-glob-to-any-file:
           - "examples/**"
