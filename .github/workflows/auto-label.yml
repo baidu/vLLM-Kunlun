@@ -53,7 +53,7 @@ jobs:
             const body = (event === 'pull_request_target'
               ? rawBody
                   .replace(/<!--[\s\S]*?-->/g, '')
-                  .split(/\n---\s*\n/, 1)[0]
+                  .split(/(?:^|\r?\n)---[ \t]*(?:\r?\n|$)/, 1)[0]
               : rawBody
             ).toLowerCase();
             const labels = new Set((item.labels || []).map(label => label.name));
