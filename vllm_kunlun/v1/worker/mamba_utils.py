@@ -44,20 +44,34 @@ logger = logging.getLogger("vllm_kunlun")
 def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     """xspeedgate stand-in for upstream's Triton ``batch_memcpy_kernel``.
 
-    ``xspeedgate_ops.batch_memcpy`` wants int64 pointer tensors. Buffers built
-    by our ``MambaCopyBuffers.create`` below are already int64; the ``view``
-    calls only matter if some other caller hands us upstream-dtype buffers.
-    ``view`` is a metadata-only reinterpret, so it is free and bit-exact.
+    ``xspeedgate_ops.batch_memcpy`` is specified for int64 pointer and size
+    tensors, and every buffer that reaches it comes from the
+    ``MambaCopyBuffers.create`` override below, which allocates exactly that:
+    the op has a single call path (upstream ``preprocess_mamba`` ->
+    ``do_mamba_copy_block``), and ``MambaCopyBuffers`` has a single construction
+    site (upstream ``MambaBuffers.create``), which goes through the override.
+
+    The dtypes are therefore asserted rather than coerced. An earlier version
+    reinterpreted mismatches with ``Tensor.view``, which is only lossless
+    between same-itemsize dtypes -- an int32 buffer would have been silently
+    re-read as half as many int64 values. Nothing produces such a buffer today,
+    so a mismatch means the call path changed and should fail loudly.
     """
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
     if batch == 0:
         return
-    if src_ptrs.dtype is not torch.int64:
-        src_ptrs = src_ptrs.view(torch.int64)
-    if dst_ptrs.dtype is not torch.int64:
-        dst_ptrs = dst_ptrs.view(torch.int64)
+    for name, tensor in (
+        ("src_ptrs", src_ptrs),
+        ("dst_ptrs", dst_ptrs),
+        ("sizes", sizes),
+    ):
+        assert tensor.dtype is torch.int64, (
+            f"xspeedgate_ops.batch_memcpy expects int64 {name}, got "
+            f"{tensor.dtype}; buffers should come from the Kunlun "
+            f"MambaCopyBuffers.create override in {__name__}"
+        )
     torch.ops.xspeedgate_ops.batch_memcpy(src_ptrs, dst_ptrs, sizes)
 
 
@@ -72,6 +86,13 @@ def _mamba_copy_buffers_create(
 
     Upstream allocates ``uint64`` pointers and ``int32`` sizes
     (mamba_utils.py:449-451); the xspeedgate op is specified for int64.
+
+    Note the ``v0.15.0-dev`` branch keeps ``int32`` sizes here (#351), so the two
+    release branches disagree on what ``xspeedgate_ops.batch_memcpy`` wants. The
+    int64 choice predates this change -- it is what the v0.25.1 branch has
+    shipped since #392 -- and is kept as-is; the assertion in ``batch_memcpy``
+    above turns any future mismatch into a loud failure rather than a silent
+    reinterpret.
     """
     mamba_group_ids, mamba_spec = _up.get_mamba_groups(kv_cache_config)
     entries_per_req = sum(
