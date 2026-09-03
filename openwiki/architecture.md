@@ -113,17 +113,20 @@ builtins.__import__ = _custom_import
 
 注册表结构是 `HookRegistration(target, is_applied, apply_patch)`（`#L35-L41`）；
 重复注册同一 target 直接 `ValueError`（`#L63-L64`）；
-`dispatch_hooks()` 是 **fail-soft** 的，单个补丁抛异常不会中断进程，
-并用 `_DISPATCHING` 标志防重入（`#L49`、`#L69-L97`）。
+`dispatch_hooks()` 是 **fail-soft** 的，单个补丁抛异常不会中断进程。
+它还做两件事保证补丁不会被静默丢掉：跳过 `__spec__._initializing` 为真
+（即正在执行模块体）的 target，避免补丁被该模块后续的语句覆盖；
+以及用 `_DISPATCHING` 防重入、`_REDISPATCH` 记录被跳过的嵌套 dispatch，
+在外层解锁后补跑（上限 `_MAX_DISPATCH_PASSES`）。
 
 ## 4. 四种覆盖手段
 
 这是本仓库最需要先建立的心智模型。**选哪一种，取决于目标符号是否已经被
 上游用 `from ... import X` 捕获**。
 
-### 4.1 整模块重定向（7 个）
+### 4.1 整模块重定向（6 个）
 
-`module_redirects.py#L22-L36` 的 `MODULE_MAPPINGS`：
+`module_redirects.py` 的 `MODULE_MAPPINGS`：
 
 | 上游模块 | 替换原因（详见对应页） |
 | --- | --- |
@@ -133,28 +136,34 @@ builtins.__import__ = _custom_import
 | `vllm.v1.sample.ops.logprobs` | 只是去掉 `torch.compile` |
 | `vllm.v1.sample.rejection_sampler` | Triton → 纯 PyTorch |
 | `vllm.attention.ops.merge_attn_states` | XPU 实现 |
-| `vllm.v1.worker.mamba_utils` | `batch_memcpy` 走 `xspeedgate_ops` + 前缀缓存修复 |
 
-`preload_mapped()`（`#L39-L53`）把替换模块**同时注册到两个名字**下；
-若上游名字已在 `sys.modules` 里就直接放弃（`#L48-L49`）。
-`from X import Y` 形式单独处理（`#L56-L68`）。
+`preload_mapped()` 把替换模块**同时注册到两个名字**下；
+若上游名字已在 `sys.modules` 里就直接放弃。
+`from X import Y` 形式单独处理。
 
-### 4.2 post-import 就地补丁（8 个）
+### 4.2 post-import 就地补丁（8 + 14 个）
 
-`compat_patches.py#L200-L230` 的 `PATCHES` 表：
+`compat_patches.py` 的 `DEFAULT_HOOKS` 表：
 
 | 目标模块 | 做了什么 |
 | --- | --- |
 | `vllm.v1.worker.utils` | `KVBlockZeroer._zero_block_ids` 变 no-op |
-| `vllm.model_executor.models.qwen3_vl` | `module.HAS_TRITON = False`（`#L57`） |
+| `vllm.model_executor.models.qwen3_vl` | `module.HAS_TRITON = False` |
 | `vllm.v1.worker.block_table` | slot mapping 换成 `kunlun_ops.compute_slot_mappings` |
 | `vllm.v1.structured_output.utils` | grammar bitmask 走 `torch_native` |
-| `vllm.v1.worker.gpu_worker` | memory pool → `nullcontext()`（`#L116-L118`） |
-| `vllm.model_executor.warmup.kernel_warmup` | `qwen_triton_warmup` → no-op（`#L136`） |
+| `vllm.v1.worker.gpu_worker` | memory pool → `nullcontext()` |
+| `vllm.model_executor.warmup.kernel_warmup` | `qwen_triton_warmup` → no-op |
 | `vllm.model_executor.custom_op` | import `vllm_kunlun.ops` 触发 OOT 层注册 |
-| compressed-tensors int8 MoE | `select_int8_moe_backend` → `return None, None`（`#L188`） |
+| compressed-tensors int8 MoE | `select_int8_moe_backend` → `return None, None` |
 
-版本兼容靠 `hasattr` 探测，**不是版本号判断**（`#L10-L12`、`#L160-L161`）。
+后面 14 条由 `_V2_PATCHES` 表经 `_v2_hook()` 生成，形状完全一致
+（import-for-side-effect + 按 `__module__` 判定是否已生效）：
+Model Runner V2 的 `vllm.v1.worker.gpu.*` 13 个模块，
+外加 V1/V2 共用的 `vllm.v1.worker.mamba_utils`。
+每个对应 `vllm_kunlun/v1/worker/gpu/` 下的一个同名模块，
+import 时把 Triton 启动点换成 torch-native / `kunlun_ops` 实现。
+
+版本兼容靠 `hasattr` 探测，**不是版本号判断**。
 
 除了这张表，还有若干模块**自己**在 import 时打补丁：
 `v1/worker/utils.py#L131-L138`、`v1/worker/block_table.py#L114-L120`、

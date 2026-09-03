@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.penalties``.
+"""Kunlun torch-native overrides for ``vllm.v1.worker.gpu.sample.penalties``.
 
-Reuses the upstream ``PenaltiesState`` / ``use_penalty`` and reimplements the
-two Triton functions ``bincount`` (prompt/output token statistics, built once
-per new penalty request) and ``apply_penalties`` (per-step repetition /
+Leaves the upstream ``PenaltiesState`` / ``use_penalty`` alone and reimplements
+the two Triton functions ``bincount`` (prompt/output token statistics, built
+once per new penalty request) and ``apply_penalties`` (per-step repetition /
 frequency / presence penalties).
 
 NOTE: the spec-decode draft-token accumulation (the ``expanded_local_pos``
@@ -14,13 +14,7 @@ loop in the upstream kernel) is omitted; in the milestone-1 non-spec path
 """
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.sample.penalties")
-
-PenaltiesState = _up.PenaltiesState
-use_penalty = _up.use_penalty
+import vllm.v1.worker.gpu.sample.penalties as _up
 
 
 def bincount(
@@ -104,8 +98,7 @@ def apply_penalties(
     logits.copy_(lf.to(logits.dtype))
 
 
-# The reused PenaltiesState (defined in the genuine module) resolves
-# ``apply_penalties`` / ``bincount`` from that module's globals, so the
-# torch-native versions must be installed there, not just re-exported here.
+# ``PenaltiesState`` resolves ``apply_penalties`` / ``bincount`` from the
+# upstream module's globals, so the torch-native versions are installed there.
 _up.apply_penalties = apply_penalties
 _up.bincount = bincount

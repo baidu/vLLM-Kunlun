@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.min_p``."""
+"""Kunlun torch-native override for ``vllm.v1.worker.gpu.sample.min_p``."""
 
 import torch
+import vllm.v1.worker.gpu.sample.min_p as _up
 
 
 def apply_min_p(
@@ -19,3 +20,7 @@ def apply_min_p(
     log_mp = torch.where(mp > 0.0, torch.log(mp), torch.full_like(mp, float("-inf")))
     threshold = (max_val + log_mp.unsqueeze(1)).to(logits.dtype)
     logits.masked_fill_(logits < threshold, float("-inf"))
+
+
+# ``SamplingStates`` binds this name at sample/states.py:10.
+_up.apply_min_p = apply_min_p

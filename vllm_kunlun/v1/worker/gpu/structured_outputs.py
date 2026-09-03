@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.structured_outputs``.
+"""Kunlun override for ``vllm.v1.worker.gpu.structured_outputs``.
 
 The V2 model runner has its own grammar-bitmask kernel
 (``_apply_grammar_bitmask_kernel``), separate from the V1 path patched in
@@ -9,25 +9,20 @@ with ``Triton Error [CUDA]: CUDA_ERROR_NOT_SUPPORTED``, and the worker process
 cannot rely on ``HAS_TRITON`` being False (Triton finds an active driver once
 ``torch_xmlir`` is initialised), so the launch site is replaced explicitly.
 
-Only ``StructuredOutputsWorker.apply_grammar_bitmask`` is overridden; the
-upstream class (buffers, sizing) is reused verbatim via ``load_upstream``. The
-upstream side copy-stream is dropped: the H2D copies are issued on the current
-stream instead, which keeps the ordering trivially correct on XPU.
+Only ``StructuredOutputsWorker.apply_grammar_bitmask`` is overridden; the rest of
+the upstream class (buffers, sizing) is left untouched. The upstream side
+copy-stream is dropped: the H2D copies are issued on the current stream instead,
+which keeps the ordering trivially correct on XPU.
 """
 
 import logging
 
 import numpy as np
 import torch
+import vllm.v1.worker.gpu.structured_outputs as _up
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
 logger = logging.getLogger("vllm_kunlun")
-
-_up = load_upstream("vllm.v1.worker.gpu.structured_outputs")
-
-StructuredOutputsWorker = _up.StructuredOutputsWorker
 
 _BITS_PER_WORD = 32
 
@@ -78,9 +73,5 @@ def _apply_grammar_bitmask(
     logits.index_copy_(0, rows, selected)
 
 
-if not getattr(StructuredOutputsWorker, "_kunlun_v2_patched", False):
-    StructuredOutputsWorker.apply_grammar_bitmask = _apply_grammar_bitmask
-    StructuredOutputsWorker._kunlun_v2_patched = True
-    logger.info(
-        "[KunlunPlugin] V2 StructuredOutputsWorker patched (torch-native bitmask)"
-    )
+_up.StructuredOutputsWorker.apply_grammar_bitmask = _apply_grammar_bitmask
+logger.info("[KunlunPlugin] V2 StructuredOutputsWorker patched (torch-native bitmask)")

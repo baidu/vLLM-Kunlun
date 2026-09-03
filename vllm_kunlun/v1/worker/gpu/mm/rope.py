@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun replacement for ``vllm.v1.worker.gpu.mm.rope``.
+"""Kunlun override for ``vllm.v1.worker.gpu.mm.rope``.
 
 Only ``RopeState.prepare_positions`` launches Triton
 (``_prepare_rope_positions_kernel``, launched at ``mm/rope.py:118``). It is on
@@ -17,21 +17,19 @@ torch and is reused as-is.
 
 import logging
 
+import vllm.v1.worker.gpu.mm.rope as _up
+
 from vllm_kunlun.v1.worker.gpu._kernels import prepare_rope_positions
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream, reexport
 
 logger = logging.getLogger("vllm_kunlun")
-
-_up = load_upstream("vllm.v1.worker.gpu.mm.rope")
-reexport(_up, globals())
 
 
 def _prepare_positions(
     self, idx_mapping, query_start_loc, prefill_lens, num_computed_tokens
 ) -> None:
     # ``prefill_positions`` is a StagedWriteTensor and ``prefill_delta`` a
-    # UvaBackedTensor from gpu.buffer_utils, which is itself swapped for the
-    # Kunlun device-tensor version -- ``.gpu`` is valid either way.
+    # UvaBackedTensor from gpu.buffer_utils, whose Kunlun patch may swap the
+    # UVA views for plain device tensors -- ``.gpu`` is valid either way.
     prepare_rope_positions(
         positions=self.positions,
         prefill_positions=self.prefill_positions.gpu,
@@ -45,7 +43,5 @@ def _prepare_positions(
     )
 
 
-if not getattr(_up.RopeState, "_kunlun_v2_patched", False):
-    _up.RopeState.prepare_positions = _prepare_positions
-    _up.RopeState._kunlun_v2_patched = True
-    logger.info("[KunlunPlugin] V2 RopeState.prepare_positions patched (torch-native)")
+_up.RopeState.prepare_positions = _prepare_positions
+logger.info("[KunlunPlugin] V2 RopeState.prepare_positions patched (torch-native)")

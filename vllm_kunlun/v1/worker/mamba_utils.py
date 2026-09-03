@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun replacement for ``vllm.v1.worker.mamba_utils``.
+"""Kunlun overrides for ``vllm.v1.worker.mamba_utils``.
 
 Exactly two things differ from upstream on Kunlun XPU:
 
@@ -10,8 +10,7 @@ Exactly two things differ from upstream on Kunlun XPU:
   what the xspeedgate op expects (upstream uses ``uint64``/``int32``).
 
 Everything else -- the 5 Triton kernels, ``MambaSpecDecodeGPUContext``,
-``MambaBuffers``, and the V1 pre/postprocess helpers -- is reused verbatim from
-the genuine upstream module via ``load_upstream`` + ``reexport``.
+``MambaBuffers``, and the V1 pre/postprocess helpers -- is left untouched.
 
 That is safe because ``@triton.jit`` is lazy: decorating a kernel compiles
 nothing, only a ``kernel[grid](...)`` launch does. The kernels we do not
@@ -25,9 +24,9 @@ This replaces a 396-line fork of an *older* upstream revision that was missing
     ImportError: cannot import name 'MambaSpecDecodeGPUContext'
 
 and four more were latent ``AttributeError``s on the V1 path
-(``gpu_model_runner.py`` lines 1547, 1570, 2098, 4258). Deriving the export
-surface from upstream instead of hand-maintaining it removes that whole class
-of failure.
+(``gpu_model_runner.py`` lines 1547, 1570, 2098, 4258). Patching the two real
+deltas in place, instead of hand-maintaining a whole export surface, removes
+that class of failure entirely.
 
 Also dropped here: ``get_hybrid_attention_mamba_layout`` and
 ``postprocess_mamba``, two symbols the old fork carried that exist neither
@@ -37,15 +36,9 @@ upstream nor in any caller.
 import logging
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream, reexport
+import vllm.v1.worker.mamba_utils as _up
 
 logger = logging.getLogger("vllm_kunlun")
-
-_up = load_upstream("vllm.v1.worker.mamba_utils")
-
-# Must come before our own definitions below so they win in this namespace.
-reexport(_up, globals())
 
 
 def batch_memcpy(src_ptrs, dst_ptrs, sizes):
@@ -94,16 +87,11 @@ def _mamba_copy_buffers_create(
     )
 
 
-# ``do_mamba_copy_block`` and friends resolve ``batch_memcpy`` from the
-# *upstream* module globals, so the override has to land on ``_up`` too -- not
-# just in this module's namespace.
-if not getattr(_up, "_kunlun_v2_patched", False):
-    _up.batch_memcpy = batch_memcpy
-    _up.MambaCopyBuffers.create = classmethod(_mamba_copy_buffers_create)
-    MambaCopyBuffers = _up.MambaCopyBuffers
-    _up._kunlun_v2_patched = True
-    logger.info(
-        "[KunlunPlugin] mamba_utils patched (xspeedgate batch_memcpy, int64 "
-        "copy buffers; %d upstream symbols re-exported)",
-        len([k for k in vars(_up) if not k.startswith("__")]),
-    )
+# ``do_mamba_copy_block`` and friends resolve ``batch_memcpy`` from the upstream
+# module globals, and gpu_model_runner.py:202 imports the module object rather
+# than the name, so both call sites pick these up at call time.
+_up.batch_memcpy = batch_memcpy
+_up.MambaCopyBuffers.create = classmethod(_mamba_copy_buffers_create)
+logger.info(
+    "[KunlunPlugin] mamba_utils patched (xspeedgate batch_memcpy, int64 buffers)"
+)

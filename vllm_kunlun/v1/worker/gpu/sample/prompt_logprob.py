@@ -1,21 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.prompt_logprob``.
+"""Kunlun torch-native override for ``vllm.v1.worker.gpu.sample.prompt_logprob``.
 
-Reuses the upstream ``PromptLogprobsWorker`` (and its chunked-logits helper,
-which already routes through the swapped ``logprob`` module) and only
-reimplements the single Triton function ``get_prompt_logprobs_token_ids`` that
-gathers the shifted next-token ids for each prompt position.
+Leaves the upstream ``PromptLogprobsWorker`` alone (its chunked-logits helper
+already picks up the patched ``logprob`` functions) and only reimplements the
+single Triton function ``get_prompt_logprobs_token_ids`` that gathers the
+shifted next-token ids for each prompt position.
 """
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.sample.prompt_logprob")
-
-PromptLogprobsWorker = _up.PromptLogprobsWorker
-compute_prompt_logprobs_with_chunking = _up.compute_prompt_logprobs_with_chunking
+import vllm.v1.worker.gpu.sample.prompt_logprob as _up
 
 
 def get_prompt_logprobs_token_ids(
@@ -44,6 +38,6 @@ def get_prompt_logprobs_token_ids(
     return token_ids
 
 
-# PromptLogprobsWorker (reused from the genuine module) resolves
-# ``get_prompt_logprobs_token_ids`` from that module's globals.
+# ``PromptLogprobsWorker`` resolves ``get_prompt_logprobs_token_ids`` from the
+# upstream module's globals; install the torch-native version there.
 _up.get_prompt_logprobs_token_ids = get_prompt_logprobs_token_ids

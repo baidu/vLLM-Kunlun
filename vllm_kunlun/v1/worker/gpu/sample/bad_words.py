@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.bad_words``.
+"""Kunlun torch-native override for ``vllm.v1.worker.gpu.sample.bad_words``.
 
-Reuses the upstream ``BadWordsState`` / constants and reimplements
+Leaves the upstream ``BadWordsState`` / constants alone and reimplements
 ``apply_bad_words``. For each sampled position it checks, per bad-word, whether
 the trailing generated tokens match the bad-word prefix and, if so, bans the
 final token by setting its logit to -inf.
@@ -14,14 +14,7 @@ output sequence.
 """
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.sample.bad_words")
-
-BadWordsState = _up.BadWordsState
-MAX_BAD_WORDS_TOTAL_TOKENS = _up.MAX_BAD_WORDS_TOTAL_TOKENS
-MAX_NUM_BAD_WORDS = _up.MAX_NUM_BAD_WORDS
+import vllm.v1.worker.gpu.sample.bad_words as _up
 
 _NEG_INF = float("-inf")
 
@@ -72,6 +65,6 @@ def apply_bad_words(
                 logits[t, last_token] = _NEG_INF
 
 
-# BadWordsState (reused from the genuine module) resolves ``apply_bad_words``
-# from that module's globals; install the torch-native version there.
+# ``BadWordsState`` resolves ``apply_bad_words`` from the upstream module's
+# globals; install the torch-native version there.
 _up.apply_bad_words = apply_bad_words

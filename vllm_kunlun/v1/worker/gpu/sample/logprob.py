@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.logprob``.
+"""Kunlun torch-native overrides for ``vllm.v1.worker.gpu.sample.logprob``.
 
-Reuses the upstream ``LogprobTokenIdsState`` and reimplements the logprob
+Leaves the upstream ``LogprobTokenIdsState`` alone and reimplements the logprob
 computation (log-softmax gather + selected-token ranks) with torch ops. The
 custom per-request ``logprob_token_ids`` path is reimplemented with a small
 per-row loop.
 """
 
 import torch
+import vllm.v1.worker.gpu.sample.logprob as _up
 from vllm.v1.outputs import LogprobsTensors
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.sample.logprob")
-
-LogprobTokenIdsState = _up.LogprobTokenIdsState
 
 
 def compute_token_logprobs(
@@ -89,7 +84,8 @@ def compute_topk_logprobs(
     )
 
 
-# Keep the genuine module's globals in sync so any reused code there also picks
-# up the torch-native implementations.
+# Install into the upstream module's globals, so both its own code and the
+# consumers that bind these names on import (sample/sampler.py,
+# sample/prompt_logprob.py, spec_decode/rejection_sampler.py) get them.
 _up.compute_token_logprobs = compute_token_logprobs
 _up.compute_topk_logprobs = compute_topk_logprobs

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun replacement for ``vllm.v1.worker.gpu.block_table``.
+"""Kunlun overrides for ``vllm.v1.worker.gpu.block_table``.
 
-Reuses the upstream ``BlockTables`` class (loaded via ``load_upstream``) and
-overrides its three Triton-backed methods with torch-native / ``kunlun_ops``
-equivalents:
+Importing this module rebinds three Triton-backed ``BlockTables`` methods on the
+upstream class with torch-native / ``kunlun_ops`` equivalents; everything else
+about the class is left untouched. The import is driven by the post-import hook
+registered in ``vllm_kunlun/registration/compat_patches.py``.
 
 * ``apply_staged_writes`` — loop ``StagedWriteTensor.apply_write`` per group
   (the Kunlun ``buffer_utils`` provides a torch-native ``apply_write``), which
@@ -20,15 +21,11 @@ import logging
 
 import kunlun_ops
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
+import vllm.v1.worker.gpu.block_table as _up
 
 logger = logging.getLogger("vllm_kunlun")
 
-_up = load_upstream("vllm.v1.worker.gpu.block_table")
-
 PAD_SLOT_ID = _up.PAD_SLOT_ID
-BlockTables = _up.BlockTables
 
 
 def _apply_staged_writes(self) -> None:
@@ -95,9 +92,7 @@ def _compute_slot_mappings(
     return self.slot_mappings[:, :num_tokens_padded]
 
 
-if not getattr(BlockTables, "_kunlun_v2_patched", False):
-    BlockTables.apply_staged_writes = _apply_staged_writes
-    BlockTables.gather_block_tables = _gather_block_tables
-    BlockTables.compute_slot_mappings = _compute_slot_mappings
-    BlockTables._kunlun_v2_patched = True
-    logger.info("[KunlunPlugin] V2 BlockTables patched (torch-native + kunlun_ops)")
+_up.BlockTables.apply_staged_writes = _apply_staged_writes
+_up.BlockTables.gather_block_tables = _gather_block_tables
+_up.BlockTables.compute_slot_mappings = _compute_slot_mappings
+logger.info("[KunlunPlugin] V2 BlockTables patched (torch-native + kunlun_ops)")

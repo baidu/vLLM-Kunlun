@@ -1,19 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.gumbel``.
+"""Kunlun torch-native overrides for ``vllm.v1.worker.gpu.sample.gumbel``.
 
-Replaces the Triton Gumbel-max sampler. Greedy requests (temperature == 0)
-reduce to a plain argmax and are bit-exact vs upstream. Random requests use
-torch-native Gumbel-max noise, which is distributionally equivalent but NOT
-bit-reproducible against the upstream Philox kernel; per-request seed
-reproducibility is therefore not preserved in this milestone (documented
-limitation -- a seeded ``kunlun_ops`` gumbel kernel is the planned follow-up).
+Replaces the two Triton Gumbel-max entry points. Greedy requests
+(temperature == 0) reduce to a plain argmax and are bit-exact vs upstream.
+Random requests use torch-native Gumbel-max noise, which is distributionally
+equivalent but NOT bit-reproducible against the upstream Philox kernel;
+per-request seed reproducibility is therefore not preserved in this milestone
+(documented limitation -- a seeded ``kunlun_ops`` gumbel kernel is the planned
+follow-up).
 
 ``gumbel_sample`` is only ever called on the sampled-position logits
 (``num_tokens`` ~= number of requests), so the tensors here are small.
+
+The Triton device functions ``tl_rand32`` / ``gumbel_block_argmax``, which
+``spec_decode/rejection_sampler_utils.py:6`` imports at module scope, are left
+in place: they are only referenced from inside ``@triton.jit`` kernel bodies,
+which are never executed on Kunlun XPU, and decorating them costs nothing.
 """
 
 import torch
+import vllm.v1.worker.gpu.sample.gumbel as _up
 
 # fp32-safe clamp bounds so log/log1p never see 0 or 1.
 _TINY = 1.0e-20
@@ -70,23 +77,9 @@ def gumbel_sample(
     return noised.argmax(dim=-1).to(torch.int64)
 
 
-# ``vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils`` imports these two
-# Triton device functions at module scope, and that module is imported
-# unconditionally by the V2 model runner (via kernel_warmup), so the names must
-# exist here or the worker fails to start. They are only ever referenced from
-# inside ``@triton.jit`` kernel bodies, which never execute on Kunlun XPU
-# (HAS_TRITON is False), so plain raising stubs are sufficient.
-_SPEC_DECODE_UNSUPPORTED = (
-    "{name} is a Triton device function and is not supported on Kunlun XPU; "
-    "the V2 GPU spec-decode rejection sampler path is unavailable."
-)
-
-
-def tl_rand32(seed, offset, includes_zero=False):
-    raise NotImplementedError(_SPEC_DECODE_UNSUPPORTED.format(name="tl_rand32"))
-
-
-def gumbel_block_argmax(*args, **kwargs):
-    raise NotImplementedError(
-        _SPEC_DECODE_UNSUPPORTED.format(name="gumbel_block_argmax")
-    )
+# ``SamplingStates`` binds ``apply_temperature`` at sample/states.py:9 and the
+# samplers bind ``gumbel_sample`` at sample/sampler.py:18 and
+# spec_decode/speculator.py:26, so these must be installed upstream before those
+# modules execute; the post-import dispatcher guarantees the ordering.
+_up.apply_temperature = apply_temperature
+_up.gumbel_sample = gumbel_sample

@@ -1,23 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.sample.logit_bias``.
+"""Kunlun torch-native override for ``vllm.v1.worker.gpu.sample.logit_bias``.
 
-Reuses the upstream ``LogitBiasState`` / constants and reimplements
+Leaves the upstream ``LogitBiasState`` / constants alone and reimplements
 ``apply_logit_bias`` (allowed-token masking, logit-bias addition, and min-token
 stop-token masking) with per-request torch ops. ``num_tokens`` here equals the
 number of sampled positions (~ request count), so the per-request loop is cheap.
 """
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.sample.logit_bias")
-
-LogitBiasState = _up.LogitBiasState
-MAX_NUM_ALLOWED_TOKEN_IDS = _up.MAX_NUM_ALLOWED_TOKEN_IDS
-MAX_NUM_LOGIT_BIAS_TOKENS = _up.MAX_NUM_LOGIT_BIAS_TOKENS
-MAX_NUM_STOP_TOKEN_IDS = _up.MAX_NUM_STOP_TOKEN_IDS
+import vllm.v1.worker.gpu.sample.logit_bias as _up
 
 _NEG_INF = float("-inf")
 
@@ -68,6 +60,6 @@ def apply_logit_bias(
             row[stids] = _NEG_INF
 
 
-# LogitBiasState (reused from the genuine module) resolves ``apply_logit_bias``
-# from that module's globals; install the torch-native version there.
+# ``LogitBiasState`` resolves ``apply_logit_bias`` from the upstream module's
+# globals; install the torch-native version there.
 _up.apply_logit_bias = apply_logit_bias

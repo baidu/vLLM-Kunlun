@@ -1,24 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.input_batch``.
+"""Kunlun torch-native overrides for ``vllm.v1.worker.gpu.input_batch``.
 
-Reuses the upstream ``InputBuffers`` / ``InputBatch`` dataclasses (loaded via
-``load_upstream``) and reimplements the seven Triton-backed module functions
-with torch-native equivalents. The functions operate on jagged per-request
-segments; the correctness-first implementation loops per request in Python
-(``num_reqs`` is small, typically <= a few hundred) and pulls the small
-metadata index tensors to host once per call. Optimizing the hot ones with
-``kunlun_ops`` is a later step.
+Leaves the upstream ``InputBuffers`` / ``InputBatch`` dataclasses alone and
+reimplements the seven Triton-backed module functions with torch-native
+equivalents. The functions operate on jagged per-request segments; the
+correctness-first implementation loops per request in Python (``num_reqs`` is
+small, typically <= a few hundred) and pulls the small metadata index tensors to
+host once per call. Optimizing the hot ones with ``kunlun_ops`` is a later step.
 """
 
 import torch
-
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
-_up = load_upstream("vllm.v1.worker.gpu.input_batch")
-
-InputBuffers = _up.InputBuffers
-InputBatch = _up.InputBatch
+import vllm.v1.worker.gpu.input_batch as _up
 
 
 def prepare_prefill_inputs(
@@ -226,3 +219,17 @@ def expand_idx_mapping(
         expanded_idx_mapping[s:e] = idx[r]
         expanded_local_pos[s:e] = torch.arange(n, dtype=torch.int32, device=device)
     return expanded_idx_mapping, expanded_local_pos
+
+
+# Install into the upstream module's globals. These are all module-level
+# functions that consumers bind by name at import time (model_runner.py:75-83,
+# sample/sampler.py:15, spec_decode/rejection_sampler.py:9), which is why the
+# patch has to be in place before those modules are executed -- the post-import
+# dispatcher in vllm_kunlun/registration/import_hooks.py guarantees that.
+_up.prepare_prefill_inputs = prepare_prefill_inputs
+_up.prepare_pos_seq_lens = prepare_pos_seq_lens
+_up.combine_sampled_and_draft_tokens = combine_sampled_and_draft_tokens
+_up.get_num_sampled_and_rejected = get_num_sampled_and_rejected
+_up.post_update = post_update
+_up.post_update_num_computed_tokens = post_update_num_computed_tokens
+_up.expand_idx_mapping = expand_idx_mapping

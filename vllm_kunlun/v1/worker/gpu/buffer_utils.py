@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native replacement for ``vllm.v1.worker.gpu.buffer_utils``.
+"""Kunlun overrides for ``vllm.v1.worker.gpu.buffer_utils``.
 
-The genuine upstream module is executed via ``load_upstream`` so that all its
-pure-Python machinery (``UvaBufferPool``, ``UvaBackedTensor``, dataclasses,
-constants) is reused verbatim. Only the two Triton kernel launch sites are
-overridden with torch-native equivalents:
+All of the module's pure-Python machinery (``UvaBufferPool``,
+``UvaBackedTensor``, dataclasses, constants) is left alone. Only the two Triton
+kernel launch sites are overridden with torch-native equivalents:
 
 * ``StagedWriteTensor.apply_write`` — applies staged row/segment writes to a
   device tensor. Replaces ``_apply_write_kernel``.
@@ -26,27 +25,11 @@ explicit H2D copies.
 import logging
 
 import torch
+import vllm.v1.worker.gpu.buffer_utils as _up
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
-from vllm_kunlun.v1.worker.gpu._upstream import load_upstream
-
 logger = logging.getLogger("vllm_kunlun")
-
-_up = load_upstream("vllm.v1.worker.gpu.buffer_utils")
-
-# Re-export the upstream public surface so consumers importing from this
-# (swapped) module name resolve the same symbols.
-async_copy_to_gpu = _up.async_copy_to_gpu
-set_default_max_concurrency = _up.set_default_max_concurrency
-UvaBuffer = _up.UvaBuffer
-UvaBufferPool = _up.UvaBufferPool
-UvaBackedTensor = _up.UvaBackedTensor
-StagedWriteTensor = _up.StagedWriteTensor
-FusedStagedWriter = _up.FusedStagedWriter
-# Imported (but never called) by the genuine block_table module; keep the name
-# so its ``from ...buffer_utils import _load_ptr`` succeeds.
-_load_ptr = getattr(_up, "_load_ptr", None)
 
 
 def _apply_write(self) -> None:
@@ -89,8 +72,8 @@ def _fused_apply(self, tensors, output_ptrs, output_strides) -> None:
     )
 
 
-StagedWriteTensor.apply_write = _apply_write
-FusedStagedWriter.apply = _fused_apply
+_up.StagedWriteTensor.apply_write = _apply_write
+_up.FusedStagedWriter.apply = _fused_apply
 
 
 def _uva_view_supported() -> bool:
@@ -138,5 +121,5 @@ if not _uva_view_supported():
         buf.uva[:n].copy_(buf.cpu[:n], non_blocking=True)
         return buf.uva[:n]
 
-    UvaBuffer.__init__ = _uvabuffer_init
-    UvaBufferPool.copy_to_uva = _pool_copy_to_uva
+    _up.UvaBuffer.__init__ = _uvabuffer_init
+    _up.UvaBufferPool.copy_to_uva = _pool_copy_to_uva

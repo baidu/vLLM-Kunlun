@@ -216,9 +216,9 @@ class KunlunPlatform(Platform):
 
         # --- Model Runner V2 Triton gate (Kunlun XPU has no Triton) ---
         # Kunlun replaces the V2 Triton kernels with torch-native / kunlun_ops
-        # equivalents (see the ``vllm.v1.worker.gpu.*`` module swaps in
-        # vllm_kunlun/registration/module_redirects.py), so upstream's Triton
-        # veto has to be lifted:
+        # equivalents (see the ``vllm.v1.worker.gpu.*`` post-import patches in
+        # vllm_kunlun/registration/compat_patches.py), so upstream's Triton veto
+        # has to be lifted:
         # ``vllm.config.vllm`` uses HAS_TRITON only for the two V2 checks
         # (``use_v2_model_runner`` returns False when ``not HAS_TRITON``, and
         # ``_validate_v2_model_runner`` hard raises "Model Runner V2 requires
