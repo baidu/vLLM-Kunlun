@@ -1,5 +1,6 @@
 """kunlun"""
 
+import functools
 from typing import TYPE_CHECKING, Optional
 
 import psutil
@@ -236,21 +237,59 @@ class KunlunPlatform(Platform):
         # in explicitly with VLLM_USE_V2_MODEL_RUNNER=1 (or force V1 with "0").
         import vllm.config.vllm as _vllm_cfg_mod
 
-        if not getattr(_vllm_cfg_mod, "_kunlun_v2_triton_gate_opened", False):
+        if not getattr(_vllm_cfg_mod, "_kunlun_v2_gate_installed", False):
+            # Kunlun P800 has no usable Triton. Set the config module's flag
+            # only to bypass upstream's V2 Triton veto; the affected V2 paths
+            # are rejected explicitly below.
             _vllm_cfg_mod.HAS_TRITON = True
-            _vllm_cfg_mod._kunlun_v2_triton_gate_opened = True
+
+            _orig_unsupported = (
+                _vllm_cfg_mod.VllmConfig._get_v2_model_runner_unsupported_features
+            )
+
+            @functools.wraps(_orig_unsupported)
+            def _kunlun_mrv2_unsupported_features(self) -> list[str]:
+                # These paths still depend on unsupported Triton kernels.
+                unsupported = _orig_unsupported(self)
+
+                if self.speculative_config is not None:
+                    unsupported.append(
+                        "speculative decoding (Kunlun XPU P800 has no Triton and the "
+                        "V2 rejection-sampler kernels are not replaced yet)"
+                    )
+
+                if self.parallel_config.decode_context_parallel_size > 1:
+                    unsupported.append(
+                        "decode context parallelism (not replaced on Kunlun XPU P800)"
+                    )
+
+                if (
+                    self.cache_config is not None
+                    and self.cache_config.mamba_cache_mode == "align"
+                ):
+                    unsupported.append(
+                        "mamba align cache mode (its Triton launch sites are not "
+                        "replaced on Kunlun XPU P800)"
+                    )
+
+                if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+                    unsupported.append(
+                        "VLLM_COMPUTE_NANS_IN_LOGITS (not replaced on Kunlun XPU P800)"
+                    )
+
+                return unsupported
+
+            _vllm_cfg_mod.VllmConfig._get_v2_model_runner_unsupported_features = (
+                _kunlun_mrv2_unsupported_features
+            )
+            _vllm_cfg_mod._kunlun_v2_gate_installed = True
             logger.info(
-                "[KunlunPlugin] Opened Model Runner V2 Triton gate "
-                "(upstream decides whether V2 is used)."
+                "[KunlunPlugin] Opened the Model Runner V2 Triton gate and installed "
+                "the Kunlun capability gate (upstream still decides whether V2 is used)."
             )
 
         if parallel_config.worker_cls == "auto":
-            # v0.15.1 do not support v0.15.1, remove the if condition
-            if vllm_config.speculative_config:
-                # if envs.VLLM_USE_V1:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
-            else:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
