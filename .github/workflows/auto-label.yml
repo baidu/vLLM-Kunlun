@@ -19,17 +19,17 @@ concurrency:
 
 jobs:
   label-by-files:
-    name: Label pull request by changed files
+    name: Synchronize pull request path labels
     needs: label-by-content
-    # Avoid applying a broad set of area labels to repository-wide refactors.
-    if: github.event_name == 'pull_request_target' && github.event.pull_request.changed_files <= 150
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
-      - name: Apply area labels
+      - name: Synchronize path labels
         uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
         with:
           configuration-path: .github/labeler.yml
-          sync-labels: false
+          # The labels in labeler.yml are workflow-managed component labels.
+          sync-labels: true
 
   label-by-content:
     name: Label issue or pull request by content
@@ -118,19 +118,21 @@ jobs:
 
             const rules = [
               { label: 'bug', patterns: [/\bbug\b/, /error/, /exception/, /crash/, /fail/, /regression/] },
-              { label: 'documentation', patterns: [/\bdocs?\b/, /documentation/, /readme/, /tutorial/] },
+              { label: 'documentation', issueOnly: true, patterns: [/\bdocs?\b/, /documentation/, /readme/, /tutorial/] },
               { label: 'feature request', patterns: [/feature request/, /propose a new feature/, /new feature/] },
               { label: 'enhancement', patterns: [/\benhancement\b/, /\bimprov(e|ement)\b/, /\boptimi[sz](e|ation)\b/, /改进/, /优化/, /support .*model/, /add .*support/] },
               { label: 'question', patterns: [/\bquestion\b/, /how do i/, /how can i/, /请问/, /咨询/] },
-              { label: 'performance', patterns: [/performance/, /benchmark/, /latency/, /throughput/, /speedup/, /性能/, /延迟/] },
-              { label: 'dependencies', patterns: [/dependenc/, /requirements/, /install/, /package/, /版本/] },
-              { label: 'ci', patterns: [/\bci\b/, /continuous integration/, /github actions/, /workflow/, /测试流水线/] },
-              { label: 'tests', patterns: [/\btest\b/, /pytest/, /unit test/, /integration test/, /e2e/, /测试/] },
-              { label: 'kunlun-xpu', patterns: [/kunlun/, /xpu/, /p800/, /mlu/, /昆仑/] }
+              { label: 'performance', issueOnly: true, patterns: [/performance/, /benchmark/, /latency/, /throughput/, /speedup/, /性能/, /延迟/] },
+              { label: 'dependencies', issueOnly: true, patterns: [/dependenc/, /requirements/, /install/, /package/, /版本/] },
+              { label: 'ci', issueOnly: true, patterns: [/\bci\b/, /continuous integration/, /github actions/, /workflow/, /测试流水线/] },
+              { label: 'tests', issueOnly: true, patterns: [/\btest\b/, /pytest/, /unit test/, /integration test/, /e2e/, /测试/] },
+              { label: 'kunlun-xpu', issueOnly: true, patterns: [/kunlun/, /xpu/, /p800/, /mlu/, /昆仑/] }
             ];
 
             for (const rule of rules) {
-              if (!labels.has(rule.label) && rule.patterns.some(pattern => pattern.test(`${title}\n${body}`))) {
+              if ((event === 'issues' || !rule.issueOnly) &&
+                  !labels.has(rule.label) &&
+                  rule.patterns.some(pattern => pattern.test(`${title}\n${body}`))) {
                 add.push(rule.label);
               }
             }
