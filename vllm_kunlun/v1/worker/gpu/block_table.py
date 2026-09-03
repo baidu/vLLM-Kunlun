@@ -15,6 +15,15 @@ registered in ``vllm_kunlun/registration/compat_patches.py``.
 * ``compute_slot_mappings`` — reuse the native ``kunlun_ops.compute_slot_mappings``
   (same op the V1 Kunlun path uses), feeding it block tables pre-gathered by
   ``idx_mapping`` so the op's per-token request lookup matches V2 semantics.
+
+Both gather methods index with ``idx_mapping`` unguarded, which is safe: the
+``-1`` sentinel never reaches them. Their callers pass either
+``InputBatch.idx_mapping`` (model_runner.py:1026/1032), built from
+``req_id_to_index.get`` and so always non-negative, or the draft speculator's
+``self.idx_mapping[:num_reqs]`` sliced to the unpadded request count
+(spec_decode/autoregressive/speculator.py:359) -- the ``-1`` padding it writes
+lives at ``[num_reqs:]``. See the sentinel-invariant note in
+``vllm_kunlun/v1/worker/gpu/input_batch.py`` for where ``-1`` does occur.
 """
 
 import logging
@@ -57,8 +66,21 @@ def _compute_slot_mappings(
 ) -> torch.Tensor:
     num_reqs = idx_mapping.shape[0]
     num_groups = self.num_kv_cache_groups
-    # Total number of real tokens this step (one small D2H sync). Everything
-    # past this is padding and must map to PAD_SLOT_ID.
+    # Total number of real tokens this step. Everything past this is padding
+    # and must map to PAD_SLOT_ID.
+    #
+    # TODO: this .item() is a host sync on the V2 per-step input-preparation
+    # path, which upstream keeps entirely sync-free, so it costs the CPU/GPU
+    # overlap a full stall every step. It cannot be removed here:
+    # ``kunlun_ops.compute_slot_mappings`` takes num_tokens as a host int and
+    # only writes ``[0, num_tokens)``, leaving the caller to pad the rest (see
+    # the V1 reference in vllm_kunlun/v1/worker/block_table.py:63-84), so
+    # passing the freely available ``num_tokens_padded`` instead would give
+    # padding tokens real slot ids and corrupt the KV cache. Fixing it needs
+    # either a kunlun_ops variant that takes num_tokens as a device scalar, or
+    # a torch-native replacement that also reproduces the cp_size / cp_rank /
+    # cp_interleave handling. Until then the other per-step syncs are not worth
+    # removing on their own, since one is enough to stall the phase.
     num_tokens = int(query_start_loc[num_reqs].item())
 
     # Pad the whole buffer first; valid slots are overwritten below.

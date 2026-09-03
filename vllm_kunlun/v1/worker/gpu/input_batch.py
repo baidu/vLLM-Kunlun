@@ -4,14 +4,56 @@
 
 Leaves the upstream ``InputBuffers`` / ``InputBatch`` dataclasses alone and
 reimplements the seven Triton-backed module functions with torch-native
-equivalents. The functions operate on jagged per-request segments; the
-correctness-first implementation loops per request in Python (``num_reqs`` is
-small, typically <= a few hundred) and pulls the small metadata index tensors to
-host once per call. Optimizing the hot ones with ``kunlun_ops`` is a later step.
+equivalents. They operate on jagged per-request segments.
+
+``post_update`` and ``get_num_sampled_and_rejected`` are fully vectorised and
+perform no device-to-host transfer, which takes the postprocess phase to zero
+syncs -- that is where a sync hurts most, because it directly negates the
+``AsyncOutput`` copy-stream design (see ``_kernels.post_update``).
+
+Sentinel invariant: every function here except ``post_update`` may assume its
+``idx_mapping`` / ``expanded_idx_mapping`` is non-negative, so none of them
+needs a ``-1`` guard. Upstream builds ``InputBatch.idx_mapping`` from
+``req_id_to_index.get`` over the scheduled request ids (model_runner.py:862),
+which cannot yield ``-1``, and derives ``expanded_idx_mapping`` from it. The
+``-1`` sentinel is produced in exactly one place on the non-spec-decode path --
+``PPHandler.get_prev_sampled_outputs`` (pp_utils.py:115) masking rows on
+non-last pipeline-parallel ranks -- and that tensor is local to
+``GPUModelRunner.postprocess_sampled`` (model_runner.py:1082, whose signature
+documents it), reaching only ``post_update`` and
+``model_state.postprocess_state``. Both handle it; see ``_kernels.post_update``
+and ``_kernels.scatter_num_accepted``. Adding guards to the rest would not just
+be dead code: the natural spelling (``x[idx_mapping >= 0]``) is a boolean-mask
+selection, i.e. a host sync, which is precisely what the TODO below is about.
+
+Pipeline parallelism is not a declared feature of the plugin (the README lists
+tensor parallelism only, and there is no PP gate or test in vllm_kunlun), but
+it does run: V2 with PP=2/TP=2 has been exercised on Kunlun. A sentinel needs
+more than that -- a request freed or no longer needing sampled output while a
+broadcast is in flight -- so the ``-1`` branch is covered by the unit tests
+rather than by any hardware run so far. Both functions keep the handling
+because in their vectorised form it costs nothing (one extra term in a
+``torch.where`` over a mask that is computed either way), and because matching
+upstream semantics is what keeps a filtered row from silently corrupting
+another request's state.
+
+TODO: the remaining five still loop per request in Python and pull their
+metadata index tensors to host with ``.tolist()``. Each such call is a
+main-stream sync, so the input-preparation phase stalls once per step and the
+V2 runner's CPU/GPU overlap is lost there. They are correct but not optimised.
+Vectorising them is deliberately deferred rather than done piecemeal: one
+remaining sync stalls the whole phase just as thoroughly as five, and
+``BlockTables.compute_slot_mappings`` cannot drop its own ``.item()`` until
+``kunlun_ops.compute_slot_mappings`` can take num_tokens as a device scalar
+(see the TODO there). When that lands, these should go in the same change.
+``_kernels.segment_ids`` is the sync-free token-to-request mapping they need;
+note ``torch.searchsorted`` is not usable on Kunlun XPU.
 """
 
 import torch
 import vllm.v1.worker.gpu.input_batch as _up
+
+from vllm_kunlun.v1.worker.gpu._kernels import post_update
 
 
 def prepare_prefill_inputs(
@@ -143,45 +185,8 @@ def get_num_sampled_and_rejected(
     return num_sampled, num_rejected
 
 
-def post_update(
-    idx_mapping: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-    last_sampled_tokens: torch.Tensor,
-    output_bin_counts: torch.Tensor | None,
-    sampled_tokens: torch.Tensor,
-    num_sampled: torch.Tensor,
-    num_rejected: torch.Tensor,
-    query_start_loc: torch.Tensor | None,
-    all_token_ids: torch.Tensor,
-    total_len: torch.Tensor,
-) -> None:
-    num_reqs = idx_mapping.shape[0]
-    idx = idx_mapping.tolist()
-    ns = num_sampled.tolist()
-    nr = num_rejected.tolist()
-    tl_list = total_len.tolist()
-    qsl = query_start_loc.tolist() if query_start_loc is not None else None
-    for b in range(num_reqs):
-        rs = idx[b]
-        if rs < 0:
-            # Filtered row.
-            continue
-        num_s = ns[b]
-        if num_s > 0:
-            base = tl_list[rs]
-            last_sampled_tokens[rs] = sampled_tokens[b, num_s - 1]
-            tokens = sampled_tokens[b, :num_s]
-            all_token_ids[rs, base : base + num_s] = tokens
-            total_len[rs] = base + num_s
-            if output_bin_counts is not None:
-                toks = tokens.to(torch.long)
-                output_bin_counts[rs].scatter_add_(
-                    0, toks, torch.ones_like(toks, dtype=output_bin_counts.dtype)
-                )
-        query_len = 0 if qsl is None else (qsl[b + 1] - qsl[b])
-        computed_delta = query_len - nr[b]
-        if computed_delta != 0:
-            num_computed_tokens[rs] += computed_delta
+# ``post_update`` is fully vectorised and sync-free; it lives in ``_kernels``
+# with the other torch-only kernel stand-ins so it can be unit-tested on CPU.
 
 
 def post_update_num_computed_tokens(
