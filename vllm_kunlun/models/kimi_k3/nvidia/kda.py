@@ -367,6 +367,7 @@ def _kimi_delta_attention_xpu_prefill(
     lower_bound: Optional[float],
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("q, k and v must be 4D tensors")
@@ -450,15 +451,29 @@ def _kimi_delta_attention_xpu_prefill(
             f"got {tuple(initial_state.shape[1:])}"
         )
 
-    cu_seqlens_cpu = cu_seqlens.detach().to(
-        device="cpu",
-        dtype=torch.int32,
-    ).contiguous()
+    # kunlun_ops.kimi_delta_attention wants a host copy of cu_seqlens. Prefer the
+    # mirror the metadata builder already produced (non_spec_query_start_loc_cpu,
+    # attached by the KimiK3KDAMetadataBuilder.build hook in vllm_kunlun/__init__)
+    # over a D2H here: this runs once per KDA layer in the hot path, and such a
+    # sync is also where an unrelated async XPU kernel fault surfaces as
+    # "wait for noc idle timeout".
+    if cu_seqlens_cpu is not None and cu_seqlens_cpu.numel() == cu_seqlens.numel():
+        cu_seqlens_cpu = cu_seqlens_cpu.to(dtype=torch.int32).contiguous()
+    else:
+        logger.warning_once(
+            "[KUNLUN] no host mirror for cu_seqlens; falling back to a device "
+            "sync per KDA layer. Check the KimiK3KDAMetadataBuilder.build hook "
+            "in vllm_kunlun/__init__.py."
+        )
+        cu_seqlens_cpu = cu_seqlens.detach().to(
+            device="cpu",
+            dtype=torch.int32,
+        ).contiguous()
 
-    cu_seqlens_xpu = cu_seqlens.detach().to(
-        device=q.device,
-        dtype=torch.int32,
-    ).contiguous()
+    # cu_seqlens_xpu = cu_seqlens.detach().to(
+    #     device=q.device,
+    #     dtype=torch.int32,
+    # ).contiguous()
 
     g_xpu = _prepare_xpu_kda_gate(
         raw_g=g,
@@ -507,7 +522,7 @@ def _kimi_delta_attention_xpu_prefill(
         o_xpu,
         alpha=scale,
         cu_seqlens_cpu=cu_seqlens_cpu,
-        cu_seqlens_xpu=cu_seqlens_xpu,
+        cu_seqlens_xpu=cu_seqlens,
         use_qk_l2norm_in_kernel=True,
     )
 
@@ -766,6 +781,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         m = attn_metadata_narrowed
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
+        # Host mirror attached by the KimiK3KDAMetadataBuilder.build hook in
+        # vllm_kunlun/__init__.py; getattr because the framework dataclass does
+        # not declare the field.
+        non_spec_query_start_loc_cpu = getattr(
+            m, "non_spec_query_start_loc_cpu", None
+        )
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
         spec_token_indx = m.spec_token_indx
         non_spec_token_indx = m.non_spec_token_indx
@@ -937,6 +958,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         lower_bound=self.gate_lower_bound,
                         initial_state=initial_state,
                         cu_seqlens=non_spec_query_start_loc,
+                        cu_seqlens_cpu=non_spec_query_start_loc_cpu,
                     )
                 else:
                     (
