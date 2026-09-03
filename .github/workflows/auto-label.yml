@@ -21,7 +21,8 @@ jobs:
   label-by-files:
     name: Label pull request by changed files
     needs: label-by-content
-    if: github.event_name == 'pull_request_target'
+    # Avoid applying a broad set of area labels to repository-wide refactors.
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.changed_files <= 150
     runs-on: ubuntu-latest
     steps:
       - name: Apply area labels
