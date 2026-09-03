@@ -1,0 +1,132 @@
+name: Auto label issues and pull requests
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Match vLLM's per-item concurrency pattern so edits and pushes cannot race
+# while updating a single Issue or pull request's labels.
+concurrency:
+  group: auto-label-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label-by-files:
+    name: Label pull request by changed files
+    needs: label-by-content
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply area labels
+        uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          configuration-path: .github/labeler.yml
+          sync-labels: false
+
+  label-by-content:
+    name: Label issue or pull request by content
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply semantic labels
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const event = context.eventName;
+            const payload = context.payload;
+            const item = payload.issue ?? payload.pull_request;
+            if (!item) return;
+
+            const title = (item.title || '').toLowerCase();
+            const body = (item.body || '').toLowerCase();
+            const labels = new Set((item.labels || []).map(label => label.name));
+            const add = [];
+
+            const labelDefinitions = [
+              { name: 'bug', color: 'd73a4a', description: 'Something is not working' },
+              { name: 'documentation', color: '0075ca', description: 'Improvements or additions to documentation' },
+              { name: 'enhancement', color: 'a2eeef', description: 'New feature or request' },
+              { name: 'question', color: 'd876e3', description: 'Further information is requested' },
+              { name: 'feature request', color: '0e8a16', description: 'New feature proposal submitted through the issue form' },
+              { name: 'needs review', color: 'fbca04', description: 'Issue or pull request is ready for maintainer review' },
+              // Area labels use a distinct, high-contrast palette to make review queues easy to scan.
+              { name: 'area: kunlun-xpu', color: '6f42c1', description: 'Kunlun XPU runtime, build, or integration code' },
+              { name: 'area: ci', color: '0969da', description: 'Continuous integration and repository automation' },
+              { name: 'area: documentation', color: '1a7f37', description: 'Documentation, tutorials, or README changes' },
+              { name: 'area: tests', color: 'bf8700', description: 'Unit, integration, or end-to-end tests' },
+              { name: 'area: dependencies', color: '8250df', description: 'Packaging, dependencies, or installation changes' },
+              { name: 'area: performance', color: 'cf222e', description: 'Performance, benchmark, latency, or throughput changes' },
+              { name: 'area: examples', color: '8c959f', description: 'Examples, demos, or community utilities' }
+            ];
+
+            for (const definition of labelDefinitions) {
+              try {
+                const existing = await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: definition.name
+                });
+                if (existing.data.color !== definition.color ||
+                    (existing.data.description || '') !== definition.description) {
+                  await github.rest.issues.updateLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: definition.name,
+                    color: definition.color,
+                    description: definition.description
+                  });
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                try {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: definition.name,
+                    color: definition.color,
+                    description: definition.description
+                  });
+                } catch (createError) {
+                  // Another workflow run may have created the label first.
+                  if (createError.status !== 422) throw createError;
+                }
+              }
+            }
+
+            const rules = [
+              { label: 'bug', patterns: [/\bbug\b/, /error/, /exception/, /crash/, /fail/, /regression/] },
+              { label: 'documentation', patterns: [/\bdocs?\b/, /documentation/, /readme/, /tutorial/] },
+              { label: 'feature request', patterns: [/feature request/, /propose a new feature/, /new feature/] },
+              { label: 'enhancement', patterns: [/\benhancement\b/, /\bimprov(e|ement)\b/, /\boptimi[sz](e|ation)\b/, /改进/, /优化/, /support .*model/, /add .*support/] },
+              { label: 'question', patterns: [/\bquestion\b/, /how do i/, /how can i/, /请问/, /咨询/] },
+              { label: 'area: performance', patterns: [/performance/, /benchmark/, /latency/, /throughput/, /speedup/, /性能/, /延迟/] },
+              { label: 'area: dependencies', patterns: [/dependenc/, /requirements/, /install/, /package/, /版本/] },
+              { label: 'area: ci', patterns: [/\bci\b/, /continuous integration/, /github actions/, /workflow/, /测试流水线/] },
+              { label: 'area: tests', patterns: [/\btest\b/, /pytest/, /unit test/, /integration test/, /e2e/, /测试/] },
+              { label: 'area: kunlun-xpu', patterns: [/kunlun/, /xpu/, /p800/, /mlu/, /昆仑/] }
+            ];
+
+            for (const rule of rules) {
+              if (!labels.has(rule.label) && rule.patterns.some(pattern => pattern.test(`${title}\n${body}`))) {
+                add.push(rule.label);
+              }
+            }
+
+            if (event === 'pull_request_target' && !labels.has('needs review')) {
+              add.push('needs review');
+            }
+
+            if (add.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: item.number,
+                labels: add
+              });
+            }

@@ -1,0 +1,53 @@
+# Keep broad refactors from accumulating noisy component labels.
+changed-files-labels-limit: 4
+max-files-changed: 150
+
+"area: kunlun-xpu":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "vllm_kunlun/**"
+          - "build.sh"
+          - "setup_env.sh"
+
+"area: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "ci.yml"
+          - ".pre-commit-config.yaml"
+
+"area: documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+          - ".readthedocs.yaml"
+
+"area: tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
+          - "**/test_*.py"
+          - "**/*_test.py"
+
+"area: dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "requirements*.txt"
+          - "pyproject.toml"
+          - "setup.py"
+          - "setup.cfg"
+          - "uv.lock"
+
+"area: performance":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "benchmarks/**"
+          - "benchmark/**"
+          - "**/benchmark*.py"
+
+"area: examples":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "examples/**"
+          - "community/**"
