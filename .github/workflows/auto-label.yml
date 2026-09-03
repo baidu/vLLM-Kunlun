@@ -76,15 +76,21 @@ jobs:
               { name: 'area: examples', color: '8c959f', description: 'Examples, demos, or community utilities' }
             ];
 
+            // Read the repository labels once per event rather than issuing one
+            // API request per definition. Only missing or drifted labels require
+            // a mutation, which avoids secondary-rate-limit pressure on edits and
+            // synchronize events.
+            const existingLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            const labelsByName = new Map(existingLabels.map(label => [label.name, label]));
+
             for (const definition of labelDefinitions) {
-              try {
-                const existing = await github.rest.issues.getLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  name: definition.name
-                });
-                if (existing.data.color !== definition.color ||
-                    (existing.data.description || '') !== definition.description) {
+              const existing = labelsByName.get(definition.name);
+              if (existing) {
+                if (existing.color !== definition.color ||
+                    (existing.description || '') !== definition.description) {
                   await github.rest.issues.updateLabel({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
@@ -93,20 +99,20 @@ jobs:
                     description: definition.description
                   });
                 }
+                continue;
+              }
+
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: definition.name,
+                  color: definition.color,
+                  description: definition.description
+                });
               } catch (error) {
-                if (error.status !== 404) throw error;
-                try {
-                  await github.rest.issues.createLabel({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    name: definition.name,
-                    color: definition.color,
-                    description: definition.description
-                  });
-                } catch (createError) {
-                  // Another workflow run may have created the label first.
-                  if (createError.status !== 422) throw createError;
-                }
+                // Another run may create the same label after the list request.
+                if (error.status !== 422) throw error;
               }
             }
 
