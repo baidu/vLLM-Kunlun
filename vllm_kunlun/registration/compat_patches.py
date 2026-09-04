@@ -106,6 +106,61 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     )
 
 
+# --- vllm.utils.import_utils: do not probe CUDA-only optional deps ---------
+#
+# ``_has_module`` decides availability with a trial import and logs a WARNING
+# plus a full traceback when that import fails.  For a library shipped only as
+# CUDA binaries the failure is certain on Kunlun (DeepGEMM dies on
+# ``libcudart.so.13``), so the traceback is noise in every startup log.
+# Answering False without importing is the same verdict, quietly.
+#
+# It cannot be left to ``VLLM_USE_DEEP_GEMM``: upstream evaluates
+# ``envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch``
+# (``utils/deep_gemm.py``), so the probe runs before the platform's own
+# ``support_deep_gemm()`` verdict is consulted -- turning the flag off would
+# work, but it means overriding a user-intent switch to state a hardware fact.
+#
+# Patching ``_has_module`` rather than ``has_deep_gemm`` is deliberate: many
+# modules do ``from vllm.utils.import_utils import has_deep_gemm``, so that
+# name is already bound by value in each of them, while ``has_deep_gemm``
+# itself resolves ``_has_module`` from module globals on every call.
+
+_CUDA_ONLY_MODULES = frozenset(
+    {
+        # DeepGEMM: JIT-compiled FP8 CUDA kernels for Hopper/Blackwell.  Kunlun
+        # has vllm_kunlun.ops.deep_gemm, which reuses only the interface.
+        "deep_gemm",
+        "vllm.third_party.deep_gemm",
+    }
+)
+
+
+def _optional_dep_probe_applied(module: ModuleType) -> bool:
+    """Return whether the probe is filtered, or the module predates it."""
+    if not hasattr(module, "_has_module"):
+        return True
+    return getattr(module, "_kunlun_dep_probe_installed", False)
+
+
+def _apply_optional_dep_probe(module: ModuleType) -> None:
+    """Answer False for CUDA-only modules instead of trial-importing them."""
+    original = module._has_module
+
+    @functools.wraps(original)
+    def _kunlun_has_module(module_name: str) -> bool:
+        if module_name in _CUDA_ONLY_MODULES:
+            return False
+        return original(module_name)
+
+    module._has_module = _kunlun_has_module
+    module._kunlun_dep_probe_installed = True
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] Reporting CUDA-only optional dependencies as "
+        "unavailable without importing them: %s",
+        ", ".join(sorted(_CUDA_ONLY_MODULES)),
+    )
+
+
 # --- vllm.v1.worker.utils: replace KVBlockZeroer --------------------------
 
 
@@ -448,6 +503,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
+    (
+        "vllm.utils.import_utils",
+        _optional_dep_probe_applied,
+        _apply_optional_dep_probe,
+    ),
     ("vllm.v1.worker.utils", _kv_block_zeroer_applied, _apply_kv_block_zeroer),
     (
         "vllm.model_executor.models.qwen3_vl",
