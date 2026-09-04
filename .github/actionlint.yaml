@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # 自建 runner 的自定义标签，actionlint 无法从 GitHub 获知，需在此声明。
+  labels:
+    - ai-review

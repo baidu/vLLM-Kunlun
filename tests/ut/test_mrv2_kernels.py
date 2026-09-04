@@ -20,6 +20,7 @@ import torch
 
 from vllm_kunlun.v1.worker.gpu._kernels import (
     post_update,
+    prepare_rope_positions,
     scatter_num_accepted,
     segment_ids,
 )
@@ -338,3 +339,65 @@ def test_scatter_does_not_mutate_its_inputs():
     scatter_num_accepted(idx_mapping, num_sampled, torch.zeros(4, dtype=torch.int32))
     for original, current in zip(originals, [idx_mapping, num_sampled]):
         assert torch.equal(original, current)
+
+
+def test_prepare_rope_positions_handles_prefill_and_decode_rows():
+    """Prefill rows gather model positions; decode rows use offset positions."""
+    num_dims, max_model_len = 2, 8
+    positions = torch.full((num_dims, 6), -1, dtype=torch.int64)
+    prefill_positions = torch.arange(2 * 2 * max_model_len, dtype=torch.int32).view(
+        4, max_model_len
+    )
+    prefill_delta = torch.tensor([2, 0], dtype=torch.int32)
+    idx_mapping = torch.tensor([1, 0], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    prefill_lens = torch.tensor([3, 3], dtype=torch.int32)
+    num_computed_tokens = torch.tensor([3, 1], dtype=torch.int32)
+
+    prepare_rope_positions(
+        positions,
+        prefill_positions,
+        prefill_delta,
+        idx_mapping,
+        query_start_loc,
+        prefill_lens,
+        num_computed_tokens,
+        num_dims,
+        max_model_len,
+    )
+
+    # Request 1 is prefilling at original positions 1 and 2.
+    assert torch.equal(positions[:, :2], prefill_positions[2:4, 1:3])
+    # Request 0 is decoding: computed position 3 plus its delta of 2.
+    assert torch.equal(positions[:, 2], torch.tensor([5, 5]))
+
+
+def test_prepare_rope_positions_clamps_prefill_lookup_and_handles_empty_batch():
+    positions = torch.full((1, 3), -1, dtype=torch.int64)
+    prefill_positions = torch.tensor([[10, 20, 30]], dtype=torch.int32)
+    prepare_rope_positions(
+        positions,
+        prefill_positions,
+        torch.zeros(1, dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([10], dtype=torch.int32),
+        torch.tensor([5], dtype=torch.int32),
+        1,
+        3,
+    )
+    assert torch.equal(positions[0, :2], torch.tensor([30, 30]))
+
+    empty = torch.full((1, 3), -1, dtype=torch.int64)
+    prepare_rope_positions(
+        empty,
+        prefill_positions,
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(0, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        1,
+        3,
+    )
+    assert torch.equal(empty, torch.full_like(empty, -1))

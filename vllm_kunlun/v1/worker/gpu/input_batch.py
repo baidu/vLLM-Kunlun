@@ -211,8 +211,11 @@ def expand_idx_mapping(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     device = idx_mapping.device
-    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-    expanded_local_pos = torch.empty(total_num_logits, dtype=torch.int32, device=device)
+    # ``cu_num_logits`` may cover fewer entries than ``total_num_logits`` for
+    # padded CUDA-graph buffers. Initialize the padding so callers never see
+    # uninitialized device memory.
+    expanded_idx_mapping = idx_mapping.new_zeros(total_num_logits)
+    expanded_local_pos = torch.zeros(total_num_logits, dtype=torch.int32, device=device)
     cnl = cu_num_logits.tolist()
     idx = idx_mapping.tolist()
     for r in range(num_reqs):
