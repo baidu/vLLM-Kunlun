@@ -202,9 +202,13 @@ def _kda_ops_apply(mod):
 
 
 def _kda_norm_apply(mod):
-    from vllm_kunlun.ops.kda import patch_rms_norm_gated
+    from vllm_kunlun.ops.kda import (
+        patch_rms_norm_gated,
+        register_oot_rms_norm_gated,
+    )
 
     patch_rms_norm_gated(mod)
+    register_oot_rms_norm_gated(mod)
 
 
 _register_post_import_hook(
