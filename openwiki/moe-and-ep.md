@@ -16,7 +16,7 @@ sources:
 - repo://vllm_kunlun/ops/_kunlun_ops.py#L377-L680
 - repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L149-L321
 - repo://vllm_kunlun/platforms/kunlun.py#L257-L274
-- repo://setup_env.sh#L8
+- repo://setup_env.sh
 claims: .claims/moe-and-ep.json
 ---
 
@@ -116,9 +116,9 @@ kernel launch 可以融成一次"，都会重新引入高并发下输出乱码�
 - `ENABLE_VLLM_MOE_FC_SORTED`（`platforms/envs.py#L53`，注释
   `fuse sorted op with fused_moe kernel`）——**没有消费者**，见
   [architecture.md](architecture.md#7-环境变量两套互不相交的集合)。
-- `XPU_USE_MOE_SORTED_THRES` —— 由 `torch_xmlir` 读取，不经过本仓库。
-  **文档与脚本给的值不一致**：`setup_env.sh#L8` 设成 `128`，
-  文档推荐 `1`。见 [known-gaps.md](known-gaps.md)。
+- `XPU_USE_MOE_SORTED_THRES` —— 厂商 legacy `moe_ffn_block` 根据 token
+  行数 `M` 选择 sorted 路径的阈值，默认 `512`。当前 vLLM-Kunlun 的
+  `fused_moe` 路径使用内部条件，不读取这个变量，因此启动脚本不再设置它。
 
 ## 相关页面
 

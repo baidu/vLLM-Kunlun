@@ -89,14 +89,12 @@
     },
     {
       "id": "gap-009",
-      "statement": "代码与文档存在九处冲突，包括构建后端（hatchling vs setuptools）、CI 里 pin vllm==0.11.0 与插件 0.25.1、Dockerfile transformers 4.57.1 vs requirements 5.2.0、XPU_USE_MOE_SORTED_THRES 128 vs 1、默认分支 v0.25.1-dev 但各处仍写 main、GLM-4.5 tutorial 标题写 Single XPU 而命令是 TP=8、支持模型数 5 vs 20+、专家并行标绿但零示例命令。",
+      "statement": "代码与文档存在七处冲突，包括构建后端（hatchling vs setuptools）、CI 里 pin vllm==0.11.0 与插件 0.25.1、Dockerfile transformers 4.57.1 vs requirements 5.2.0、默认分支 v0.25.1-dev 但各处仍写 main、GLM-4.5 tutorial 标题写 Single XPU 而命令是 TP=8、支持模型数 5 vs 20+、专家并行标绿但零示例命令。",
       "kind": "caveat",
       "evidence": [
         "repo://README.md",
         "repo://pyproject.toml#L6",
         "repo://requirements.txt",
-        "repo://setup_env.sh#L8",
-        "repo://setup_env.sh#L11-L13",
         "repo://docs/source/tutorials/multi_xpu_GLM-4.5.md",
         "repo://docs/source/user_guide/support_matrix/supported_models.md",
         "repo://docs/source/user_guide/support_matrix/supported_features.md#L8-L14"

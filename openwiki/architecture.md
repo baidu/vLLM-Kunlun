@@ -268,11 +268,14 @@ fake impl `#L255-L257`，调用点 `#L110-L112`）、
 （`mla/common.py#L1152`、`#L1459`、`#L1969`）。9 个里有 6 个没有任何消费者；
 另外 2 个（日志/hook）的消费者在 `vllm_kunlun/utils.py`，而**没有任何模块 import 它**。
 
-**文档里的集合**：`docs/source/user_guide/configuration/env_vars.md#L7-L17`
-记录了 11 个**完全不同**的 XPU/XMLIR 变量：`XPU_VISIBLE_DEVICES`、
-`XPU_USE_MOE_SORTED_THRES`、`XFT_USE_FAST_SWIGLU`、`XPU_USE_FAST_SWIGLU`、
+**文档里的集合**：`docs/source/user_guide/configuration/env_vars.md`
+记录了 12 个**完全不同**的 XPU/XMLIR 变量：`XPU_VISIBLE_DEVICES`、
+`XPU_USE_MOE_SORTED_THRES`（仅 legacy `moe_ffn_block` 使用）、
+`XFT_USE_FAST_SWIGLU`、`XPU_USE_FAST_SWIGLU`、
 `XMLIR_CUDNN_ENABLED`、`XPU_USE_DEFAULT_CTX`、`XMLIR_FORCE_USE_XPU_GRAPH`、
-`VLLM_HOST_IP`、`XMLIR_ENABLE_MOCK_TORCH_COMPILE`、`FUSED_QK_ROPE_OP`、
+`VLLM_HOST_IP`、`XMLIR_ENABLE_MOCK_TORCH_COMPILE`、
+`XMLIR_DYNAMO_WORKAROUND`（由 torch_xmlir 的 `nn/linear.py` 读取，
+将 `F.linear` 注册为自定义算子以规避 Dynamo tracing 问题）、`FUSED_QK_ROPE_OP`、
 以及 `unset XPU_DUMMY_EVENT`。这些是 `torch_xmlir` 运行时读的，不经过本仓库。
 
 `docs/envs.py` 是从 vllm-ascend 抄来的死代码（`#L5` 自己写着

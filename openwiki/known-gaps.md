@@ -3,7 +3,7 @@ type: reference
 title: 已知缺口、死代码与文档冲突
 summary: >-
   PD 分离不支持的穷尽证据、名字与行为不符的函数、无消费者的环境变量与死代码、
-  以及代码与文档之间的九处冲突。
+  以及代码与文档之间的七处冲突。
 generated:
   by: hand-authored (Claude Code, OpenWiki OKF v0.2 conventions)
   at: 2026-09-02T00:00:00Z
@@ -19,7 +19,6 @@ sources:
 - repo://vllm_kunlun/quantization/moe_wna16.py#L27-L107
 - repo://vllm_kunlun/models/config.py
 - repo://vllm_kunlun/platforms/envs.py#L34-L71
-- repo://setup_env.sh#L8-L13
 - repo://pyproject.toml#L6-L19
 claims: .claims/known-gaps.json
 ---
@@ -112,19 +111,17 @@ buffer 仍在分配（`#L81-L96`）。
 
 详见 [architecture.md](architecture.md#7-环境变量两套互不相交的集合)。
 
-## 5. 代码与文档的九处冲突
+## 5. 代码与文档的七处冲突
 
 | # | 冲突 | 以哪个为准 |
 | --- | --- | --- |
 | 1 | README 说构建后端是 hatchling；`pyproject.toml#L6` 是 setuptools | 代码 |
 | 2 | CI 里 pin `vllm==0.11.0`，插件版本是 0.25.1 | `faqs.md#L43` 的规则：版本必须相同 → 0.25.1 |
 | 3 | Dockerfile `transformers==4.57.1` vs `requirements.txt` `5.2.0` | requirements |
-| 4 | `setup_env.sh#L8` 设 `XPU_USE_MOE_SORTED_THRES=128`，文档推荐 `1` | 需实测确认 |
-| 5 | `setup_env.sh#L11-L13` 给 `VLLM_USE_V1` / `USE_ORI_ROPE` 赋值但**没 export** | 需自行 export |
-| 6 | 默认分支是 `v0.25.1-dev`，但 CONTRIBUTING / `conf.py` / workflows 都写 `main` | `v0.25.1-dev` |
-| 7 | `multi_xpu_GLM-4.5.md` 标题写 "Single XPU"，命令是 TP=8 | 命令 |
-| 8 | `supported_models.md` 列 5 个模型，README 宣称 20+ | `models/__init__.py` 的 12 个注册项 |
-| 9 | `supported_features.md#L8-L14` 声称专家并行 🟢，但 0 条示例命令，且 EP 是 Python 逐专家循环 | 代码（见 [moe-and-ep.md](moe-and-ep.md#5-ep-路径是-python-逐专家循环)） |
+| 4 | 默认分支是 `v0.25.1-dev`，但 CONTRIBUTING / `conf.py` / workflows 都写 `main` | `v0.25.1-dev` |
+| 5 | `multi_xpu_GLM-4.5.md` 标题写 "Single XPU"，命令是 TP=8 | 命令 |
+| 6 | `supported_models.md` 列 5 个模型，README 宣称 20+ | `models/__init__.py` 的 10 个注册项 |
+| 7 | `supported_features.md#L8-L14` 声称专家并行 🟢，但 0 条示例命令，且 EP 是 Python 逐专家循环 | 代码（见 [moe-and-ep.md](moe-and-ep.md#5-ep-路径是-python-逐专家循环)） |
 
 另外两处版本号自相矛盾：`platforms/version.py#L3` = `0.25.1` vs
 `pyproject.toml#L10` = `0.25.1.dev0`；以及 `main` 分支的 README 仍宣称

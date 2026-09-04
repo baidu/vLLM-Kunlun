@@ -165,18 +165,41 @@ curl http://localhost:8356/v1/chat/completions \
 
 ### Environment Variables
 
+The following values are a starting point for the Mamba-hybrid example below.
+Adjust device visibility and model-specific kernel options for your deployment.
+
 ```bash
-export XPU_VISIBLE_DEVICES=0,1          # physical XPU cards to use
-export CUDA_VISIBLE_DEVICES=0,1         # logical CUDA device mapping
+# Select the physical XPU devices visible to this process.
+export XPU_VISIBLE_DEVICES=0,1
+
+# Keep the CUDA-compatible device view aligned with the selected XPUs.
+export CUDA_VISIBLE_DEVICES=0,1
+
+# Enable the fast SwiGLU implementation in XFT operators.
 export XFT_USE_FAST_SWIGLU=1
+
+# Enable the XMLIR runtime's cuDNN-compatible path.
 export XMLIR_CUDNN_ENABLED=1
+
+# Enable the XMLIR fast fully connected implementation.
 export XMLIR_ENABLE_FAST_FC=true
+
+# Select the SDNN BF16 rounding mode used by XPU kernels.
 export XPUAPI_SDNN_BF16_ROUND_MODE=3
-export XPU_USE_MOE_SORTED_THRES=1
+
+# Use the XPU runtime's default device context.
 export XPU_USE_DEFAULT_CTX=1
+
+# Route CUDA Graph-compatible APIs to XPU Graph capture and replay.
 export XMLIR_FORCE_USE_XPU_GRAPH=1
+
+# Enable the fast SwiGLU implementation in Kunlun MoE operators.
 export XPU_USE_FAST_SWIGLU=1
+
+# Select the newer XPU flash-attention decoder implementation.
 export XPU_FLASH_ATTENTION_DECODER_USE_NEW_IMPL=1
+
+# Select the fast FP16 forward implementation for recurrent gated delta rule.
 export XPU_SET_RECURRENT_GATED_DELTA_RULE_FWDV2_FP16_FAST_OPT=3
 ```
 

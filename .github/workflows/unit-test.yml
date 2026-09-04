@@ -1,0 +1,26 @@
+name: Unit Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  unit-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # The unit tests are hardware-free by design: no torch, vllm or Kunlun
+      # device is installed here, so pytest is the only dependency.
+      - name: Install pytest
+        run: pip install "pytest==8.3.4"
+
+      - name: Run unit tests
+        run: pytest

@@ -90,12 +90,12 @@
     },
     {
       "id": "moe-010",
-      "statement": "ENABLE_VLLM_MOE_FC_SORTED 在 platforms/envs.py 有声明但没有消费者；XPU_USE_MOE_SORTED_THRES 由 torch_xmlir 读取且脚本值（setup_env.sh 设 128）与文档推荐值（1）不一致。",
+      "statement": "ENABLE_VLLM_MOE_FC_SORTED 在 platforms/envs.py 有声明但没有消费者；XPU_USE_MOE_SORTED_THRES 只控制 legacy moe_ffn_block，当前 vLLM-Kunlun fused MoE 路径不读取它。",
       "kind": "caveat",
       "evidence": [
         "repo://vllm_kunlun/platforms/envs.py#L53",
-        "repo://setup_env.sh#L8",
-        "repo://docs/source/user_guide/configuration/env_vars.md#L7-L17"
+        "repo://vllm_kunlun/ops/_custom_ops.py#L819-L897",
+        "repo://docs/source/user_guide/configuration/env_vars.md"
       ],
       "confidence": "high"
     }

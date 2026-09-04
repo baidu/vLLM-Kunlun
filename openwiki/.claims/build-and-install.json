@@ -74,12 +74,12 @@
     },
     {
       "id": "build-008",
-      "statement": "setup_env.sh 存在两个已知问题：XPU_USE_MOE_SORTED_THRES 设为 128 与文档推荐值 1 矛盾；VLLM_USE_V1 / USE_ORI_ROPE 被赋值但没有 export，子进程看不到。",
-      "kind": "defect",
+      "statement": "setup_env.sh 不再设置 XPU_USE_MOE_SORTED_THRES；该变量只影响当前主 MoE 路径未调用的 legacy moe_ffn_block。",
+      "kind": "fact",
       "evidence": [
-        "repo://setup_env.sh#L8",
-        "repo://setup_env.sh#L11-L13",
-        "repo://docs/source/user_guide/configuration/env_vars.md#L7-L17"
+        "repo://setup_env.sh",
+        "repo://docs/source/user_guide/configuration/env_vars.md",
+        "repo://vllm_kunlun/ops/_custom_ops.py#L819-L897"
       ],
       "confidence": "high"
     },

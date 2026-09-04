@@ -17,7 +17,7 @@ sources:
 - repo://pyproject.toml#L6-L27
 - repo://setup.py#L25-L81
 - repo://build.sh#L22-L23
-- repo://setup_env.sh#L8-L13
+- repo://setup_env.sh
 - repo://docs/source/installation.md#L100-L106
 claims: .claims/build-and-install.json
 ---
@@ -102,14 +102,10 @@ graph TD
 （这些变量**不经过** `platforms/envs.py`，见
 [architecture.md](architecture.md#7-环境变量两套互不相交的集合)）。
 
-两个已知问题：
-
-- `#L8` 设 `XPU_USE_MOE_SORTED_THRES=128`，而文档推荐 `1`。**两者矛盾。**
-- `#L11-L13` 给 `VLLM_USE_V1` / `USE_ORI_ROPE` 赋值但**没有 `export`**，
-  所以子进程看不到。如果依赖这两个变量，需要自己 export。
-
 `torch_xmlir` 会读的变量清单在
-`docs/source/user_guide/configuration/env_vars.md#L7-L17`（11 个）。
+`docs/source/user_guide/configuration/env_vars.md`。其中
+`XPU_USE_MOE_SORTED_THRES` 只影响未被当前主 MoE 路径调用的 legacy 算子，
+所以启动脚本不设置它。
 
 ## 6. 分支与版本号
 
