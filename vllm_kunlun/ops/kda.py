@@ -997,6 +997,9 @@ def patch_kda_ops(mod) -> None:
     logger.info("[KunlunPlugin] fused_kda_gate_chunk_cumsum -> xspeedgate_ops")
 
 
+_LOGGED_GATE_LAYOUT = False
+
+
 def layer_norm_gated_fwd(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -1018,6 +1021,29 @@ def layer_norm_gated_fwd(
     separate ``rms_norm_gated_fwd`` op hardcodes the swish gate). Returns
     upstream's ``(y, mean, rstd, residual_out)``.
     """
+    # K3's o_norm has D=128 <= 512, so upstream's rms_norm_gated takes its tiled
+    # branch: x is flattened to [T*H, D] while g stays [T, H, D], and the triton
+    # kernel indexes row n at (n // H) * g_stride_n + (n % H) * D, i.e. exactly
+    # g[n // H, n % H]. The XPU op only implements the H == 1 layout, so
+    # materialise that: reshape to [T*H, D] pairs row n with the same element
+    # for any g stride (g2 is a strided view of the fused qkvgfab projection,
+    # so g_stride_n is generally NOT H*D).
+    if H > 1 and g.dim() == 3 and g.shape[0] * H == x.shape[0]:
+        if not _LOGGED_GATE_LAYOUT:
+            logger.info(
+                "[KunlunPlugin] gated norm layout: x=%s g=%s stride=%s H=%d "
+                "g_stride_n=%s -> collapsing to H=1",
+                tuple(x.shape),
+                tuple(g.shape),
+                tuple(g.stride()),
+                H,
+                g_stride_n,
+            )
+            globals()["_LOGGED_GATE_LAYOUT"] = True
+        g = g.reshape(-1, g.shape[-1])
+        H = 1
+        g_stride_n = g.shape[-1]
+
     return torch.ops.xspeedgate_ops.layer_norm_gated_fwd(
         x,
         g,
@@ -1045,3 +1071,41 @@ def patch_rms_norm_gated(mod) -> None:
     mod.layer_norm_gated_fwd = layer_norm_gated_fwd
     mod._kunlun_kda_patched = True
     logger.info("[KunlunPlugin] layer_norm_gated_fwd -> xspeedgate_ops")
+
+
+def register_oot_rms_norm_gated(mod) -> None:
+    """Route ``FusedRMSNormGated`` to ``forward_cuda`` so the swapped kernel runs.
+
+    ``CustomOp.dispatch_forward`` tests ``is_out_of_tree()`` before
+    ``forward_cuda``, and the base ``forward_oot`` delegates to
+    ``forward_native``. For ``residual=None, prenorm=False`` -- how K3 calls
+    ``o_norm`` -- ``forward_native`` never reaches ``layer_norm_gated_fwd`` and
+    instead runs 7 decomposed fp32 elementwise ops per call, leaving
+    ``patch_rms_norm_gated`` dead. Registering an OOT subclass makes
+    ``CustomOp.__new__`` instantiate this class, so ``forward_oot`` reaches
+    ``rms_norm_gated`` -> the patched kernel entry.
+
+    Must run after ``patch_rms_norm_gated`` and before the model builds
+    ``o_norm``; the FLA-kda post-import hook satisfies both.
+    """
+    from vllm.model_executor.custom_op import CustomOp, op_registry_oot
+
+    base = getattr(mod, "FusedRMSNormGated", None)
+    if base is None or "FusedRMSNormGated" in op_registry_oot:
+        return
+
+    @CustomOp.register_oot(name="FusedRMSNormGated")
+    class KunlunFusedRMSNormGated(base):
+        def forward_oot(
+            self,
+            x,
+            g,
+            residual=None,
+            prenorm: bool = False,
+            residual_in_fp32: bool = False,
+        ):
+            return self.forward_cuda(x, g, residual, prenorm, residual_in_fp32)
+
+    logger.info(
+        "[KunlunOOT] Registered KunlunFusedRMSNormGated via CustomOp.register_oot"
+    )
