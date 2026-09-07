@@ -812,6 +812,118 @@ class KunlunOps:
         return output
 
     @staticmethod
+    def moe_ct_w4a16_experts(
+        hidden_states: torch.Tensor,
+        w13_weight_packed_signed: torch.Tensor,
+        w2_weight_packed_signed: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        moe_top_k: int,
+    ) -> torch.Tensor:
+        """Expert compute without routing, for vLLM's modular MoE path.
+
+        Identical to the second half of fused_moe_ct_w4a16, except that
+        topk_ids / topk_weights are supplied by the caller (vLLM's
+        select_experts plus the expert_map remap). Under EP, w13/w2 only hold
+        this rank's experts, so topk_ids must already be local ids.
+        """
+        dev = hidden_states.device
+        num_local_experts = w13_weight_packed_signed.shape[0]
+        up_gate_size = w13_weight_packed_signed.shape[1]
+        M, N = hidden_states.shape
+        hidden_dim = w2_weight_packed_signed.shape[1]
+
+        ids = topk_ids.to(torch.int32).contiguous()
+        normed_score = topk_weights.to(torch.float32).contiguous()
+
+        block_statistic = torch.zeros(
+            12, num_local_experts, dtype=torch.int32, device=dev
+        )
+        torch.ops._C.gen_block_statistic(ids, block_statistic)
+
+        moe_expand = torch.empty(
+            (M * moe_top_k, N), dtype=hidden_states.dtype, device=dev
+        )
+        expert_m = torch.zeros(num_local_experts, dtype=torch.int32, device=dev)
+        sorted_tokens_num_lod = torch.zeros(
+            num_local_experts + 1, dtype=torch.int32, device=dev
+        )
+        sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=dev)
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
+        del expert_m, block_statistic
+
+        # Must be zeros, not empty: under the EP shapes / expert
+        # distribution (112 local experts, very skewed per-expert row counts)
+        # moe_fc_v3 leaves part of its output tensor untouched. With empty,
+        # the NaNs sitting in uninitialized device memory flow straight into
+        # silu_and_mul / moe_post and the whole layer output becomes NaN.
+        y = torch.zeros(
+            M * moe_top_k, up_gate_size, dtype=hidden_states.dtype, device=dev
+        )
+        torch.ops._C.moe_fc_v3(
+            x=moe_expand,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=None,
+            w_perchannel_max=w13_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del moe_expand
+
+        d = y.shape[-1] // 2
+        out1 = torch.empty(y.shape[:-1] + (d,), dtype=y.dtype, device=dev)
+        torch.ops._C.silu_and_mul(out1, y)
+        del y
+
+        # Must be zeros, not empty: under the EP shapes / expert
+        # distribution (112 local experts, very skewed per-expert row counts)
+        # moe_fc_v3 leaves part of its output tensor untouched. With empty,
+        # the NaNs sitting in uninitialized device memory flow straight into
+        # silu_and_mul / moe_post and the whole layer output becomes NaN.
+        out = torch.zeros(
+            M * moe_top_k, hidden_dim, dtype=hidden_states.dtype, device=dev
+        )
+        out1 = out1.reshape(-1, out1.shape[-1])
+        torch.ops._C.moe_fc_v3(
+            x=out1,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=None,
+            w_perchannel_max=w2_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del out1
+
+        dequant_scale = torch.ones([M, moe_top_k], dtype=torch.float32, device=dev)
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=dev)
+        torch.ops._C.moe_post(
+            x=out.view(M, moe_top_k, hidden_dim),
+            moe_index=sorted_tokens_idx.view(M, moe_top_k),
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+        return output
+
+    @staticmethod
     def fused_moe_ep(
         hidden_states: torch.Tensor,
         w13_weight: torch.Tensor,
