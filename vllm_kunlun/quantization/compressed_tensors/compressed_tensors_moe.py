@@ -382,11 +382,64 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
             layer.w2_weight_scale.data = w2_scale_data
 
     @property
+    def topk_indices_dtype(self):
+        # Kunlun's moe_pre_sorted / gen_block_statistic both take int32.
+        return torch.int32
+
+    @property
     def is_monolithic(self) -> bool:
-        # Kunlun runs a single fused kernel (fused_moe_ct_w4a16) that does its
-        # own routing, so RoutedExperts must use forward_monolithic ->
-        # apply_monolithic rather than the modular (topk_weights/topk_ids) path.
-        return True
+        # TP-only keeps the monolithic kernel that fuses routing in: it is
+        # the production-validated path and the faster one. With EP enabled,
+        # switch to vLLM's modular path, where routing is done by the runner's
+        # select_experts and this method only performs the expert_map remap
+        # plus the local-expert GEMMs. DeepEP ships Modular-only
+        # prepare/finalize implementations, so EP has to take that path.
+        return not self.moe.use_ep
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts=None,
+        shared_experts_input=None,
+    ) -> torch.Tensor:
+        # topk_ids are global expert ids while this rank only holds
+        # num_local_experts weight slots. Follow vLLM's own approach
+        # (moe_align_block_size.py:101 expert_ids = expert_map[expert_ids]):
+        # remap along the expert dimension only and keep the M*topk row
+        # layout unchanged.
+        expert_map = getattr(layer, "expert_map", None)
+        ids = topk_ids
+        weights = topk_weights
+        if expert_map is not None:
+            local = expert_map.to(ids.device)[ids.long()]
+            keep = local >= 0
+            # Use where rather than multiplying by zero: a remote slot may
+            # hold NaN, and NaN * 0 is still NaN.
+            weights = torch.where(keep, weights, torch.zeros_like(weights))
+            # Placeholder rows must not all be parked on local expert 0:
+            # that expert would own ~15/16 of all rows, and the grouped GEMM
+            # is known to misbehave under such skew (the sibling
+            # moe_fc_mn_kmn out-of-bounds bug is distribution dependent too).
+            # Spread them round-robin by pair index: the total row count stays
+            # M*topk while per-expert row counts stay close to the TP case.
+            n_local = layer.w13_weight_packed.shape[0]
+            filler = torch.arange(
+                local.numel(), device=local.device, dtype=local.dtype
+            ).remainder_(n_local).view_as(local)
+            ids = torch.where(keep, local, filler)
+        return ops.moe_ct_w4a16_experts(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            topk_ids=ids,
+            topk_weights=weights,
+            moe_top_k=layer.top_k,
+        )
 
     def apply_monolithic(
         self,
