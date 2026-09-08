@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cross-platform (Triton) kernels for MiniMax M3 sparse attention."""
+"""Torch implementations of MiniMax M3 sparse-attention kernels, for Kunlun XPU."""
 
 from .index_topk import (
     minimax_m3_index_decode,
