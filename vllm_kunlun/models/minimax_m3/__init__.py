@@ -1,30 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MiniMax M3 model — hardware-isolated entry point.
+"""MiniMax M3 for Kunlun XPU.
 
-The implementation lives under ``nvidia/`` and ``amd/``; this module picks the
-right one for the current platform and re-exports the public classes used by
-the model registry. (Mirrors ``vllm.models.deepseek_v4``.)
+Vendored from upstream ``vllm.models.minimax_m3`` and adapted, because upstream
+selects its variant by platform predicate and Kunlun -- device_type "cuda" with
+is_cuda_alike/is_cuda/is_rocm/is_xpu/is_cpu all False and is_out_of_tree() True --
+is handed the nvidia variant, which needs flashinfer, fmha_sm100 and triton kernels
+that do not run here. Registered through ModelRegistry in
+``vllm_kunlun/models/__init__.py``.
+
+Upstream's entry point chose between nvidia/ and amd/; there is nothing left to
+choose here.
 """
 
-from typing import TYPE_CHECKING
-
-from vllm.platforms import current_platform
-
-# The NVIDIA branch is the static default that type-checkers see; the ROCm
-# branch overrides it at runtime (kept type-compatible via type: ignore).
-if TYPE_CHECKING or not current_platform.is_rocm():
-    from .nvidia.model import (
-        MiniMaxM3SparseForCausalLM,
-        MiniMaxM3SparseForConditionalGeneration,
-    )
-    from .nvidia.mtp import MiniMaxM3MTP
-else:
-    from .amd.model import (  # type: ignore[assignment]
-        MiniMaxM3SparseForCausalLM,
-        MiniMaxM3SparseForConditionalGeneration,
-    )
-    from .amd.mtp import MiniMaxM3MTP  # type: ignore[assignment]
+from .nvidia.model import (
+    MiniMaxM3SparseForCausalLM,
+    MiniMaxM3SparseForConditionalGeneration,
+)
+from .nvidia.mtp import MiniMaxM3MTP
 
 __all__ = [
     "MiniMaxM3MTP",

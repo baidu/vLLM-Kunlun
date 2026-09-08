@@ -24,21 +24,15 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
+from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
 from vllm.platforms import current_platform
 
-# AMD/ROCm uses the gfx942/gfx950-optimized block-sparse kernels in amd.ops;
-# every other platform uses the generic common.ops implementation.
-if current_platform.is_rocm():
-    from vllm.models.minimax_m3.amd.ops.sparse_attn import (
-        minimax_m3_sparse_attn,
-        minimax_m3_sparse_attn_decode,
-    )
-else:
-    from vllm.models.minimax_m3.common.ops.sparse_attn import (
-        minimax_m3_sparse_attn,
-        minimax_m3_sparse_attn_decode,
-    )
+# Kunlun-only fork: upstream picks the gfx942/gfx950 kernels on ROCm and the
+# generic ones everywhere else; this platform always takes the generic branch.
+from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import (
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -423,7 +417,7 @@ def select_main_impl_cls(
         topk_blocks,
     )
     if use_msa:
-        from vllm.models.minimax_m3.nvidia.sparse_attention_msa import (
+        from vllm_kunlun.models.minimax_m3.nvidia.sparse_attention_msa import (
             MiniMaxM3SparseMSAImpl,
         )
 

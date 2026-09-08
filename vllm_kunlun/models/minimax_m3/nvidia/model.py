@@ -69,18 +69,18 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
-from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
-from vllm.models.minimax_m3.common.mm_preprocess import (
+from vllm_kunlun.models.minimax_m3.common.indexer import MiniMaxM3Indexer
+from vllm_kunlun.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
     MiniMaxM3VLProcessingInfo,
 )
-from vllm.models.minimax_m3.common.sparse_attention import (
+from vllm_kunlun.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
     MiniMaxM3SparseImpl,
     select_main_impl_cls,
 )
-from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+from vllm_kunlun.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype

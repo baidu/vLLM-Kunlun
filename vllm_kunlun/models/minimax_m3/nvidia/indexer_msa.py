@@ -29,14 +29,14 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
-from vllm.models.minimax_m3.common.indexer import (
+from vllm_kunlun.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
     MiniMaxM3IndexerDecodeMetadata,
     MiniMaxM3IndexerImpl,
     MiniMaxM3IndexerMetadata,
     MiniMaxM3IndexerMetadataBuilder,
 )
-from vllm.models.minimax_m3.common.ops.index_topk import (
+from vllm_kunlun.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode_score,
 )
 from vllm.v1.attention.backend import (
