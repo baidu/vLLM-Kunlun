@@ -36,6 +36,7 @@ from . import activation as _activation  # noqa: E402,F401
 from . import fused_moe as _fused_moe  # noqa: F401
 from . import layernorm as _layernorm  # noqa: E402,F401
 from . import linear as _linear  # noqa: E402,F401
+from . import minimax_m3 as _minimax_m3  # noqa: E402,F401
 from . import rotary_embedding as _rotary_embedding  # noqa: E402,F401
 from . import vocab_parallel_embedding as _vocab_parallel_embedding  # noqa: E402,F401
 
