@@ -71,6 +71,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm_kunlun.models.minimax_m3.common.indexer import MiniMaxM3Indexer
+from vllm_kunlun.models.minimax_m3.common.ops.dense_attn import (
+    USE_TORCH_DENSE_ATTN,
+    dense_attn_inputs,
+    minimax_m3_dense_attn,
+)
 from vllm_kunlun.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
@@ -368,7 +373,17 @@ class MiniMaxM3Attention(nn.Module):
             kv_cache_dtype="auto",
         )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        attn_output = self.attn(q, k, v)
+        # The platform's dense attention kernel is off by relL2 0.33 / 0.44 / 0.08 on
+        # these three layers against causal attention over this very q/k/v (see
+        # common/ops/dense_attn.py), so the default is the torch path. Warmup batches
+        # have no bound cache and fall back rather than invent a layout.
+        bound = (
+            dense_attn_inputs(self, self.attn) if USE_TORCH_DENSE_ATTN else None
+        )
+        if bound is None:
+            attn_output = self.attn(q, k, v)
+        else:
+            attn_output = minimax_m3_dense_attn(self, q, k, v, *bound)
         output, _ = self.o_proj(attn_output)
         return output
 
