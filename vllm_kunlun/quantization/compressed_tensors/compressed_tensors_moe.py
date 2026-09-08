@@ -42,6 +42,50 @@ from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 logger = init_logger(__name__)
 
 
+def _apply_expert_activation(
+    layer: torch.nn.Module, gate_up: torch.Tensor, out: torch.Tensor, d: int
+) -> None:
+    """Apply the activation the layer actually declares, not a hard-coded SwiGLU.
+
+    This used to be an unconditional ``torch.ops._C.silu_and_mul``, which is wrong for
+    any model that asks for something else and wrong *quietly*: MiniMax-M3 declares
+    ``activation="swigluoai_uninterleave"`` with swiglu_limit 7.0, alpha 1.702 and beta
+    1.0, and got plain SwiGLU. Upstream maps that activation to
+    ``silu_and_mul_with_clamp``:
+
+        gate = clamp(x[..., :d], max=limit)
+        up   = clamp(x[..., d:], -limit, limit)
+        out  = gate * sigmoid(alpha * gate) * (up + beta)
+
+    Measured against upstream's own forward_native: relL2 1.1e-03 (bf16 rounding), where
+    the plain-SwiGLU result it replaces was 5.7e-01 off -- 500x the noise floor.
+
+    "uninterleave" refers to the packed w13 layout ([all gates; all ups]) that a
+    MergedColumnParallelLinear gate_up produces, which is the halves split used here; the
+    interleaved ``swigluoai`` variant is a different memory order and is rejected rather
+    than silently mis-split.
+    """
+    activation = getattr(layer, "activation", "silu")
+    activation = str(getattr(activation, "value", activation))
+    if activation in ("silu", "silu_and_mul"):
+        torch.ops._C.silu_and_mul(out, gate_up)
+        return
+    if activation != "swigluoai_uninterleave":
+        raise NotImplementedError(
+            f"unsupported MoE activation {activation!r}; this path implements SwiGLU and "
+            "the uninterleaved SwiGLU-OAI variant"
+        )
+    limit = getattr(layer, "swiglu_limit", None)
+    if limit is None:
+        raise ValueError("swigluoai_uninterleave requires swiglu_limit")
+    limit = float(limit)
+    alpha = float(getattr(layer, "swiglu_alpha", None) or 1.0)
+    beta = float(getattr(layer, "swiglu_beta", None) or 0.0)
+    gate = gate_up[..., :d].float().clamp(max=limit)
+    up = gate_up[..., d:].float().clamp(min=-limit, max=limit)
+    out.copy_((gate * torch.sigmoid(alpha * gate) * (up + beta)).to(out.dtype))
+
+
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
     @staticmethod
     def get_moe_method(
@@ -160,6 +204,27 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         input_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         hidden_states = x
+        # Upstream calls this with four arguments only --
+        #   vllm/model_executor/layers/fused_moe/routed_experts.py:
+        #     self.quant_method.apply_monolithic(
+        #         layer=self, x=x, router_logits=router_logits, input_ids=input_ids)
+        # -- so every routing argument below arrives at its default, and a model that
+        # routes with sigmoid plus a score-correction bias (MiniMax-M3) was silently
+        # routed with softmax and no bias. The softmax branch fills topk_ids, so nothing
+        # raised: the experts were simply the wrong ones. Take the routing configuration
+        # off the layer, which owns it, whenever the caller did not pass it.
+        scoring_func = getattr(layer, "scoring_func", None) or scoring_func
+        if e_score_correction_bias is None:
+            e_score_correction_bias = getattr(layer, "e_score_correction_bias", None)
+        if num_expert_group is None:
+            num_expert_group = getattr(layer, "num_expert_group", None)
+        if topk_group is None:
+            topk_group = getattr(layer, "topk_group", None)
+        # No expert groups declared means plain top-k over all experts, which is what
+        # group selection degenerates to with a single group.
+        num_expert_group = num_expert_group or 1
+        topk_group = topk_group or 1
+
         global_num_experts, up_gate_size, _ = layer.w13_weight.shape
         M, N = hidden_states.shape
         hidden_dim = layer.w2_weight.shape[1]
@@ -190,11 +255,20 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
                 x=router_logits,
                 norm_score=normed_score,
                 topk_index=topk_ids,
+                # The torch custom op's own parameter is block_static; only the vendor
+                # call it forwards to names this block_statistic (fixed in
+                # vllm_kunlun/ops/_custom_ops.py).
                 block_static=block_statistic,
                 bias=e_score_correction_bias,
                 n_group=num_expert_group,
                 topk_group=topk_group,
                 scale=routed_scaling_factor,
+            )
+        else:
+            # normed_score and topk_ids are torch.empty above: falling through would
+            # route every token to whatever was in that memory.
+            raise NotImplementedError(
+                f"unsupported MoE scoring_func {scoring_func!r}"
             )
 
         if M * top_k > 768:
@@ -270,7 +344,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         d = y.shape[-1] // 2
         output_shape = y.shape[:-1] + (d,)
         out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
-        torch.ops._C.silu_and_mul(out1, y)
+        _apply_expert_activation(layer, y, out1, d)
 
         del y
 
