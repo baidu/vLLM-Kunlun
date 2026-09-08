@@ -114,6 +114,37 @@ class TestTritonPatches:
         assert "Skipping qwen_triton_warmup" in caplog.text
 
 
+class TestOptionalDepProbePatch:
+    """CUDA-only libraries must be reported absent without a trial import."""
+
+    def test_cuda_only_modules_answer_false_without_importing(self, module_factory):
+        probed = []
+
+        def probe(module_name):
+            probed.append(module_name)
+            return True
+
+        module = module_factory(_has_module=probe)
+        assert compat_patches._optional_dep_probe_applied(module) is False
+
+        compat_patches._apply_optional_dep_probe(module)
+
+        assert compat_patches._optional_dep_probe_applied(module) is True
+        for name in compat_patches._CUDA_ONLY_MODULES:
+            assert module._has_module(name) is False
+        assert probed == []
+
+    def test_other_modules_still_reach_the_original_probe(self, module_factory):
+        module = module_factory(_has_module=lambda module_name: True)
+
+        compat_patches._apply_optional_dep_probe(module)
+
+        assert module._has_module("numba") is True
+
+    def test_old_vllm_without_the_probe_needs_nothing(self, module_factory):
+        assert compat_patches._optional_dep_probe_applied(module_factory()) is True
+
+
 class TestInt8MoePatch:
     def test_selector_is_replaced_and_reports_no_backend(self, module_factory):
         module = module_factory(select_int8_moe_backend=lambda config: ("cuda", "impl"))
