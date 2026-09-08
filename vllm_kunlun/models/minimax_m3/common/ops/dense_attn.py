@@ -88,11 +88,19 @@ def _head_major(target: torch.Tensor, heads: int, block_size: int) -> bool:
 
 
 def _write(cache_half, values, slot_mapping, block_size, head_major) -> None:
-    blocks = (slot_mapping // block_size).to(torch.long)
-    offsets = (slot_mapping % block_size).to(torch.long)
+    """Scatter one token per slot, skipping vLLM's PAD_SLOT_ID (-1) entries.
+
+    Floor division maps -1 to block -1 offset block_size-1, i.e. the last block, so a
+    padded token would silently overwrite another sequence's KV. Validity is resolved once
+    into a python list rather than per token with a device-to-host read.
+    """
+    flat = slot_mapping.view(-1).to(torch.long)
+    blocks = flat // block_size
+    offsets = flat % block_size
+    writable = (flat >= 0).tolist()
     stored = values.to(cache_half.dtype)
     for token in range(stored.shape[0]):
-        if slot_mapping[token] < 0:
+        if not writable[token]:
             continue
         if head_major:
             cache_half[blocks[token], :, offsets[token], :] = stored[token]

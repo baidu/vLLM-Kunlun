@@ -76,9 +76,23 @@ def _neox_partial_rope(
 
 def _slots(
     slot_mapping: torch.Tensor, block_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list[bool]]:
+    """(block, offset, writable) per token, from a slot mapping that may contain padding.
+
+    vLLM pads slot mappings with ``PAD_SLOT_ID = -1``
+    (``vllm/v1/attention/backends/utils.py``) for tokens whose KV must not be stored, and
+    floor division sends -1 to block -1 offset block_size-1 -- measured, for block_size
+    128: slots [-1, 0, 5, 130] give blocks [-1, 0, 0, 1] and offsets [127, 0, 5, 2]. So a
+    padded token silently overwrites the *last* block, which some other sequence is
+    using: no exception, no out-of-range index, just corrupted KV in the place most
+    likely to be reused.
+
+    Validity is resolved once here, as a python list, rather than per token with
+    ``.item()``: the callers are per-token loops and a device-to-host sync inside one of
+    those is the last thing they need.
+    """
     flat = slot_mapping.view(-1).to(torch.long)
-    return flat // block_size, flat % block_size
+    return flat // block_size, flat % block_size, (flat >= 0).tolist()
 
 
 def _pair_half(cache: torch.Tensor, which: int) -> torch.Tensor:
@@ -98,7 +112,7 @@ def _insert(
     block_size: int,
 ) -> None:
     """Scatter [N, heads, dim] into a paged cache by slot, layout read off the tensor."""
-    blocks, offsets = _slots(slot_mapping, block_size)
+    blocks, offsets, writable = _slots(slot_mapping, block_size)
     target = _pair_half(cache, which) if cache.dim() == 5 else cache
     if target.dim() == 3:
         # The index cache: [num_blocks, block_size, head_dim], keys only, one head.
@@ -108,6 +122,8 @@ def _insert(
             )
         stored = values.reshape(values.shape[0], -1).to(target.dtype)
         for token in range(stored.shape[0]):
+            if not writable[token]:
+                continue
             target[blocks[token], offsets[token], :] = stored[token]
         return
     if target.dim() != 4:
@@ -127,6 +143,8 @@ def _insert(
         )
     stored = values.to(target.dtype)
     for token in range(stored.shape[0]):
+        if not writable[token]:
+            continue
         if head_major:
             target[blocks[token], :, offsets[token], :] = stored[token]
         else:
