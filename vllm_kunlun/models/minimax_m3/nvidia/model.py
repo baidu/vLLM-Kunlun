@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     MinimaxM3QKVParallelLinearWithIndexer,
@@ -110,35 +111,22 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     return moe_layer_freq[layer_id] != 0
 
 
-class MiniMAXGemmaRMSNorm(nn.Module):
-    """Gemma-style RMS normalization backed by FlashInfer kernels.
+class MiniMAXGemmaRMSNorm(GemmaRMSNorm):
+    """Gemma-style RMS normalization, dispatched through CustomOp.
 
-    When ``residual`` is given, the fused add + norm runs in place and the
-    updated ``(x, residual)`` pair is returned.
+    Upstream reaches straight into ``flashinfer.norm`` here, which is the first wall a
+    MiniMax-M3 launch hits on Kunlun:
+
+        ModuleNotFoundError: No module named 'flashinfer'
+
+    The capability was already present, just bypassed: this plugin registers
+    ``KunlunGemmaRMSNorm`` as the out-of-tree implementation of vLLM's ``GemmaRMSNorm``
+    CustomOp (``vllm_kunlun/ops/layernorm.py``), and that op has the same contract --
+    ``x * (1 + w)``, and with ``residual`` it fuses the add and returns the updated
+    pair. Subclassing it keeps the M3-specific name (the model constructs this in a
+    dozen places and reads ``.weight`` and ``.variance_epsilon`` off it) while routing
+    the arithmetic through dispatch instead of around it.
     """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
-
-        if residual is None:
-            return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
-
-        # gemma_fused_add_rmsnorm mutates x and residual in place.
-        gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
-        return x, residual
 
 
 class MiniMaxM3MLP(nn.Module):
