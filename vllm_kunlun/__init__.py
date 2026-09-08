@@ -617,6 +617,52 @@ def import_hook():
     builtins.__import__ = _custom_import
 
 
+# --- hook: MooncakeConnector mamba region registration ---------------------
+# upstream unpacks MambaSpec caches as (conv_state, ssm_state); the current
+# gpu_model_runner hands out a single contiguous page view per mamba layer.
+# See vllm_kunlun/distributed/mooncake_mamba_region.py for the reasoning.
+def _mooncake_mamba_region_applied(mod):
+    from vllm_kunlun.distributed.mooncake_mamba_region import applied as _applied
+
+    return _applied(mod)
+
+
+def _mooncake_mamba_region_apply(mod):
+    from vllm_kunlun.distributed.mooncake_mamba_region import apply as _apply
+
+    _apply(mod)
+
+
+_register_post_import_hook(
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",
+    _mooncake_mamba_region_applied,
+    _mooncake_mamba_region_apply,
+)
+
+
+# --- hook: keep CUDA-style device selection under data parallelism ---------
+# KunlunPlatform is PlatformEnum.OOT, so vLLM shards the device list per DP
+# rank while the worker still applies the CUDA DP local-rank offset. See
+# vllm_kunlun/distributed/dp_device_assign.py for the failure it causes.
+def _dp_device_assign_applied(mod):
+    from vllm_kunlun.distributed.dp_device_assign import applied as _applied
+
+    return _applied(mod)
+
+
+def _dp_device_assign_apply(mod):
+    from vllm_kunlun.distributed.dp_device_assign import apply as _apply
+
+    _apply(mod)
+
+
+_register_post_import_hook(
+    "vllm.v1.engine.utils",
+    _dp_device_assign_applied,
+    _dp_device_assign_apply,
+)
+
+
 def register():
     """Register the Kunlun platform"""
 
