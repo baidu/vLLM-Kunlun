@@ -17,7 +17,6 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -70,16 +69,21 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, get_kv_quant_mode
+
 from vllm_kunlun.models.minimax_m3.common.indexer import MiniMaxM3Indexer
-from vllm_kunlun.models.minimax_m3.common.ops.dense_attn import (
-    USE_TORCH_DENSE_ATTN,
-    dense_attn_inputs,
-    minimax_m3_dense_attn,
-)
 from vllm_kunlun.models.minimax_m3.common.mm_preprocess import (
     MiniMaxM3VLDummyInputsBuilder,
     MiniMaxM3VLMultiModalProcessor,
     MiniMaxM3VLProcessingInfo,
+)
+from vllm_kunlun.models.minimax_m3.common.ops.dense_attn import (
+    USE_TORCH_DENSE_ATTN,
+    dense_attn_inputs,
+    minimax_m3_dense_attn,
 )
 from vllm_kunlun.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
@@ -87,14 +91,6 @@ from vllm_kunlun.models.minimax_m3.common.sparse_attention import (
     select_main_impl_cls,
 )
 from vllm_kunlun.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
-from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheSpec,
-    get_kv_quant_mode,
-)
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -377,9 +373,7 @@ class MiniMaxM3Attention(nn.Module):
         # these three layers against causal attention over this very q/k/v (see
         # common/ops/dense_attn.py), so the default is the torch path. Warmup batches
         # have no bound cache and fall back rather than invent a layout.
-        bound = (
-            dense_attn_inputs(self, self.attn) if USE_TORCH_DENSE_ATTN else None
-        )
+        bound = dense_attn_inputs(self, self.attn) if USE_TORCH_DENSE_ATTN else None
         if bound is None:
             attn_output = self.attn(q, k, v)
         else:

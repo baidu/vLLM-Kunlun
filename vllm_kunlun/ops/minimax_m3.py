@@ -226,9 +226,7 @@ def _apply(
         if index_k_heads is None:
             raise ValueError("an index cache was given but num_index_heads is 0")
         # Upstream: when index_slot_mapping is omitted, slot_mapping serves both.
-        mapping = (
-            index_slot_mapping if index_slot_mapping is not None else slot_mapping
-        )
+        mapping = index_slot_mapping if index_slot_mapping is not None else slot_mapping
         if mapping is None or not block_size:
             raise ValueError("inserting into the index cache needs a slot mapping")
         _insert(index_cache, 0, index_k_heads, mapping, block_size)
@@ -258,10 +256,26 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     kv_cache_dtype: str = "auto",
 ) -> None:
     _apply(
-        qkv, q_norm_weight, k_norm_weight, cos_sin_cache, positions, num_heads,
-        num_kv_heads, rotary_dim, eps, index_q_norm_weight, index_k_norm_weight,
-        num_index_heads, slot_mapping, index_slot_mapping, kv_cache, index_cache,
-        block_size, q_out, index_q_out, kv_cache_dtype,
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        num_index_heads,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        block_size,
+        q_out,
+        index_q_out,
+        kv_cache_dtype,
     )
 
 
@@ -289,10 +303,26 @@ def fused_minimax_m3_qknorm_rope_kv_insert_xpu(
     kv_cache_dtype: str = "auto",
 ) -> None:
     _apply(
-        qkv, q_norm_weight, k_norm_weight, cos_sin_cache, positions, num_heads,
-        num_kv_heads, rotary_dim, eps, index_q_norm_weight, index_k_norm_weight,
-        num_index_heads, slot_mapping, index_slot_mapping, kv_cache, index_cache,
-        block_size, q_out, index_q_out, kv_cache_dtype,
+        qkv,
+        q_norm_weight,
+        k_norm_weight,
+        cos_sin_cache,
+        positions,
+        num_heads,
+        num_kv_heads,
+        rotary_dim,
+        eps,
+        index_q_norm_weight,
+        index_k_norm_weight,
+        num_index_heads,
+        slot_mapping,
+        index_slot_mapping,
+        kv_cache,
+        index_cache,
+        block_size,
+        q_out,
+        index_q_out,
+        kv_cache_dtype,
     )
 
 

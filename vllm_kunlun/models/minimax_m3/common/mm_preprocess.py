@@ -8,22 +8,14 @@ from typing import cast
 import torch
 from transformers import BatchFeature
 from transformers.video_utils import VideoMetadata
-
 from vllm.config.multimodal import (
     BaseDummyOptions,
     ImageDummyOptions,
     VideoDummyOptions,
 )
 from vllm.inputs import MultiModalDataDict
-from vllm.multimodal.inputs import (
-    MultiModalFieldConfig,
-    MultiModalKwargsItems,
-)
-from vllm.multimodal.parse import (
-    ImageSize,
-    MultiModalDataItems,
-    MultiModalDataParser,
-)
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.parse import ImageSize, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,

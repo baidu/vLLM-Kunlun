@@ -6,14 +6,9 @@ from collections.abc import Iterable
 import regex as re
 import torch
 import torch.nn as nn
-
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.fused_moe import (
-    fused_moe_make_expert_params_mapping,
-)
-from vllm.model_executor.layers.linear import (
-    ReplicatedLinear,
-)
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -23,15 +18,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from vllm.model_executor.models.utils import (
-    maybe_prefix,
-)
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
-from .model import (
-    MiniMAXGemmaRMSNorm,
-    MiniMaxM3DecoderLayer,
-)
+from .model import MiniMAXGemmaRMSNorm, MiniMaxM3DecoderLayer
 
 
 class MiniMaxM3MultiTokenPredictorLayer(nn.Module):

@@ -36,6 +36,8 @@ import logging
 import sys
 from types import ModuleType
 
+logger = logging.getLogger("vllm_kunlun")
+
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
 # Kunlun swaps the V2 Triton kernels for torch-native / kunlun_ops equivalents

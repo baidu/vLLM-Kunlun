@@ -267,9 +267,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
         else:
             # normed_score and topk_ids are torch.empty above: falling through would
             # route every token to whatever was in that memory.
-            raise NotImplementedError(
-                f"unsupported MoE scoring_func {scoring_func!r}"
-            )
+            raise NotImplementedError(f"unsupported MoE scoring_func {scoring_func!r}")
 
         if M * top_k > 768:
             moe_expand = torch.empty(

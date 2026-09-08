@@ -8,8 +8,9 @@ imports are function-local, so this module is import-safe on AMD/non-SM100.
 """
 
 import torch
-
 from vllm.forward_context import get_forward_context
+from vllm.v1.attention.backend import AttentionLayer
+
 from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
@@ -18,7 +19,6 @@ from vllm_kunlun.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseImpl,
     MiniMaxM3SparseMetadata,
 )
-from vllm.v1.attention.backend import AttentionLayer
 
 
 class MiniMaxM3SparseMSAImpl(MiniMaxM3SparseImpl):

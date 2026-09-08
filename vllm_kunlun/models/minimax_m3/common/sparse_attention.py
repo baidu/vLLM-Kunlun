@@ -19,20 +19,11 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import SPARSE_BLOCK_SIZE
 from vllm.platforms import current_platform
-
-# Kunlun-only fork: upstream picks the gfx942/gfx950 kernels on ROCm and the
-# generic ones everywhere else; this platform always takes the generic branch.
-from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import (
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
-)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -48,6 +39,14 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
+
+# Kunlun-only fork: upstream picks the gfx942/gfx950 kernels on ROCm and the
+# generic ones everywhere else; this platform always takes the generic branch.
+from vllm_kunlun.models.minimax_m3.common.ops.sparse_attn import (
+    SPARSE_BLOCK_SIZE,
+    minimax_m3_sparse_attn,
+    minimax_m3_sparse_attn_decode,
+)
 
 logger = init_logger(__name__)
 

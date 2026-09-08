@@ -114,9 +114,9 @@ def minimax_m3_index_score(
     max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, _ = idx_q.shape
-    assert num_idx_heads == num_kv_heads, (
-        "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
-    )
+    assert (
+        num_idx_heads == num_kv_heads
+    ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
     max_block = (max_seq_len + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
     score = idx_q.new_full(
         (num_idx_heads, total_q, round_up(max_block, 16)),

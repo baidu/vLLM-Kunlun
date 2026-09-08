@@ -19,7 +19,6 @@ from typing import ClassVar
 
 import torch
 from torch import nn
-
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
@@ -47,11 +46,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheSpec,
-    MLAAttentionSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
 
