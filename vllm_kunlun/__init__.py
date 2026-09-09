@@ -58,8 +58,6 @@ def _run_startup_stages(logger: logging.Logger) -> None:
     logger.info("[KunlunPlugin] import hook installed")
     # 7. Add torch_xmlir's missing memory-info API.
     bootstrap.patch_memory_info(logger)
-    # 8. Repair GLM-5.2's head dims before the first config load.
-    bootstrap.repair_glm_moe_dsa_head_dims(logger)
 
 
 def register() -> str:
@@ -76,6 +74,11 @@ def register() -> str:
         return _KUNLUN_PLATFORM
     _REGISTER_STATE = "registering"
 
+    # Repair the transformers class before configuring the vLLM logger or
+    # importing any startup-stage dependencies. ModelConfig derives MLA cache
+    # dimensions during config construction, so this must precede every path
+    # that could trigger a config load.
+    bootstrap.repair_glm_moe_dsa_head_dims(logging.getLogger("vllm_kunlun"))
     logger = _configure_kunlun_logger()
     logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
     try:

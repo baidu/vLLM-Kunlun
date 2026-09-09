@@ -132,6 +132,23 @@ def test_sparse_mla_selects_custom_prefill_with_legacy_config(stub_module):
     assert attention_config.mla_prefill_backend is backend_enum.CUSTOM
 
 
+def test_sparse_mla_keeps_default_when_prefill_registry_is_unavailable(stub_module):
+    """An older vLLM without the registry must not fail configuration setup."""
+    platform, cudagraph_mode = _load_platform(stub_module)
+    _install_mla_backend_stubs(stub_module)
+    sys.modules.pop("vllm.v1.attention.backends.mla.prefill.registry")
+    attention_config = SimpleNamespace()
+    config = _mla_config(
+        use_sparse=True,
+        attention_config=attention_config,
+        cudagraph_mode=cudagraph_mode,
+    )
+
+    platform.check_and_update_config(config)
+
+    assert not hasattr(attention_config, "mla_prefill_backend")
+
+
 def _load_worker_utils(stub_module):
     """Load the worker helper without importing an installed vLLM package."""
     _stub_packages(

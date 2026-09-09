@@ -269,15 +269,21 @@ class KunlunPlatform(Platform):
                 and attention_config is not None
                 and getattr(attention_config, "mla_prefill_backend", None) is None
             ):
-                from vllm.v1.attention.backends.mla.prefill.registry import (
-                    MLAPrefillBackendEnum,
-                )
-
-                attention_config.mla_prefill_backend = MLAPrefillBackendEnum.CUSTOM
-                logger.info(
-                    "Using the Kunlun MLA prefill backend placeholder "
-                    "(sparse MLA never calls it)."
-                )
+                try:
+                    from vllm.v1.attention.backends.mla.prefill.registry import (
+                        MLAPrefillBackendEnum,
+                    )
+                except ImportError:
+                    logger.debug(
+                        "MLA prefill registry unavailable; preserving vLLM's "
+                        "default sparse MLA selection."
+                    )
+                else:
+                    attention_config.mla_prefill_backend = MLAPrefillBackendEnum.CUSTOM
+                    logger.info(
+                        "Using the Kunlun MLA prefill backend placeholder "
+                        "(sparse MLA never calls it)."
+                    )
 
         from vllm.config import CUDAGraphMode
 

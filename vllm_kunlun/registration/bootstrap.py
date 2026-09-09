@@ -4,13 +4,15 @@
 platform discovery, before the import dispatcher in ``import_hooks`` takes
 over.  Each public function is one self-contained startup stage:
 
-1. ``stub_vllm_cuda_extensions()``: keep vLLM's CUDA extension imports from
+1. ``repair_glm_moe_dsa_head_dims()``: correct GLM-5.2 configuration aliases
+   before any vLLM startup dependency can load a model config.
+2. ``stub_vllm_cuda_extensions()``: keep vLLM's CUDA extension imports from
    failing on a machine without CUDA.
-2. ``register_custom_ops()``: register Kunlun operators with torch early.
-3. ``load_spec_decode_compat()``: optional speculative-decoding patches.
-4. ``register_weak_ref_tensor()``: alias the ``_C`` operator vLLM hardcodes.
-5. ``load_schema_helpers()``: patch vLLM's custom-op schema registration.
-6. ``patch_memory_info()``: fill in a torch API missing from torch_xmlir.
+3. ``register_custom_ops()``: register Kunlun operators with torch early.
+4. ``load_spec_decode_compat()``: optional speculative-decoding patches.
+5. ``register_weak_ref_tensor()``: alias the ``_C`` operator vLLM hardcodes.
+6. ``load_schema_helpers()``: patch vLLM's custom-op schema registration.
+7. ``patch_memory_info()``: fill in a torch API missing from torch_xmlir.
 
 Failure policy differs by stage on purpose: operator registration and the
 memory-info patch are load-bearing and re-raise, while the optional stages
