@@ -74,14 +74,15 @@ def register() -> str:
         return _KUNLUN_PLATFORM
     _REGISTER_STATE = "registering"
 
-    # Repair the transformers class before configuring the vLLM logger or
-    # importing any startup-stage dependencies. ModelConfig derives MLA cache
-    # dimensions during config construction, so this must precede every path
-    # that could trigger a config load.
-    bootstrap.repair_glm_moe_dsa_head_dims(logging.getLogger("vllm_kunlun"))
-    logger = _configure_kunlun_logger()
-    logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
+    logger = logging.getLogger("vllm_kunlun")
     try:
+        # Repair the transformers class before configuring the vLLM logger or
+        # importing any startup-stage dependencies. ModelConfig derives MLA
+        # cache dimensions during config construction, so this must precede
+        # every path that could trigger a config load.
+        bootstrap.repair_glm_moe_dsa_head_dims(logger)
+        logger = _configure_kunlun_logger()
+        logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
         _run_startup_stages(logger)
     except Exception as error:
         if isinstance(error, bootstrap.CustomOpsRegistrationError):
