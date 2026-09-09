@@ -176,6 +176,67 @@ def _apply_kv_block_zeroer(module: ModuleType) -> None:
         import vllm_kunlun.v1.worker.utils  # noqa: F401
 
 
+# --- vllm.v1.attention.backends.mla.prefill.registry: claim CUSTOM --------
+#
+# vLLM's automatic MLA prefill selection only walks CUDA/ROCm backends, so
+# `MLAAttention.__init__` raises "No valid MLA prefill backend found" on Kunlun
+# and no MLA model loads at all.  `KunlunPlatform.check_and_update_config`
+# selects CUSTOM, but the registry's override dict is per-process and that hook
+# runs only in the API server, so every worker has to claim the slot itself.
+#
+# A post-import patch rather than a bootstrap stage: `vllm.v1.attention...` is
+# not importable during plugin registration.  Registering by dotted path keeps
+# the Kunlun class unimported until something asks for it.
+
+_KUNLUN_MLA_PREFILL_PATH = (
+    "vllm_kunlun.v1.attention.backends.mla.prefill.KunlunMLAPrefillBackend"
+)
+
+
+def _mla_prefill_backend_applied(module: ModuleType) -> bool:
+    """Return whether the CUSTOM slot is taken, or the registry is absent."""
+    backend_enum = getattr(module, "MLAPrefillBackendEnum", None)
+    overrides = getattr(module, "_MLA_PREFILL_OVERRIDES", None)
+    if backend_enum is None or overrides is None:
+        return True
+    return backend_enum.CUSTOM in overrides
+
+
+def _apply_mla_prefill_backend(module: ModuleType) -> None:
+    """Point the registry's CUSTOM slot at the Kunlun prefill backend."""
+    register = getattr(module, "register_mla_prefill_backend", None)
+    backend_enum = getattr(module, "MLAPrefillBackendEnum", None)
+    if register is None or backend_enum is None:
+        return
+    register(backend_enum.CUSTOM, _KUNLUN_MLA_PREFILL_PATH)
+
+
+# --- vllm.v1.worker.gpu_model_runner: tolerant bind_kv_cache --------------
+#
+# `gpu_model_runner` binds `bind_kv_cache` into its own namespace at import
+# time, so patching `vllm.v1.worker.utils` is not enough -- the already-bound
+# name has to be replaced here.  See the docstring on the replacement for why
+# DSA models need it.
+
+
+def _bind_kv_cache_applied(module: ModuleType) -> bool:
+    """Return whether ``bind_kv_cache`` is absent or already Kunlun's."""
+    fn = getattr(module, "bind_kv_cache", None)
+    if fn is None:
+        return True
+    return getattr(fn, "__module__", "").startswith("vllm_kunlun")
+
+
+def _apply_bind_kv_cache(module: ModuleType) -> None:
+    """Swap in the Kunlun ``bind_kv_cache`` that allows shared layer indices."""
+    if not hasattr(module, "bind_kv_cache"):
+        return
+    from vllm_kunlun.v1.worker.utils import bind_kv_cache
+
+    module.bind_kv_cache = bind_kv_cache
+
+
+
 # --- vllm.model_executor.models.qwen3_vl: disable Triton kernels ----------
 
 
@@ -509,6 +570,16 @@ DEFAULT_HOOKS = (
         _apply_optional_dep_probe,
     ),
     ("vllm.v1.worker.utils", _kv_block_zeroer_applied, _apply_kv_block_zeroer),
+    (
+        "vllm.v1.attention.backends.mla.prefill.registry",
+        _mla_prefill_backend_applied,
+        _apply_mla_prefill_backend,
+    ),
+    (
+        "vllm.v1.worker.gpu_model_runner",
+        _bind_kv_cache_applied,
+        _apply_bind_kv_cache,
+    ),
     (
         "vllm.model_executor.models.qwen3_vl",
         _qwen3_vl_applied,

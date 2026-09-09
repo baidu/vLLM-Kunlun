@@ -255,6 +255,26 @@ class KunlunPlatform(Platform):
                     "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
                 )
 
+            # vLLM picks the MLA prefill backend from a CUDA/ROCm-only priority
+            # list, so `MLAAttention.__init__` dies with "No valid MLA prefill
+            # backend found" on Kunlun. Point it at ours explicitly; the class
+            # itself is registered in every process by the plugin bootstrap,
+            # because this function only runs in the API server process while
+            # the registry override dict is per-process.
+            attention_config = getattr(vllm_config, "attention_config", None)
+            if attention_config is not None and (
+                attention_config.mla_prefill_backend is None
+            ):
+                from vllm.v1.attention.backends.mla.prefill.registry import (
+                    MLAPrefillBackendEnum,
+                )
+
+                attention_config.mla_prefill_backend = MLAPrefillBackendEnum.CUSTOM
+                logger.info(
+                    "Using the Kunlun MLA prefill backend placeholder "
+                    "(sparse MLA never calls it)."
+                )
+
         from vllm.config import CUDAGraphMode
 
         if (
