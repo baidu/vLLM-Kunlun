@@ -58,6 +58,8 @@ def _run_startup_stages(logger: logging.Logger) -> None:
     logger.info("[KunlunPlugin] import hook installed")
     # 7. Add torch_xmlir's missing memory-info API.
     bootstrap.patch_memory_info(logger)
+    # 8. Repair GLM-5.2's head dims before the first config load.
+    bootstrap.repair_glm_moe_dsa_head_dims(logger)
 
 
 def register() -> str:
