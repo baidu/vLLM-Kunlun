@@ -2,26 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional, Union
 
 import numpy as np
 import torch
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionLayer,
-    AttentionMetadata,
-)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm_kunlun.v1.attention.backends.mla.common import MLACommonBaseImpl
 from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
+    AttentionLayer,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
@@ -593,7 +591,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         return metadata
 
 
-class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
+class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+    """Sparse MLA on Kunlun XPU.
+
+    vLLM split the MLA impl contract into ``forward_mha`` (prefill) and
+    ``forward_mqa`` (decode) and moved q/kv projection, RoPE, the weight
+    absorption (``W_UK_T`` / ``_v_up_proj``) and the output write into the
+    shared ``MLAAttention`` layer. Sparse impls only implement ``forward_mqa``:
+    the sparse kernels use the MQA 576/512 shape for prefill *and* decode, so
+    the layer routes every token here.
+    """
 
     def __init__(
         self,
@@ -608,27 +615,50 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         attn_type: str,
         kv_sharing_target_layer_name: Optional[str],
         # MLA Specific Arguments
-        topk_indice_buffer: Optional[torch.Tensor] = None,
+        topk_indices_buffer: Optional[torch.Tensor] = None,
         indexer: Optional["Indexer"] = None,
         **mla_args,
     ) -> None:
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            num_kv_heads,
-            alibi_slopes,
-            sliding_window,
-            kv_cache_dtype,
-            logits_soft_cap,
-            attn_type,
-            kv_sharing_target_layer_name,
-            **mla_args,
-        )
+        # No super().__init__(): AttentionImplBase.__new__ already sets the
+        # DCP/PCP attributes, and the MLA weight absorption this class used to
+        # inherit now lives in the attention layer.
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_lora_rank = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
-        assert indexer is not None
-        self.topk_indices_buffer = indexer.topk_indices_buffer
-        self.padding = 128 if current_platform.is_device_capability(100) else 64
+        # The indexer owns the shared buffer on selecting layers; the layer
+        # passes it explicitly for the skip-topk layers, whose indexer is never
+        # constructed (see models/deepseek_v2.py).
+        self.topk_indices_buffer = (
+            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
+        )
+        assert self.topk_indices_buffer is not None, (
+            "Sparse MLA needs the shared top-k indices buffer, from the "
+            "indexer or from the layer"
+        )
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        # Kunlun's _C::concat_and_cache_mla takes four tensors and no
+        # dtype/scale, so the base implementation's call signature does not fit.
+        if kv_cache.numel() == 0:
+            return
+        torch.ops._C.concat_and_cache_mla(
+            kv_c=kv_c_normed,
+            k_pe=k_pe.squeeze(1),
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping.flatten(),
+        )
 
     def _forward_bf16_kv(
         self,
@@ -748,68 +778,28 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
 
         return _attn_out
 
-    def forward(
+    def forward_mqa(
         self,
-        layer: AttentionLayer,
-        q: torch.Tensor,
-        k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
-        kv_cache: torch.Tensor,
+        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
-        output: Optional[torch.Tensor] = None,
-        output_scale: Optional[torch.Tensor] = None,
-        output_block_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
-        # MQA 576/512 approach for both prefill and decode
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # The layer hands over the absorbed query, either already concatenated
+        # or as (ql_nope, q_pe); the sparse kernels want the 576-wide form.
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
 
-        assert output is not None, "Output tensor must be provided."
-
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported" " for MLACommonImpl"
-            )
-
-        if attn_metadata is None:
-            # The zero fill is required when used with DP + EP
-            # to ensure all ranks within a DP group compute the
-            # same expert outputs.
-            return output.fill_(0)
-
-        num_actual_toks = attn_metadata.num_actual_tokens
-
-        # Inputs and outputs may be padded for CUDA graphs
-
-        q = q[:num_actual_toks, ...]
-        k_c_normed = k_c_normed[:num_actual_toks, ...]
-        k_pe = k_pe[:num_actual_toks, ...]
-
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        ql_nope = ql_nope.transpose(0, 1)
-
+        num_actual_toks = q.shape[0]
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        q = torch.cat([ql_nope, q_pe], dim=-1)
-
-        if self.kv_cache_dtype != "fp8_ds_mla":
-            # write the latent and rope to kv cache
-            if kv_cache.numel() > 0:
-                torch.ops._C.concat_and_cache_mla(
-                    kv_c=k_c_normed,
-                    k_pe=k_pe.squeeze(1),
-                    kv_cache=kv_cache,
-                    slot_mapping=attn_metadata.slot_mapping.flatten(),
-                )
-            attn_out = self._forward_bf16_kv(q, kv_cache, topk_indices, attn_metadata)
-        else:
-            # attn_out = self._forward_fp8_kv(q, kv_cache, topk_indices_global,
-            #                                 attn_metadata)
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            # _forward_fp8_kv stays unreachable until fwd_kvcache_mla takes a
+            # uint8 kv cache.
             raise NotImplementedError("Only support --kv-cache-dtype bfloat16")
 
-        self._v_up_proj(attn_out, out=output[:num_actual_toks])
-        return output
+        attn_out = self._forward_bf16_kv(
+            q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+        )
+        # No lse: Kunlun's sparse kernels do not return one, and DCP is off.
+        return attn_out, None
