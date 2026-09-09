@@ -46,7 +46,10 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -216,8 +219,8 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=config.topk_group,
                 prefix=f"{prefix}.experts",
                 scoring_func=config.scoring_func,
-                # we do scaling outside, set factor to 1.0 to avoid double mul
-                routed_scaling_factor=1.0,
+                routed_scaling_factor=config.routed_scaling_factor,
+                apply_routed_scale_to_output=True,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.n_redundant_experts,
@@ -250,8 +253,10 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=config.topk_group,
                 prefix=f"{prefix}.experts",
                 scoring_func=config.scoring_func,
-                # we do scaling outside, set factor to 1.0 to avoid double mul
-                routed_scaling_factor=1.0,
+                # The runner scales the routed output before adding the shared
+                # experts, so the factor must not also be applied outside.
+                routed_scaling_factor=config.routed_scaling_factor,
+                apply_routed_scale_to_output=True,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.n_redundant_experts,
@@ -271,37 +276,18 @@ class DeepseekV2MoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        fused_moe_out = self.experts(
+        # The MoE runner returns one tensor: it already added the shared-expert
+        # output, applied routed_scaling_factor and done the TP all-reduce, so
+        # none of that may be repeated here.
+        final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-
-        if self.shared_experts is not None:
-            shared_output, final_hidden_states = fused_moe_out
-        else:
-            shared_output = None
-            final_hidden_states = fused_moe_out
-
-        # Fix FP16 overflow
-        # See DeepseekV2DecoderLayer for more details.
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
-
-        if self.shared_experts is not None:
-            assert shared_output is not None
-            final_hidden_states += shared_output
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
-                final_hidden_states
-            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -776,6 +762,32 @@ class Indexer(nn.Module):
 
         self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
 
+    def _resolve_kv_cache(self, device: torch.device) -> torch.Tensor:
+        """Return the indexer's paged K cache as the 3-D tensor its op wants.
+
+        ``DeepseekV32IndexerBackend.get_kv_cache_shape`` is
+        ``(num_blocks, block_size, head_size)`` and
+        ``xspeedgate_ops.indexer_k_quant_and_cache`` asserts exactly three
+        dimensions. vLLM binds that tensor straight onto the cache module, so
+        the older ``kv_cache[0]`` -- which assumed a list of per-engine tensors
+        -- silently sliced off the block dimension and handed the op a 2-D view.
+
+        Empty during the profile run: the op's own dummy-run branch is what
+        handles that, but only if indexing does not blow up first.
+        """
+        cache = self.k_cache.kv_cache
+        if isinstance(cache, (list, tuple)):
+            if not cache:
+                return torch.empty(0, dtype=torch.uint8, device=device)
+            cache = cache[0]
+        if cache.numel() == 0:
+            return cache
+        assert cache.dim() == 3, (
+            f"indexer KV cache for {self.prefix} has shape {tuple(cache.shape)}; "
+            "indexer_k_quant_and_cache needs (num_blocks, block_size, head_size)"
+        )
+        return cache
+
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
@@ -815,10 +827,12 @@ class Indexer(nn.Module):
         weights = weights * self.n_head**-0.5
         weights = weights * q_scale * self.softmax_scale
 
+        indexer_kv_cache = self._resolve_kv_cache(hidden_states.device)
+
         torch.ops.vllm.sparse_attn_indexer_vllm_kunlun(
             hidden_states,
             self.k_cache.prefix,
-            self.k_cache.kv_cache[0],
+            indexer_kv_cache,
             q_fp8,
             k,
             weights,
@@ -1382,7 +1396,11 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsLoR
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+        # `FusedMoE` is a factory returning a MoERunner now, not a class, so the
+        # mapping helper moved to module scope and takes the model (it scans the
+        # parameters for LoRA's `base_layer.` prefix).
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
