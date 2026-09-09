@@ -29,7 +29,7 @@ MODULE_MAPPINGS: dict[str, str] = {
     ),
     "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
     "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
-    "vllm.attention.ops.merge_attn_states": (
+    "vllm.v1.attention.ops.merge_attn_states": (
         "vllm_kunlun.ops.attention.merge_attn_states"
     ),
 }

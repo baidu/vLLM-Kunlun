@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Optional, Union
 
 import torch
-from vllm.attention.backends.abstract import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import AttentionCGSupport

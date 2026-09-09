@@ -6,17 +6,17 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
-from vllm.attention.backends.abstract import (
+from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionLayer,
     AttentionMetadata,
 )
-from vllm.attention.backends.utils import get_mla_dims
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.common import MLACommonBaseImpl
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,

@@ -5,17 +5,86 @@ from typing import Optional
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
-    kv_spans_from_batches,
-    split_prefill_chunks,
-)
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     split_decodes_and_prefills,
 )
 
 logger = init_logger(__name__)
+
+
+def kv_spans_from_batches(
+    start_seq_loc: torch.Tensor,
+    seq_len_per_batch: torch.Tensor,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query-token ``[start, end)`` KV spans into the concatenated KV buffer.
+
+    vLLM used to export this; 0.25.1 replaced it with a Triton kernel
+    (``_build_prefill_chunk_metadata_kernel``) that also folds in DCP sharding
+    and query sub-slicing. Kunlun has no Triton execution path, so the span
+    arithmetic is kept here in torch. The semantics are unchanged: a query token
+    sees its request's whole context prefix plus itself, causally.
+
+    Args:
+        start_seq_loc: cumulative query lengths, ``[0, q0, q0+q1, ...]``.
+        seq_len_per_batch: total KV length per request.
+
+    Returns:
+        ``(row_starts, row_ends)`` int32 on ``device``; ``row_ends`` is exclusive.
+    """
+    query_start_loc = start_seq_loc.to(torch.long).cpu()
+    seq_lens = seq_len_per_batch.to(torch.long).cpu()
+    num_reqs = seq_lens.numel()
+    assert query_start_loc.numel() == num_reqs + 1
+
+    query_counts = query_start_loc[1:] - query_start_loc[:-1]
+    num_tokens = int(query_start_loc[-1].item())
+
+    kv_starts_per_batch = torch.cumsum(seq_lens, dim=0) - seq_lens
+    batch_id = torch.repeat_interleave(torch.arange(num_reqs), query_counts)
+    row_starts = kv_starts_per_batch[batch_id]
+
+    # Position of this token inside its request's KV span, 1-based: the context
+    # already in cache (seq_len - query_len) plus how far into the query we are.
+    pos_within_query = (
+        torch.arange(num_tokens)
+        - torch.repeat_interleave(query_start_loc[:-1], query_counts)
+        + 1
+    )
+    context_len = torch.repeat_interleave(seq_lens - query_counts, query_counts)
+    row_ends = row_starts + context_len + pos_within_query
+
+    return row_starts.int().to(device), row_ends.int().to(device)
+
+
+def split_prefill_chunks(
+    seq_lens_cpu: torch.Tensor,
+    max_prefill_buffer_size: int,
+    start_req_idx: int,
+) -> list[tuple[int, int]]:
+    """Greedily pack prefill requests into ``(reqs_start, reqs_end)`` chunks.
+
+    Upstream's replacement (``split_indexer_prefill_chunks``) also sub-chunks the
+    query dimension against a logits-byte budget and returns slice pairs, which
+    the Kunlun ``topk_per_row`` path does not consume. Only the workspace bound
+    is reproduced here so one chunk's concatenated KV always fits the indexer's
+    prefill buffer.
+    """
+    chunks: list[tuple[int, int]] = []
+    num_reqs = len(seq_lens_cpu)
+    end = start_req_idx
+    while end < num_reqs:
+        start, total = end, 0
+        while end < num_reqs:
+            seq_len = int(seq_lens_cpu[end].item())
+            if total + seq_len > max_prefill_buffer_size and end > start:
+                break
+            total += seq_len
+            end += 1
+        chunks.append((start, end))
+    return chunks
 
 
 @dataclass
