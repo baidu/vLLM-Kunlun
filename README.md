@@ -76,6 +76,7 @@ This plugin provides a hardware-pluggable interface that decouples the integrati
 | Qwen3-Next | ✅ | ✅ | ✅ | ✅ |
 | Qwen3.5 | ✅ | ✅ | | ✅ |
 | Qwen3.5-Moe | ✅ | ✅ | | ✅ |
+| [Qwen3.8](docs/source/tutorials/single_xpu_Qwen3.8-27B-W8A8.md) | ✅ | ✅ | | ✅ |
 | MiMo-V2-Flash | ✅ | ✅ | | ✅ |
 | Llama2 | ✅ | ✅ | ✅ | ✅ |
 | Llama3 | ✅ | ✅ | ✅ | ✅ |
