@@ -6,9 +6,10 @@ from typing import Optional
 import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata,
     split_decodes_and_prefills,
+    split_prefill_chunks,
 )
 
 logger = init_logger(__name__)
@@ -57,34 +58,6 @@ def kv_spans_from_batches(
     row_ends = row_starts + context_len + pos_within_query
 
     return row_starts.int().to(device), row_ends.int().to(device)
-
-
-def split_prefill_chunks(
-    seq_lens_cpu: torch.Tensor,
-    max_prefill_buffer_size: int,
-    start_req_idx: int,
-) -> list[tuple[int, int]]:
-    """Greedily pack prefill requests into ``(reqs_start, reqs_end)`` chunks.
-
-    Upstream's replacement (``split_indexer_prefill_chunks``) also sub-chunks the
-    query dimension against a logits-byte budget and returns slice pairs, which
-    the Kunlun ``topk_per_row`` path does not consume. Only the workspace bound
-    is reproduced here so one chunk's concatenated KV always fits the indexer's
-    prefill buffer.
-    """
-    chunks: list[tuple[int, int]] = []
-    num_reqs = len(seq_lens_cpu)
-    end = start_req_idx
-    while end < num_reqs:
-        start, total = end, 0
-        while end < num_reqs:
-            seq_len = int(seq_lens_cpu[end].item())
-            if total + seq_len > max_prefill_buffer_size and end > start:
-                break
-            total += seq_len
-            end += 1
-        chunks.append((start, end))
-    return chunks
 
 
 @dataclass

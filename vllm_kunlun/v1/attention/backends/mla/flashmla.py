@@ -8,7 +8,7 @@ import torch
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import AttentionCGSupport
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_kunlun.ops.attention.flashmla import (

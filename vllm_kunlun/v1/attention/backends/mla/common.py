@@ -218,9 +218,11 @@ from vllm.model_executor.layers.linear import (
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.flashinfer import has_nvidia_artifactory
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.utils import (
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
