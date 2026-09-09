@@ -149,7 +149,10 @@ def bind_kv_cache(
 
     from vllm.model_executor.models.utils import extract_layer_index
 
-    assert len(runner_kv_caches) == 0
+    # vLLM normally constructs an empty list for this binding. Clearing in
+    # place preserves that behavior when callers reuse the list and makes this
+    # replacement safe to invoke more than once.
+    runner_kv_caches.clear()
 
     index2name = defaultdict(list)
     for layer_name in kv_caches:

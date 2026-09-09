@@ -236,7 +236,6 @@ def _apply_bind_kv_cache(module: ModuleType) -> None:
     module.bind_kv_cache = bind_kv_cache
 
 
-
 # --- vllm.model_executor.models.qwen3_vl: disable Triton kernels ----------
 
 

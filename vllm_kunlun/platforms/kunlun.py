@@ -257,13 +257,17 @@ class KunlunPlatform(Platform):
 
             # vLLM picks the MLA prefill backend from a CUDA/ROCm-only priority
             # list, so `MLAAttention.__init__` dies with "No valid MLA prefill
-            # backend found" on Kunlun. Point it at ours explicitly; the class
-            # itself is registered in every process by the plugin bootstrap,
-            # because this function only runs in the API server process while
-            # the registry override dict is per-process.
+            # backend found" on Kunlun. Sparse MLA never invokes a prefill
+            # backend, so point it at ours explicitly. Dense MLA must keep its
+            # existing selection: the Kunlun placeholder deliberately raises
+            # if it is called. The class itself is registered in every process
+            # by the plugin bootstrap, because this function only runs in the
+            # API server process while the registry override dict is per-process.
             attention_config = getattr(vllm_config, "attention_config", None)
-            if attention_config is not None and (
-                attention_config.mla_prefill_backend is None
+            if (
+                use_sparse
+                and attention_config is not None
+                and getattr(attention_config, "mla_prefill_backend", None) is None
             ):
                 from vllm.v1.attention.backends.mla.prefill.registry import (
                     MLAPrefillBackendEnum,

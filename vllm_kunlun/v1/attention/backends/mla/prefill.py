@@ -47,9 +47,7 @@ class KunlunMLAPrefillBackend(MLAPrefillBackend):
         return "KUNLUN_MLA_PREFILL"
 
     @classmethod
-    def supports_compute_capability(
-        cls, device_capability: "DeviceCapability"
-    ) -> bool:
+    def supports_compute_capability(cls, device_capability: "DeviceCapability") -> bool:
         # Kunlun reports a synthetic capability; it says nothing about this
         # backend's validity.
         return True
