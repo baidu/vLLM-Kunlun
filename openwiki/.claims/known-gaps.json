@@ -1,0 +1,161 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "known-gaps.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "gap-001",
+      "statement": "PD 分离（Prefill/Decode Disaggregation）不支持：distributed/ 下没有任何 KV connector 实现，全仓库 0 处 nixl、0 处 --kv-transfer-config，特性矩阵未列出该特性；唯一相关代码是从上游继承的通用 KV connector 钩子点，没有 connector group 时全部 no-op。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/ops/attention/layer.py#L9-L13",
+        "repo://vllm_kunlun/ops/attention/layer.py#L191-L232",
+        "repo://docs/source/user_guide/support_matrix/supported_features.md"
+      ],
+      "confidence": "high",
+      "note": "否定证据：对全仓 239 个跟踪文件搜索 nixl / --kv-transfer-config / KVConnector 实现类均为 0 命中；仅命中上游继承的钩子调用点。"
+    },
+    {
+      "id": "gap-002",
+      "statement": "PD 分离曾有尝试但已废弃，留下化石证据：docs/envs.py 死代码里有 DISAGGREGATED_PREFILL_RANK_TABLE_PATH / LLMDataDistCMgrConnector / VLLM_KUNLUN_LLMDD_RPC_IP 与 mooncake 注释；本地化 .po 文件里 \"Prefill Decode Disaggregation\" 是带 #~ 前缀的废弃条目（表示已从源文档移除）。",
+      "kind": "fact",
+      "evidence": [
+        "repo://docs/envs.py#L94-L113",
+        "repo://docs/envs.py#L149-L151",
+        "repo://docs/source/locale/zh_CN/LC_MESSAGES/user_guide/support_matrix/supported_features.po#L175"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-003",
+      "statement": "tutorial 的 curl 示例里出现 kv_transfer_params: null，这是 vLLM 请求体的通用字段，不代表支持 PD 分离——这是最容易误判的点。",
+      "kind": "caveat",
+      "evidence": ["repo://docs/source/tutorials/multi_xpu_DeepSeek-V3.2-Exp-w8a8.md"],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-004",
+      "statement": "四个名字与行为不符的符号：is_flashmla_supported() 永远 return True, None；get_mla_metadata() 返回 cache_seqlens 而非 tile scheduler metadata；flashinfer 相关命名与日志下实际调的是 kunlun_ops；KVBlockZeroer 的清零方法是空实现。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/ops/attention/flashmla.py#L34-L38",
+        "repo://vllm_kunlun/ops/attention/flashmla.py#L56-L58",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L28-L34",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L206-L219",
+        "repo://vllm_kunlun/v1/worker/utils.py#L110-L112"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-005",
+      "statement": "MiMoV2Flash 名字里的 \"Flash\" 不代表线性注意力或 FlashAttention，它是普通 attention 的 MoE 模型。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/models/mimo_v2_flash.py#L190",
+        "repo://vllm_kunlun/models/mimo_v2_flash.py#L639"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-006",
+      "statement": "vllm_kunlun/utils.py 没有任何模块 import 它，其中的日志/hook 消费者因此永不执行——这也是 VLLM_MULTI_LOGPATH / ENABLE_VLLM_MULTI_LOG 两个环境变量实际失效的原因。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/utils.py"],
+      "confidence": "high",
+      "note": "否定证据：全仓搜索 from vllm_kunlun.utils / import vllm_kunlun.utils 得到 0 命中。"
+    },
+    {
+      "id": "gap-007",
+      "statement": "platforms/envs.py 定义 9 个环境变量，只有 VLLM_KUNLUN_ENABLE_INT8_BMM 有真实消费者；6 个完全无消费者，2 个的消费者在无人 import 的 utils.py 中；VLLM_MULTI_LOGPATH 的 TYPE_CHECKING 存根写 \"./log\" 而实际默认值是 \"./logs\"。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/envs.py#L34-L71",
+        "repo://vllm_kunlun/platforms/envs.py#L7",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1152"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-008",
+      "statement": "有一个真实生效但既不在 platforms/envs.py 也不在文档里的环境变量：FAST_RANDOM_SAMPLE，直接用 os.getenv 读取。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L161-L167"],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-009",
+      "statement": "代码与文档存在七处冲突，包括构建后端（hatchling vs setuptools）、CI 里 pin vllm==0.11.0 与插件 0.25.1、Dockerfile transformers 4.57.1 vs requirements 5.2.0、默认分支 v0.25.1-dev 但各处仍写 main、GLM-4.5 tutorial 标题写 Single XPU 而命令是 TP=8、支持模型数 5 vs 20+、专家并行标绿但零示例命令。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://README.md",
+        "repo://pyproject.toml#L6",
+        "repo://requirements.txt",
+        "repo://docs/source/tutorials/multi_xpu_GLM-4.5.md",
+        "repo://docs/source/user_guide/support_matrix/supported_models.md",
+        "repo://docs/source/user_guide/support_matrix/supported_features.md#L8-L14"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-010",
+      "statement": "明确未实现或抛异常的特性共 11 项：PD 分离、cascade attention、MLA + KV sharing、混合 Mamba + 投机解码、CUDAGraphMode.FULL / FULL_AND_PIECEWISE、use_inductor、W4A8 compressed-tensors MoE、AWQ MoE 的 Kunlun 实现、DFlash 并行 drafting、LoRA V1 引擎、fp8 权重/激活。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L992-L1013",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1024-L1025",
+        "repo://vllm_kunlun/v1/worker/mamba_utils.py#L277-L281",
+        "repo://docs/source/developer_guide/feature_guide/Kunlun_Graph.md#L74-L75",
+        "repo://vllm_kunlun/platforms/kunlun.py#L276-L279",
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L109-L113",
+        "repo://vllm_kunlun/quantization/awq.py#L58-L70",
+        "repo://vllm_kunlun/models/qwen3_dflash.py#L36-L45",
+        "repo://docs/source/user_guide/feature_guide/lora.md#L9",
+        "repo://vllm_kunlun/platforms/kunlun.py#L390-L405"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-011",
+      "statement": "十处未修的潜在 bug：opaque_attention_op 缺 @classmethod、change_state 在 finally 之外恢复状态、add_lora_embedding / add_lora_logits arity 不匹配、LoRA 硬编码 expert_num = 9、paged_attention_v1 与 v2 函数体相同、worker_cls 两个分支赋同值、两处过期 docstring、actionlint 排除了唯一检查对象。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L407-L411",
+        "repo://vllm_kunlun/distributed/kunlun_communicator.py#L66-L86",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L375-L399",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L495-L545",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L442",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L50-L131",
+        "repo://vllm_kunlun/platforms/kunlun.py#L217-L223",
+        "repo://vllm_kunlun/platforms/kunlun.py#L183-L184",
+        "repo://vllm_kunlun/platforms/kunlun.py#L293-L299",
+        "repo://.pre-commit-config.yaml#L75"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "gap-012",
+      "statement": "死代码与未接线代码共 15 处，包括 utils.py 无 import 方、docs/envs.py 抄自 vllm-ascend、moe_wna16.py 坏 import、models/config.py 651 行全注释、native_ops.py 无 import 方、if False: 死分支、多处整块注释的分支、vllm_kunlun/csrc/utils.cpp 无 Python 调用方、两个空 parser 注册表、未注册的 DFlashQwen3ForCausalLM、指向不存在模块的 console script。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/utils.py",
+        "repo://docs/envs.py#L5",
+        "repo://vllm_kunlun/quantization/moe_wna16.py#L27",
+        "repo://vllm_kunlun/models/config.py",
+        "repo://vllm_kunlun/transformers_utils/config.py",
+        "repo://vllm_kunlun/ops/native_ops.py#L1-L9",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L297-L321",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L478-L496",
+        "repo://vllm_kunlun/csrc/utils.cpp#L26-L31",
+        "repo://vllm_kunlun/tool_parsers/__init__.py#L8",
+        "repo://vllm_kunlun/reasoning/__init__.py#L8",
+        "repo://pyproject.toml#L18-L19"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

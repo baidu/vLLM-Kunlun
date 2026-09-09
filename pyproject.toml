@@ -33,7 +33,11 @@ include = ["vllm_kunlun*"]
 vllm_kunlun = [
     "conf/*",
     "data/*",
-    "so/*.so",
-    "include/*.h",
-    "_kunlun*.so",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The repository root has to be importable: the unit tests run against the
+# source tree, without installing the package.
+pythonpath = ["."]
+addopts = "-ra --strict-markers"

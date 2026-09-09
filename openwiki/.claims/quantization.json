@@ -1,0 +1,129 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "quantization.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "quant-001",
+      "statement": "量化 config 的唯一注册入口是 KunlunPlatform.pre_register_and_update，它 import 五个符号纯为触发副作用。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L421-L431"],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-002",
+      "statement": "每个量化 config 模块在 import 时把上游注册表里的同名条目移除再注册自己，因此用户仍用 --quantization awq 这类标准名字但拿到 Kunlun 实现。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/utils.py#L19-L24",
+        "repo://vllm_kunlun/quantization/awq.py#L39-L44",
+        "repo://vllm_kunlun/quantization/gptq.py#L51-L56",
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors.py#L43-L48"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-003",
+      "statement": "除运行时注册外，vllm/model_executor/layers/quantization/__init__.py 在安装期被整文件替换，替换文件头部带 # patched by vLLM-Kunlun 标记。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://docs/source/installation.md#L106",
+        "repo://vllm_kunlun/quantization/__init__.py#L3"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-004",
+      "statement": "AWQ 的核心启发式是 FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256：token 数 ≥ 256 时先 awq_dequantize 再普通 matmul，否则走融合 awq_gemm。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/awq.py#L161",
+        "repo://vllm_kunlun/quantization/awq.py#L164-L171"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-005",
+      "statement": "AWQ 权重需要按 AWQ_TO_KUNLUN_ORDER_NORMAL = [4, 0, 5, 1, 6, 2, 7, 3] 重排序（另有 FAST 变体），这是 AWQ 打包顺序到昆仑 kernel 期望顺序的映射。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/awq.py#L92",
+        "repo://vllm_kunlun/quantization/awq.py#L107-L111"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-006",
+      "statement": "AWQ MoE 没有 Kunlun 实现，回落到上游 MoeWNA16Config，不享受 Kunlun 的融合 MoE 优化。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/quantization/awq.py#L58-L70"],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-007",
+      "statement": "GPTQ 的 gemm 落到 torch.ops.xspeedgate_ops.gptq_gemm；exllama kernel 通过 _POSSIBLE_KERNELS[PlatformEnum.OOT] 注册。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/gptq.py#L140-L148",
+        "repo://vllm_kunlun/quantization/kernels/exllama.py#L52-L53"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-008",
+      "statement": "W8A8 的 int8 linear kernel 通过 _POSSIBLE_INT8_KERNELS[PlatformEnum.OOT] = [KunlunScaledMMLinearKernel] 注册；scale_mm.py 中 w_s.mul_(127.0) 把上游的 scale 语义转成昆仑 kernel 要的 max 语义。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/kernels/__init__.py#L7",
+        "repo://vllm_kunlun/quantization/kernels/scale_mm.py#L43-L50"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-009",
+      "statement": "compressed-tensors MoE 支持 W4A16 与 W8A8（int8），W4A8 分支整块被注释掉。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L46-L117",
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L109-L113"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-010",
+      "statement": "有一处 post-import 补丁把上游 select_int8_moe_backend 短路为 return None, None，阻止上游选到 CUDA/Triton 专用 backend。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/compat_patches.py#L188",
+        "repo://vllm_kunlun/registration/compat_patches.py#L225"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "quant-011",
+      "statement": "quantization/moe_wna16.py 是死代码：#L27 的 import 路径 vllm_kunlun.ops.quantization.kernels.quant_ops 不存在，且 KunlunMoeWNA16Method 无引用方。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/moe_wna16.py#L27",
+        "repo://vllm_kunlun/quantization/moe_wna16.py#L107"
+      ],
+      "confidence": "high",
+      "note": "无引用方通过全仓搜索 KunlunMoeWNA16Method 得到仅定义处 1 命中确认。"
+    },
+    {
+      "id": "quant-012",
+      "statement": "开启 W8A8 不是通过命令行 flag，而是手工编辑模型 config.json 里的 quantization_config，tutorial 给出完整片段。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://docs/source/tutorials/multi_xpu_DeepSeek-V3.2-Exp-w8a8.md#L45",
+        "repo://docs/source/tutorials/multi_xpu_DeepSeek-V3.2-Exp-w8a8.md#L49-L95"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

@@ -15,6 +15,7 @@
 # This file is a part of the vllm-kunlun project.
 #
 import copy
+import math
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -50,9 +51,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
 
-import inspect
-
-from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -217,7 +215,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     cross_slot_mapping: Optional[torch.Tensor] = None
     cross_block_tables: Optional[torch.Tensor] = None
 
-    # Input positions for rotrary embeddings since for MLA the rotary
+    # Input positions for rotary embeddings. For MLA, the rotary
     # position embeddings are applied inside the attention backend
     input_positions: Optional[torch.Tensor] = None
 
@@ -278,7 +276,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             else self.query_start_loc[-(self.num_prefills + 1) :]
             - self.query_start_loc[-(self.num_prefills + 1)]
         )
-        # flash attention needs both lod information on host and device
+        # The flash-attention metadata keeps LOD information on both host and
+        # device.
         query_start_loc_host = (
             None
             if self.query_start_loc_host is None
@@ -286,7 +285,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             - self.query_start_loc_host[-(self.num_prefills + 1)]
         )
 
-        # TODO(chengruichang):how to support prefix cache
+        # Prefix-cache metadata is populated when prefix caching is enabled.
         kv_prefix_start_loc_host = None
         kv_prefix_start_loc = None
         slot_mapping = (
@@ -481,6 +480,7 @@ class KunlunAttentionMetadataBuilder:
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
     def _init_reorder_batch_threshold(
         self,
@@ -490,9 +490,8 @@ class KunlunAttentionMetadataBuilder:
     ) -> None:
         self.reorder_batch_threshold = reorder_batch_threshold
         if self.reorder_batch_threshold is not None and supports_spec_as_decode:
-            # If the backend supports spec-as-decode kernels, then we can set
-            # the reorder_batch_threshold based on the number of speculative
-            # tokens from the config.
+            # Speculative decoding uses the number of speculative tokens to
+            # determine whether a request should be treated as decode.
             speculative_config = self.vllm_config.speculative_config
             if (
                 speculative_config is not None
@@ -606,11 +605,6 @@ class KunlunAttentionMetadataBuilder:
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
-        kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
-        kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-        kv_lod_xpu = kv_lod_cpu.to(self.device)
-
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
@@ -618,6 +612,14 @@ class KunlunAttentionMetadataBuilder:
                 require_uniform=True,
             )
         )
+
+        if num_prefill_tokens > 0:
+            kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
+            kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
+            kv_lod_xpu = kv_lod_cpu.to(self.device, non_blocking=True)
+        else:
+            kv_lod_cpu = None
+            kv_lod_xpu = None
 
         num_scheduled_tokens = np.diff(
             common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -735,6 +737,10 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
+        # prefill_attention internally applies 1/sqrt(head_dim) and then
+        # multiplies the scores by alpha, so alpha = scale * sqrt(head_dim)
+        # yields the effective scaling `scale` (1.0 for standard models).
+        self.prefill_alpha = self.scale * math.sqrt(head_size)
         self.num_kv_heads = num_kv_heads
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
@@ -763,6 +769,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 f"num_heads: {num_heads}."
             )
         self.multi_modal_placeholder_index_maps = multi_modal_placeholder_index_maps
+        self._sinks_fp32: Optional[torch.Tensor] = None
+
+    def _get_sinks_fp32(self) -> Optional[torch.Tensor]:
+        # Lazily cached: sink weights are loaded after __init__, so the fp32
+        # copy must not be taken at construction time.
+        if self.sinks is not None and self._sinks_fp32 is None:
+            self._sinks_fp32 = self.sinks.to(torch.float32)
+        return self._sinks_fp32
 
     def forward(
         self,
@@ -793,17 +807,13 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         else:
             assert value is None
 
-        # Self-attention vs. cross-attention will impact
-        # which KV cache memory-mapping & which
-        # seqlen datastructures we utilize
+        # Self-attention and cross-attention use different KV-cache mappings
+        # and sequence-length metadata.
         if attn_type != AttentionType.ENCODER and kv_cache.numel() > 0:
-            # KV-cache during decoder-self- or
-            # encoder-decoder-cross-attention, but not
-            # during encoder attention.
-            #
-            # Even if there are no new key/value pairs to cache,
-            # we still need to break out key_cache and value_cache
-            # i.e. for later use by paged attention
+            # Decoder self-attention and encoder-decoder cross-attention use
+            # the KV cache; encoder attention does not.
+            # Split the cache even when this step has no new K/V, because the
+            # attention kernel may still need to read the existing cache.
             key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache=kv_cache)
 
             if (key is not None) and (value is not None):
@@ -812,11 +822,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 # Skip cache write for KV sharing layers: their cache is
                 # the target layer's cache and already contains correct values.
                 if self.kv_sharing_target_layer_name is None:
-                    # Reshape the input keys and values and store them in
-                    # the cache. If kv_cache is not provided, the new key
-                    # and value tensors are not cached. This happens during
-                    # the initial memory
+                    # Write the new keys and values to the paged KV cache.
+                    # reshape_and_cache_flash requires contiguous k/v;
+                    # both calls are no-ops for already-contiguous tensors.
                     value = value.contiguous()
+                    key = key.contiguous()
                     kunlun_ops.reshape_and_cache_flash(
                         key[: attn_metadata.num_actual_tokens],
                         value[: attn_metadata.num_actual_tokens],
@@ -829,33 +839,34 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         assert attn_type == AttentionType.DECODER
         # Decoder self-attention supports chunked prefill.
         num_decode_tokens = attn_metadata.num_decode_tokens
-        # Only enforce this shape-constraint for decoder
-        # self-attention
+        # The following shape constraints apply to decoder self-attention.
 
+        # Prefill: process prompt tokens after any decode tokens.
         if prefill_meta := attn_metadata.prefill_metadata:
-            # Prompt run.
+            # Prompt tokens are stored after the decode tokens in the packed
+            # query/key/value tensors.
             prefill_query = query[num_decode_tokens : attn_metadata.num_actual_tokens]
             prefill_key = key[num_decode_tokens : attn_metadata.num_actual_tokens]
             prefill_value = value[num_decode_tokens : attn_metadata.num_actual_tokens]
 
-            # NOTE(kunlun): prefill_attention kernel internally applies
-            # 1/sqrt(head_dim) and multiplies by alpha. Compute alpha to
-            # achieve the desired effective scaling:
-            #   score = Q @ K^T * (1/sqrt(d)) * alpha
-            # We want: score = Q @ K^T * self.scale
-            # So: alpha = self.scale * sqrt(d) = self.scale / (1/sqrt(d))
-            # import math
-
-            # _prefill_alpha = self.scale * math.sqrt(self.head_size)
-
-            # For hybrid/packed attention, Kunlun kernels assume contiguous
-            # block stride. Scale logical block ids to match the actual
-            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            # Convert logical block IDs to the physical stride expected by
+            # Kunlun kernels. Reuse the original table when no conversion is
+            # needed.
             block_table_scale = self._get_block_table_scale(key_cache)
-            tmp_block_tables = prefill_meta.block_tables * block_table_scale
+            tmp_block_tables = (
+                prefill_meta.block_tables
+                if block_table_scale == 1
+                else prefill_meta.block_tables * block_table_scale
+            )
 
-            # Prefix cache or KV sharing layers (must read K/V from cache)
-            if prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]:
+            # Prefix cache or KV sharing layers (must read K/V from cache).
+            # KV sharing layers receive raw (un-normed, un-roped) k/v from the
+            # model, so they must always read the target layer's cache.
+            is_kv_sharing = self.kv_sharing_target_layer_name is not None
+            if (
+                is_kv_sharing
+                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
+            ):
                 kunlun_ops.prefill_attention(
                     q=prefill_query,
                     k=key_cache,  # Key Cache [block_num, head, block_size, dim]
@@ -863,6 +874,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
                     is_prefix_cache=True,
+                    alpha=self.prefill_alpha,
                     block_table=tmp_block_tables,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
@@ -874,9 +886,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         self.sliding_window if self.sliding_window is not None else -1
                     ),
                     swa_right=0 if self.sliding_window is not None else -1,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
+                    sink=self._get_sinks_fp32(),
                 )
             else:
                 kunlun_ops.prefill_attention(
@@ -885,6 +895,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
                     is_causal=True,
+                    alpha=self.prefill_alpha,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
@@ -893,9 +904,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         self.sliding_window if self.sliding_window is not None else -1
                     ),
                     swa_right=0 if self.sliding_window is not None else -1,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
+                    sink=self._get_sinks_fp32(),
                 )
 
         if decode_meta := attn_metadata.decode_metadata:
@@ -904,33 +913,27 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             ), "Encoder-only models should not have decode metadata."
             decode_query = query[:num_decode_tokens]
 
-            # For hybrid/packed attention, Kunlun kernels assume contiguous
-            # block stride. Scale logical block ids to match the actual
-            # packed KV-cache block stride (e.g. 2 * attn_pack_size).
+            # Convert logical block IDs to the physical stride expected by
+            # Kunlun kernels. Reuse the original table when no conversion is
+            # needed.
             block_table_scale = self._get_block_table_scale(key_cache)
-            tmp_block_tables = decode_meta.block_tables * block_table_scale
+            tmp_block_tables = (
+                decode_meta.block_tables
+                if block_table_scale == 1
+                else decode_meta.block_tables * block_table_scale
+            )
 
-            has_max_window_size = getattr(self, "_spec_attn_has_max_window_size", None)
-            if has_max_window_size is None:
-                has_max_window_size = (
-                    "max_window_size"
-                    in inspect.signature(kunlun_ops.speculative_attention).parameters
-                )
-                setattr(self, "_spec_attn_has_max_window_size", has_max_window_size)
-            if has_max_window_size:
-                # kunlun_ops.speculative_attention is not support max_window_size parameter in torch29
+            if not attn_metadata.is_speculative:
+                # Regular decoding has one query token per request.
                 kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],
-                    # Only MLA support q len > 1 right now
-                    q=decode_query.unsqueeze(0),
+                    q=decode_query.view(-1, 1, self.num_heads, self.head_size),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
                     context_lens_xpu=decode_meta.seq_lens_tensor,
                     batch_num=decode_meta.block_tables.shape[0],
-                    # TODO (@xyDong23): Support MTP(q lens >1)
                     qlen=1,
-                    # TODO (@xyDong23): Support max_context_len to (262144)
                     max_context_len=decode_meta.max_model_len,
                     head_num=self.num_heads,
                     head_dim=self.head_size,
@@ -942,28 +945,18 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                         self.sliding_window if self.sliding_window is not None else -1
                     ),
                     block_tables=tmp_block_tables,
-                    sink=(
-                        self.sinks.to(torch.float32) if self.sinks is not None else None
-                    ),
-                )
-            elif not attn_metadata.is_speculative:
-                kunlun_ops.paged_attention(
-                    x=decode_query,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    block_tables=tmp_block_tables,
-                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                    context_lens_xpu=decode_meta.seq_lens_tensor,
-                    is_context=False,
-                    is_causal=True,
-                    out=output[:num_decode_tokens],
-                    vo_head_dim=self.head_size,
+                    sink=self._get_sinks_fp32(),
                 )
             else:
                 batch_size = attn_metadata.num_decodes
                 query_seq_len, head_num, head_dim = decode_query.shape
                 assert query_seq_len % batch_size == 0
                 qlen = query_seq_len // batch_size
+                # kunlun_ops.speculative_attention kernel hard limit.
+                if qlen > 32:
+                    raise ValueError(
+                        "speculative_attention supports qlen <= 32, " f"got {qlen}"
+                    )
                 out = output[:num_decode_tokens]
                 assert out.is_contiguous()
 
@@ -979,11 +972,15 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     max_context_len=decode_meta.max_model_len,
                     head_num=self.num_heads,
                     head_dim=self.head_size,
-                    scale=0.0,
+                    scale=self.scale,
                     kv_head_num=self.num_kv_heads,
                     block_size=key_cache.shape[2],
                     max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                    max_window_size=(
+                        self.sliding_window if self.sliding_window is not None else -1
+                    ),
                     block_tables=tmp_block_tables,
+                    sink=self._get_sinks_fp32(),
                 )
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
@@ -1000,67 +997,5 @@ def use_cascade_attention(
     dcp_world_size: int,
     use_local_attention: bool = False,
 ) -> bool:
-    """Decide whether to use cascade attention.
-
-    This function 1) checks whether cascade attention is supported with the
-    given configuration, and 2) heuristically decides whether using cascade
-    attention can improve performance.
-    """
-    # Too short common prefix. Probably not worth using cascade attention.
-    # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.
-    # NOTE(woosuk): This is the common case. We should return False as soon as
-    # possible to avoid any unnecessary computation.
+    """Cascade attention is not supported on Kunlun; always disabled."""
     return False
-
-    if common_prefix_len < 256:
-        return False
-    # Cascade attention is currently not supported with these variants.
-    if use_alibi or use_sliding_window or use_local_attention:
-        return False
-    # Too few queries. Probably not worth using cascade attention.
-    # We use an arbitrary threshold of 8 queries. TODO: Tune this threshold.
-    num_reqs = len(query_lens)
-    if num_reqs < 8:
-        return False
-
-    # Heuristics to decide whether using cascade attention is beneficial.
-    # 1. When FlashDecoding is not used for normal attention, cascade attention
-    #    is likely to be faster since it saves memory bandwidth.
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    # The criteria for using FlashDecoding can be found in the following link:
-    # https://github.com/vllm-project/flash-attention/blob/96266b1111111f3d11aabefaf3bacbab6a89d03c/csrc/flash_attn/flash_api.cpp#L535
-    use_flash_decoding = (
-        num_queries_per_kv > 1
-        and not use_sliding_window
-        and not use_alibi
-        and np.all(query_lens == 1)
-    )
-    if not use_flash_decoding:
-        # Use cascade attention.
-        return True
-
-    # 2. When FlashDecoding is used for normal attention, it is not clear
-    #    whether cascade attention is beneficial, because FlashDecoding can
-    #    launch more CTAs than cascade attention.
-    #    We use a simple performance model to compare the two methods.
-    #    NOTE(woosuk): The performance model is very rough and may not be
-    #    accurate.
-    num_tokens = num_reqs
-    # NOTE(woosuk): These are default tile sizes. flash-attn might use
-    # different tile sizes (e.g., 64 or 256) depending on the configuration.
-    q_tile_size = 128
-    kv_tile_size = 128
-    num_prefix_tiles = cdiv(common_prefix_len, kv_tile_size)
-
-    cascade_ctas = num_query_heads * cdiv(num_tokens, q_tile_size)
-    cascade_waves = cdiv(cascade_ctas, num_sms)
-    cascade_time = cascade_waves * num_prefix_tiles
-
-    flash_decoding_ctas = (
-        num_reqs * num_kv_heads * cdiv(num_queries_per_kv, q_tile_size)
-    )
-    flash_decoding_ctas *= num_prefix_tiles
-    flash_decoding_time = cdiv(flash_decoding_ctas, num_sms)
-
-    # Use cascade attention if it is faster than FlashDecoding.
-    return cascade_time < flash_decoding_time

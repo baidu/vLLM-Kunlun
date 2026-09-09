@@ -1,10 +1,9 @@
 import torch
-
-from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 
 from vllm_kunlun.ops.deep_gemm import int8_mqa_logits, int8_paged_mqa_logits
 from vllm_kunlun.v1.attention.backends.mla.indexer import (

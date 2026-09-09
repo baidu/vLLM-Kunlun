@@ -1,0 +1,152 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "model-support.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "model-001",
+      "statement": "models/__init__.py 注册 10 个 OOT 模型；文件开头有 # TODO Remove all of models registration below，说明这些 OOT 实现被视为临时状态、上游化是长期方向。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/models/__init__.py#L14-L54",
+        "repo://vllm_kunlun/models/__init__.py#L6"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-002",
+      "statement": "DeepseekV32ForCausalLM 与 DeepseekV3ForCausalLM 注册到同一个类，靠 config 属性区分而非独立实现。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/models/__init__.py#L14-L64"],
+      "confidence": "high"
+    },
+    {
+      "id": "model-003",
+      "statement": "qwen3_dflash.py 里的 DFlashQwen3ForCausalLM 不在注册表中，走不通正常模型加载流程。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/models/qwen3_dflash.py#L36-L45",
+        "repo://vllm_kunlun/models/__init__.py#L14-L64"
+      ],
+      "confidence": "high",
+      "note": "否定证据：注册表中无 DFlashQwen3ForCausalLM 条目。"
+    },
+    {
+      "id": "model-004",
+      "statement": "deepseek_v2.py 把 DSA 稀疏 indexer 包装成切图算子 vllm::sparse_attn_indexer_vllm_kunlun。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/models/deepseek_v2.py#L472-L655"],
+      "confidence": "high"
+    },
+    {
+      "id": "model-005",
+      "statement": "Gemma4 不再注册 Kunlun 专用 OOT 模型，而是使用上游 vLLM 实现；Attention 缩放差异由 Kunlun Attention 后端统一处理。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/models/__init__.py#L14-L54",
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-006",
+      "statement": "qwen3_5.py 继承 qwen3_next 并改成四路 QKVZ projection；它 import 的是上游 config，仓库内的 transformers_utils/configs/qwen3_5*.py 未被使用。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/models/qwen3_5.py#L84-L88"],
+      "confidence": "high"
+    },
+    {
+      "id": "model-007",
+      "statement": "DeepSeek V3.2（DSA）的识别方式是 hasattr(config, \"index_topk\")，出现在 use_sparse 判定与 backend 选择两处，没有版本号判断——自定义 config 时可能误触发。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L235",
+        "repo://vllm_kunlun/platforms/kunlun.py#L304-L310"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-008",
+      "statement": "MTP 实现在 models/deepseek_mtp.py：eh_proj + 复用 DeepseekV2DecoderLayer，inputs_embeds[positions == 0] = 0，current_step_idx = spec_step_idx % self.num_mtp_layers。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/models/deepseek_mtp.py"],
+      "confidence": "high"
+    },
+    {
+      "id": "model-009",
+      "statement": "LoRA 由 KunlunPlatform.get_punica_wrapper 返回 punica_kunlun.py；prefill 走 SGMV（sgmv_*_sdnn）、decode 走 BGMV（bgmv_*_cluster），共 6 个算子；实现把 LoRA 当 MoE 风格描述符传下去并硬编码 expert_num = 9。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L383-L388",
+        "repo://vllm_kunlun/lora/ops/kunlun_ops/lora_ops.py",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L70",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L442",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L466",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L480"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-010",
+      "statement": "add_lora_embedding 与 add_lora_logits 两个调用点 arity 不匹配：只传 4~5 个位置参数而被调函数签名要 7~9 个，一旦走到就会 TypeError。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L375-L399",
+        "repo://vllm_kunlun/lora/punica_wrapper/punica_kunlun.py#L495-L545"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-011",
+      "statement": "LoRA 只支持 V0 引擎，启动方式为 USE_ORI_ROPE=0 VLLM_USE_V1=0。",
+      "kind": "constraint",
+      "evidence": ["repo://docs/source/user_guide/feature_guide/lora.md#L9"],
+      "confidence": "high"
+    },
+    {
+      "id": "model-012",
+      "statement": "结构化输出把后端固定为 _XPU_BACKEND = \"torch_native\" 以避免 CUDA_ERROR_NOT_SUPPORTED，并用 __dict__.get 重新绑定绕开 transformers 的约 192 个 alias 模块，注释记录代价为每进程约 0.75s / 约 38MB。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/v1/structured_output/utils.py#L36",
+        "repo://vllm_kunlun/v1/structured_output/utils.py#L112-L119"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-013",
+      "statement": "8 篇官方 tutorial 全部是单机 TP-only（TP=8），没有任何一条命令包含 --pipeline-parallel-size / --enable-expert-parallel / --data-parallel-size。",
+      "kind": "fact",
+      "evidence": ["repo://docs/source/tutorials/index.md"],
+      "confidence": "high",
+      "note": "否定证据：对 docs/source/tutorials/ 下 8 个 tutorial 全文搜索三个 flag 得到 0 命中。"
+    },
+    {
+      "id": "model-014",
+      "statement": "存在若干未接线的模型相关代码：models/config.py 651 行全部被注释（含一个 fp8_ds_mla 钩子）、_XPU_CONFIG_REGISTRY 无引用方、TOOL_PARSERS 与 REASONING_PARSERS 都是空字典（entry point 已接但无内容，实际解析走上游默认实现）。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/models/config.py",
+        "repo://vllm_kunlun/transformers_utils/config.py",
+        "repo://vllm_kunlun/tool_parsers/__init__.py#L8",
+        "repo://vllm_kunlun/reasoning/__init__.py#L8"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-015",
+      "statement": "文档矩阵与实际不一致：supported_models.md 只列 5 个模型，而 README 宣称 20+。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://docs/source/user_guide/support_matrix/supported_models.md",
+        "repo://README.md"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

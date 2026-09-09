@@ -47,8 +47,8 @@ def _run_startup_stages(logger: logging.Logger) -> None:
     bootstrap.register_custom_ops(logger)
     # 3. Optional speculative-decoding compatibility patches.
     bootstrap.load_spec_decode_compat(logger)
-    # 4. Native operators backing the Python ops.
-    bootstrap.load_native_extension(logger)
+    # 4. Provide the _C operator vLLM's CUDA-graph capture hardcodes.
+    bootstrap.register_weak_ref_tensor(logger)
     # 5. Patch custom-op schema registration before any model loads.
     bootstrap.load_schema_helpers(logger)
     # 6. Install the import dispatcher, then patch the vLLM modules that

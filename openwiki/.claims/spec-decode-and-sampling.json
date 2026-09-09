@@ -1,0 +1,88 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "spec-decode-and-sampling.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "spec-001",
+      "statement": "EAGLE 的接入方式是猴补丁：模块末尾直接 EagleProposer.propose = propose，替换上游方法而不是继承。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/sample/spec_decode/eagle.py#L340-L341"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-002",
+      "statement": "EAGLE propose 里有一处针对硬件的修复：XPU/XMLIR 的 index_fill_ 不接受空 index tensor，因此加了 if idx.numel() > 0: 保护。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/sample/spec_decode/eagle.py#L295-L306"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-003",
+      "statement": "EAGLE proposer 内含 mtp 分支，MTP 与 EAGLE 共用同一条投机解码路径。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/v1/sample/spec_decode/eagle.py#L116-L125"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-004",
+      "statement": "DFlash 以 EAGLE 风格路径承载，docstring 自述目的是保留 DFlash 方法同时避开上游 Triton 的 DFlash 输入扩展 kernel。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/sample/spec_decode/dflash.py#L10-L17"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-005",
+      "statement": "DFlash 的核心机制实际被 stub 掉：qwen3_dflash.py 的 precompute_and_store_context_kv 是空实现，且 DFlashQwen3ForCausalLM 未注册进模型表。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/models/qwen3_dflash.py#L36-L45"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-006",
+      "statement": "rejection sampler 的主要性能隐患是一个 Python 级 per-request 循环（for req_idx in range(batch_size)）。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/v1/sample/rejection_sampler.py#L779-L800"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-007",
+      "statement": "rejection sampler 带一个合成接受率模式，用于在不跑真实草稿模型的情况下模拟接受行为。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/v1/sample/rejection_sampler.py#L69-L82"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-008",
+      "statement": "topk_topp_sampler 中 flashinfer_sampler_supported() 恒返回 False，但日志仍打印 \"Using FlashInfer for top-p & top-k sampling.\"——名字与日志都有误导性，真实快路径是 kunlun_ops 的三个采样 kernel。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L15-L17",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L28-L34",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L206-L208",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L211-L213",
+        "repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L216-L219"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-009",
+      "statement": "采样快路径在两种情况下退回 forward_native：请求带 per-request generator，或 top-k 与 top-p 都未设置。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L206-L219"],
+      "confidence": "high"
+    },
+    {
+      "id": "spec-010",
+      "statement": "FAST_RANDOM_SAMPLE 通过裸 os.getenv 读取，未登记在 platforms/envs.py 的环境变量表中。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/v1/sample/ops/topk_topp_sampler.py#L161-L167"],
+      "confidence": "high"
+    }
+  ]
+}

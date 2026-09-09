@@ -1,0 +1,68 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "index.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "idx-001",
+      "statement": "vLLM-Kunlun 是 vLLM 的树外硬件插件，通过 entry point 被 vLLM 发现，不 fork vLLM。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://setup.py#L74-L81",
+        "repo://pyproject.toml#L21-L27",
+        "repo://vllm_kunlun/__init__.py#L63-L91"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "idx-002",
+      "statement": "插件对 vLLM 自称是 CUDA 设备：device_name=\"cuda\"、dispatch_key=\"CUDA\"、dist_backend=\"nccl\"、ray_device_key=\"GPU\"，但 _enum 是 PlatformEnum.OOT。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L22-L29"],
+      "confidence": "high"
+    },
+    {
+      "id": "idx-003",
+      "statement": "共有四种覆盖上游代码的手段，各自对已 import 代码的可见性不同：sys.modules 整模块重定向、post-import 就地补丁、OOT 层注册、安装期文件覆盖。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/module_redirects.py#L22-L68",
+        "repo://vllm_kunlun/registration/compat_patches.py#L200-L230",
+        "repo://vllm_kunlun/ops/__init__.py#L27-L45",
+        "repo://docs/source/installation.md#L100-L106"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "idx-004",
+      "statement": "单卡 num_compute_units 为常量 64。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L136-L140"],
+      "confidence": "high"
+    },
+    {
+      "id": "idx-005",
+      "statement": "支持的模型 dtype 白名单只有 float32 / float16 / bfloat16 / int8，不含 fp8。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L390-L405"],
+      "confidence": "high"
+    },
+    {
+      "id": "idx-006",
+      "statement": "默认分支是 v0.25.1-dev；main 分支的 README 陈旧，仍宣称 v0.15.1 / Initial release，不应作为阅读依据。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://README.md",
+        "repo://pyproject.toml#L10",
+        "repo://vllm_kunlun/platforms/version.py#L3"
+      ],
+      "confidence": "high",
+      "note": "分支陈旧性通过 GitHub API 报告的 default_branch 与两个分支 README 内容比对确认。"
+    }
+  ]
+}

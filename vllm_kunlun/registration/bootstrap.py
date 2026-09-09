@@ -8,7 +8,7 @@ over.  Each public function is one self-contained startup stage:
    failing on a machine without CUDA.
 2. ``register_custom_ops()``: register Kunlun operators with torch early.
 3. ``load_spec_decode_compat()``: optional speculative-decoding patches.
-4. ``load_native_extension()``: the Kunlun C++ operator extension.
+4. ``register_weak_ref_tensor()``: alias the ``_C`` operator vLLM hardcodes.
 5. ``load_schema_helpers()``: patch vLLM's custom-op schema registration.
 6. ``patch_memory_info()``: fill in a torch API missing from torch_xmlir.
 
@@ -21,7 +21,9 @@ import importlib
 import importlib.util
 import logging
 import os
+import re
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from types import ModuleType
 
 _CUDA_EXTENSION_MODULES = ("vllm._C", "vllm._moe_C")
@@ -32,6 +34,8 @@ _SPEC_DECODE_COMPAT_MODULES = (
     "vllm_kunlun.v1.sample.spec_decode.dflash",
     "vllm_kunlun.v1.sample.spec_decode.eagle",
 )
+_MIN_XSPEEDGATE_VERSION = (1, 5, 0)
+_WEAK_REF_TENSOR_LIBRARY = None
 
 
 class CustomOpsRegistrationError(RuntimeError):
@@ -133,20 +137,58 @@ def load_spec_decode_compat(logger: logging.Logger) -> None:
             )
 
 
-def load_native_extension(logger: logging.Logger) -> None:
-    """Load native operators, if the extension is available.
+def register_weak_ref_tensor(logger: logging.Logger) -> None:
+    """Provide ``torch.ops._C.weak_ref_tensor`` by aliasing xspeedgate_ops.
 
-    The ``_kunlun`` extension supplies the C++ kernels behind the Python
-    operators.  Its absence (e.g. a source checkout without a build) is
-    only a warning here; operators that need it fail later with a clearer
-    error at the point of use.
+    vLLM's CUDA-graph capture calls ``torch.ops._C.weak_ref_tensor``, which
+    normally comes from vLLM's own CUDA extension.  ``_C`` is empty on Kunlun
+    because ``stub_vllm_cuda_extensions()`` blocks that extension, so the
+    equivalent xspeedgate_ops operator is registered under the name vLLM
+    expects.  Both build an alias tensor with ``from_blob`` and no deleter,
+    and torch_xmlir maps Kunlun tensors to the CUDA dispatch key.
     """
+    global _WEAK_REF_TENSOR_LIBRARY
+
+    if _WEAK_REF_TENSOR_LIBRARY is not None:
+        return
+
+    import torch
+
     try:
-        from .. import _kunlun  # noqa: F401
-    except ImportError as error:
-        logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", error)
-    else:
-        logger.info("[KunlunPlugin] _kunlun native extension loaded")
+        import xspeedgate_ops  # noqa: F401  registers the custom operators
+
+        installed_version = version("xspeedgate_ops")
+    except (ImportError, PackageNotFoundError) as error:
+        raise RuntimeError(
+            "Kunlun requires xspeedgate_ops>=1.5.0; install a compatible "
+            "vendor wheel before loading the vLLM-Kunlun plugin"
+        ) from error
+
+    version_match = re.match(r"^(\d+)\.(\d+)\.(\d+)", installed_version)
+    if version_match is None or tuple(map(int, version_match.groups())) < (
+        _MIN_XSPEEDGATE_VERSION
+    ):
+        raise RuntimeError(
+            "Kunlun requires xspeedgate_ops>=1.5.0; found " f"{installed_version!r}"
+        )
+
+    try:
+        weak_ref_op = torch.ops.xspeedgate_ops.weak_ref_tensor.default
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError(
+            "Kunlun requires xspeedgate_ops>=1.5.0 with the " "weak_ref_tensor operator"
+        ) from error
+
+    # The Library must stay referenced: its destructor deregisters the op.
+    library = torch.library.Library("_C", "FRAGMENT")
+    library.define("weak_ref_tensor(Tensor input) -> Tensor")
+    library.impl(
+        "weak_ref_tensor",
+        weak_ref_op,
+        "CUDA",
+    )
+    _WEAK_REF_TENSOR_LIBRARY = library
+    logger.info("[KunlunPlugin] registered _C::weak_ref_tensor via xspeedgate_ops")
 
 
 def load_schema_helpers(logger: logging.Logger) -> None:

@@ -1,0 +1,225 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "architecture.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "arch-001",
+      "statement": "插件声明 1 个 vllm.platform_plugins entry point（kunlun -> vllm_kunlun:register）和 3 个 vllm.general_plugins（register_model / register_reasoning_parser / register_tool_parser）。",
+      "kind": "mechanism",
+      "evidence": ["repo://setup.py#L74-L81", "repo://pyproject.toml#L21-L27"],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-002",
+      "statement": "register() 唯一返回值是平台类的字符串路径 \"vllm_kunlun.platforms.kunlun.KunlunPlatform\"。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/__init__.py#L20", "repo://vllm_kunlun/__init__.py#L63-L91"],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-003",
+      "statement": "register() 用模块级 _REGISTER_STATE 做幂等保护；只有 CustomOpsRegistrationError 会把状态锁定为 failed，因为 torch dispatcher 注册无法回滚，重试无意义。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/__init__.py#L18-L19",
+        "repo://vllm_kunlun/__init__.py#L66-L74",
+        "repo://vllm_kunlun/__init__.py#L81-L88"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-004",
+      "statement": "pyproject.toml 声明 console script vllm-kunlun = vllm_kunlun.cmdline:main，但仓库中不存在 cmdline.py，该命令是坏的。",
+      "kind": "defect",
+      "evidence": ["repo://pyproject.toml#L18-L19"],
+      "confidence": "high",
+      "note": "否定证据：全仓库 239 个跟踪文件中无 vllm_kunlun/cmdline.py。"
+    },
+    {
+      "id": "arch-005",
+      "statement": "_run_startup_stages() 按固定顺序执行七个阶段：stub CUDA 扩展、注册裸算子、投机解码兼容层、原生扩展、schema helper、装 import hook 并 dispatch、patch memory info。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/__init__.py#L37-L60",
+        "repo://vllm_kunlun/registration/bootstrap.py#L7-L14"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-006",
+      "statement": "阶段 1 往 sys.modules 塞空 ModuleType 到 vllm._C 与 vllm._moe_C，阻止 vLLM 加载真正的 CUDA 扩展。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/bootstrap.py#L27",
+        "repo://vllm_kunlun/registration/bootstrap.py#L41-L51"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-007",
+      "statement": "阶段 2 按文件路径（非包名）把 ops/_custom_ops.py 加载为 _vllm_kunlun_custom_ops_registration，失败不可重试。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/bootstrap.py#L57-L110",
+        "repo://vllm_kunlun/registration/bootstrap.py#L96-L103"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-008",
+      "statement": "阶段 5 把 vllm.utils.torch_utils.direct_register_custom_op 换成自有版本，用于把 PEP-604 注解归一化成 torch.library.infer_schema 可接受的形式；默认 dispatch key 为 \"CUDA\"。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/schema.py#L117",
+        "repo://vllm_kunlun/schema.py#L58-L114",
+        "repo://vllm_kunlun/schema.py#L25"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-009",
+      "statement": "阶段 7 把 torch.accelerator.get_memory_info 指向基于 torch.cuda.mem_get_info 的实现，因为 torch_xmlir 未实现前者。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/registration/bootstrap.py#L163-L196"],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-010",
+      "statement": "import 劫持不是 PEP-302 meta path finder，而是直接替换 builtins.__import__；wrapper 只在 level == 0（绝对 import）时做重定向。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/import_hooks.py#L123-L125",
+        "repo://vllm_kunlun/registration/import_hooks.py#L45",
+        "repo://vllm_kunlun/registration/import_hooks.py#L106-L120"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-011",
+      "statement": "dispatch_hooks() 是 fail-soft 的：单个补丁抛异常不中断进程，并用 _DISPATCHING 标志防重入；重复注册同一 target 会 ValueError。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/import_hooks.py#L69-L97",
+        "repo://vllm_kunlun/registration/import_hooks.py#L49",
+        "repo://vllm_kunlun/registration/import_hooks.py#L63-L64"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-012",
+      "statement": "MODULE_MAPPINGS 共 7 条整模块重定向；preload_mapped 把替换模块同时注册到上下游两个名字，若上游名字已在 sys.modules 中则放弃。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/module_redirects.py#L22-L36",
+        "repo://vllm_kunlun/registration/module_redirects.py#L39-L53",
+        "repo://vllm_kunlun/registration/module_redirects.py#L56-L68"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-013",
+      "statement": "PATCHES 表共 8 条 post-import 就地补丁；版本兼容通过 hasattr 探测而非版本号判断。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/registration/compat_patches.py#L200-L230",
+        "repo://vllm_kunlun/registration/compat_patches.py#L10-L12",
+        "repo://vllm_kunlun/registration/compat_patches.py#L160-L161"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-014",
+      "statement": "PluggableLayer 没有 forward_native/forward_oot 分派；按 CustomOp 习惯定义 forward_oot() 永不被调用，会静默退回基类 forward()，触发 vLLM 被 torch.compile 的 get_masked_input_and_mask 并可能在 XPU 上失败。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/ops/vocab_parallel_embedding.py#L30-L36"],
+      "confidence": "high",
+      "note": "该陷阱由源码 docstring 逐字记录。"
+    },
+    {
+      "id": "arch-015",
+      "statement": "ops/linear.py 的两个 register_oot 覆盖的是权重加载而非计算。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/ops/linear.py#L29-L30",
+        "repo://vllm_kunlun/ops/linear.py#L48-L49",
+        "repo://vllm_kunlun/ops/linear.py#L111",
+        "repo://vllm_kunlun/ops/linear.py#L262",
+        "repo://vllm_kunlun/ops/linear.py#L333"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-016",
+      "statement": "安装期用 cp 覆盖两个 site-packages 文件：torch/_dynamo/eval_frame.py 与 vllm/model_executor/layers/quantization/__init__.py；后者头部带 # patched by vLLM-Kunlun 标记。这两处不在任何运行时机制里。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://docs/source/installation.md#L100",
+        "repo://docs/source/installation.md#L106",
+        "repo://vllm_kunlun/quantization/__init__.py#L3"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-017",
+      "statement": "自定义算子有三个命名空间：本仓库声明的 _C/_moe_C（约 55 个算子，schema 与 impl 分开声明，impl 下沉到 xspeedgate_ops）、厂商 xspeedgate_ops/custom_ops、以及 kunlun_ops pybind 模块。另有 Kunlun 往 vllm:: 命名空间加的切图算子。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/_custom_ops.py#L20",
+        "repo://vllm_kunlun/ops/_custom_ops.py#L2842",
+        "repo://vllm_kunlun/ops/_custom_ops.py#L2863",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L22-L35",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L46-L47",
+        "repo://vllm_kunlun/ops/attention/layer.py#L223-L240"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-018",
+      "statement": "vllm_kunlun/csrc/utils.cpp（32 行）只提供 weak_ref_tensor，被注册两次，经 CppExtension 编译，但仓库内没有 Python 调用方——utils.py 用的是 vLLM 自带版本。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/csrc/utils.cpp#L26-L31",
+        "repo://setup.py#L25-L34",
+        "repo://vllm_kunlun/utils.py#L13"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-019",
+      "statement": "KunlunCommunicator 声明继承 CudaCommunicator，但跳过其 __init__ 并系统性委托到祖父类 DeviceCommunicatorBase；ca_comm 置 None（无 custom all-reduce），destroy 是空实现。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/distributed/kunlun_communicator.py#L12-L13",
+        "repo://vllm_kunlun/distributed/kunlun_communicator.py#L28-L40",
+        "repo://vllm_kunlun/distributed/kunlun_communicator.py#L42-L64"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-020",
+      "statement": "change_state 在 finally 之外恢复状态，中间抛异常会泄漏状态。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/distributed/kunlun_communicator.py#L66-L86"],
+      "confidence": "high"
+    },
+    {
+      "id": "arch-021",
+      "statement": "存在两套互不相交的环境变量集合：platforms/envs.py 定义的 9 个（只有 VLLM_KUNLUN_ENABLE_INT8_BMM 有真实消费者），与文档记录的 11 个由 torch_xmlir 读取的 XPU/XMLIR 变量。docs/envs.py 是从 vllm-ascend 抄来的死代码。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/envs.py#L34-L71",
+        "repo://vllm_kunlun/platforms/envs.py#L76-L92",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1152",
+        "repo://docs/source/user_guide/configuration/env_vars.md#L7-L17",
+        "repo://docs/envs.py#L5"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

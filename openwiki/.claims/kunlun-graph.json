@@ -1,0 +1,102 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "kunlun-graph.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "graph-001",
+      "statement": "\"Kunlun Graph\" 不是新的图后端类；平台返回上游 CUDAPiecewiseBackend 与 CUDAGraphWrapper，XPU 化发生在 torch_xmlir 的 CUDA graph shim 与 vllm.compilation.wrapper 的整模块替换两层。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L128-L134",
+        "repo://vllm_kunlun/registration/module_redirects.py#L22-L36"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-002",
+      "statement": "替换后的 wrapper 核心类是 TorchCompileWithNoGuardsWrapper：guard installer 全部改为 no-op，guard_filter_fn 让所有 guard 都不保留。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/compilation/wrapper.py#L72-L85",
+        "repo://vllm_kunlun/compilation/wrapper.py#L26-L37",
+        "repo://vllm_kunlun/compilation/wrapper.py#L166"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-003",
+      "statement": "_compilation_context() 把 dynamo 的 cache_size_limit 抬到 2048、accumulated_cache_size_limit 抬到 8192；编译时用 fullgraph=True, dynamic=False。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/compilation/wrapper.py#L40-L69",
+        "repo://vllm_kunlun/compilation/wrapper.py#L188-L198"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-004",
+      "statement": "存在一个 buffer-mutation 守卫：cudagraph 开启且被编译函数的 co_names 含 \"update\" 时直接抛异常，用于兜底 guard 全关带来的风险。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/compilation/wrapper.py#L285-L300"],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-005",
+      "statement": "reset_compile_wrapper 是空实现（no-op stub）。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/compilation/wrapper.py#L316-L318"],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-006",
+      "statement": "patches/eval_frame.py 是 torch 2.5.1 该文件的逐字副本（1717 行，全文 0 次出现 kunlun/xmlir/xpu/baidu），只有两处功能差异：set_eval_frame 被提升到模块作用域，以及删掉一处无用赋值。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/patches/eval_frame.py#L98",
+        "repo://vllm_kunlun/patches/eval_frame.py#L1683"
+      ],
+      "confidence": "high",
+      "note": "通过对该文件全文搜索 kunlun/xmlir/xpu/baidu 得到 0 命中，以及与 torch 2.5.1 原文件逐行比对得出。"
+    },
+    {
+      "id": "graph-007",
+      "statement": "该补丁在安装期覆盖 site-packages 中的 torch/_dynamo/eval_frame.py，因此把 dynamo 的 eval frame 实现锁定在 torch 2.5.1。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://docs/source/installation.md#L100",
+        "repo://vllm_kunlun/patches/eval_frame.py#L98"
+      ],
+      "confidence": "medium",
+      "note": "\"锁定在 2.5.1\" 是从逐字副本这一事实推出的后果，不是源码明写。"
+    },
+    {
+      "id": "graph-008",
+      "statement": "piecewise 图的切分点是 vllm::unified_attention_with_output_kunlun；另有 gdn_attention_core 与 sparse_attn_indexer_vllm_kunlun 两个 Kunlun 自定义切图算子。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/attention/layer.py#L223-L240",
+        "repo://vllm_kunlun/ops/attention/layer.py#L255-L257",
+        "repo://vllm_kunlun/ops/attention/layer.py#L110-L112",
+        "repo://vllm_kunlun/models/qwen3_next.py#L1471-L1508",
+        "repo://vllm_kunlun/models/deepseek_v2.py#L472-L473"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "graph-009",
+      "statement": "CUDAGraphMode.FULL、FULL_AND_PIECEWISE 与 use_inductor 均不支持；与之一致，启用任何 cudagraph mode 时 backend 被强制成 eager 以避开 inductor/Triton。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://docs/source/developer_guide/feature_guide/Kunlun_Graph.md#L74-L75",
+        "repo://vllm_kunlun/platforms/kunlun.py#L276-L279"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

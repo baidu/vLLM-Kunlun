@@ -7,7 +7,7 @@ This document describes how to install vllm-kunlun manually.
 - **OS**: Ubuntu 20.04
 - **Software**:
   - Python >=3.10
-  - PyTorch ≥ 2.5.1
+  - PyTorch ≥ 2.9.0
   - vLLM (same version as vllm-kunlun)
 
 ## Setup environment using container
@@ -68,6 +68,12 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ::::
 :::::
 ## Install vLLM-kunlun
+### Install PyTorch
+
+```{code-block} bash
+uv pip install torch==2.9.0 torchvision torchaudio
+```
+
 ### Install vLLM
 
 ```{code-block} bash
@@ -77,8 +83,7 @@ uv pip install vllm==|pip_vllm_version| --no-build-isolation --no-deps
 ```
 
 ### Build and Install
-Navigate to the vllm-kunlun directory and install the package. This builds the
-native `_kunlun` extension during installation:
+Navigate to the vllm-kunlun directory and install the package:
 
 ```{code-block} bash
 :substitutions:
@@ -93,26 +98,13 @@ uv pip install -r requirements.txt
 uv pip install --no-build-isolation --no-deps .
 ```
 
-### Replace eval_frame.py
-Copy the eval_frame.py patch:
-
-```
-cp vllm_kunlun/patches/eval_frame.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
-```
-
-### Replace quantization __init__.py
-
-```
-cp vllm_kunlun/quantization/__init__.py "${CONDA_PREFIX:-$VIRTUAL_ENV}"/lib/python3.10/site-packages/vllm/model_executor/layers/quantization/__init__.py
-```
-
 ## Choose to download customized xpytorch
 
 ### Install the KL3-customized build of PyTorch
 
 ```
-wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-customer.su.bcebos.com/aiak/qwen3_next/20260226/xpytorch-cp310-torch251-ubuntu2004-x64.run
-bash xpytorch-cp310-torch251-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
+wget -O xpytorch-cp310-torch290-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260806/xpytorch-cp310-torch290-ubuntu2004-x64.run
+bash xpytorch-cp310-torch290-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
 sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
 ```
 
@@ -120,13 +112,11 @@ sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
 
 ```
 # Install kunlun_ops
-uv pip install "https://baidu-kunlun-customer.su.bcebos.com/aiak/mimo/20260227/kunlun_ops-0.1.58+ee39020a-cp310-cp310-linux_x86_64.whl"
+uv pip install "https://klx-sdk-release-public.su.bcebos.com/kunlun2jituan/20260806/kunlun_ops-0.1.227%2B2b100f96-cp310-cp310-linux_x86_64.whl"
 
-# Install xspeedgate_ops
-uv pip install "https://vllm-ai-models.bj.bcebos.com/aiak_share/20260403/xspeedgate_ops-1.1.0+53992ca-cp310-cp310-linux_x86_64.whl"
+# Install xspeedgate_ops (1.5.0 is the minimum: it provides weak_ref_tensor)
+uv pip install "https://vllm-ai-models.bj.bcebos.com/aiak_share/20260827/torch29/xspeedgate_ops-1.5.1%2B87067b3.torch29-cp310-cp310-linux_x86_64.whl"
 
-# Install cocopod
-uv pip install "https://vllm-ai-models.bj.bcebos.com/aiak_share/20260403/cocopod-1.1.0-cp310-cp310-linux_x86_64.whl"
 ```
 
 ## Quick Start
@@ -150,19 +140,11 @@ python -m vllm.entrypoints.openai.api_server \
       --host 0.0.0.0 \
       --port 8356 \
       --model models/Qwen3-VL-30B-A3B-Instruct \
-      --gpu-memory-utilization 0.9 \
       --trust-remote-code \
       --max-model-len 32768 \
       --tensor-parallel-size 1 \
       --dtype float16 \
-      --max_num_seqs 128 \
-      --max_num_batched_tokens 32768 \
-      --block-size 128 \
-      --no-enable-prefix-caching \
-      --no-enable-chunked-prefill \
-      --distributed-executor-backend mp \
       --served-model-name Qwen3-VL-30B-A3B-Instruct
-
 ```
 
 ::::

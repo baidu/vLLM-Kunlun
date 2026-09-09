@@ -1,0 +1,80 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "testing-and-ci.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "ci-001",
+      "statement": "仓库没有功能性 CI 门禁：唯一会拦住 PR 的检查是 pylint-check.yml 跑的 pre-commit lint。",
+      "kind": "fact",
+      "evidence": [
+        "repo://.github/workflows/pylint-check.yml",
+        "repo://.github/workflows/runner-smoke-test.yml",
+        "repo://.github/workflows/ai-review.yml"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-002",
+      "statement": "runner-smoke-test.yml 只在 workflow_dispatch 手动触发，内容仅 echo hostname / uname 与 curl api.github.com/meta，不测任何功能。",
+      "kind": "fact",
+      "evidence": ["repo://.github/workflows/runner-smoke-test.yml"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-003",
+      "statement": "ai-review.yml 是 286 行的 LLM 代码审查（MODEL_NAME: gpt-5.6-sol，评论标记 <!-- baidu-vllm-kunlun-ai-review -->），只留评论不阻塞合并。",
+      "kind": "fact",
+      "evidence": ["repo://.github/workflows/ai-review.yml"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-004",
+      "statement": "ci.yml 是百度内部 CI 配置（非 GitHub Actions），只执行 sh build.sh，而 build.sh 只打 tarball，因此连编译都不算真正跑了。",
+      "kind": "fact",
+      "evidence": ["repo://ci.yml", "repo://build.sh#L22-L23"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-005",
+      "statement": "ci/scripts/** 下的 E2E / 精度 / 性能脚本没有任何 workflow 引用；精度用 evalscope eval --datasets gsm8k arc --limit 10、性能只跑单一 1024x1024 形状并发 1，两者都没有阈值判定。",
+      "kind": "caveat",
+      "evidence": ["repo://ci/scripts"],
+      "confidence": "high",
+      "note": "否定证据：对 .github/workflows/ 全目录搜索 ci/scripts 得到 0 命中。"
+    },
+    {
+      "id": "ci-006",
+      "statement": "全仓库只有 6 个真正的单元测试，位于 tests/ut/test.py，全部针对 TorchCompileWrapperWithCustomDispatcher。",
+      "kind": "fact",
+      "evidence": ["repo://tests/ut/test.py"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-007",
+      "statement": "vllm_kunlun/tests/test_prefill_attention_prefix_cache.py（469 行）不是 pytest，而是用退出码表达结果的硬件诊断脚本，需要真实 XPU 才能跑。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/tests/test_prefill_attention_prefix_cache.py"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-008",
+      "statement": ".pre-commit-config.yaml 把所有 workflow 文件排除在 actionlint 之外，而 workflow 文件正是 actionlint 唯一的检查对象——actionlint 实际什么都没检查。",
+      "kind": "defect",
+      "evidence": ["repo://.pre-commit-config.yaml#L75"],
+      "confidence": "high"
+    },
+    {
+      "id": "ci-009",
+      "statement": ".readthedocs.yaml 设了 fail_on_warning: true，文档警告即构建失败——这是仓库里比代码检查更严格的检查。",
+      "kind": "fact",
+      "evidence": ["repo://.readthedocs.yaml"],
+      "confidence": "high"
+    }
+  ]
+}

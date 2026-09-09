@@ -48,6 +48,17 @@ _OLD_IMPORT = builtins.__import__
 # recursively enter dispatch_hooks() through the custom __import__.
 _DISPATCHING = False
 
+# Set when a re-entrant dispatch was skipped by the guard above.  Those nested
+# imports can make further hooks eligible, so the outer dispatch runs the table
+# again instead of dropping them.
+_REDISPATCH = False
+
+# Upper bound on those extra passes.  Patches are idempotent, so one or two
+# passes always suffice in practice; the cap only stops a hook whose is_applied
+# never turns True from spinning.  Anything left over is picked up by the
+# dispatch that follows the next import.
+_MAX_DISPATCH_PASSES = 4
+
 # Registered hooks, applied in registration order on every dispatch.
 _HOOKS: list[HookRegistration] = []
 _HOOK_TARGETS: set[str] = set()
@@ -66,6 +77,38 @@ def register_hook(target: str, applied: HookApplied, apply: HookApply) -> None:
     _HOOKS.append(HookRegistration(target, applied, apply))
 
 
+def _is_executing(module: ModuleType) -> bool:
+    """Return whether ``module`` is published but still running its body.
+
+    Python inserts a module into ``sys.modules`` *before* executing it, so a
+    dispatch triggered by one of that module's own top-level imports would see
+    a half-built module.  Patching it there is worse than useless: the
+    statements still to run rebind the very names the patch just installed, and
+    a patch that records "done" would never be retried.  Waiting costs nothing
+    -- the import currently loading the module ends in another dispatch, by
+    which point the body has finished.
+    """
+    spec = getattr(module, "__spec__", None)
+    return spec is not None and getattr(spec, "_initializing", False)
+
+
+def _dispatch_once() -> None:
+    """Run every registered hook whose target is loaded and not yet patched."""
+    logger = logging.getLogger("vllm_kunlun")
+    for hook in _HOOKS:
+        module = sys.modules.get(hook.target)
+        if module is None or _is_executing(module):
+            continue
+        try:
+            if not hook.is_applied(module):
+                hook.apply_patch(module)
+        except Exception:
+            logger.exception(
+                "[KunlunPlugin] post-import hook failed for target=%s",
+                hook.target,
+            )
+
+
 def dispatch_hooks() -> None:
     """Apply registered patches whose target modules have finished loading.
 
@@ -75,26 +118,20 @@ def dispatch_hooks() -> None:
     is logged and isolated from the remaining registrations; this preserves
     vLLM's normal import flow and lets later hooks run.
     """
-    global _DISPATCHING
+    global _DISPATCHING, _REDISPATCH
     if _DISPATCHING:
+        _REDISPATCH = True
         return
     _DISPATCHING = True
     try:
-        logger = logging.getLogger("vllm_kunlun")
-        for hook in _HOOKS:
-            module = sys.modules.get(hook.target)
-            if module is None:
-                continue
-            try:
-                if not hook.is_applied(module):
-                    hook.apply_patch(module)
-            except Exception:
-                logger.exception(
-                    "[KunlunPlugin] post-import hook failed for target=%s",
-                    hook.target,
-                )
+        for _ in range(_MAX_DISPATCH_PASSES):
+            _REDISPATCH = False
+            _dispatch_once()
+            if not _REDISPATCH:
+                break
     finally:
         _DISPATCHING = False
+        _REDISPATCH = False
 
 
 # Register the built-in patches at module import time.  The dispatcher itself

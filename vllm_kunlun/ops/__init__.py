@@ -37,8 +37,8 @@ from . import fused_moe as _fused_moe  # noqa: F401
 from . import layernorm as _layernorm  # noqa: E402,F401
 from . import linear as _linear  # noqa: E402,F401
 from . import rotary_embedding as _rotary_embedding  # noqa: E402,F401
-from . import vocab_parallel_embedding as _vocab_parallel_embedding  # noqa: E402,F401
 from . import sparse_attn_indexer as _sparse_attn_indexer  # noqa: E402,F401
+from . import vocab_parallel_embedding as _vocab_parallel_embedding  # noqa: E402,F401
 
 # Set only after every registration module has finished importing. The plugin
 # import hook uses this sentinel to distinguish a complete package from a

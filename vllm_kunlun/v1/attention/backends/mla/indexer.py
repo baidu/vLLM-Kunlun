@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from dataclasses import dataclass
 
-import logging
 import torch
 import vllm.v1.attention.backends.mla.indexer as mla_indexer
 from vllm.v1.attention.backends.mla.indexer import (
@@ -12,9 +12,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadataBuilder,
     DeepseekV32IndexerPrefillChunkMetadata,
 )
-from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata,
-)
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
 
 def fill_prefill_chunk_meta_torch(

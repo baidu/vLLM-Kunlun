@@ -74,7 +74,6 @@ class Qwen2Model(nn.Module):
 ```bash
 unset XPU_DUMMY_EVENT
 export XPU_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export XPU_USE_MOE_SORTED_THRES=1
 export XFT_USE_FAST_SWIGLU=1
 export XMLIR_CUDNN_ENABLED=1
 export XPU_USE_DEFAULT_CTX=1

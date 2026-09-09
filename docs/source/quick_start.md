@@ -89,20 +89,6 @@ def main():
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
         served_model_name="Qwen3-VL",
-        compilation_config={
-            "splitting_ops": [
-                "vllm.unified_attention",
-                "vllm.unified_attention_with_output",
-                "vllm.unified_attention_with_output_kunlun",
-                "vllm.mamba_mixer2",
-                "vllm.mamba_mixer",
-                "vllm.short_conv",
-                "vllm.linear_attention",
-                "vllm.plamo2_mamba_mixer",
-                "vllm.gdn_attention",
-                "vllm.sparse_attn_indexer",
-            ]
-        },
     )
 
     # === test chat ===

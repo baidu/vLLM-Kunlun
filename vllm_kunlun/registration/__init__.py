@@ -15,6 +15,6 @@ Modules, in suggested reading order:
     compat_patches:   Content, part 2.  Targeted patches applied to upstream
         modules right after they finish importing.
     bootstrap:        Ordered startup helpers (CUDA extension stubs, operator
-        registration, native extension loading, torch shims) that run during
-        platform discovery, before the import dispatcher takes over.
+        registration, torch shims) that run during platform discovery, before
+        the import dispatcher takes over.
 """
