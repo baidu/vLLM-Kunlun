@@ -537,6 +537,92 @@ _register_post_import_hook(
 )
 
 
+# --- hook: MLA key concat -> xspeedgate_ops.concat_k_nope_k_pe ------------
+# Upstream MLACommonBaseImpl._concat_k_nope_k_pe allocates an empty key and
+# fills it with two strided slice-copies (mla_attention.py:2247-2258). On K3
+# only the chunked-context path reaches it -- the new-token concat already
+# lives inside fused_kimi_k3_mla_key_concat_kv_cache_insert -- and it runs
+# once per context chunk per MLA layer, with the token dim growing as context
+# accumulates (measured 8192 -> 57344 over 7 chunks).
+#
+# The XPU op has hard layout constraints, so every call is screened and falls
+# back to upstream when they do not hold.
+_CONCAT_K_DTYPES = ("float16", "bfloat16", "float32")
+
+
+def _concat_k_supported(k_nope, k_pe) -> bool:
+    if k_nope.dtype is not k_pe.dtype:
+        return False
+    if str(k_nope.dtype).rsplit(".", 1)[-1] not in _CONCAT_K_DTYPES:
+        return False
+    if k_nope.dim() != 3 or k_pe.dim() != 3:
+        return False
+    # k_pe is broadcast over heads, so it must be [num_tokens, 1, pe_dim].
+    if k_pe.shape[0] != k_nope.shape[0] or k_pe.shape[1] != 1:
+        return False
+    if k_nope.stride(-1) != 1 or k_pe.stride(-1) != 1:
+        return False
+    if k_nope.device != k_pe.device:
+        return False
+    # nope_dim, pe_dim and the output row must each be 64-byte aligned.
+    width = k_nope.element_size()
+    nope_dim, pe_dim = k_nope.shape[-1], k_pe.shape[-1]
+    return all(
+        (dim * width) % 64 == 0 for dim in (nope_dim, pe_dim, nope_dim + pe_dim)
+    )
+
+
+def _mla_concat_k_applied(mod):
+    cls = getattr(mod, "MLACommonBaseImpl", None)
+    return cls is None or getattr(
+        cls._concat_k_nope_k_pe, "_kunlun_concat_k", False
+    )
+
+
+def _mla_concat_k_apply(mod):
+    import torch
+
+    cls = getattr(mod, "MLACommonBaseImpl", None)
+    if cls is None:
+        return
+
+    upstream = cls._concat_k_nope_k_pe
+    log = logging.getLogger("vllm_kunlun")
+
+    # torch.ops.xspeedgate_ops.* only resolves once the extension module has
+    # been imported, and this hook can fire before anything else pulls it in.
+    import xspeedgate_ops  # noqa: F401
+
+    op = getattr(torch.ops.xspeedgate_ops, "concat_k_nope_k_pe", None)
+    if op is None:
+        # Older xspeedgate build. Mark the untouched method as handled so the
+        # dispatcher (which re-runs on every import) stops retrying.
+        upstream._kunlun_concat_k = True
+        log.info(
+            "[KunlunPlugin] xspeedgate_ops.concat_k_nope_k_pe not available, "
+            "keeping upstream _concat_k_nope_k_pe"
+        )
+        return
+
+    def _concat_k_nope_k_pe(self, k_nope, k_pe):
+        if _concat_k_supported(k_nope, k_pe):
+            return op(k_nope, k_pe)
+        return upstream(self, k_nope, k_pe)
+
+    _concat_k_nope_k_pe._kunlun_concat_k = True
+    cls._concat_k_nope_k_pe = _concat_k_nope_k_pe
+    log.info(
+        "[KunlunPlugin] MLACommonBaseImpl._concat_k_nope_k_pe -> xspeedgate_ops"
+    )
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.attention.mla_attention",
+    _mla_concat_k_applied,
+    _mla_concat_k_apply,
+)
+
+
 # --- hook: skip fa4_cutedsl_warmup on Kunlun XPU --------------------------
 # FA4 CuTeDSL MLA-prefill warmup is NV-only. Because our FlashAttnPrefillBackend
 # override reports get_name()=="FLASH_ATTN", fa4_cutedsl_warmup() does not early
