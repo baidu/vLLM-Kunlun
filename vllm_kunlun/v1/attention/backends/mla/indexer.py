@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
 
+import logging
 import torch
+import vllm.v1.attention.backends.mla.indexer as mla_indexer
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
     DeepSeekV32IndexerDecodeMetadata,
@@ -13,6 +15,101 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
+
+
+def fill_prefill_chunk_meta_torch(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    cu_seq_len_ks: torch.Tensor,
+    cu_seq_len_ke: torch.Tensor,
+    query_slice_start: int,
+    query_slice_stop: int,
+):
+    device = query_start_loc.device
+    num_requests = seq_lens.shape[0]
+
+    query_starts = query_start_loc[:-1]
+    query_lens = query_start_loc[1:] - query_starts
+    seq_starts = cu_seq_lens[:-1]
+    start_pos = seq_lens - query_lens
+
+    token_to_seq[:] = torch.repeat_interleave(
+        torch.arange(num_requests, device=device, dtype=torch.int32),
+        seq_lens,
+        output_size=token_to_seq.numel(),
+    )
+
+    abs_pos = torch.arange(
+        query_slice_start,
+        query_slice_stop,
+        device=device,
+        dtype=torch.int32,
+    )
+    request_idx = torch.searchsorted(query_starts, abs_pos, right=True) - 1
+    query_offset = abs_pos - query_starts[request_idx]
+    cu_seq_len_ks[:] = seq_starts[request_idx]
+    cu_seq_len_ke[:] = (
+        seq_starts[request_idx] + start_pos[request_idx] + 1 + query_offset
+    )
+
+
+class KunlunBuildPrefillChunkMetaKernel:
+    """Duck-type the upstream @triton.jit kernel."""
+
+    def __getitem__(self, grid):
+        return self
+
+    def warmup(self, *args, **kwargs):
+        return
+
+    def __call__(
+        self,
+        query_start_loc,
+        uncompressed_seq_lens,
+        cu_compressed_seq_lens,
+        row_start_cu_compressed_seq_lens,
+        token_to_seq,
+        cu_seq_len_ks,
+        cu_seq_len_ke,
+        query_slice_start,
+        query_slice_stop,
+        DCP_RANK,
+        DCP_WORLD,
+        DCP_INTERLEAVE,
+        *,
+        BLOCK_SIZE,
+        COMPRESS_RATIO,
+    ) -> None:
+        if DCP_WORLD != 1:
+            raise NotImplementedError("Kunlun indexer metadata: DCP not supported")
+        if COMPRESS_RATIO != 1:
+            raise NotImplementedError(
+                "Kunlun indexer metadata: compression not supported"
+            )
+        fill_prefill_chunk_meta_torch(
+            query_start_loc,
+            uncompressed_seq_lens,
+            cu_compressed_seq_lens,
+            token_to_seq,
+            cu_seq_len_ks,
+            cu_seq_len_ke,
+            query_slice_start,
+            query_slice_stop,
+        )
+
+
+def patch_prefill_chunk_metadata_kernel() -> None:
+    kernel = mla_indexer._build_prefill_chunk_metadata_kernel
+    if getattr(kernel, "_kunlun_patched", False):
+        return
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched _build_prefill_chunk_metadata_kernel"
+    )
+    replacement = KunlunBuildPrefillChunkMetaKernel()
+    replacement._kunlun_patched = True
+    mla_indexer._build_prefill_chunk_metadata_kernel = replacement
 
 
 @dataclass(kw_only=True)
@@ -33,14 +130,9 @@ class KunlunDeepSeekV32IndexerDecodeMetadata(DeepSeekV32IndexerDecodeMetadata):
 
 
 def _adapt_prefill_chunk(
-    self, chunk: DeepseekV32IndexerPrefillChunkMetadata
+    chunk: DeepseekV32IndexerPrefillChunkMetadata,
+    device: torch.device,
 ) -> KunlunDeepseekV32IndexerPrefillChunkMetadata:
-    if chunk.num_reqs > 1:
-        raise NotImplementedError(
-            "Kunlun I8_mqa_logits LOD is still one sequence per chunk "
-            f"([0, total]); this chunk has num_reqs={chunk.num_reqs}."
-        )
-
     seq_len_q = chunk.token_end - chunk.token_start
     seq_len_kv = chunk.total_seq_lens
 
@@ -58,12 +150,8 @@ def _adapt_prefill_chunk(
         local_cu_seq_lens=chunk.local_cu_seq_lens,
         local_total_seq_lens=chunk.local_total_seq_lens,
         max_local_total_seq_lens=chunk.max_local_total_seq_lens,
-        context_q_lens=torch.tensor(
-            [0, seq_len_q], dtype=torch.int32, device=self.device
-        ),
-        context_k_lens=torch.tensor(
-            [0, seq_len_kv], dtype=torch.int32, device=self.device
-        ),
+        context_q_lens=torch.tensor([0, seq_len_q], dtype=torch.int32, device=device),
+        context_k_lens=torch.tensor([0, seq_len_kv], dtype=torch.int32, device=device),
         context_q_lens_cpu=torch.tensor(
             [0, seq_len_q], dtype=torch.int32, device="cpu"
         ),
@@ -74,7 +162,6 @@ def _adapt_prefill_chunk(
 
 
 def _adapt_decode_metadata(
-    self,
     decode_metadata: DeepSeekV32IndexerDecodeMetadata,
     common_attn_metadata: CommonAttentionMetadata,
     num_decodes: int,
@@ -102,19 +189,24 @@ class KunlunDeepseekV32IndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder)
             raise NotImplementedError("DCP is not supported by Kunlun sparse indexer.")
         if self.compress_ratio != 1:
             raise NotImplementedError(
-                "Compressed indexer cache is not supported by Kunlun."
+                "Compressed indexer cache is not supported by Kunlun sparse indexer."
+            )
+        if self.use_flattening:
+            raise NotImplementedError(
+                "Kunlun sparse indexer supports at most 1 speculative token "
+                f"(next_n <= 2), got num_speculative_tokens="
+                f"{self.num_speculative_tokens}."
             )
         indexer_meta_data = super().build(
             common_prefix_len, common_attn_metadata, fast_build=fast_build
         )
         if indexer_meta_data.prefill is not None:
             indexer_meta_data.prefill.chunks = [
-                _adapt_prefill_chunk(self, chunk)
+                _adapt_prefill_chunk(chunk, self.device)
                 for chunk in indexer_meta_data.prefill.chunks
             ]
         if indexer_meta_data.decode is not None:
             indexer_meta_data.decode = _adapt_decode_metadata(
-                self,
                 indexer_meta_data.decode,
                 common_attn_metadata,
                 indexer_meta_data.num_decodes,

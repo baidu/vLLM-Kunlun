@@ -196,29 +196,60 @@ def _apply_int8_moe_patch(module: ModuleType) -> None:
     module._kunlun_select_int8_patched = True
 
 
-# --- vllm.model_executor.models.deepseek_v2: Indexer attention backend ----
+# --- vllm.model_executor.models.deepseek_v2: Indexer  ----
 
 
-def _indexer_backend_applied(module: ModuleType) -> bool:
-    """Return whether ``DeepseekV32IndexerCache`` is absent or already patched."""
+def _indexer_applied(module: ModuleType) -> bool:
+    """Return whether indexer hook is already patched.
+
+    1. DeepseekV32IndexerCache.get_attn_backend -> Kunlun backend
+    2. per_token_group_quant_fp8 -> indexer_quant2d
+    3. mla.indexer prefill metadata kernel -> Torch replacement
+    """
     cls = getattr(module, "DeepseekV32IndexerCache", None)
-    fn = getattr(cls, "get_attn_backend", None) if cls is not None else None
-    return cls is None or (
-        fn is not None and getattr(fn, "_kunlun_patched", False)
-    )
+    if cls is None:
+        return True
+
+    backend_fn = getattr(cls, "get_attn_backend", None)
+    backend_ok = getattr(backend_fn, "_kunlun_patched", False)
+    quant_fn = getattr(module, "per_token_group_quant_fp8", None)
+    quant_ok = getattr(quant_fn, "_kunlun_patched", False)
+    indexer_mod = sys.modules.get("vllm.v1.attention.backends.mla.indexer")
+    kernel = getattr(indexer_mod, "_build_prefill_chunk_metadata_kernel", None)
+    kernel_ok = getattr(kernel, "_kunlun_patched", False)
+
+    return backend_ok and quant_ok and kernel_ok
 
 
-def _apply_indexer_backend_patch(module: ModuleType) -> None:
-    """Replace vLLM's DeepseekV32IndexerCache.get_attn_backend() which always 
+def _apply_indexer_patch(module: ModuleType) -> None:
+    """Replace vLLM's DeepseekV32IndexerCache.get_attn_backend() which always
     returns DeepseekV32IndexerBackend with the Kunlun fallback."""
     cls = getattr(module, "DeepseekV32IndexerCache", None)
     if cls is None:
         return
     from vllm_kunlun.v1.attention.backends.mla.indexer import (
         KunlunDeepseekV32IndexerBackend,
+        patch_prefill_chunk_metadata_kernel,
     )
+
+    # Importing the Kunlun indexer has already loaded
+    # vllm.v1.attention.backends.mla.indexer. Replace its Triton
+    # _BUILD_PREFILL_CHUNK_METADATA_KERNEL now so build() does not launch
+    # a kernel Kunlun cannot run.
+    patch_prefill_chunk_metadata_kernel()
+
+    # Replace the indexer quant with the Kunlun implementation.
+    from vllm_kunlun.ops.sparse_attn_indexer import indexer_quant2d
+
+    indexer_quant2d._kunlun_patched = True
+    module.per_token_group_quant_fp8 = indexer_quant2d
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched deepseek Indexer fp8 quant"
+    )
+
     def get_attn_backend(self):
         return KunlunDeepseekV32IndexerBackend
+
     get_attn_backend._kunlun_patched = True
     cls.get_attn_backend = get_attn_backend
 
@@ -256,7 +287,7 @@ DEFAULT_HOOKS = (
     ),
     (
         "vllm.model_executor.models.deepseek_v2",
-        _indexer_backend_applied,
-        _apply_indexer_backend_patch,
+        _indexer_applied,
+        _apply_indexer_patch,
     ),
 )

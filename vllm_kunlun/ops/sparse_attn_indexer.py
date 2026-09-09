@@ -1,6 +1,6 @@
 import torch
 
-from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
@@ -11,6 +11,19 @@ from vllm_kunlun.v1.attention.backends.mla.indexer import (
     KunlunDeepSeekV32IndexerDecodeMetadata,
     KunlunDeepseekV32IndexerPrefillChunkMetadata,
 )
+
+
+def indexer_quant2d(
+    q: torch.Tensor, group_size: int, *args, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    "Kunlun implementation of deepseek_v2.per_token_group_quant_fp8."
+
+    assert q.shape[-1] == group_size
+    q_int8 = torch.empty(q.shape, device=q.device, dtype=torch.int8)
+    q_scale = torch.empty((q.shape[0], 1), device=q.device, dtype=torch.float32)
+    torch.ops._C.quant2d(q.contiguous(), q_int8, q_scale, force_sdnn=True)
+    q_scale /= 127
+    return q_int8, q_scale
 
 
 @CustomOp.register_oot(name="SparseAttnIndexer")
@@ -182,18 +195,18 @@ class KunlunSparseAttnIndexer(SparseAttnIndexer):
         next_n = padded_q_fp8_decode_tokens.shape[1]
         num_padded_tokens = batch_size * next_n
 
-        # deal with 2D seq_lens
-        # Kunlun I8_paged_mqa_logits and topk_per_row take 1D seq_lens [B], matching
-        # the old metadata. Upstream v0.25.1 may pass (B, 1) for plain decode; squeeze
-        # it so it matches request-level seq_lens_cpu. A (B, next_n) tensor with
-        # next_n > 1 is the new native-MTP layout and is not wired to the old kernel;
-        # fail the asserts below instead of silently treating it as 1D.
+        # Upstream builds per-token context lengths: (B, 1) for plain decode and
+        # (B, max_decode_len) for native MTP
         seq_lens = decode_metadata.seq_lens
         seq_lens_cpu = decode_metadata.seq_lens_cpu
-        if seq_lens.ndim == 2 and seq_lens.shape[-1] == 1:
-            seq_lens = seq_lens.squeeze(-1)
+        if seq_lens.ndim == 2:
+            if seq_lens.shape[0] != batch_size:
+                raise NotImplementedError(
+                    "Kunlun SparseAttnIndexer decode requires 1D seq_lens [B], "
+                    f"got {seq_lens.shape}."
+                )
+            seq_lens = seq_lens[:, -1].contiguous()
         assert seq_lens.shape[0] == batch_size
-        assert seq_lens_cpu.shape == seq_lens.shape
 
         logits = int8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
