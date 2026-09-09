@@ -23,7 +23,7 @@ Please follow the [installation.md](../installation.md) document to set up the e
 Create a container
 
 ```bash
-# !/bin/bash
+#!/bin/bash
 # rundocker.sh
 XPU_NUM=1
 DOCKER_DEVICE_CONFIG=""
@@ -34,13 +34,12 @@ if [ $XPU_NUM -gt 0 ]; then
     DOCKER_DEVICE_CONFIG="${DOCKER_DEVICE_CONFIG} --device=/dev/xpuctrl:/dev/xpuctrl"
 fi
 
-export build_image="xxxxxxxxxxxxxxxxx"
+export build_image="<your-kunlun-vllm-image>"
 
 docker run -itd ${DOCKER_DEVICE_CONFIG} \
     --net=host \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     --tmpfs /dev/shm:rw,nosuid,nodev,exec,size=32g \
-    --cap-add=SYS_PTRACE \
     -v /home/users/vllm-kunlun:/home/vllm-kunlun \
     -v /usr/local/bin/xpu-smi:/usr/local/bin/xpu-smi \
     --name "$1" \
@@ -48,7 +47,7 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
     "$build_image" /bin/bash
 ```
 
-### Preparation Weight
+### Preparation of Model Weights
 
 - Download the Qwen3.8-27B-W8A8-INT8-Dynamic weights (HuggingFace format,
   15 shards + `model-mtp.safetensors`, about 30 GiB)
@@ -140,12 +139,12 @@ single-XPU run above.
 
 ### Verified Memory Budget (single XPU, TP=1)
 
-Reconciled against `xpu_smi` on the P800:
+Reconciled against `xpu-smi` on the P800:
 
 | Category | MiB | Source |
 | --- | --- | --- |
 | Model weights | 29194 | server log |
 | KV pool (754392 tokens) | 50801 | server log |
 | Graph capture | 123 | server log |
-| Driver / runtime / allocator | 8868 | xpu_smi remainder |
-| Free | 9318 | xpu_smi |
+| Driver / runtime / allocator | 8868 | xpu-smi remainder |
+| Free | 9318 | xpu-smi |
