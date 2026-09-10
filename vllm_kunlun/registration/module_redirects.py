@@ -32,6 +32,9 @@ MODULE_MAPPINGS: dict[str, str] = {
     "vllm.attention.ops.merge_attn_states": (
         "vllm_kunlun.ops.attention.merge_attn_states"
     ),
+    "vllm.v1.attention.ops.merge_attn_states": (
+        "vllm_kunlun.ops.attention.merge_attn_states"
+    ),
 }
 
 

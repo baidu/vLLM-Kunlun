@@ -5,17 +5,84 @@ from typing import Optional
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
-    kv_spans_from_batches,
-    split_prefill_chunks,
-)
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.attention.backends.utils import (
-    CommonAttentionMetadata,
     split_decodes_and_prefills,
+    split_prefill_chunks,
 )
 
 logger = init_logger(__name__)
+
+
+def kv_spans_from_batches(
+    start_seq_loc: torch.Tensor,
+    seq_len_per_batch: torch.Tensor,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-query-token ``[start, end)`` KV spans into the concatenated KV buffer.
+
+    vLLM used to export this; 0.25.1 replaced it with a Triton kernel
+    (``_build_prefill_chunk_metadata_kernel``) that also folds in DCP sharding
+    and query sub-slicing. Kunlun has no Triton execution path, so the span
+    arithmetic is kept here in torch. The semantics are unchanged: a query token
+    sees its request's whole context prefix plus itself, causally.
+
+    Args:
+        start_seq_loc: cumulative query lengths, ``[0, q0, q0+q1, ...]``.
+        seq_len_per_batch: total KV length per request.
+
+    Returns:
+        ``(row_starts, row_ends)`` int32 on ``device``; ``row_ends`` is exclusive.
+    """
+    query_start_loc = start_seq_loc.to(torch.long).cpu()
+    seq_lens = seq_len_per_batch.to(torch.long).cpu()
+    num_reqs = seq_lens.numel()
+    assert query_start_loc.numel() == num_reqs + 1
+
+    query_counts = query_start_loc[1:] - query_start_loc[:-1]
+    num_tokens = int(query_start_loc[-1].item())
+
+    kv_starts_per_batch = torch.cumsum(seq_lens, dim=0) - seq_lens
+    batch_id = torch.repeat_interleave(torch.arange(num_reqs), query_counts)
+    row_starts = kv_starts_per_batch[batch_id]
+
+    # Position of this token inside its request's KV span, 1-based: the context
+    # already in cache (seq_len - query_len) plus how far into the query we are.
+    pos_within_query = (
+        torch.arange(num_tokens)
+        - torch.repeat_interleave(query_start_loc[:-1], query_counts)
+        + 1
+    )
+    context_len = torch.repeat_interleave(seq_lens - query_counts, query_counts)
+    row_ends = row_starts + context_len + pos_within_query
+
+    return row_starts.int().to(device), row_ends.int().to(device)
+
+
+_XPU_KV_SPANS: bool | None = None
+
+
+def _xpu_kv_spans_available() -> bool:
+    """Whether the XSpeedGate XPU kernel is registered in this process.
+
+    Resolved once. The torch path above stays as the fallback for installs
+    whose xspeedgate_ops predates kv_spans_from_batches; when the kernel is
+    present, inputs go up and outputs stay on device with no CPU round trip.
+    """
+    global _XPU_KV_SPANS
+    if _XPU_KV_SPANS is None:
+        try:
+            torch.ops.xspeedgate_ops.kv_spans_from_batches
+            _XPU_KV_SPANS = True
+        except (AttributeError, RuntimeError):
+            _XPU_KV_SPANS = False
+            logger.info(
+                "kv_spans_from_batches: xspeedgate_ops kernel absent, using torch shim"
+            )
+        else:
+            logger.info("kv_spans_from_batches: using xspeedgate_ops XPU kernel")
+    return _XPU_KV_SPANS
 
 
 @dataclass
@@ -84,9 +151,16 @@ def kunlun_build_one_prefill_chunk(
     prefill_query_start_loc = (
         query_start_loc_cpu[reqs_start : reqs_end + 1] - query_start_loc_cpu[reqs_start]
     )
-    cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
-        prefill_query_start_loc, seq_lens_cpu[reqs_start:reqs_end], self.device
-    )
+    seq_lens = seq_lens_cpu[reqs_start:reqs_end]
+    if _xpu_kv_spans_available():
+        cu_seqlen_ks, cu_seqlen_ke = torch.ops.xspeedgate_ops.kv_spans_from_batches(
+            prefill_query_start_loc.to(device=self.device, dtype=torch.int32),
+            seq_lens.to(device=self.device, dtype=torch.int32),
+        )
+    else:
+        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
+            prefill_query_start_loc, seq_lens, self.device
+        )
     token_start = query_start_loc_cpu[reqs_start].item()
     token_end = query_start_loc_cpu[reqs_end].item()
     total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
