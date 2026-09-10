@@ -36,6 +36,8 @@ import logging
 import sys
 from types import ModuleType
 
+logger = logging.getLogger("vllm_kunlun")
+
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
 # Kunlun swaps the V2 Triton kernels for torch-native / kunlun_ops equivalents
@@ -312,6 +314,90 @@ def _apply_warmup_patch(module: ModuleType) -> None:
 # --- vllm.model_executor.custom_op: load Kunlun OOT registrations ----------
 
 
+def _bind_kv_cache_applied(module: ModuleType) -> bool:
+    """Whether bind_kv_cache already tolerates an out-of-tree platform."""
+    fn = getattr(module, "bind_kv_cache", None)
+    return fn is not None and getattr(fn, "_kunlun_patched", False)
+
+
+def _apply_bind_kv_cache_patch(module: ModuleType) -> None:
+    """Let a layer index own several layer names on an out-of-tree platform.
+
+    Upstream tolerates one layer_index mapping to several layer_names only for a
+    whitelist of platforms:
+
+        if (current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()):
+            pass
+        else:
+            raise NotImplementedError
+
+    Kunlun answers False to all three -- device_type is "cuda" but is_cuda_alike(),
+    is_cuda(), is_rocm(), is_xpu() and is_cpu() are all False, and is_out_of_tree() is
+    True -- so the branch raises. MiniMax-M3 reaches it because a sparse layer owns two
+    caches at the same layer index: the main KV cache and the lightning indexer's index
+    cache. The comment above the whitelist explains why it is safe ("the GPU / CPU runner
+    is not impacted by this case"), and that reasoning covers this runner too, so the
+    predicate is widened rather than the behaviour changed.
+
+    Belongs upstream: the fix there is one clause, `or current_platform.is_out_of_tree()`.
+    This carries it until then.
+    """
+    from collections import defaultdict
+
+    from vllm.platforms import current_platform
+
+    # Taken off the module object rather than imported: this runs while
+    # vllm.v1.worker.utils is being set up, and importing it again would re-enter.
+    extract_layer_index = module.extract_layer_index
+
+    def bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module=1):
+        assert len(runner_kv_caches) == 0
+
+        index2name = defaultdict(list)
+        for layer_name in kv_caches:
+            index2name[extract_layer_index(layer_name, num_attn_module)].append(
+                layer_name
+            )
+
+        for layer_index in sorted(index2name.keys()):
+            layer_names = index2name[layer_index]
+            if len(layer_names) > 1 and not (
+                current_platform.is_cuda_alike()
+                or current_platform.is_xpu()
+                or current_platform.is_cpu()
+                or current_platform.is_out_of_tree()
+            ):
+                raise NotImplementedError
+            for layer_name in layer_names:
+                runner_kv_caches.append(kv_caches[layer_name])
+
+        for layer_name, kv_cache in kv_caches.items():
+            forward_context[layer_name].kv_cache = kv_cache
+
+    bind_kv_cache._kunlun_patched = True
+    module.bind_kv_cache = bind_kv_cache
+    logger.info("[KunlunPlugin] Patched bind_kv_cache for out-of-tree platforms")
+
+
+def _worker_utils_applied(module: ModuleType) -> bool:
+    """Both vllm.v1.worker.utils patches are in place.
+
+    register_hook allows one hook per target, so the two independent patches that both
+    live in this module share an entry rather than each claiming it.
+    """
+    return _kv_block_zeroer_applied(module) and _bind_kv_cache_applied(module)
+
+
+def _apply_worker_utils_patches(module: ModuleType) -> None:
+    """Apply both vllm.v1.worker.utils patches."""
+    if not _kv_block_zeroer_applied(module):
+        _apply_kv_block_zeroer(module)
+    if not _bind_kv_cache_applied(module):
+        _apply_bind_kv_cache_patch(module)
+
+
 def _oot_registrations_applied(module: ModuleType) -> bool:
     """Return whether Kunlun out-of-tree operators finished registering."""
     # Without PluggableLayer this vLLM version predates the OOT registration
@@ -508,7 +594,7 @@ DEFAULT_HOOKS = (
         _optional_dep_probe_applied,
         _apply_optional_dep_probe,
     ),
-    ("vllm.v1.worker.utils", _kv_block_zeroer_applied, _apply_kv_block_zeroer),
+    ("vllm.v1.worker.utils", _worker_utils_applied, _apply_worker_utils_patches),
     (
         "vllm.model_executor.models.qwen3_vl",
         _qwen3_vl_applied,
