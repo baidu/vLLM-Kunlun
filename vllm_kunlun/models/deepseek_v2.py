@@ -775,8 +775,11 @@ class Indexer(nn.Module):
         Empty during the profile run: the op's own dummy-run branch is what
         handles that, but only if indexing does not blow up first. The empty
         case keeps the 3-D rank even with nothing to show -- downstream
-        consumers assert on rank before they check numel, so a 1-D empty
-        tensor from an unallocated list-of-engines cache would trip them.
+        consumers assert on rank before they check numel, so an unallocated
+        cache (an empty engine list, or a bare torch.empty(0) bound before
+        allocation) must not leak a wrong rank through either branch. A
+        correctly shaped empty cache keeps its shape; only a mis-ranked one
+        is reshaped.
         """
         cache = self.k_cache.kv_cache
         if isinstance(cache, (list, tuple)):
@@ -784,7 +787,7 @@ class Indexer(nn.Module):
                 return torch.empty((0, 0, 0), dtype=torch.uint8, device=device)
             cache = cache[0]
         if cache.numel() == 0:
-            return cache
+            return cache if cache.dim() == 3 else cache.reshape((0, 0, 0))
         assert cache.dim() == 3, (
             f"indexer KV cache for {self.prefix} has shape {tuple(cache.shape)}; "
             "indexer_k_quant_and_cache needs (num_blocks, block_size, head_size)"
