@@ -77,7 +77,9 @@ def _xpu_kv_spans_available() -> bool:
             _XPU_KV_SPANS = True
         except (AttributeError, RuntimeError):
             _XPU_KV_SPANS = False
-            logger.info("kv_spans_from_batches: xspeedgate_ops kernel absent, using torch shim")
+            logger.info(
+                "kv_spans_from_batches: xspeedgate_ops kernel absent, using torch shim"
+            )
         else:
             logger.info("kv_spans_from_batches: using xspeedgate_ops XPU kernel")
     return _XPU_KV_SPANS
