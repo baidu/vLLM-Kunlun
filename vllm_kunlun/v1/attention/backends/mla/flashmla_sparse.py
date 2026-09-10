@@ -666,7 +666,12 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
-        num_actual_toks = q.shape[0]
+        # q may carry CUDA-graph / spec-decode padding rows the metadata does
+        # not describe: req_id_per_token and every per-token table below are
+        # num_actual_tokens long, so slice the query to match or the sparse
+        # kernels read padded rows against uninitialized topk indices.
+        num_actual_toks = attn_metadata.num_actual_tokens
+        q = q[:num_actual_toks]
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
         if self.kv_cache_dtype == "fp8_ds_mla":
