@@ -670,8 +670,9 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             # Profiling run, matching MLACommonImpl and KunlunAttention:
             # no metadata, no kernels. The output must still carry the
             # normal path's (num_tokens, num_heads, kv_lora_rank) shape --
-            # q here is the absorbed query (num_heads, qk_nope + qk_rope),
-            # which downstream consumers never see on a real run.
+            # q here is the absorbed query per token
+            # (num_tokens, num_heads, qk_nope + qk_rope), a layout
+            # downstream consumers never see on a real run.
             return (
                 torch.empty(
                     (q.shape[0], self.num_heads, self.kv_lora_rank),
