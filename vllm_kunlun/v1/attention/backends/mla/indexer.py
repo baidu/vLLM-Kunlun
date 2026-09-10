@@ -60,6 +60,29 @@ def kv_spans_from_batches(
     return row_starts.int().to(device), row_ends.int().to(device)
 
 
+_XPU_KV_SPANS: bool | None = None
+
+
+def _xpu_kv_spans_available() -> bool:
+    """Whether the XSpeedGate XPU kernel is registered in this process.
+
+    Resolved once. The torch path above stays as the fallback for installs
+    whose xspeedgate_ops predates kv_spans_from_batches; when the kernel is
+    present, inputs go up and outputs stay on device with no CPU round trip.
+    """
+    global _XPU_KV_SPANS
+    if _XPU_KV_SPANS is None:
+        try:
+            torch.ops.xspeedgate_ops.kv_spans_from_batches
+            _XPU_KV_SPANS = True
+        except (AttributeError, RuntimeError):
+            _XPU_KV_SPANS = False
+            logger.info("kv_spans_from_batches: xspeedgate_ops kernel absent, using torch shim")
+        else:
+            logger.info("kv_spans_from_batches: using xspeedgate_ops XPU kernel")
+    return _XPU_KV_SPANS
+
+
 @dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
@@ -126,9 +149,16 @@ def kunlun_build_one_prefill_chunk(
     prefill_query_start_loc = (
         query_start_loc_cpu[reqs_start : reqs_end + 1] - query_start_loc_cpu[reqs_start]
     )
-    cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
-        prefill_query_start_loc, seq_lens_cpu[reqs_start:reqs_end], self.device
-    )
+    seq_lens = seq_lens_cpu[reqs_start:reqs_end]
+    if _xpu_kv_spans_available():
+        cu_seqlen_ks, cu_seqlen_ke = torch.ops.xspeedgate_ops.kv_spans_from_batches(
+            prefill_query_start_loc.to(device=self.device, dtype=torch.int32),
+            seq_lens.to(device=self.device, dtype=torch.int32),
+        )
+    else:
+        cu_seqlen_ks, cu_seqlen_ke = kv_spans_from_batches(
+            prefill_query_start_loc, seq_lens, self.device
+        )
     token_start = query_start_loc_cpu[reqs_start].item()
     token_end = query_start_loc_cpu[reqs_end].item()
     total_seq_lens = seq_lens_cpu[reqs_start:reqs_end].sum()
