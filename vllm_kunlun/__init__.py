@@ -749,6 +749,48 @@ _register_post_import_hook(
 )
 
 
+# --- hook: route DeepEP all2all managers to Kunlun's BufferV2 --------------
+# See vllm_kunlun/distributed/deepep_buffer_v2.py.
+def _deepep_buffer_v2_applied(mod):
+    from vllm_kunlun.distributed.deepep_buffer_v2 import applied as _applied
+
+    return _applied(mod)
+
+
+def _deepep_buffer_v2_apply(mod):
+    from vllm_kunlun.distributed.deepep_buffer_v2 import apply as _apply
+
+    _apply(mod)
+
+
+_register_post_import_hook(
+    "vllm.distributed.device_communicators.all2all",
+    _deepep_buffer_v2_applied,
+    _deepep_buffer_v2_apply,
+)
+
+
+# --- hook: DeepEP HT finalize accepts float16 expert output ----------------
+# See vllm_kunlun/distributed/deepep_ht_dtype.py.
+def _deepep_ht_dtype_applied(mod):
+    from vllm_kunlun.distributed.deepep_ht_dtype import applied as _applied
+
+    return _applied(mod)
+
+
+def _deepep_ht_dtype_apply(mod):
+    from vllm_kunlun.distributed.deepep_ht_dtype import apply as _apply
+
+    _apply(mod)
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht",
+    _deepep_ht_dtype_applied,
+    _deepep_ht_dtype_apply,
+)
+
+
 def register():
     """Register the Kunlun platform"""
 

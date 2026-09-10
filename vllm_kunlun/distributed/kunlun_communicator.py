@@ -91,10 +91,13 @@ class KunlunCommunicator(CudaCommunicator):
         backend = self.all2all_backend
         if backend in ("naive", "allgather_reducescatter"):
             cls = all2all.AgRsAll2AllManager
+        elif backend == "deepep_high_throughput":
+            cls = all2all.DeepEPHTAll2AllManager
         else:
             raise NotImplementedError(
                 "all2all backend %r is not adapted for Kunlun; use "
-                "allgather_reducescatter" % (backend,)
+                "allgather_reducescatter or deepep_high_throughput"
+                % (backend,)
             )
         self.all2all_manager = cls(self.cpu_group, tcp_store_group)
         logger.info("[KunlunPlugin] all2all manager: %s", cls.__name__)
