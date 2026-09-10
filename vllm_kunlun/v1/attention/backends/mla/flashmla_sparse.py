@@ -668,9 +668,18 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
         if attn_metadata is None:
             # Profiling run, matching MLACommonImpl and KunlunAttention:
-            # no metadata, no kernels -- return an output of q's shape so
-            # the memory measurement still sees the real allocation.
-            return torch.empty_like(q), None
+            # no metadata, no kernels. The output must still carry the
+            # normal path's (num_tokens, num_heads, kv_lora_rank) shape --
+            # q here is the absorbed query (num_heads, qk_nope + qk_rope),
+            # which downstream consumers never see on a real run.
+            return (
+                torch.empty(
+                    (q.shape[0], self.num_heads, self.kv_lora_rank),
+                    dtype=q.dtype,
+                    device=q.device,
+                ),
+                None,
+            )
 
         # q may carry CUDA-graph / spec-decode padding rows the metadata does
         # not describe: req_id_per_token and every per-token table below are
