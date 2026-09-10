@@ -773,12 +773,15 @@ class Indexer(nn.Module):
         -- silently sliced off the block dimension and handed the op a 2-D view.
 
         Empty during the profile run: the op's own dummy-run branch is what
-        handles that, but only if indexing does not blow up first.
+        handles that, but only if indexing does not blow up first. The empty
+        case keeps the 3-D rank even with nothing to show -- downstream
+        consumers assert on rank before they check numel, so a 1-D empty
+        tensor from an unallocated list-of-engines cache would trip them.
         """
         cache = self.k_cache.kv_cache
         if isinstance(cache, (list, tuple)):
             if not cache:
-                return torch.empty(0, dtype=torch.uint8, device=device)
+                return torch.empty((0, 0, 0), dtype=torch.uint8, device=device)
             cache = cache[0]
         if cache.numel() == 0:
             return cache
