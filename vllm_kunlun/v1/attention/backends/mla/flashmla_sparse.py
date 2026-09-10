@@ -666,6 +666,12 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
+        if attn_metadata is None:
+            # Profiling run, matching MLACommonImpl and KunlunAttention:
+            # no metadata, no kernels -- return an output of q's shape so
+            # the memory measurement still sees the real allocation.
+            return torch.empty_like(q), None
+
         # q may carry CUDA-graph / spec-decode padding rows the metadata does
         # not describe: req_id_per_token and every per-token table below are
         # num_actual_tokens long, so slice the query to match or the sparse
