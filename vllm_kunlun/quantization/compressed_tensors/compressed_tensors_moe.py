@@ -108,11 +108,11 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        # TODO: @liwei support w4a8
-        # elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
-        #     return CompressedTensorsW4A8Int8MoEMethod(
-        #         weight_quant, input_quant, layer.moe_config
-        #     )
+        elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+            logger.info_once("Using KunlunCompressedTensorsW4A8Int8MoEMethod")
+            return KunlunCompressedTensorsW4A8Int8MoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -507,6 +507,82 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         )
 
 
+class KunlunCompressedTensorsW4A8Int8MoEMethod(KunlunCompressedTensorsWNA16MoEMethod):
+    """W4A8-int8 MoE: per-channel int4 weights, dynamic per-token int8 acts.
+
+    The checkpoint stores exactly the same weights as the W4A16 scheme
+    (per-channel int4, two nibbles per int8, ``pack-quantized``); only
+    ``input_activations`` is declared, which asks for the activations to be
+    quantized to int8 per token at runtime. So weight creation and
+    ``process_weights_after_loading`` are inherited unchanged and just the GEMM
+    entry point differs: ``fused_moe_ct_w4a8`` quantizes each GEMM input with
+    ``quant2d`` and passes the per-token absmax to ``moe_fc_v3``.
+    """
+
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe: "FusedMoEConfig",  # type: ignore # noqa: F821
+        layer_name: Optional[str] = None,
+    ):
+        super().__init__(weight_quant, input_quant, moe, layer_name)
+        assert input_quant is not None, "W4A8 needs input_activations"
+        assert input_quant.num_bits == 8, (
+            f"Unsupported activation bits: {input_quant.num_bits}, expected 8"
+        )
+        assert input_quant.dynamic, "only dynamic activation quantization"
+        assert input_quant.strategy == "token", (
+            f"Unsupported activation strategy: {input_quant.strategy}, "
+            "expected 'token'"
+        )
+        assert input_quant.symmetric, "only symmetric activation quantization"
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts=None,
+        shared_experts_input=None,
+    ) -> torch.Tensor:
+        # The inherited modular path runs the A16 expert kernel, which would
+        # silently ignore the int8 activation scheme. Fail loudly instead.
+        raise NotImplementedError(
+            "W4A8 is only implemented for the monolithic (TP) path; EP would "
+            "fall back to the A16 expert kernel."
+        )
+
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """W4A8 MoE via the Kunlun fused kernel (routing done inside)."""
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
+            )
+        return ops.fused_moe_ct_w4a8(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            router_logits=router_logits,
+            moe_top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+
+
 # The RoutedExperts weight loader gates the compressed-tensors packed-weight
 # transpose (loaded_weight.t()) on an exact class-name allowlist
 # (routed_experts.py: "CompressedTensorsWNA16MoEMethod", etc.). Our subclass
@@ -515,7 +591,12 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 # name so the loader applies the transpose.
 KunlunCompressedTensorsWNA16MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
 KunlunCompressedTensorsWNA16MoEMethod.__qualname__ = "CompressedTensorsWNA16MoEMethod"
-
+# Same for W4A8: the packed weight layout is identical, so it needs the same
+# loader treatment (transpose + intermediate_size param).
+KunlunCompressedTensorsW4A8Int8MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
+KunlunCompressedTensorsW4A8Int8MoEMethod.__qualname__ = (
+    "CompressedTensorsWNA16MoEMethod"
+)
 
 _KUNLUN_EXPERTS_CLS = None
 
