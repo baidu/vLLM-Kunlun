@@ -791,6 +791,27 @@ _register_post_import_hook(
 )
 
 
+# --- hook: DeepEP LL dispatch/combine are bfloat16-only --------------------
+# See vllm_kunlun/distributed/deepep_ll_dtype.py.
+def _deepep_ll_dtype_applied(mod):
+    from vllm_kunlun.distributed.deepep_ll_dtype import applied as _applied
+
+    return _applied(mod)
+
+
+def _deepep_ll_dtype_apply(mod):
+    from vllm_kunlun.distributed.deepep_ll_dtype import apply as _apply
+
+    _apply(mod)
+
+
+_register_post_import_hook(
+    "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll",
+    _deepep_ll_dtype_applied,
+    _deepep_ll_dtype_apply,
+)
+
+
 def register():
     """Register the Kunlun platform"""
 

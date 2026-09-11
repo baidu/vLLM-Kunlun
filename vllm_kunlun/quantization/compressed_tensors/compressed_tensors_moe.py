@@ -403,11 +403,12 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         builds a FusedMoEModularMethod out of that pair plus the experts
         implementation returned here instead of calling ``apply()`` above.
 
-        Only the Standard activation format (a flat ``[M*topk, K]`` dispatch, as
-        used by DeepEP high-throughput) is implemented. ``BatchedExperts``
-        prepare/finalize pairs need a masked experts stage; refuse them here
-        rather than letting ``modular_kernel._post_init_setup`` fail on the
-        format mismatch.
+        High-throughput dispatches a flat ``[M*topk, K]`` tensor (Standard
+        format); low-latency dispatches a padded
+        ``[num_local_experts, max_tokens, K]`` tensor plus a per-expert valid row
+        count (BatchedExperts format). ``modular_kernel._post_init_setup``
+        asserts the pair and the experts agree on the format, so pick the experts
+        implementation from what the prepare/finalize declares.
         """
         # FusedMoEModularMethod.apply reads layer.w13_weight / layer.w2_weight,
         # while this path repacks the int4 weights into *_weight_packed. Expose
@@ -419,13 +420,19 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 
-        if prepare_finalize.activation_format != (
-            mk.FusedMoEActivationFormat.Standard
+        if (
+            prepare_finalize.activation_format
+            == mk.FusedMoEActivationFormat.BatchedExperts
         ):
-            raise NotImplementedError(
-                "%s only implements the Standard activation format, got %s"
-                % (type(self).__name__, prepare_finalize.activation_format)
+            return _kunlun_batched_experts_cls()(
+                self.moe,
+                self.moe_quant_config,
+                layer,
+                max_num_tokens=prepare_finalize.max_num_tokens_per_rank(),
+                num_dispatchers=prepare_finalize.num_dispatchers(),
             )
+        # max_num_tokens / num_dispatchers stay unset for the Standard format;
+        # they only describe the padded batched layout.
         return _kunlun_experts_cls()(self.moe, self.moe_quant_config, layer)
 
     def apply(
@@ -738,4 +745,218 @@ def _kunlun_experts_cls():
 
     _KUNLUN_EXPERTS_CLS = KunlunW4A16Experts
     return _KUNLUN_EXPERTS_CLS
+
+
+_KUNLUN_BATCHED_EXPERTS_CLS = None
+
+
+def _kunlun_batched_experts_cls():
+    """Batched (masked) W4A16 experts, for the DeepEP low-latency dispatch.
+
+    Low-latency dispatch hands out a padded
+    ``[num_local_experts, max_tokens, K]`` activation tensor plus
+    ``expert_num_tokens`` (how many of those rows are real per expert) and
+    expects the same padded shape back. Kunlun's masked grouped GEMM consumes
+    exactly that layout, so the whole expert stage is three masked kernels with
+    no sorting or scatter/gather.
+    """
+    global _KUNLUN_BATCHED_EXPERTS_CLS
+    if _KUNLUN_BATCHED_EXPERTS_CLS is not None:
+        return _KUNLUN_BATCHED_EXPERTS_CLS
+
+    import kunlun_ops
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceDelegate,
+    )
+
+    class KunlunW4A16BatchedExperts(mk.FusedMoEExpertsModular):
+        """Kunlun masked grouped GEMM as a batched modular-kernel stage."""
+
+        def __init__(
+            self,
+            moe_config,
+            quant_config,
+            layer=None,
+            max_num_tokens=None,
+            num_dispatchers=None,
+        ):
+            super().__init__(
+                moe_config=moe_config,
+                quant_config=quant_config,
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=num_dispatchers,
+            )
+            self._layer = layer
+
+        @property
+        def expects_unquantized_inputs(self) -> bool:
+            # This flag becomes defer_input_quant on the prepare/finalize, and
+            # DeepEPLLPrepareAndFinalize rejects that. W4A16 has no activation
+            # quantization to defer anyway: the dispatch moves the activations
+            # as they are and apply() only casts them.
+            return False
+
+        @staticmethod
+        def activation_format() -> "mk.FusedMoEActivationFormat":
+            return mk.FusedMoEActivationFormat.BatchedExperts
+
+        @staticmethod
+        def _supports_current_device() -> bool:
+            return True
+
+        @staticmethod
+        def _supports_activation(activation) -> bool:
+            return activation == MoEActivation.SILU
+
+        @staticmethod
+        def _supports_no_act_and_mul() -> bool:
+            return False
+
+        @staticmethod
+        def _supports_parallel_config(moe_parallel_config) -> bool:
+            return True
+
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key) -> bool:
+            return activation_key is None
+
+        def finalize_weight_and_reduce_impl(self):
+            # Low-latency combine applies the topk weights itself.
+            return TopKWeightAndReduceDelegate()
+
+        def workspace_shapes(
+            self,
+            M,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        ):
+            # The intermediates are allocated in apply(): the masked kernels
+            # pin their own dtypes, which need not match the one the framework
+            # would pick for a shared workspace. Only the output shape matters.
+            max_tokens = self.max_num_tokens or M
+            rows = max_tokens * (self.num_dispatchers or 1)
+            return ((0,), (0,), (local_num_experts, rows, K))
+
+        def _expected_m(self, global_num_experts, max_tokens_per_expert, topk):
+            """Rows per expert the masked GEMM should plan for.
+
+            ``estimate_expected_m`` lives on BatchedDeepGemmExperts rather than
+            on the shared base class, so reproduce it: assume the DP-wide token
+            count spreads evenly over the experts, round up to 16, clamp to the
+            padded height. Without a forward context (profile runs) fall back to
+            the padded height.
+            """
+            dp_meta = None
+            try:
+                from vllm.forward_context import (
+                    get_forward_context,
+                    is_forward_context_available,
+                )
+
+                if is_forward_context_available():
+                    dp_meta = get_forward_context().dp_metadata
+            except Exception:
+                dp_meta = None
+            if dp_meta is None:
+                return max_tokens_per_expert
+            # num_tokens_across_dp_cpu is a CPU tensor, so .item() is free.
+            total = int(dp_meta.num_tokens_across_dp_cpu.sum().item()) * topk
+            per_expert = total // max(int(global_num_experts), 1)
+            est = ((per_expert + 15) // 16) * 16
+            return min(max_tokens_per_expert, max(est, 16))
+
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            assert expert_tokens_meta is not None, (
+                "batched experts need expert_num_tokens from the dispatch"
+            )
+            assert hidden_states.ndim == 3, (
+                "batched experts expect [num_local_experts, tokens, K], got %s"
+                % (tuple(hidden_states.shape),)
+            )
+            masked_m = expert_tokens_meta.expert_num_tokens
+
+            # The masked int4 GEMM takes float16 activations and writes a
+            # 2-byte float output, so the stage casts in and out of float16 and
+            # keeps bfloat16 for the two intermediates.
+            a = hidden_states
+            if a.dtype != torch.float16:
+                a = a.to(torch.float16)
+
+            num_groups, m, _ = a.shape
+            n = w1.shape[1]
+            expected_m = min(
+                self._expected_m(
+                    global_num_experts=global_num_experts,
+                    max_tokens_per_expert=m,
+                    topk=topk_ids.shape[-1],
+                ),
+                m,
+            )
+
+            w13_scale = (
+                self._layer.w13_weight_scale
+                if self._layer is not None
+                else self.w1_scale
+            )
+            w2_scale = (
+                self._layer.w2_weight_scale
+                if self._layer is not None
+                else self.w2_scale
+            )
+
+            gateup = torch.empty(
+                (num_groups, m, n), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+                a, (w1, w13_scale), gateup, masked_m, expected_m
+            )
+
+            # silu_and_mul_mask_fwd derives num_groups from masked_m and takes
+            # the flattened 2-D views; in and out dtypes must match.
+            down_in = torch.empty(
+                (num_groups, m, n // 2), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.silu_and_mul_mask_fwd(
+                gateup.view(-1, n), down_in.view(-1, n // 2), masked_m
+            )
+            del gateup
+
+            down_out = torch.empty(
+                (num_groups, m, w2.shape[1]), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+                down_in.to(torch.float16),
+                (w2, w2_scale),
+                down_out,
+                masked_m,
+                expected_m,
+            )
+            output[:, :m, :].copy_(down_out.to(output.dtype))
+
+    _KUNLUN_BATCHED_EXPERTS_CLS = KunlunW4A16BatchedExperts
+    return _KUNLUN_BATCHED_EXPERTS_CLS
 
