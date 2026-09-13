@@ -36,7 +36,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
 
 logger = init_logger(__name__)
 
@@ -51,24 +50,34 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         quant_config._add_fused_moe_to_target_scheme_map()
-        unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        # The fused RoutedExperts layer is resolved by looking up its
+        # per-expert projection names. Different checkpoints / vllm builds
+        # name these either gate/up/down_proj (HF-canonical) or w1/w3/w2
+        # (Mixtral-style: w1=gate, w3=up, w2=down). Some vllm builds do not
+        # remap w1/w2/w3 -> gate/up/down in the compressed-tensors target
+        # map, so try both conventions and use the first that resolves.
+        name_variant_suffixes = [
+            [".0.gate_proj", ".0.up_proj", ".0.down_proj"],
+            [".0.w1", ".0.w3", ".0.w2"],
         ]
-        # TODO: refactor this to use expert_mapping and check all layer numbers
-        all_scheme_dicts = [
-            quant_config.get_scheme_dict(layer, name) for name in unfused_names
-        ]
-        scheme_dict = all_scheme_dicts.pop()
+        scheme_dict = None
+        for proj_suffixes in name_variant_suffixes:
+            dicts = [
+                quant_config.get_scheme_dict(layer, layer_name + p)
+                for p in proj_suffixes
+            ]
+            if any(d is None for d in dicts):
+                continue
+            # multiple schemes found
+            if not all(cur_dict == dicts[0] for cur_dict in dicts):
+                raise ValueError(
+                    "All MoE projections need to have same "
+                    "quantization scheme but found multiple"
+                )
+            scheme_dict = dicts[0]
+            break
 
-        # multiple schemes found
-        if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
-            raise ValueError(
-                "All MoE projections need to have same "
-                "quantization scheme but found multiple"
-            )
-
-        if scheme_dict is None:  # ignored layer
+        if scheme_dict is None:  # ignored / unquantized layer
             return UnquantizedFusedMoEMethod(layer.moe_config)
 
         weight_quant = scheme_dict.get("weights")
@@ -99,11 +108,11 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        # TODO: @liwei support w4a8
-        # elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
-        #     return CompressedTensorsW4A8Int8MoEMethod(
-        #         weight_quant, input_quant, layer.moe_config
-        #     )
+        elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+            logger.info_once("Using KunlunCompressedTensorsW4A8Int8MoEMethod")
+            return KunlunCompressedTensorsW4A8Int8MoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -296,68 +305,658 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe: "FusedMoEConfig",  # type: ignore # noqa: F821
+        layer_name: Optional[str] = None,
+    ):
+        # Skip parent __init__ which hard-asserts `strategy == "group"`.
+        # Call grandparent directly so both "group" and "channel" work on P800.
+        FusedMoEMethodBase.__init__(self, moe)
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // weight_quant.num_bits
+        self.strategy = weight_quant.strategy
+        assert self.strategy in ("group", "channel"), (
+            f"Unsupported strategy: {self.strategy}, expected 'group' or 'channel'"
+        )
+        self.group_size = weight_quant.group_size if self.strategy == "group" else -1
+        assert weight_quant.actorder != "group", (
+            "grouped actorder isn't supported by this kernel"
+        )
+        assert weight_quant.symmetric, (
+            "Only symmetric quantization is supported for MoE"
+        )
+        assert self.num_bits in WNA16_SUPPORTED_BITS, (
+            f"Unsupported num_bits: {self.num_bits}, expected {WNA16_SUPPORTED_BITS}"
+        )
+        # We skip the parent __init__ (it selects a GPU marlin/flashinfer
+        # backend via an oracle and asserts group-only). Newer vllm's inherited
+        # create_weights / get_weight_shape need these attributes explicitly.
+        # is_transposed=True -> "Marlin" (transposed) weight layout, which is
+        # identical to the layout this plugin's process_weights_after_loading
+        # (transpose(1,2)+XOR 0x88) and fused_moe_ct_w4a16 expect.
+        self.symmetric = weight_quant.symmetric
+        self.actorder = weight_quant.actorder
+        self.is_transposed = True
+
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Preprocess loaded weights for ``ops.fused_moe_ct_w4a16``.
+
+        1. Drop params created by the parent create_weights that Kunlun doesn't
+           use (shapes / g_idx / g_idx sort indices), to free memory.
+        2. Transpose packed weights, reinterpret as int8, in-place XOR 0x88 to
+           convert uint4-packed -> signed-int representation.
+        3. Transpose scales, cast to float32, multiply by 7.0.
+        Modify ``.data`` in place to avoid doubling memory.
+        """
+        del layer.w13_weight_shape
+        del layer.w2_weight_shape
+        del layer.w13_weight_g_idx
+        del layer.w2_weight_g_idx
+        del layer.w13_g_idx_sort_indices
+        del layer.w2_g_idx_sort_indices
+        with torch.no_grad():
+            w13_data = layer.w13_weight_packed.data.transpose(1, 2).contiguous()
+            w13_data = w13_data.view(torch.int8)
+            w13_data.bitwise_xor_(0x88)
+            layer.w13_weight_packed.data = w13_data
+
+            w2_data = layer.w2_weight_packed.data.transpose(1, 2).contiguous()
+            w2_data = w2_data.view(torch.int8)
+            w2_data.bitwise_xor_(0x88)
+            layer.w2_weight_packed.data = w2_data
+
+            w13_scale_data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
+            w13_scale_data = w13_scale_data.to(torch.float32)
+            w13_scale_data.mul_(7.0)
+            layer.w13_weight_scale.data = w13_scale_data
+
+            w2_scale_data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
+            w2_scale_data = w2_scale_data.to(torch.float32)
+            w2_scale_data.mul_(7.0)
+            layer.w2_weight_scale.data = w2_scale_data
+
+    @property
+    def topk_indices_dtype(self):
+        # Kunlun's moe_pre_sorted / gen_block_statistic both take int32.
+        return torch.int32
+
+    @property
+    def is_monolithic(self) -> bool:
+        # TP-only keeps the monolithic kernel that fuses routing in: it is
+        # the production-validated path and the faster one. With EP enabled,
+        # switch to vLLM's modular path, where routing is done by the runner's
+        # select_experts and this method only performs the expert_map remap
+        # plus the local-expert GEMMs. DeepEP ships Modular-only
+        # prepare/finalize implementations, so EP has to take that path.
+        return not self.moe.use_ep
+
+    def select_gemm_impl(self, prepare_finalize, layer):
+        """Build the modular experts object the DeepEP backends compose with.
+
+        With an all2all backend that provides a prepare/finalize pair, vLLM
+        builds a FusedMoEModularMethod out of that pair plus the experts
+        implementation returned here instead of calling ``apply()`` above.
+
+        High-throughput dispatches a flat ``[M*topk, K]`` tensor (Standard
+        format); low-latency dispatches a padded
+        ``[num_local_experts, max_tokens, K]`` tensor plus a per-expert valid row
+        count (BatchedExperts format). ``modular_kernel._post_init_setup``
+        asserts the pair and the experts agree on the format, so pick the experts
+        implementation from what the prepare/finalize declares.
+        """
+        # FusedMoEModularMethod.apply reads layer.w13_weight / layer.w2_weight,
+        # while this path repacks the int4 weights into *_weight_packed. Expose
+        # the packed tensors under the names vLLM expects (plain attributes, so
+        # they are not registered as parameters a second time).
+        if not hasattr(layer, "w13_weight"):
+            layer.w13_weight = layer.w13_weight_packed.data
+            layer.w2_weight = layer.w2_weight_packed.data
+
+        import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+
+        if (
+            prepare_finalize.activation_format
+            == mk.FusedMoEActivationFormat.BatchedExperts
+        ):
+            return _kunlun_batched_experts_cls()(
+                self.moe,
+                self.moe_quant_config,
+                layer,
+                max_num_tokens=prepare_finalize.max_num_tokens_per_rank(),
+                num_dispatchers=prepare_finalize.num_dispatchers(),
+            )
+        # max_num_tokens / num_dispatchers stay unset for the Standard format;
+        # they only describe the padded batched layout.
+        return _kunlun_experts_cls()(self.moe, self.moe_quant_config, layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # dequant packed weights to float16
-        w13_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w13_weight_packed,
-            scale=self.moe_quant_config.w1_scale,
-        )
-        w2_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w2_weight_packed,
-            scale=self.moe_quant_config.w2_scale,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts=None,
+        shared_experts_input=None,
+    ) -> torch.Tensor:
+        # topk_ids are global expert ids while this rank only holds
+        # num_local_experts weight slots. Follow vLLM's own approach
+        # (moe_align_block_size.py:101 expert_ids = expert_map[expert_ids]):
+        # remap along the expert dimension only and keep the M*topk row
+        # layout unchanged.
+        expert_map = getattr(layer, "expert_map", None)
+        ids = topk_ids
+        weights = topk_weights
+        if expert_map is not None:
+            local = expert_map.to(ids.device)[ids.long()]
+            keep = local >= 0
+            # Use where rather than multiplying by zero: a remote slot may
+            # hold NaN, and NaN * 0 is still NaN.
+            weights = torch.where(keep, weights, torch.zeros_like(weights))
+            # Placeholder rows must not all be parked on local expert 0:
+            # that expert would own ~15/16 of all rows, and the grouped GEMM
+            # is known to misbehave under such skew (the sibling
+            # moe_fc_mn_kmn out-of-bounds bug is distribution dependent too).
+            # Spread them round-robin by pair index: the total row count stays
+            # M*topk while per-expert row counts stay close to the TP case.
+            n_local = layer.w13_weight_packed.shape[0]
+            filler = torch.arange(
+                local.numel(), device=local.device, dtype=local.dtype
+            ).remainder_(n_local).view_as(local)
+            ids = torch.where(keep, local, filler)
+        return ops.moe_ct_w4a16_experts(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            topk_ids=ids,
+            topk_weights=weights,
+            moe_top_k=layer.top_k,
         )
 
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """W4A16 MoE via the Kunlun fused kernel (routing done inside).
+
+        Routing params are read from the RoutedExperts ``layer`` attributes.
+        Weights are already signed int8 (XOR 0x88) and scales float32*7.0 after
+        process_weights_after_loading.
+        """
         if self.moe.use_ep:
-            return ops.fused_moe_ep(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
             )
-        else:
-            return ops.fused_moe(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-                w1_bias=getattr(layer, "w13_bias", None),
-                w2_bias=getattr(layer, "w2_bias", None),
+        return ops.fused_moe_ct_w4a16(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            router_logits=router_logits,
+            moe_top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+
+
+class KunlunCompressedTensorsW4A8Int8MoEMethod(KunlunCompressedTensorsWNA16MoEMethod):
+    """W4A8-int8 MoE: per-channel int4 weights, dynamic per-token int8 acts.
+
+    The checkpoint stores exactly the same weights as the W4A16 scheme
+    (per-channel int4, two nibbles per int8, ``pack-quantized``); only
+    ``input_activations`` is declared, which asks for the activations to be
+    quantized to int8 per token at runtime. So weight creation and
+    ``process_weights_after_loading`` are inherited unchanged and just the GEMM
+    entry point differs: ``fused_moe_ct_w4a8`` quantizes each GEMM input with
+    ``quant2d`` and passes the per-token absmax to ``moe_fc_v3``.
+    """
+
+    def __init__(
+        self,
+        weight_quant,
+        input_quant,
+        moe: "FusedMoEConfig",  # type: ignore # noqa: F821
+        layer_name: Optional[str] = None,
+    ):
+        super().__init__(weight_quant, input_quant, moe, layer_name)
+        assert input_quant is not None, "W4A8 needs input_activations"
+        assert input_quant.num_bits == 8, (
+            f"Unsupported activation bits: {input_quant.num_bits}, expected 8"
+        )
+        assert input_quant.dynamic, "only dynamic activation quantization"
+        assert input_quant.strategy == "token", (
+            f"Unsupported activation strategy: {input_quant.strategy}, "
+            "expected 'token'"
+        )
+        assert input_quant.symmetric, "only symmetric activation quantization"
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts=None,
+        shared_experts_input=None,
+    ) -> torch.Tensor:
+        # The inherited modular path runs the A16 expert kernel, which would
+        # silently ignore the int8 activation scheme. Fail loudly instead.
+        raise NotImplementedError(
+            "W4A8 is only implemented for the monolithic (TP) path; EP would "
+            "fall back to the A16 expert kernel."
+        )
+
+    def apply_monolithic(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """W4A8 MoE via the Kunlun fused kernel (routing done inside)."""
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "EP mode is not supported for int4 packed weights yet."
             )
+        return ops.fused_moe_ct_w4a8(
+            hidden_states=x,
+            w13_weight_packed_signed=layer.w13_weight_packed,
+            w2_weight_packed_signed=layer.w2_weight_packed,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            router_logits=router_logits,
+            moe_top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            use_grouped_topk=layer.use_grouped_topk,
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            scoring_func=layer.scoring_func,
+            e_score_correction_bias=layer.e_score_correction_bias,
+        )
+
+
+# The RoutedExperts weight loader gates the compressed-tensors packed-weight
+# transpose (loaded_weight.t()) on an exact class-name allowlist
+# (routed_experts.py: "CompressedTensorsWNA16MoEMethod", etc.). Our subclass
+# name is not in that list, so the transpose would be skipped and the checkpoint
+# [N, K_packed] weights would be sharded on the wrong dim. Masquerade the class
+# name so the loader applies the transpose.
+KunlunCompressedTensorsWNA16MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
+KunlunCompressedTensorsWNA16MoEMethod.__qualname__ = "CompressedTensorsWNA16MoEMethod"
+# Same for W4A8: the packed weight layout is identical, so it needs the same
+# loader treatment (transpose + intermediate_size param).
+KunlunCompressedTensorsW4A8Int8MoEMethod.__name__ = "CompressedTensorsWNA16MoEMethod"
+KunlunCompressedTensorsW4A8Int8MoEMethod.__qualname__ = (
+    "CompressedTensorsWNA16MoEMethod"
+)
+
+_KUNLUN_EXPERTS_CLS = None
+
+
+def _kunlun_experts_cls():
+    """Define the modular experts class lazily to avoid import cycles."""
+    global _KUNLUN_EXPERTS_CLS
+    if _KUNLUN_EXPERTS_CLS is not None:
+        return _KUNLUN_EXPERTS_CLS
+
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceNoOP,
+    )
+
+    class KunlunW4A16Experts(mk.FusedMoEExpertsModular):
+        """Kunlun W4A16 grouped GEMM as a modular-kernel experts stage."""
+
+        def __init__(self, moe_config, quant_config, layer=None):
+            super().__init__(moe_config, quant_config)
+            # The per-channel dequant scales live on the layer, not in
+            # FusedMoEQuantConfig, so keep a handle on it.
+            self._layer = layer
+
+        @property
+        def expects_unquantized_inputs(self) -> bool:
+            # W4A16: the weights are quantized, the activations are not.
+            return True
+
+        @staticmethod
+        def activation_format() -> "mk.FusedMoEActivationFormat":
+            return mk.FusedMoEActivationFormat.Standard
+
+        @staticmethod
+        def _supports_current_device() -> bool:
+            return True
+
+        @staticmethod
+        def _supports_activation(activation) -> bool:
+            return activation == MoEActivation.SILU
+
+        @staticmethod
+        def _supports_no_act_and_mul() -> bool:
+            # silu_and_mul is fused inside the Kunlun expert pipeline.
+            return False
+
+        @staticmethod
+        def _supports_parallel_config(moe_parallel_config) -> bool:
+            return True
+
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key) -> bool:
+            # W4A16: quantized weights, unquantized activations.
+            return activation_key is None
+
+        def finalize_weight_and_reduce_impl(self):
+            # moe_post already scales by topk_weights and sums over topk.
+            return TopKWeightAndReduceNoOP()
+
+        def workspace_shapes(
+            self,
+            M,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        ):
+            return ((0,), (0,), (M, K))
+
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            ids = topk_ids
+            weights = topk_weights
+            # DeepEP dispatch already returns local expert ids with -1 for the
+            # slots that belong to another rank; the non-DeepEP path hands us
+            # global ids plus an expert_map. Normalise both here.
+            if expert_map is not None:
+                local = expert_map.to(ids.device)[ids.long()]
+            else:
+                local = ids
+            keep = local >= 0
+            if not bool(keep.all()):
+                # Zero the weight rather than the id: a remote slot may hold a
+                # non-finite value, and NaN * 0 is still NaN.
+                weights = torch.where(keep, weights, torch.zeros_like(weights))
+                # Spread the dropped rows over all local experts instead of
+                # parking them all on expert 0, so the grouped GEMM sees a
+                # per-expert row count close to the non-EP case.
+                n_local = w1.shape[0]
+                filler = (
+                    torch.arange(
+                        local.numel(), device=local.device, dtype=local.dtype
+                    )
+                    .remainder_(n_local)
+                    .view_as(local)
+                )
+                ids = torch.where(keep, local, filler)
+            else:
+                ids = local
+            out = ops.moe_ct_w4a16_experts(
+                hidden_states=hidden_states,
+                w13_weight_packed_signed=w1,
+                w2_weight_packed_signed=w2,
+                w13_scale=(
+                    self._layer.w13_weight_scale
+                    if self._layer is not None
+                    else self.w1_scale
+                ),
+                w2_scale=(
+                    self._layer.w2_weight_scale
+                    if self._layer is not None
+                    else self.w2_scale
+                ),
+                topk_ids=ids,
+                topk_weights=weights,
+                moe_top_k=topk_ids.shape[-1],
+            )
+            output.copy_(out)
+
+    _KUNLUN_EXPERTS_CLS = KunlunW4A16Experts
+    return _KUNLUN_EXPERTS_CLS
+
+
+_KUNLUN_BATCHED_EXPERTS_CLS = None
+
+
+def _kunlun_batched_experts_cls():
+    """Batched (masked) W4A16 experts, for the DeepEP low-latency dispatch.
+
+    Low-latency dispatch hands out a padded
+    ``[num_local_experts, max_tokens, K]`` activation tensor plus
+    ``expert_num_tokens`` (how many of those rows are real per expert) and
+    expects the same padded shape back. Kunlun's masked grouped GEMM consumes
+    exactly that layout, so the whole expert stage is three masked kernels with
+    no sorting or scatter/gather.
+    """
+    global _KUNLUN_BATCHED_EXPERTS_CLS
+    if _KUNLUN_BATCHED_EXPERTS_CLS is not None:
+        return _KUNLUN_BATCHED_EXPERTS_CLS
+
+    import kunlun_ops
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+        TopKWeightAndReduceDelegate,
+    )
+
+    class KunlunW4A16BatchedExperts(mk.FusedMoEExpertsModular):
+        """Kunlun masked grouped GEMM as a batched modular-kernel stage."""
+
+        def __init__(
+            self,
+            moe_config,
+            quant_config,
+            layer=None,
+            max_num_tokens=None,
+            num_dispatchers=None,
+        ):
+            super().__init__(
+                moe_config=moe_config,
+                quant_config=quant_config,
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=num_dispatchers,
+            )
+            self._layer = layer
+
+        @property
+        def expects_unquantized_inputs(self) -> bool:
+            # This flag becomes defer_input_quant on the prepare/finalize, and
+            # DeepEPLLPrepareAndFinalize rejects that. W4A16 has no activation
+            # quantization to defer anyway: the dispatch moves the activations
+            # as they are and apply() only casts them.
+            return False
+
+        @staticmethod
+        def activation_format() -> "mk.FusedMoEActivationFormat":
+            return mk.FusedMoEActivationFormat.BatchedExperts
+
+        @staticmethod
+        def _supports_current_device() -> bool:
+            return True
+
+        @staticmethod
+        def _supports_activation(activation) -> bool:
+            return activation == MoEActivation.SILU
+
+        @staticmethod
+        def _supports_no_act_and_mul() -> bool:
+            return False
+
+        @staticmethod
+        def _supports_parallel_config(moe_parallel_config) -> bool:
+            return True
+
+        @staticmethod
+        def _supports_quant_scheme(weight_key, activation_key) -> bool:
+            return activation_key is None
+
+        def finalize_weight_and_reduce_impl(self):
+            # Low-latency combine applies the topk weights itself.
+            return TopKWeightAndReduceDelegate()
+
+        def workspace_shapes(
+            self,
+            M,
+            N,
+            K,
+            topk,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        ):
+            # The intermediates are allocated in apply(): the masked kernels
+            # pin their own dtypes, which need not match the one the framework
+            # would pick for a shared workspace. Only the output shape matters.
+            max_tokens = self.max_num_tokens or M
+            rows = max_tokens * (self.num_dispatchers or 1)
+            return ((0,), (0,), (local_num_experts, rows, K))
+
+        def _expected_m(self, global_num_experts, max_tokens_per_expert, topk):
+            """Rows per expert the masked GEMM should plan for.
+
+            ``estimate_expected_m`` lives on BatchedDeepGemmExperts rather than
+            on the shared base class, so reproduce it: assume the DP-wide token
+            count spreads evenly over the experts, round up to 16, clamp to the
+            padded height. Without a forward context (profile runs) fall back to
+            the padded height.
+            """
+            dp_meta = None
+            try:
+                from vllm.forward_context import (
+                    get_forward_context,
+                    is_forward_context_available,
+                )
+
+                if is_forward_context_available():
+                    dp_meta = get_forward_context().dp_metadata
+            except Exception:
+                dp_meta = None
+            if dp_meta is None:
+                return max_tokens_per_expert
+            # num_tokens_across_dp_cpu is a CPU tensor, so .item() is free.
+            total = int(dp_meta.num_tokens_across_dp_cpu.sum().item()) * topk
+            per_expert = total // max(int(global_num_experts), 1)
+            est = ((per_expert + 15) // 16) * 16
+            return min(max_tokens_per_expert, max(est, 16))
+
+        def apply(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        ):
+            assert expert_tokens_meta is not None, (
+                "batched experts need expert_num_tokens from the dispatch"
+            )
+            assert hidden_states.ndim == 3, (
+                "batched experts expect [num_local_experts, tokens, K], got %s"
+                % (tuple(hidden_states.shape),)
+            )
+            masked_m = expert_tokens_meta.expert_num_tokens
+
+            # The masked int4 GEMM takes float16 activations and writes a
+            # 2-byte float output, so the stage casts in and out of float16 and
+            # keeps bfloat16 for the two intermediates.
+            a = hidden_states
+            if a.dtype != torch.float16:
+                a = a.to(torch.float16)
+
+            num_groups, m, _ = a.shape
+            n = w1.shape[1]
+            expected_m = min(
+                self._expected_m(
+                    global_num_experts=global_num_experts,
+                    max_tokens_per_expert=m,
+                    topk=topk_ids.shape[-1],
+                ),
+                m,
+            )
+
+            w13_scale = (
+                self._layer.w13_weight_scale
+                if self._layer is not None
+                else self.w1_scale
+            )
+            w2_scale = (
+                self._layer.w2_weight_scale
+                if self._layer is not None
+                else self.w2_scale
+            )
+
+            gateup = torch.empty(
+                (num_groups, m, n), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+                a, (w1, w13_scale), gateup, masked_m, expected_m
+            )
+
+            # silu_and_mul_mask_fwd derives num_groups from masked_m and takes
+            # the flattened 2-D views; in and out dtypes must match.
+            down_in = torch.empty(
+                (num_groups, m, n // 2), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.silu_and_mul_mask_fwd(
+                gateup.view(-1, n), down_in.view(-1, n // 2), masked_m
+            )
+            del gateup
+
+            down_out = torch.empty(
+                (num_groups, m, w2.shape[1]), device=a.device, dtype=torch.bfloat16
+            )
+            kunlun_ops.m_grouped_gemm_fp16_I4_bf16_nt_masked_v3(
+                down_in.to(torch.float16),
+                (w2, w2_scale),
+                down_out,
+                masked_m,
+                expected_m,
+            )
+            output[:, :m, :].copy_(down_out.to(output.dtype))
+
+    _KUNLUN_BATCHED_EXPERTS_CLS = KunlunW4A16BatchedExperts
+    return _KUNLUN_BATCHED_EXPERTS_CLS
+

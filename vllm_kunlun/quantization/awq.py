@@ -20,7 +20,7 @@ from typing import Optional, Union
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig as AWQConfig
@@ -55,7 +55,7 @@ class KunlunAWQConfig(AWQConfig):
             ):
                 return UnquantizedLinearMethod()
             return KunlunAWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, FusedMoEFactory):
             logger.warning_once(
                 f"Layer '{prefix}' is not supported by AWQMoeMarlin. "
                 "Falling back to Moe WNA16 kernels."

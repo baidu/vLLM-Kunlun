@@ -1160,6 +1160,7 @@ def moe_pre_sorted(
         moe_index,
         expert_m,
         sorted_tokens_num_lod,
+        index_have_neg,
     )
 
 
@@ -1182,6 +1183,7 @@ def moe_pre_sorted_cuda(
         moe_index,
         expert_m,
         sorted_tokens_num_lod,
+        index_have_neg,
     )
 
 
@@ -1312,6 +1314,119 @@ def fake_moe_fc(
 
 moe_fc.register_fake(fake_moe_fc)
 
+@custom_op("_C::moe_fc_v3", mutates_args=())
+def moe_fc_v3(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+) -> None:
+    kunlun_ops.moe_fc_v3(
+        x=x,
+        weight=weight,
+        sorted_tokens_num_lod=sorted_tokens_num_lod,
+        sorted_tokens_idx=sorted_tokens_idx,
+        moe_topk=moe_topk,
+        y=y,
+        act=act,
+        x_perchannel_max=x_perchannel_max,
+        w_perchannel_max=w_perchannel_max,
+        topk_ids=topk_ids,
+        topk_w=topk_w,
+        bias=bias,
+        tgemm_type=tgemm_type,
+        tweight_type=tweight_type,
+        scale_n=scale_n,
+        scale_k=scale_k,
+        use_pack_int4=use_pack_int4,
+        sort_mode=sort_mode,
+    )
+
+
+@impl("_C::moe_fc_v3", "CUDA")
+def moe_fc_v3_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+    recommended_expert_tokens: int = -1,
+) -> None:
+    kunlun_ops.moe_fc_v3(
+        x=x,
+        weight=weight,
+        sorted_tokens_num_lod=sorted_tokens_num_lod,
+        sorted_tokens_idx=sorted_tokens_idx,
+        moe_topk=moe_topk,
+        y=y,
+        act=act,
+        x_perchannel_max=x_perchannel_max,
+        w_perchannel_max=w_perchannel_max,
+        topk_ids=topk_ids,
+        topk_w=topk_w,
+        bias=bias,
+        tgemm_type=tgemm_type,
+        tweight_type=tweight_type,
+        scale_n=scale_n,
+        scale_k=scale_k,
+        use_pack_int4=use_pack_int4,
+        sort_mode=sort_mode,
+        recommended_expert_tokens=recommended_expert_tokens,
+    )
+
+
+def fake_moe_fc_v3(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    sorted_tokens_num_lod: torch.Tensor,
+    sorted_tokens_idx: torch.Tensor,
+    moe_topk: int,
+    y: torch.Tensor,
+    act: Optional[str] = None,
+    x_perchannel_max: Optional[torch.Tensor] = None,
+    w_perchannel_max: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_w: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    tgemm_type: Optional[str] = None,
+    tweight_type: Optional[str] = None,
+    scale_n: int = 0,
+    scale_k: int = 0,
+    use_pack_int4: bool = False,
+    sort_mode: bool = True,
+    recommended_expert_tokens: int = -1,
+) -> None:
+    return None
+
+
+moe_fc_v3.register_fake(fake_moe_fc_v3)
 
 @custom_op("_C::moe_post", mutates_args=())
 def moe_post(
@@ -1363,7 +1478,7 @@ def moe_sigmoid_group_topk_norm(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
-        block_static=block_static,
+        block_statistic=block_static,
         bias=bias,
         n_group=n_group,
         topk_group=topk_group,
@@ -1386,7 +1501,7 @@ def moe_sigmoid_group_topk_norm_cuda(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
-        block_static=block_static,
+        block_statistic=block_static,
         bias=bias,
         n_group=n_group,
         topk_group=topk_group,
@@ -2894,3 +3009,63 @@ def _fake_lora_matmul_inplace(
 
 
 lora_matmul_inplace.register_fake(_fake_lora_matmul_inplace)
+
+
+# ``_C_cache_ops::gather_and_maybe_dequant_cache`` gathers a prefill's paged
+# context KV into a contiguous workspace; upstream reaches it from
+# ``MLACommonImpl._compute_prefill_context`` via ``vllm/_custom_ops.py``.
+# Upstream passes ``token_to_seq`` and ``num_tokens``, which the Kunlun kernel
+# derives itself from ``cu_seq_lens`` (binary search for the seq index,
+# ``cu_seq_lens[-1]`` for the token count), so they are accepted for signature
+# compatibility and dropped. The index math is identical on both sides.
+@custom_op("_C_cache_ops::gather_and_maybe_dequant_cache", mutates_args=())
+def gather_and_maybe_dequant_cache(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    num_tokens: int,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+    seq_starts: Optional[torch.Tensor] = None,
+) -> None:
+    # The xspeedgate kernel is dispatched by
+    # REGISTER_PYTORCH_2TYPES(src_cache, dst, kFloat16, kFloat16, ...) and its
+    # wrapper has NO trailing XCHECK
+    # (XSpeedGate/wrapper/src/cache/gather_and_maybe_dequant_cache.cpp:95-100),
+    # so any other dtype combination falls through and the op RETURNS WITHOUT
+    # WRITING dst. For a bf16 model that left the MLA chunked-prefill workspace
+    # uninitialized: the context attention then saw garbage K/V, returned
+    # LSE == -FLT_MAX with NaN output, and every prefill split into more than
+    # one chunk produced garbage tokens.
+    #
+    # With kv_cache_dtype == "auto" the op is pure data movement and the fp16
+    # kernel is a bit-exact 16-bit copy (verified on P800 with arbitrary bit
+    # patterns), so reinterpret same-width dtypes as fp16 instead. Anything the
+    # kernel genuinely cannot do now fails loudly rather than silently.
+    src, out = src_cache, dst
+    if src.dtype != torch.float16 or dst.dtype != torch.float16:
+        if (
+            kv_cache_dtype == "auto"
+            and src.dtype == dst.dtype
+            and src.element_size() == 2
+        ):
+            src = src.view(torch.float16)
+            out = dst.view(torch.float16)
+        else:
+            raise NotImplementedError(
+                "[KUNLUN] gather_and_maybe_dequant_cache supports fp16 or a "
+                "same-width unquantized copy; got src_cache="
+                f"{src.dtype}, dst={dst.dtype}, kv_cache_dtype={kv_cache_dtype}"
+            )
+    torch.ops.xspeedgate_ops.gather_and_maybe_dequant_cache(
+        src_cache=src,
+        dst=out,
+        block_table=block_table,
+        cu_seq_lens=cu_seq_lens,
+        batch_size=block_table.size(0),
+        kv_cache_dtype=kv_cache_dtype,
+        scale=scale,
+        seq_starts=seq_starts,
+    )

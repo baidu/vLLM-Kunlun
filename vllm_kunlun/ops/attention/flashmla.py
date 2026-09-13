@@ -98,8 +98,11 @@ def flash_mla_with_kvcache(
     )
     kv_lora_rank = head_dim_v
     qk_rope_head_dim = q.size(3) - head_dim_v
-    head_dim = k_cache.shape[3]
+    # vLLM's MLA cache is [num_blocks, page_block_size, head_dim] (a single
+    # latent "head"); the upstream flash_mla signature is 4D with an explicit
+    # num_heads_k. Accept both.
     page_block_size = k_cache.shape[1]
+    head_dim = k_cache.shape[-1]
     k_cache = k_cache.view(-1, 1, page_block_size, head_dim)
 
     # todo: optimize memcp
