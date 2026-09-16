@@ -30,6 +30,30 @@ from vllm_kunlun.registration import bootstrap
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# These tests import ``vllm_kunlun.ops`` / ``vllm_kunlun.models`` at module load,
+# which eagerly pulls the full Kunlun + vLLM runtime stack: the Kunlun device
+# packages (kunlun_ops, xspeedgate_ops) and, through vllm.model_executor ->
+# vllm.distributed, vLLM runtime deps such as psutil. The unit-test CI is
+# deliberately hardware-free and installs ``vllm --no-deps`` (40+ of vLLM's deps,
+# including GPU-only ones, are intentionally absent), so none of these can be
+# collected there. Some also build ``torch.device("cuda")`` / run kernels at
+# import and end in ``raise SystemExit``. They run by hand on a Kunlun box with
+# the full stack (``python tests/ut/ops/test_*.py`` or ``pytest`` on that box).
+collect_ignore_glob = [
+    "ut/ops/test_e2e_routing.py",
+    "ut/ops/test_fused_moe.py",
+    "ut/ops/test_fused_moe_int8.py",
+    "ut/ops/test_get_quant_method_delegation.py",
+    "ut/ops/test_moe_edges.py",
+    "ut/ops/test_moe_ep_poison.py",
+    "ut/ops/test_moe_router_factory.py",
+    "ut/ops/test_route_matrix.py",
+    "ut/ops/test_router_logits_dtype.py",
+    "ut/ops/test_routing_parity.py",
+    "ut/ops/test_swigluoai_uninterleave.py",
+    "ut/models/test_qwen3_5_loader.py",
+]
+
 
 class FakeLibrary:
     """Record ``torch.library.Library`` calls instead of touching torch.

@@ -20,19 +20,10 @@ from typing import Optional
 
 import torch
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.linear import (
-    LinearBase,
-    LinearMethodBase,
-    UnquantizedLinearMethod,
-)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
-    CompressedTensorsKVCacheMethod,
-    CompressedTensorsLinearMethod,
-    CompressedTensorsLinearTransformMethod,
-    get_linear_transform_schemes,
 )
 
 from vllm_kunlun.quantization.utils import _remove_quantization_method
@@ -51,34 +42,11 @@ class KunlunCompressedTensorsConfig(CompressedTensorsConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-        from vllm.model_executor.layers.attention import (
-            Attention,  # Avoid circular import
-        )
-
-        if isinstance(layer, LinearBase):
-            # collect schemes
-            quant_scheme = self.get_scheme(layer=layer, layer_name=prefix)
-            input_tfms, output_tfms = get_linear_transform_schemes(
-                layer, prefix, self.transform_config, self.packed_modules_mapping
-            )
-
-            # choose quantization method
-            quant_method: LinearMethodBase = UnquantizedLinearMethod()
-            if quant_scheme is not None:
-                layer.scheme = quant_scheme
-                quant_method = CompressedTensorsLinearMethod(self)
-
-            # choose transform method
-            if any((input_tfms, output_tfms)):
-                return CompressedTensorsLinearTransformMethod.from_schemes(
-                    quant_method, quant_scheme, input_tfms, output_tfms
-                )
-
-            else:
-                return quant_method
-
-        if isinstance(layer, Attention):
-            return CompressedTensorsKVCacheMethod(self)
+        # Only MoE needs the Kunlun implementation; every other layer type goes
+        # back to upstream. Copying the whole dispatch is what let it drift:
+        # upstream has grown ParallelLMHead and VocabParallelEmbedding branches
+        # that the copy silently dropped, so a quantized lm_head or embedding
+        # was being treated as unquantized.
         if isinstance(layer, RoutedExperts):
             return KunlunCompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
-        return None
+        return super().get_quant_method(layer, prefix)

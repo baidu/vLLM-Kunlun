@@ -17,13 +17,12 @@
 
 """kunlun custom op entry"""
 
-from typing import Optional
-
 import cocopod  # noqa
 import torch
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
-from vllm.v1.worker.workspace import current_workspace_manager
+
+from vllm_kunlun.ops.moe import entry as _moe_entry
 
 logger = init_logger(__name__)
 
@@ -374,310 +373,24 @@ class KunlunOps:
             return (type(x), x.device, x.dtype, x.shape, x.is_contiguous())
         return (type(x), x)
 
+    # MoE implementations live in the lightweight ops.moe package. These thin
+    # forwarders preserve the established KunlunOps static API without making
+    # MoE callers import this large operator facade. Arguments are passed
+    # through rather than restated: see ops/moe/entry.py for the signatures.
     @staticmethod
-    def fused_moe(
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        router_logits: torch.Tensor,
-        ep_rank: int,
-        moe_top_k: int,
-        renormalize: bool,
-        inplace: bool = False,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """fused_moe"""
-        global_num_experts, up_gate_size, _ = w1.shape
-        M, N = hidden_states.shape
-        hidden_dim = w2.shape[1]
-        normed_score = torch.empty(
-            M, moe_top_k, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(
-            M, moe_top_k, dtype=torch.int32, device=hidden_states.device
-        )
-        num_blocks = 12
-        block_statistic = torch.zeros(
-            num_blocks,
-            global_num_experts,
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        router_logits = router_logits.to(torch.float)
-        if scoring_func == "softmax":
-            torch.ops._C.moe_softmax_topk_norm(
-                x=router_logits,
-                normed_score=normed_score,
-                topk_index=topk_ids,
-                block_statistic=None,
-                stable=True,
-            )
-        elif scoring_func == "sigmoid":
-            torch.ops._C.moe_sigmoid_group_topk_norm(
-                x=router_logits,
-                topk_index=topk_ids,
-                norm_score=normed_score,
-                block_static=block_statistic,
-                bias=e_score_correction_bias,
-                scale=1.0,
-                n_group=num_expert_group,
-                topk_group=topk_group,
-            )
-
-        if w1_bias is not None or w2_bias is not None:
-            # Rignt now this branch is for gpt oss
-            # TODO (@xyDong23): faster here using moe_fc kernel
-            normed_score = normed_score.to(hidden_states.dtype)
-            out = torch.zeros(
-                M * moe_top_k, N, dtype=hidden_states.dtype, device=hidden_states.device
-            )
-            repeat_x = hidden_states.repeat_interleave(moe_top_k, dim=0)
-            topk_ids_flat = topk_ids.flatten()
-            for i in range(global_num_experts):
-                experts_id = ep_rank * global_num_experts + i
-                selected_token = topk_ids_flat == experts_id
-                if selected_token.sum():
-                    cur_token = repeat_x[selected_token]
-                    up_gate = torch.empty(
-                        selected_token.sum(),
-                        up_gate_size // 2,
-                        dtype=cur_token.dtype,
-                        device=cur_token.device,
-                    )
-                    groupgemm1 = cur_token @ w1[i].T
-                    # Add w13 bias
-                    if w1_bias is not None:
-                        groupgemm1 = groupgemm1 + w1_bias[i]
-                    up_gate = torch.ops._C.swigluoai_and_mul(groupgemm1)
-                    groupgemm2 = up_gate @ w2[i].T
-                    # Add w2 bias
-                    if w2_bias is not None:
-                        groupgemm2 = groupgemm2 + w2_bias[i]
-                    out[selected_token] = groupgemm2
-            ouput = (
-                (out.view(M, moe_top_k, N) * normed_score.unsqueeze(2))
-                .sum(dim=1)
-                .to(hidden_states.dtype)
-            )
-            return ouput
-        else:
-            # from vllm.forward_context import get_forward_context
-            # forward_context = get_forward_context()
-            # attn_metadata: AttentionMetadata = forward_context.attn_metadata
-            # prefix = "model.layers.0.linear_attn"
-            # if attn_metadata is not None:
-            #     attn_metadata = attn_metadata[prefix]
-
-            # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
-            # if M * moe_top_k < 400:
-            #     sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-            #         torch.ops.xspeedgate_ops.moe_pre_small(
-            #             topk_ids, global_num_experts, False, False, hidden_states
-            #         )
-            #     )
-            #     experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(
-            #         topk_ids, global_num_experts, False
-            #     )
-            #     out = torch.ops.xspeedgate_ops.fused_moe(
-            #         hidden_states,
-            #         w1,
-            #         w2,
-            #         normed_score.to(hidden_states.dtype),
-            #         sorted_tokens_num_lod,
-            #         sorted_tokens_idx,
-            #         experts_num_lod,
-            #     )
-            #     return out.sum(1)
-
-            # Allocate two shared workspaces for the large temporary buffers
-            # used by the preprocess, W1, activation, and W2 stages.
-            y_numel = M * moe_top_k * w1.shape[1]
-            out_numel = M * moe_top_k * w2.shape[1]
-            out1_numel = M * moe_top_k * (w1.shape[1] // 2)
-            moe_expand_numel = M * moe_top_k * N
-
-            # NOTE(2026-XX): the fused `moe_fc(act="SWISH_GLU")` kernel
-            # produces incorrect output across all M >= 1024 (verified by
-            # standalone repro: kernel rel-err ~2000% vs fp32 reference,
-            # while `moe_fc(act=None) + silu_and_mul` matches reference at
-            # bf16 precision floor). This was the source of the multi-
-            # concurrent "garbled output" symptom: concurrent requests
-            # batch up to M >= 1024 and hit the broken fused path. Until
-            # the kernel team fixes SWISH_GLU, always use the act=None +
-            # explicit silu_and_mul path. Repro: .comate/test_fused_moe_compare.py
-            #
-            # Live ranges (act=None path, all M):
-            #   workspace_a: (moe_expand if M*top_k > 768) -> out1
-            #   workspace_b: y -> out
-            workspace_a_numel = max(out1_numel, out_numel)
-            workspace_b_numel = max(y_numel, out_numel)
-            if M * moe_top_k > 768:
-                workspace_a_numel = max(workspace_a_numel, moe_expand_numel)
-
-            workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
-                ((workspace_a_numel,), hidden_states.dtype),
-                ((workspace_b_numel,), hidden_states.dtype),
-            )
-
-            if M * moe_top_k > 768:
-                expert_m = torch.zeros(
-                    global_num_experts,
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )  # [E]
-                sorted_tokens_num_lod = torch.zeros(
-                    global_num_experts + 1,
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )  # [E+1]
-                sorted_tokens_idx = torch.zeros(
-                    M * moe_top_k,
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )
-
-                moe_expand = workspace_a[:moe_expand_numel].view(M * moe_top_k, N)
-
-                torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
-
-                torch.ops._C.moe_pre_sorted(
-                    x=hidden_states,
-                    topk_index=topk_ids,
-                    block_statistic=block_statistic,
-                    moe_expand=moe_expand,
-                    moe_index=sorted_tokens_idx,
-                    expert_m=expert_m,
-                    sorted_tokens_num_lod=sorted_tokens_num_lod,
-                )
-            else:
-                sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-                    torch.ops.xspeedgate_ops.moe_pre_small(
-                        topk_ids,
-                        global_num_experts,
-                        index_have_neg=False,
-                        sort_mode=True,
-                        x=hidden_states,
-                    )
-                )
-
-            moe_expand = moe_expand.reshape(M * moe_top_k, hidden_dim)
-            y = workspace_b[:y_numel].view(M, moe_top_k, w1.shape[1])
-
-            # W1 GEMM (no fused activation; the fused SWISH_GLU kernel is
-            # buggy at large M -- see note above).
-            torch.ops._C.moe_fc(
-                x=moe_expand,
-                weight=w1,
-                sorted_tokens_num_lod=sorted_tokens_num_lod,
-                sorted_tokens_idx=sorted_tokens_idx,
-                moe_topk=moe_top_k,
-                y=y,
-                topk_ids=topk_ids,
-                act=None,
-            )
-            # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
-            # needed.
-            out1 = workspace_a[:out1_numel].view(M, moe_top_k, w1.shape[1] // 2)
-            torch.ops._C.silu_and_mul(out1, y)
-            out1 = out1.reshape(-1, out1.shape[-1])
-            # Reuse `workspace_b` for `out` after `y` has been consumed by
-            # the activation.
-            out = workspace_b[:out_numel].view(M, moe_top_k, w2.shape[1])
-
-            dequant_scale = torch.ones(
-                (M, moe_top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-            torch.ops._C.moe_fc(
-                x=out1,
-                weight=w2,
-                sorted_tokens_num_lod=sorted_tokens_num_lod,
-                sorted_tokens_idx=sorted_tokens_idx,
-                moe_topk=moe_top_k,
-                y=out,
-                topk_ids=topk_ids,
-                act=None,
-            )
-
-            output = torch.empty(
-                [M, N], dtype=hidden_states.dtype, device=hidden_states.device
-            )
-            sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
-
-            torch.ops._C.moe_post(
-                x=out,
-                moe_index=sorted_tokens_idx,
-                normed_scale=normed_score,
-                dequant_scale=dequant_scale,
-                y=output,
-            )
-
-            return output
+    def fused_moe(*args, **kwargs):
+        """Forward to `ops.moe.entry.fused_moe`."""
+        return _moe_entry.fused_moe(*args, **kwargs)
 
     @staticmethod
-    def fused_moe_ep(
-        hidden_states: torch.Tensor,
-        w13_weight: torch.Tensor,
-        w2_weight: torch.Tensor,
-        router_logits: torch.Tensor,
-        ep_rank: int,
-        top_k: int,
-        renormalize: bool,
-        inplace: bool = False,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        x = hidden_states
-        batch, hidden_size = x.shape
-        num_local_experts, up_gate_size, _ = w13_weight.shape
+    def fused_moe_int8(*args, **kwargs):
+        """Forward to `ops.moe.entry.fused_moe_int8`."""
+        return _moe_entry.fused_moe_int8(*args, **kwargs)
 
-        topk_weights = torch.empty(
-            batch, top_k, dtype=router_logits.dtype, device=router_logits.device
-        )
-        topk_ids = torch.empty(
-            batch, top_k, dtype=torch.int32, device=router_logits.device
-        )
-        block_static = torch.empty(0, dtype=torch.int32, device=router_logits.device)
-        torch.ops._C.moe_softmax_topk(
-            router_logits, topk_weights, topk_ids, block_static
-        )
-
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(1, keepdim=True)
-
-        topk_weights = topk_weights.to(x.dtype)
-        out = torch.zeros(batch * top_k, hidden_size, dtype=x.dtype, device=x.device)
-        repeat_x = x.repeat_interleave(top_k, dim=0)
-        topk_ids_flat = topk_ids.flatten()
-        for i in range(num_local_experts):
-            experts_id = ep_rank * num_local_experts + i
-            selected_token = topk_ids_flat == experts_id
-            if selected_token.sum():
-                cur_token = repeat_x[selected_token]
-                up_gate = torch.empty(
-                    selected_token.sum(),
-                    up_gate_size // 2,
-                    dtype=cur_token.dtype,
-                    device=cur_token.device,
-                )
-                torch.ops._C.silu_and_mul(up_gate, cur_token @ w13_weight[i].T)
-                out[selected_token] = up_gate @ w2_weight[i].T
-        output = (
-            (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2))
-            .sum(dim=1)
-            .to(x.dtype)
-        )
-
-        return output
+    @staticmethod
+    def fused_moe_ep(*args, **kwargs):
+        """Forward to `ops.moe.entry.fused_moe_ep`."""
+        return _moe_entry.fused_moe_ep(*args, **kwargs)
 
     @staticmethod
     def fused_multi_head_latent_page_attention(

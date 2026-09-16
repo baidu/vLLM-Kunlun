@@ -2,8 +2,8 @@
 type: reference
 title: Fused MoE 与专家并行
 summary: >-
-  UnquantizedFusedMoEMethod 的 OOT 实现：M*top_k > 768 的大小 batch 分支、
-  act=None + 显式 silu_and_mul 这个规避 kernel bug 的必要写法，以及 EP 路径的 Python 逐专家循环。
+  UnquantizedFusedMoEMethod 的 OOT 实现：统一的 route/preprocess/FFN/combine 流水线、
+  M*top_k > 768 的 sorted 分支，以及 mapped EP 的固定形状 partial output 语义。
 generated:
   by: hand-authored (Claude Code, OpenWiki OKF v0.2 conventions)
   at: 2026-09-02T00:00:00Z
@@ -12,9 +12,12 @@ evidence_version:
   ref: v0.25.1-dev
   commit: c53e090ff8800f586bf9e36e0d876779981bfb20
 sources:
-- repo://vllm_kunlun/ops/fused_moe/layer.py#L16-L89
-- repo://vllm_kunlun/ops/_kunlun_ops.py#L377-L680
-- repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L149-L321
+- repo://vllm_kunlun/ops/fused_moe/layer.py
+- repo://vllm_kunlun/ops/moe/entry.py
+- repo://vllm_kunlun/ops/moe/router.py
+- repo://vllm_kunlun/ops/moe/preprocess.py
+- repo://vllm_kunlun/ops/moe/ffn.py
+- repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py
 - repo://vllm_kunlun/platforms/kunlun.py#L257-L274
 - repo://setup_env.sh
 claims: .claims/moe-and-ep.json
@@ -64,8 +67,14 @@ else:
     # torch.ops.xspeedgate_ops.moe_pre_small
 ```
 
-`M` 是 token 数。也就是说同一个 MoE 层在 prefill 和 decode 下走的是
-**两套不同 kernel**，切换点在 `M * top_k = 768`。
+`M` 是 token 数，`M * moe_top_k` 是展开后的 token-expert 对数量。
+`768` 是预处理 kernel 的切换阈值。也就是说同一个 MoE 层在 prefill 和
+decode 下走的是两套不同 kernel：
+
+- `M * moe_top_k <= 768`：使用 `moe_pre_small`；
+- `M * moe_top_k > 768`：使用 `gen_block_statistic + moe_pre_sorted`。
+
+两条路径最终都会生成后续 `moe_fc` 所需的排序 token、索引和专家分段信息。
 
 `#L523-L526` 通过 `current_workspace_manager().get_simultaneous(...)` 拿工作区。
 具体算子调用在 `#L547-L619`：`torch.ops._C.gen_block_statistic` /
@@ -77,14 +86,15 @@ else:
 
 `ops/_kunlun_ops.py#L505-L519` 有一段必须原文引用的 NOTE：
 
-> 融合的 `moe_fc(act="SWISH_GLU")` 对**所有 `M >= 1024`** 数值都是错的，
-> 并且它"**was the source of the multi-concurrent 'garbled output' symptom**"。
+> 当前版本暂不启用 `moe_fc(act="SWISH_GLU")` 融合；该能力待后续
+> `kunlun_ops` kernel 支持后再接入。
 
-所以代码**永远**用 `moe_fc(act=None)` 拿到中间结果，再显式调一次
-`silu_and_mul`，然后第二个 `moe_fc`。
+当前所有 gated activation 都使用 `moe_fc(act=None)`，再显式调用对应的
+`*_and_mul` 算子，然后执行第二个 `moe_fc`。这样可以明确保证
+`activation(gate) * up` 的计算语义。
 
-**这是本仓库最重要的一条"不要优化掉"的注释。**任何人看到这里想"两次
-kernel launch 可以融成一次"，都会重新引入高并发下输出乱码的 bug。
+`SWISH_GLU` 后续支持后，可以在 FFN helper 中增加独立的 fused epilogue
+路径，并重新验证不同 dtype 和 `M` 下的数值与性能。
 排查"并发一高就输出乱码"类问题时，也应先确认这条规避是否还在。
 
 ## 4. 量化 int8 单体路径
@@ -111,7 +121,25 @@ kernel launch 可以融成一次"，都会重新引入高并发下输出乱码�
    **强制 full eager**（`platforms/kunlun.py#L257-L274`）——
    这条路径显然还没有和图捕获一起验证过。
 
-## 6. 相关环境变量
+## 6. 硬件验证结果
+
+当前 `fused_moe_ep` 与普通 FP 路径共用 route/preprocess/FFN/combine 流水线。
+映射 EP 保留固定的 `M*top_k` 行，使用 `-1` index 跳过非本地行，并在
+combine 前将非本地 score 置零。
+
+FP16/BF16 poison 实验覆盖 mixed/all-nonlocal route、eager 和 CUDA Graph
+replay。硬件实测表明 FC kernel 不会可靠跳过所有未写入的 output 行；
+未初始化的 `workspace.b` 会传播 NaN。因此 mapped EP 仅对整块
+`workspace.b` 做一次 `zero_()`。control 与 poison 输出均 finite，
+all-nonlocal 输出精确为零，Graph replay 改变输入后仍产生新结果。
+full-local identity EP 不执行 map、mask 或 local histogram。
+
+Graph median（local=32/global=128/top-k=8）为：FP16 M=1 约 90 us、M=97
+约 321 us；BF16 M=512 约 672 us、M=2048 约 1169 us。旧 Python 逐专家
+实现的 M=1 eager 基线约 4262 us，旧实现 Graph capture 因错误形状申请约
+5.5 TiB 而失败。INT8 BF16 M=97 Graph smoke 约 74 us，输出 finite。
+
+## 7. 相关环境变量
 
 - `ENABLE_VLLM_MOE_FC_SORTED`（`platforms/envs.py#L53`，注释
   `fuse sorted op with fused_moe kernel`）——**没有消费者**，见

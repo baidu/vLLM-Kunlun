@@ -420,9 +420,9 @@ class Qwen3_5Model(Qwen3NextModel):
                 break
             else:
                 is_expert_weight = False
-                # gate_up_proj 是 gate+up 两部分合并存储的，需要先切成两半分别加载
-                if "experts.gate_up_proj" in name:
-                    # 找到对应的 w13_weight param 路径
+                # Fused expert weights need to be split before the per-expert
+                # loader applies EP global-to-local mapping and TP slicing.
+                if loaded_weight.ndim == 3 and "experts.gate_up_proj" in name:
                     w13_name = name.replace(
                         "experts.gate_up_proj", "experts.routed_experts.w13_weight"
                     )
@@ -433,20 +433,46 @@ class Qwen3_5Model(Qwen3NextModel):
                             f"Parameter {w13_name} not found in params_dict, skip loading"
                         )
                         continue
-                    # 沿 dim=-2 切成两半：w1=gate, w3=up
                     w1_weight, w3_weight = loaded_weight.chunk(2, dim=-2)
-                    param = params_dict[w13_name]
-                    weight_loader = param.weight_loader
-                    # 加载 w1（gate）
-                    weight_loader(
-                        param, w1_weight, w13_name, shard_id="w1", expert_id=0
+                    num_experts = loaded_weight.shape[0]
+                    loaded_w1 = self.load_fused_expert_weights(
+                        w13_name,
+                        params_dict,
+                        w1_weight,
+                        shard_id="w1",
+                        num_experts=num_experts,
                     )
-                    # 加载 w3（up）
-                    weight_loader(
-                        param, w3_weight, w13_name, shard_id="w3", expert_id=0
+                    loaded_w3 = self.load_fused_expert_weights(
+                        w13_name,
+                        params_dict,
+                        w3_weight,
+                        shard_id="w3",
+                        num_experts=num_experts,
                     )
-                    name = w13_name
-                    loaded_params.add(name)
+                    if loaded_w1 or loaded_w3:
+                        loaded_params.add(w13_name)
+                    continue
+
+                if loaded_weight.ndim == 3 and "experts.down_proj" in name:
+                    w2_name = name.replace(
+                        "experts.down_proj", "experts.routed_experts.w2_weight"
+                    )
+                    if is_pp_missing_parameter(w2_name, self):
+                        continue
+                    if w2_name not in params_dict:
+                        logger.warning_once(
+                            f"Parameter {w2_name} not found in params_dict, skip loading"
+                        )
+                        continue
+                    loaded_w2 = self.load_fused_expert_weights(
+                        w2_name,
+                        params_dict,
+                        loaded_weight,
+                        shard_id="w2",
+                        num_experts=loaded_weight.shape[0],
+                    )
+                    if loaded_w2:
+                        loaded_params.add(w2_name)
                     continue
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping

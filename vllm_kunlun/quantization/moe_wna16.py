@@ -16,6 +16,35 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 
+"""DEAD CODE -- kept for reference only, nothing in the tree can reach it.
+
+Two independent reasons, both verified 2026-09-10:
+
+1. The module cannot even be imported: the ``dequant_int4`` import below points
+   at ``vllm_kunlun.ops.quantization.kernels.quant_ops``, which does not exist
+   (the real path is ``vllm_kunlun.quantization.kernels.quant_ops``), so any
+   import raises ``ModuleNotFoundError``.
+2. ``KunlunMoeWNA16Method`` has no reference anywhere. It is not registered
+   through ``CustomOp.register_oot`` the way
+   ``KunlunUnquantizedFusedMoEMethod`` is, and ``quantization/__init__.py``
+   maps the ``"moe_wna16"`` method name to upstream's ``MoeWNA16Config``, not
+   to anything here.
+3. ``apply`` below still has the pre-0.25 signature. This vLLM's
+   ``RoutedExperts.forward_modular`` calls
+   ``apply(layer=, x=, topk_weights=, topk_ids=, shared_experts=,
+   shared_experts_input=)``, so even a registered version would raise
+   ``TypeError`` on the first token. Reviving this means porting it to the
+   monolithic interface the way ``ops/fused_moe/layer.py`` did.
+
+So ``ops.fused_moe`` call below is never executed; it is only kept in sync with
+the live call sites so that reviving this file stays a small diff. It does not
+pass a prebuilt ``router``, which is the supported lazy path: ``fused_moe``
+selects the same routing kernel from these arguments. A revived version should
+build one in ``process_weights_after_loading`` instead, so an unsupported MoE
+config fails at load time. Before using any of it, fix the import path, port
+``apply``, and register the method.
+"""
+
 from typing import Callable, Optional, Union
 
 import torch
@@ -268,6 +297,14 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
                 use_grouped_topk=use_grouped_topk,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                w13_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                activation=activation,
+                custom_routing_function=custom_routing_function,
+                routed_scaling_factor=routed_scaling_factor,
+                expert_map=expert_map,
             )
         else:
             return ops.fused_moe(
@@ -275,15 +312,16 @@ class KunlunMoeWNA16Method(MoeWNA16Method):
                 w13_weight,
                 w2_weight,
                 router_logits,
-                self.moe.ep_rank,
                 top_k,
                 renormalize=renormalize,
-                inplace=True,
                 use_grouped_topk=use_grouped_topk,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 scoring_func=scoring_func,
                 e_score_correction_bias=e_score_correction_bias,
-                w1_bias=getattr(layer, "w13_bias", None),
+                w13_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
+                activation=activation,
+                custom_routing_function=custom_routing_function,
+                routed_scaling_factor=routed_scaling_factor,
             )

@@ -696,7 +696,7 @@ if hasattr(torch.ops.custom_ops, "fc_fusion"):
         pass
 
 
-@custom_op("_C::silu_and_mul", mutates_args=())
+@custom_op("_C::silu_and_mul", mutates_args=("out",))
 def silu_and_mul(
     out: torch.Tensor, x: torch.Tensor, axis: int = -1, turn: bool = True
 ) -> None:
@@ -725,6 +725,26 @@ def _fake_silu_and_mul(
 silu_and_mul.register_fake(_fake_silu_and_mul)
 
 
+def _swigluoai_and_mul_native(
+    x: torch.Tensor, alpha: float, limit: float
+) -> torch.Tensor:
+    """`swigluoai` over an interleaved [.., 2 * d] input, as plain PyTorch.
+
+    There is no Kunlun kernel for this activation, so this is ~8 elementwise
+    launches over stride-2 views plus an allocation. The nearest kernel,
+    `kunlun_ops.swiglu_bias(alpha=1.702, beta=1.0, limit=7.0)`, computes the
+    same formula in one pass but reads gate/up as halves, so using it would
+    mean permuting the producing weight's rows at load time.
+
+    All three registrations below delegate here instead of keeping three copies
+    of the formula in sync.
+    """
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    return (up + 1) * (gate * torch.sigmoid(gate * alpha))
+
+
 @custom_op("_C::swigluoai_and_mul", mutates_args=())
 def swigluoai_and_mul(
     x: torch.Tensor,
@@ -733,13 +753,7 @@ def swigluoai_and_mul(
     axis: int = -1,
     turn: bool = True,
 ) -> torch.Tensor:
-    """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    glu = gate * torch.sigmoid(gate * alpha)
-    gated_output = (up + 1) * glu
-    return gated_output
+    return _swigluoai_and_mul_native(x, alpha, limit)
 
 
 @impl("_C::swigluoai_and_mul", "CUDA")
@@ -750,13 +764,7 @@ def swigluoai_and_mul_cuda(
     axis: int = -1,
     turn: bool = True,
 ) -> torch.Tensor:
-    """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    glu = gate * torch.sigmoid(gate * alpha)
-    gated_output = (up + 1) * glu
-    return gated_output
+    return _swigluoai_and_mul_native(x, alpha, limit)
 
 
 def _fake_swigluoai_and_mul(
@@ -766,24 +774,62 @@ def _fake_swigluoai_and_mul(
     axis: int = -1,
     turn: bool = True,
 ) -> torch.Tensor:
-    """PyTorch-native implementation equivalent to forward()."""
-    gate, up = x[..., ::2], x[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    glu = gate * torch.sigmoid(gate * alpha)
-    gated_output = (up + 1) * glu
-    return gated_output
+    return _swigluoai_and_mul_native(x, alpha, limit)
 
 
 swigluoai_and_mul.register_fake(_fake_swigluoai_and_mul)
 
 
-@custom_op("_C::moe_softmax_topk", mutates_args=())
+# NOTE: unlike the ops above these declare `mutates_args=("out",)`, which is
+# what torch.library actually needs to keep an out-param call from being
+# reordered or elided once the region is traced. `kunlun_ops` registers its own
+# wrappers only when ENABLE_XINFER_XRAY=1, so without these the MoE activation
+# path would call plain Python functions that Dynamo cannot see.
+
+
+@custom_op("_C::gelu_tanh_and_mul", mutates_args=("out",))
+def gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    kunlun_ops.gelu_tanh_and_mul(x, out)
+
+
+@impl("_C::gelu_tanh_and_mul", "CUDA")
+def gelu_tanh_and_mul_cuda(out: torch.Tensor, x: torch.Tensor) -> None:
+    kunlun_ops.gelu_tanh_and_mul(x, out)
+
+
+def _fake_gelu_tanh_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    return None
+
+
+gelu_tanh_and_mul.register_fake(_fake_gelu_tanh_and_mul)
+
+
+@custom_op("_C::swiglustep", mutates_args=("out",))
+def swiglustep(out: torch.Tensor, x: torch.Tensor, limit: float = 7.0) -> None:
+    kunlun_ops.swiglustep(x, out, limit)
+
+
+@impl("_C::swiglustep", "CUDA")
+def swiglustep_cuda(out: torch.Tensor, x: torch.Tensor, limit: float = 7.0) -> None:
+    kunlun_ops.swiglustep(x, out, limit)
+
+
+def _fake_swiglustep(out: torch.Tensor, x: torch.Tensor, limit: float = 7.0) -> None:
+    return None
+
+
+swiglustep.register_fake(_fake_swiglustep)
+
+
+@custom_op(
+    "_C::moe_softmax_topk",
+    mutates_args=("normed_score", "topk_index", "block_statistic"),
+)
 def moe_softmax_topk(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     axis: int = -1,
     turn: bool = True,
 ) -> None:
@@ -795,7 +841,7 @@ def moe_softmax_topk_cuda(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     axis: int = -1,
     turn: bool = True,
 ) -> None:
@@ -806,7 +852,7 @@ def _fake_moe_softmax_topk(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     axis: int = -1,
     turn: bool = True,
 ) -> None:
@@ -1042,7 +1088,7 @@ def _fake_rotary_embedding(
 rotary_embedding.register_fake(_fake_rotary_embedding)
 
 
-@custom_op("_C::gemm_I8_I8_bf16_nt", mutates_args=())
+@custom_op("_C::gemm_I8_I8_bf16_nt", mutates_args=("out",))
 def gemm_I8_I8_bf16_nt(
     x_q: torch.Tensor,
     x_scale: torch.Tensor,
@@ -1081,12 +1127,15 @@ def _fake_gemm_I8_I8_bf16_nt(
 gemm_I8_I8_bf16_nt.register_fake(_fake_gemm_I8_I8_bf16_nt)
 
 
-@custom_op("_C::moe_softmax_topk_norm", mutates_args=())
+@custom_op(
+    "_C::moe_softmax_topk_norm",
+    mutates_args=("normed_score", "topk_index", "block_statistic"),
+)
 def moe_softmax_topk_norm(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     stable: bool = True,
 ) -> None:
     kunlun_ops.moe_softmax_topk_norm(
@@ -1099,7 +1148,7 @@ def moe_softmax_topk_norm_cuda(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     stable: bool = True,
 ) -> None:
     kunlun_ops.moe_softmax_topk_norm(
@@ -1111,7 +1160,7 @@ def _fake_moe_softmax_topk_norm(
     x: torch.Tensor,
     normed_score: torch.Tensor,
     topk_index: torch.Tensor,
-    block_statistic: torch.Tensor,
+    block_statistic: Optional[torch.Tensor],
     stable: bool = True,
 ) -> None:
     return None
@@ -1120,7 +1169,7 @@ def _fake_moe_softmax_topk_norm(
 moe_softmax_topk_norm.register_fake(_fake_moe_softmax_topk_norm)
 
 
-@custom_op("_C::gen_block_statistic", mutates_args=())
+@custom_op("_C::gen_block_statistic", mutates_args=("block_statistic",))
 def gen_block_statistic(topk_ids: torch.Tensor, block_statistic: torch.Tensor) -> None:
     kunlun_ops.gen_block_statistic(topk_ids, block_statistic)
 
@@ -1141,7 +1190,15 @@ def fake_gen_block_statistic(
 gen_block_statistic.register_fake(fake_gen_block_statistic)
 
 
-@custom_op("_C::moe_pre_sorted", mutates_args=())
+@custom_op(
+    "_C::moe_pre_sorted",
+    mutates_args=(
+        "moe_expand",
+        "moe_index",
+        "expert_m",
+        "sorted_tokens_num_lod",
+    ),
+)
 def moe_pre_sorted(
     x: torch.Tensor,
     topk_index: torch.Tensor,
@@ -1160,6 +1217,7 @@ def moe_pre_sorted(
         moe_index,
         expert_m,
         sorted_tokens_num_lod,
+        index_have_neg,
     )
 
 
@@ -1182,6 +1240,7 @@ def moe_pre_sorted_cuda(
         moe_index,
         expert_m,
         sorted_tokens_num_lod,
+        index_have_neg,
     )
 
 
@@ -1201,7 +1260,7 @@ def fake_moe_pre_sorted(
 moe_pre_sorted.register_fake(fake_moe_pre_sorted)
 
 
-@custom_op("_C::moe_fc", mutates_args=())
+@custom_op("_C::moe_fc", mutates_args=("y",))
 def moe_fc(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1222,13 +1281,15 @@ def moe_fc(
     use_pack_int4: Optional[bool] = False,
     sort_mode: Optional[bool] = True,
 ) -> None:
-    kunlun_ops.moe_fc(
+    kunlun_ops.moe_fc_v3(
         x=x,
         weight=weight,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
         sorted_tokens_idx=sorted_tokens_idx,
         moe_topk=moe_topk,
-        y=y,
+        # Keep the vLLM-facing [tokens, topk, O] contract while passing the
+        # flattened view expected by the current v3 block implementation.
+        y=y.view(-1, y.shape[-1]),
         act=act,
         x_perchannel_max=x_perchannel_max,
         w_perchannel_max=w_perchannel_max,
@@ -1241,6 +1302,7 @@ def moe_fc(
         scale_k=scale_k,
         use_pack_int4=use_pack_int4,
         sort_mode=sort_mode,
+        recommended_expert_tokens=-1,
     )
 
 
@@ -1265,13 +1327,15 @@ def moe_fc_cuda(
     use_pack_int4: Optional[bool] = False,
     sort_mode: Optional[bool] = True,
 ) -> None:
-    kunlun_ops.moe_fc(
+    kunlun_ops.moe_fc_v3(
         x=x,
         weight=weight,
         sorted_tokens_num_lod=sorted_tokens_num_lod,
         sorted_tokens_idx=sorted_tokens_idx,
         moe_topk=moe_topk,
-        y=y,
+        # Keep the vLLM-facing [tokens, topk, O] contract while passing the
+        # flattened view expected by the current v3 block implementation.
+        y=y.view(-1, y.shape[-1]),
         act=act,
         x_perchannel_max=x_perchannel_max,
         w_perchannel_max=w_perchannel_max,
@@ -1284,6 +1348,7 @@ def moe_fc_cuda(
         scale_k=scale_k,
         use_pack_int4=use_pack_int4,
         sort_mode=sort_mode,
+        recommended_expert_tokens=-1,
     )
 
 
@@ -1313,7 +1378,7 @@ def fake_moe_fc(
 moe_fc.register_fake(fake_moe_fc)
 
 
-@custom_op("_C::moe_post", mutates_args=())
+@custom_op("_C::moe_post", mutates_args=("y",))
 def moe_post(
     x: torch.Tensor,
     moe_index: torch.Tensor,
@@ -1348,7 +1413,10 @@ def fake_moe_post(
 moe_post.register_fake(fake_moe_post)
 
 
-@custom_op("_C::moe_sigmoid_group_topk_norm", mutates_args=())
+@custom_op(
+    "_C::moe_sigmoid_group_topk_norm",
+    mutates_args=("topk_index", "norm_score", "block_static"),
+)
 def moe_sigmoid_group_topk_norm(
     x: torch.Tensor,
     topk_index: torch.Tensor,
@@ -1363,7 +1431,7 @@ def moe_sigmoid_group_topk_norm(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
-        block_static=block_static,
+        block_statistic=block_static,
         bias=bias,
         n_group=n_group,
         topk_group=topk_group,
@@ -1386,7 +1454,7 @@ def moe_sigmoid_group_topk_norm_cuda(
         x=x,
         norm_score=norm_score,
         topk_index=topk_index,
-        block_static=block_static,
+        block_statistic=block_static,
         bias=bias,
         n_group=n_group,
         topk_group=topk_group,
@@ -1909,7 +1977,7 @@ matmul.register_fake(_fake_matmul)
 ##################################################
 # ------------------- quant2d --------------------
 ##################################################
-@custom_op("_C::quant2d", mutates_args=())
+@custom_op("_C::quant2d", mutates_args=("x_q", "max"))
 def quant2d(
     x: torch.Tensor,
     x_q: torch.Tensor,
