@@ -55,6 +55,94 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
         **kwargs,
     ):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
+        self._zero_index_buffers()
+        self._single_lora_slot: Optional[int] = None
+
+    def update_metadata(
+        self,
+        mapping,
+        lora_index_to_id: list,
+        max_loras: int,
+        vocab_size: int,
+        **kwargs,
+    ):
+        self._single_lora_slot = self._compute_single_lora_slot(
+            mapping, lora_index_to_id
+        )
+        super().update_metadata(
+            mapping, lora_index_to_id, max_loras, vocab_size, **kwargs
+        )
+
+    @staticmethod
+    def _compute_single_lora_slot(mapping, lora_index_to_id: list) -> Optional[int]:
+        """The one slot this step uses, or ``None`` if that is not well defined."""
+        index_mapping = getattr(mapping, "index_mapping", None)
+        if not index_mapping:
+            return None
+        ids = {i for i in set(index_mapping) if i > 0}
+        if len(ids) != 1:
+            return None
+        try:
+            return lora_index_to_id.index(next(iter(ids)))
+        except ValueError:
+            # The id has not been mapped to a slot (should not happen; the
+            # activation precedes the step).  bgmv is always correct.
+            return None
+
+    @property
+    def single_lora_slot(self) -> Optional[int]:
+        """Slot number when this step has exactly one active adapter, else None."""
+        return self._single_lora_slot
+
+    def _zero_index_buffers(self) -> None:
+        """Zero the persistent index buffers ``PunicaWrapperBase`` leaves empty."""
+        for name in (
+            "_token_lora_indices",
+            "_sampler_indices",
+            "_sampler_indices_padded",
+            "_embeddings_indices",
+            "_seq_start_locs",
+            "_seq_lengths",
+            "_lora_indices_per_batch",
+        ):
+            buffer = getattr(self, name, None)
+            if isinstance(buffer, torch.Tensor):
+                buffer.zero_()
+
+    @staticmethod
+    def _moe_grouping_placeholders(x: torch.Tensor):
+        """Build the MoE grouping arguments the Kunlun sgmv/bgmv ops ignore."""
+        expert_num = 9
+        block_statistic = torch.zeros(
+            [12, expert_num], dtype=torch.int32, device=x.device
+        )
+        sorted_tokens_num_lod = torch.zeros(
+            expert_num + 1, dtype=torch.int32, device=x.device
+        )
+        moe_index = torch.zeros(x.size(0), dtype=torch.int32, device=x.device)
+        return block_statistic, sorted_tokens_num_lod, moe_index
+
+    def _logits_indices(self, rows: int) -> torch.Tensor:
+        """Return one adapter index per row of the logits the sampler will see."""
+        indices = self.sampler_indices
+        if indices.numel() == rows:
+            return indices
+        token_indices = self.token_lora_indices
+        if token_indices.numel() >= rows:
+            return token_indices[:rows]
+        if indices.numel() == 0:
+            return torch.full((rows,), -1, dtype=torch.long, device=self.device)
+        return indices[:1].expand(rows)
+
+    def _mask_no_lora_rows(
+        self, buffer: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Zero the rows of a token-major buffer that carry no adapter."""
+        rows = min(buffer.size(0), indices.size(0))
+        if rows == 0:
+            return buffer
+        buffer[:rows].masked_fill_(indices[:rows].unsqueeze(1) < 0, 0)
+        return buffer
 
     def _shrink_prefill(
         self,
@@ -393,10 +481,36 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
+        if self.no_lora:
+            return
+
         expand_fun: Callable = (
             self._expand_prefill if self.is_prefill else self._expand_decode
         )
-        expand_fun(y, x, lora_b_stacked, add_inputs)
+        (
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+        ) = self._moe_grouping_placeholders(x)
+
+        # lora_b_stacked arrives as (max_loras, 1, embedding_dim, rank); the
+        # kernels expect the 3D layout that add_lora_linear also passes.
+        if lora_b_stacked.dim() == 4:
+            lora_b_stacked = lora_b_stacked.squeeze(1)
+
+        # x holds the lora_a embedding lookup per token; masking it here keeps
+        # base-model tokens in a mixed batch from receiving an adapter delta.
+        x = self._mask_no_lora_rows(x.clone(), self.token_lora_indices)
+
+        expand_fun(
+            y,
+            x,
+            lora_b_stacked,
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+            add_inputs,
+        )
 
     def add_lora_linear(
         self,
@@ -431,7 +545,7 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
             output_slices (Tuple[int, ...]): Every slice's size.
             buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
         """
-        # 从 kwargs 中获取 lora_bias_stacked（如果有）
+        # Get lora_bias_stacked from kwargs (if present)
         lora_bias_stacked: Optional[Tuple[torch.Tensor, ...]] = kwargs.get(
             "lora_bias_stacked", None
         )
@@ -439,15 +553,11 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
         if self.no_lora:
             return
 
-        expert_num = 9
-        block_statistic = torch.zeros(
-            [12, expert_num], dtype=torch.int32, device=x.device
-        )
-        sorted_tokens_num_lod = torch.zeros(
-            expert_num + 1, dtype=torch.int32, device=x.device
-        )
-        token_nums = x.size(0)
-        moe_index = torch.zeros(token_nums, dtype=torch.int32, device=x.device)
+        (
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+        ) = self._moe_grouping_placeholders(x)
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
         if lora_bias_stacked is not None:
@@ -474,6 +584,8 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
             scale,
             **kwargs,
         )
+        for buf in buffer:
+            self._mask_no_lora_rows(buf, self.token_lora_indices)
         # [tensor.unsqueeze_(1) for tensor in lora_a_stacked]
 
         # [tensor.squeeze_(1) for tensor in lora_b_stacked]
@@ -518,6 +630,9 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
             scale (float): Scaling factor.
             buffer (Optional[torch.Tensor]):Default to None.
         """
+        if self.no_lora:
+            return
+
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
@@ -527,19 +642,55 @@ class PunicaWrapperKunlun(PunicaWrapperBase):
         if lora_b_stacked.dim() == 2:
             lora_b_stacked = lora_b_stacked.unsqueeze(0)
 
-        r = lora_a_stacked.size(-1)
+        # lora_a_stacked is (max_loras, 1, rank, hidden_size) and lora_b_stacked
+        # is (max_loras, 1, vocab_size, rank), which is exactly the layout the
+        # bgmv kernels accept -- so the rank is lora_b's last dim, not lora_a's.
+        r = lora_b_stacked.size(-1)
 
         if buffer is None:
             buffer = torch.zeros((x.size(0), r), dtype=torch.float32, device=x.device)
 
-        indices = self.sampler_indices
-        if indices.max() >= lora_a_stacked.size(0):
-            indices = torch.clamp(indices, 0, lora_a_stacked.size(0) - 1)
+        indices = self._logits_indices(x.size(0))
+        # ``lora_ops`` clamps negative slots itself, so only an out-of-range
+        # positive slot needs fixing here; keep ``indices`` unclamped so the
+        # masking below can still recognize the rows that carry no adapter.
+        kernel_indices = indices
+        if indices.numel() and int(indices.max()) >= lora_a_stacked.size(0):
+            kernel_indices = torch.clamp(indices, 0, lora_a_stacked.size(0) - 1)
 
-        lora_a_reshaped = lora_a_stacked.transpose(1, 2)
-        lora_b_reshaped = lora_b_stacked.transpose(1, 2)
+        lora_a_reshaped = lora_a_stacked
+        lora_b_reshaped = lora_b_stacked
 
-        bgmv_shrink(x, lora_a_reshaped, buffer, indices, scale)
-        bgmv_expand(buffer, lora_b_reshaped, y, indices, add_inputs=True)
+        (
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+        ) = self._moe_grouping_placeholders(x)
+        expert_m = torch.zeros(9, dtype=torch.int32, device=x.device)
+
+        bgmv_shrink(
+            x,
+            lora_a_reshaped,
+            buffer,
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+            expert_m,
+            kernel_indices,
+            scale,
+        )
+        # Rows whose index is -1 belong to requests served without an adapter;
+        # zero them so the expand below leaves the base logits intact.
+        self._mask_no_lora_rows(buffer, indices)
+        bgmv_expand(
+            buffer,
+            lora_b_reshaped,
+            y,
+            block_statistic,
+            sorted_tokens_num_lod,
+            moe_index,
+            kernel_indices,
+            add_inputs=True,
+        )
 
         y = y.view_as(y_org)
