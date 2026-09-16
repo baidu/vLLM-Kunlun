@@ -2,26 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional, Union
 
 import numpy as np
 import torch
-from vllm.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionLayer,
-    AttentionMetadata,
-)
-from vllm.attention.backends.utils import get_mla_dims
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils import cdiv
-from vllm.v1.attention.backends.mla.common import MLACommonBaseImpl
-from vllm.v1.attention.backends.utils import (
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backend import (
+    AttentionBackend,
     AttentionCGSupport,
+    AttentionLayer,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    SparseMLAAttentionImpl,
+)
+from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
     split_decodes_and_prefills,
@@ -302,130 +302,6 @@ def triton_convert_req_index_to_global_index(
     return out
 
 
-def kunlun_convert_req_index_to_global_index(
-    req_id: torch.Tensor,  # int32 [num_tokens]
-    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]
-    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
-    BLOCK_SIZE: int = 64,
-    NUM_TOPK_TOKENS: int = 2048,
-):
-    assert req_id.dtype == torch.int32
-    assert block_table.dtype == torch.int32
-    assert token_indices.dtype == torch.int32
-    assert token_indices.shape[1] == NUM_TOPK_TOKENS
-
-    _, max_num_blocks_per_req = block_table.shape
-
-    out = torch.zeros_like(token_indices)
-
-    # Compute block_id and inblock_off for all tokens at once
-    block_id = token_indices // BLOCK_SIZE
-    inblock_off = token_indices % BLOCK_SIZE
-
-    # Create mask for invalid tokens (tok < 0)
-    invalid_tok_mask = token_indices < 0
-
-    # Create mask for out-of-bounds block_id
-    oob_block_mask = block_id >= max_num_blocks_per_req
-
-    # Combine masks - output -1 for either condition
-    invalid_mask = invalid_tok_mask | oob_block_mask
-
-    # Get request IDs expanded to match token_indices shape
-    req_ids_expanded = req_id.unsqueeze(1).expand(-1, NUM_TOPK_TOKENS)
-
-    # Gather base addresses from block_table
-    # Clamp block_id to avoid index errors (we'll mask these out anyway)
-    block_id_clamped = torch.clamp(block_id, 0, max_num_blocks_per_req - 1)
-
-    # Use advanced indexing to get base addresses
-    base_addrs = block_table[req_ids_expanded, block_id_clamped]
-
-    # Compute the global indices
-    global_indices = base_addrs * BLOCK_SIZE + inblock_off
-
-    # Apply mask: set invalid positions to -1
-    out = torch.where(
-        invalid_mask,
-        torch.tensor(-1, dtype=torch.int32, device=token_indices.device),
-        global_indices,
-    )
-
-    return out
-
-
-def kunlun_concat_and_cache_mla(
-    kv_c: torch.Tensor,  # [num_tokens, kv_lora_rank]
-    k_pe: torch.Tensor,  # [num_tokens, pe_dim]
-    kv_cache: torch.Tensor,  # [num_blocks, block_size, (kv_lora_rank + pe_dim)]
-    slot_mapping: torch.Tensor,  # [num_tokens] or [num_actual_tokens]
-    kv_cache_dtype: str,
-    scale: torch.Tensor,
-):
-    num_tokens = slot_mapping.shape[0]
-    kv_lora_rank = kv_c.shape[1]
-    pe_dim = k_pe.shape[1]
-    block_size = kv_cache.shape[1]
-
-    def kunlun_fp8_ds_mla():
-        for token_idx in range(num_tokens):
-            slot = slot_mapping[token_idx].item()
-            if slot < 0:
-                continue
-            block_idx = slot // block_size
-            block_offset = slot % block_size
-            kv_c_i = kv_c[token_idx].view(4, kv_lora_rank // 4).contiguous()
-            kv_c_i_int8 = torch.zeros(
-                kv_c_i.shape,
-                device=kv_c.device,
-                dtype=torch.int8,
-            )
-            kv_c_i_scale = torch.zeros(
-                [kv_c_i.shape[0], 1],
-                device=kv_c.device,
-                dtype=torch.float32,
-            )
-            torch.ops._C.quant2d(kv_c_i, kv_c_i_int8, kv_c_i_scale, force_sdnn=True)
-            kv_c_i_scale /= 127
-            kv_cache[block_idx, block_offset, :kv_lora_rank] = (
-                kv_c_i_int8.view(-1).view(torch.uint8).contiguous()
-            )
-            kv_cache[block_idx, block_offset, kv_lora_rank : kv_lora_rank + 16] = (
-                kv_c_i_scale.view(-1).view(torch.uint8).contiguous()
-            )
-            kv_cache[block_idx, block_offset, kv_lora_rank + 16 :] = (
-                k_pe[token_idx, :].view(torch.uint8).contiguous()
-            )
-
-    def kunlun_mla():
-        for token_idx in range(num_tokens):
-            slot = slot_mapping[token_idx].item()
-            if slot < 0:
-                continue
-            block_idx = slot // block_size
-            block_offset = slot % block_size
-            kv_cache[block_idx, block_offset, :kv_lora_rank] = kv_c[
-                token_idx, :
-            ].contiguous()
-            kv_cache[block_idx, block_offset, kv_lora_rank:] = k_pe[
-                token_idx, :
-            ].contiguous()
-
-    if kv_cache_dtype == "fp8_ds_mla":
-        assert kv_lora_rank == 512, "kv_lora_rank must be 512 for fp8_ds_mla"
-        assert pe_dim == 64, "pe_dim must be 64 for fp8_ds_mla"
-        assert (
-            kv_cache.shape[2] == 656 // kv_cache.element_size()
-        ), "kv_cache.shape[2] must be 656 bytes for fp8_ds_mla"
-        assert kv_c.element_size() == 2, "kv_c.element_size() must be 2 for fp8_ds_mla"
-        assert k_pe.element_size() == 2, "k_pe.element_size() must be 2 for fp8_ds_mla"
-        kunlun_fp8_ds_mla()
-    else:
-        assert kv_cache.shape[2] == kv_lora_rank + pe_dim
-        kunlun_mla()
-
-
-@dataclass
 class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetadata]):
     cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
@@ -591,7 +467,16 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         return metadata
 
 
-class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
+class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+    """Sparse MLA on Kunlun XPU.
+
+    vLLM split the MLA impl contract into ``forward_mha`` (prefill) and
+    ``forward_mqa`` (decode) and moved q/kv projection, RoPE, the weight
+    absorption (``W_UK_T`` / ``_v_up_proj``) and the output write into the
+    shared ``MLAAttention`` layer. Sparse impls only implement ``forward_mqa``:
+    the sparse kernels use the MQA 576/512 shape for prefill *and* decode, so
+    the layer routes every token here.
+    """
 
     def __init__(
         self,
@@ -606,27 +491,50 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         attn_type: str,
         kv_sharing_target_layer_name: Optional[str],
         # MLA Specific Arguments
-        topk_indice_buffer: Optional[torch.Tensor] = None,
+        topk_indices_buffer: Optional[torch.Tensor] = None,
         indexer: Optional["Indexer"] = None,
         **mla_args,
     ) -> None:
-        super().__init__(
-            num_heads,
-            head_size,
-            scale,
-            num_kv_heads,
-            alibi_slopes,
-            sliding_window,
-            kv_cache_dtype,
-            logits_soft_cap,
-            attn_type,
-            kv_sharing_target_layer_name,
-            **mla_args,
-        )
+        # No super().__init__(): AttentionImplBase.__new__ already sets the
+        # DCP/PCP attributes, and the MLA weight absorption this class used to
+        # inherit now lives in the attention layer.
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_lora_rank = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
-        assert indexer is not None
-        self.topk_indices_buffer = indexer.topk_indices_buffer
-        self.padding = 128 if current_platform.is_device_capability(100) else 64
+        # The indexer owns the shared buffer on selecting layers; the layer
+        # passes it explicitly for the skip-topk layers, whose indexer is never
+        # constructed (see models/deepseek_v2.py).
+        self.topk_indices_buffer = (
+            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
+        )
+        assert self.topk_indices_buffer is not None, (
+            "Sparse MLA needs the shared top-k indices buffer, from the "
+            "indexer or from the layer"
+        )
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        # Kunlun's _C::concat_and_cache_mla takes four tensors and no
+        # dtype/scale, so the base implementation's call signature does not fit.
+        if kv_cache.numel() == 0:
+            return
+        torch.ops._C.concat_and_cache_mla(
+            kv_c=kv_c_normed,
+            k_pe=k_pe.squeeze(1),
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping.flatten(),
+        )
 
     def _forward_bf16_kv(
         self,
@@ -746,68 +654,49 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
 
         return _attn_out
 
-    def forward(
+    def forward_mqa(
         self,
-        layer: AttentionLayer,
-        q: torch.Tensor,
-        k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
-        kv_cache: torch.Tensor,
+        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+        kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
-        output: Optional[torch.Tensor] = None,
-        output_scale: Optional[torch.Tensor] = None,
-        output_block_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
-        # MQA 576/512 approach for both prefill and decode
-
-        assert output is not None, "Output tensor must be provided."
-
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "fused output quantization is not yet supported" " for MLACommonImpl"
-            )
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # The layer hands over the absorbed query, either already concatenated
+        # or as (ql_nope, q_pe); the sparse kernels want the 576-wide form.
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
 
         if attn_metadata is None:
-            # The zero fill is required when used with DP + EP
-            # to ensure all ranks within a DP group compute the
-            # same expert outputs.
-            return output.fill_(0)
+            # Profiling run, matching MLACommonImpl and KunlunAttention:
+            # no metadata, no kernels. The output must still carry the
+            # normal path's (num_tokens, num_heads, kv_lora_rank) shape --
+            # q here is the absorbed query per token
+            # (num_tokens, num_heads, qk_nope + qk_rope), a layout
+            # downstream consumers never see on a real run.
+            return (
+                torch.empty(
+                    (q.shape[0], self.num_heads, self.kv_lora_rank),
+                    dtype=q.dtype,
+                    device=q.device,
+                ),
+                None,
+            )
 
+        # q may carry CUDA-graph / spec-decode padding rows the metadata does
+        # not describe: req_id_per_token and every per-token table below are
+        # num_actual_tokens long, so slice the query to match or the sparse
+        # kernels read padded rows against uninitialized topk indices.
         num_actual_toks = attn_metadata.num_actual_tokens
-
-        # Inputs and outputs may be padded for CUDA graphs
-
-        q = q[:num_actual_toks, ...]
-        k_c_normed = k_c_normed[:num_actual_toks, ...]
-        k_pe = k_pe[:num_actual_toks, ...]
-
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        ql_nope = ql_nope.transpose(0, 1)
-
+        q = q[:num_actual_toks]
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        q = torch.cat([ql_nope, q_pe], dim=-1)
-
-        if self.kv_cache_dtype != "fp8_ds_mla":
-            # write the latent and rope to kv cache
-            if kv_cache.numel() > 0:
-                torch.ops._C.concat_and_cache_mla(
-                    kv_c=k_c_normed,
-                    k_pe=k_pe.squeeze(1),
-                    kv_cache=kv_cache,
-                    slot_mapping=attn_metadata.slot_mapping.flatten(),
-                )
-            attn_out = self._forward_bf16_kv(q, kv_cache, topk_indices, attn_metadata)
-        else:
-            # attn_out = self._forward_fp8_kv(q, kv_cache, topk_indices_global,
-            #                                 attn_metadata)
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            # _forward_fp8_kv stays unreachable until fwd_kvcache_mla takes a
+            # uint8 kv cache.
             raise NotImplementedError("Only support --kv-cache-dtype bfloat16")
 
-        self._v_up_proj(attn_out, out=output[:num_actual_toks])
-        return output
+        attn_out = self._forward_bf16_kv(
+            q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+        )
+        # No lse: Kunlun's sparse kernels do not return one, and DCP is off.
+        return attn_out, None

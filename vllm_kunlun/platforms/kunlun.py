@@ -228,11 +228,19 @@ class KunlunPlatform(Platform):
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
             use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
-            )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            # vLLM 0.25.1 dropped the VLLM_ATTENTION_BACKEND env var; with no
+            # override present FlashMLA is the default. Same defensive getattr
+            # already used for VLLM_ALL2ALL_BACKEND below.
+            attention_backend = getattr(envs, "VLLM_ATTENTION_BACKEND", None)
+            use_flashmla = attention_backend in (None, "FLASHMLA")
+            # 0.25.1 moved this under vllm.v1.attention and renamed it for the
+            # dense/sparse split; keep the old path working on older installs.
+            try:
+                from vllm.v1.attention.ops.flashmla import (
+                    is_flashmla_dense_supported as is_flashmla_supported,
+                )
+            except ImportError:
+                from vllm.attention.ops.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
@@ -246,6 +254,36 @@ class KunlunPlatform(Platform):
                 logger.info(
                     "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
                 )
+
+            # vLLM picks the MLA prefill backend from a CUDA/ROCm-only priority
+            # list, so `MLAAttention.__init__` dies with "No valid MLA prefill
+            # backend found" on Kunlun. Sparse MLA never invokes a prefill
+            # backend, so point it at ours explicitly. Dense MLA must keep its
+            # existing selection: the Kunlun placeholder deliberately raises
+            # if it is called. The class itself is registered in every process
+            # by the plugin bootstrap, because this function only runs in the
+            # API server process while the registry override dict is per-process.
+            attention_config = getattr(vllm_config, "attention_config", None)
+            if (
+                use_sparse
+                and attention_config is not None
+                and getattr(attention_config, "mla_prefill_backend", None) is None
+            ):
+                try:
+                    from vllm.v1.attention.backends.mla.prefill.registry import (
+                        MLAPrefillBackendEnum,
+                    )
+                except ImportError:
+                    logger.debug(
+                        "MLA prefill registry unavailable; preserving vLLM's "
+                        "default sparse MLA selection."
+                    )
+                else:
+                    attention_config.mla_prefill_backend = MLAPrefillBackendEnum.CUSTOM
+                    logger.info(
+                        "Using the Kunlun MLA prefill backend placeholder "
+                        "(sparse MLA never calls it)."
+                    )
 
         from vllm.config import CUDAGraphMode
 

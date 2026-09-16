@@ -128,6 +128,44 @@ def _zero_block_ids(self, block_ids):
                         kv.select(block_dim, idx).zero_()
 
 
+def bind_kv_cache(
+    kv_caches,
+    forward_context,
+    runner_kv_caches,
+    num_attn_module: int = 1,
+) -> None:
+    """``vllm.v1.worker.utils.bind_kv_cache`` with the Kunlun platform allowed.
+
+    Upstream raises ``NotImplementedError`` when one layer index owns several
+    cache names, except on cuda-alike / xpu / cpu platforms.  Kunlun is none of
+    those, yet it runs the GPU runner, so upstream's own reasoning applies:
+    ``runner_kv_caches`` ordering does not matter there.
+
+    DSA models hit this on every layer -- ``self_attn.attn`` and
+    ``self_attn.indexer.k_cache`` share a layer index -- so without this
+    GLM-5.2 and DeepSeek-V3.2 die immediately after the KV cache is sized.
+    """
+    from collections import defaultdict
+
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    # vLLM normally constructs an empty list for this binding. Clearing in
+    # place preserves that behavior when callers reuse the list and makes this
+    # replacement safe to invoke more than once.
+    runner_kv_caches.clear()
+
+    index2name = defaultdict(list)
+    for layer_name in kv_caches:
+        index2name[extract_layer_index(layer_name, num_attn_module)].append(layer_name)
+
+    for layer_index in sorted(index2name.keys()):
+        for layer_name in index2name[layer_index]:
+            runner_kv_caches.append(kv_caches[layer_name])
+
+    for layer_name, kv_cache in kv_caches.items():
+        forward_context[layer_name].kv_cache = kv_cache
+
+
 # Idempotent monkey-patch: safe under fork() and re-import.
 if not getattr(_upstream_cls, "_kunlun_patched", False):
     _upstream_cls.init_meta = _init_meta

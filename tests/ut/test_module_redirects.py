@@ -13,10 +13,14 @@ class TestMappingTable:
             assert upstream.startswith("vllm.")
             assert replacement.startswith("vllm_kunlun.")
 
-    def test_no_replacement_is_reused(self):
-        replacements = list(module_redirects.MODULE_MAPPINGS.values())
+    def test_maps_legacy_and_v1_merge_attention_imports(self):
+        legacy = "vllm.attention.ops.merge_attn_states"
+        v1 = "vllm.v1.attention.ops.merge_attn_states"
 
-        assert len(set(replacements)) == len(replacements)
+        assert (
+            module_redirects.MODULE_MAPPINGS[legacy]
+            == module_redirects.MODULE_MAPPINGS[v1]
+        )
 
 
 class TestPreloadMapped:

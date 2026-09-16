@@ -4,13 +4,15 @@
 platform discovery, before the import dispatcher in ``import_hooks`` takes
 over.  Each public function is one self-contained startup stage:
 
-1. ``stub_vllm_cuda_extensions()``: keep vLLM's CUDA extension imports from
+1. ``repair_glm_moe_dsa_head_dims()``: correct GLM-5.2 configuration aliases
+   before any vLLM startup dependency can load a model config.
+2. ``stub_vllm_cuda_extensions()``: keep vLLM's CUDA extension imports from
    failing on a machine without CUDA.
-2. ``register_custom_ops()``: register Kunlun operators with torch early.
-3. ``load_spec_decode_compat()``: optional speculative-decoding patches.
-4. ``register_weak_ref_tensor()``: alias the ``_C`` operator vLLM hardcodes.
-5. ``load_schema_helpers()``: patch vLLM's custom-op schema registration.
-6. ``patch_memory_info()``: fill in a torch API missing from torch_xmlir.
+3. ``register_custom_ops()``: register Kunlun operators with torch early.
+4. ``load_spec_decode_compat()``: optional speculative-decoding patches.
+5. ``register_weak_ref_tensor()``: alias the ``_C`` operator vLLM hardcodes.
+6. ``load_schema_helpers()``: patch vLLM's custom-op schema registration.
+7. ``patch_memory_info()``: fill in a torch API missing from torch_xmlir.
 
 Failure policy differs by stage on purpose: operator registration and the
 memory-info patch are load-bearing and re-raise, while the optional stages
@@ -236,3 +238,44 @@ def patch_memory_info(logger: logging.Logger) -> None:
 
     torch.accelerator.get_memory_info = _kunlun_get_memory_info
     logger.info("[KunlunPlugin] patched torch.accelerator.get_memory_info")
+
+
+def repair_glm_moe_dsa_head_dims(logger: logging.Logger) -> None:
+    """Drop the ``head_dim`` -> ``qk_rope_head_dim`` alias on GlmMoeDsaConfig.
+
+    ``GlmMoeDsaConfig.attribute_map`` aliases ``head_dim`` onto
+    ``qk_rope_head_dim``, and GLM-5.2's config.json carries both
+    ``head_dim: 192`` and ``qk_rope_head_dim: 64``.  The alias wins, so the
+    loaded config reports ``qk_rope_head_dim=192`` and derives
+    ``qk_head_dim=384``.  The checkpoint disagrees: for GLM-5.2-W8A8-INT8
+    ``kv_a_proj_with_mqa.weight`` is ``[576, 6144]`` = kv_lora_rank(512) + 64,
+    ``q_b_proj.weight`` is ``[16384, 2048]`` = 64 heads * (192 + 64), and
+    ``kv_b_proj.weight`` is ``[28672, 512]`` = 64 * (192 + 256).  So the real
+    split is 192 + 64 and the alias is what is wrong.
+
+    This has to run before any config is loaded, not inside the model file:
+    MLA's KV-cache head size is ``kv_lora_rank + qk_rope_head_dim`` and is
+    computed while ``ModelConfig`` is built, long before the model is imported.
+
+    Removing the alias leaves ``head_dim`` as a plain attribute, which nothing
+    on the MLA path reads.  Absent transformers, or a transformers without this
+    model, there is nothing to repair.
+    """
+    try:
+        from transformers.models.glm_moe_dsa.configuration_glm_moe_dsa import (
+            GlmMoeDsaConfig,
+        )
+    except Exception as error:
+        logger.debug("[KunlunPlugin] GlmMoeDsaConfig unavailable: %s", error)
+        return
+
+    alias_map = getattr(GlmMoeDsaConfig, "attribute_map", None)
+    if not alias_map or alias_map.get("head_dim") != "qk_rope_head_dim":
+        return
+    GlmMoeDsaConfig.attribute_map = {
+        key: value for key, value in alias_map.items() if key != "head_dim"
+    }
+    logger.info(
+        "[KunlunPlugin] dropped GlmMoeDsaConfig head_dim alias so "
+        "qk_rope_head_dim matches the checkpoint"
+    )
