@@ -870,7 +870,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             k_perchannel_scale=None,
             v_perchannel_scale=None,
             smooth=None,
-            context_seq_lod_cpu=prefill.query_start_loc.cpu(),
+            context_seq_lod_cpu=prefill.query_start_loc_cpu,
             context_seq_lod_xpu=prefill.query_start_loc,
             slot_mapping_cpu=None,
             slot_mapping_xpu=None,
