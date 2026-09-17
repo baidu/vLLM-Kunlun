@@ -271,7 +271,21 @@ def causal_conv1d_update(
             # One index per fed row: a short index tensor would make the kernel
             # read past the scratch instead of past the paged cache.
             sel = torch.cat([sel, sel.new_zeros(x.shape[0] - sel.numel())])
-        scratch = native.index_select(0, sel)
+        # index_select/index_copy_ on the pool-strided conv_state copy the whole
+        # paged cache on XPU (O(num_slots)); gather/scatter the contiguous per-slot
+        # page rows instead so the cost is O(len(sel)).
+        n = native.shape[0]
+        row_elems = native.stride(0)
+        s1, s2 = native.stride(1), native.stride(2)
+        rows = native.as_strided((n, row_elems), (row_elems, 1))
+        sel_rows = rows.index_select(0, sel)
+        # carve the conv slot (contiguous within a row) and hand the kernel a dense
+        # copy -- byte-for-byte identical to the old native.index_select.
+        sel_conv = sel_rows.as_strided(
+            (sel.numel(), native.shape[1], native.shape[2]),
+            (row_elems, s1, s2),
+        )
+        scratch = sel_conv.contiguous()
         packed = scratch if conv_state.stride(-1) == 1 else scratch.transpose(-1, -2)
         kunlun_ops.causal_conv1d_update(
             buf.unsqueeze(-1),
@@ -286,7 +300,10 @@ def causal_conv1d_update(
             is_ncw=True,
             pad_slot_id=-1,
         )
-        native.index_copy_(0, sel, scratch)
+        # write the updated conv bytes back and scatter whole rows (recurrent
+        # bytes in each row are round-tripped unchanged).
+        sel_conv.copy_(scratch)
+        rows.index_copy_(0, sel, sel_rows)
         return buf
 
     kunlun_ops.causal_conv1d_update(
