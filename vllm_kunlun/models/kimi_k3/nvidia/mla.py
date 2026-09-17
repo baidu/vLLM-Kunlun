@@ -382,9 +382,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
         # (L, N, V) -> (N, L, V)
-        replace_parameter(self, "W_UV", W_UV.transpose(0, 1), prefer_copy=True)
+        replace_parameter(self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True)
         # (L, N, P) -> (N, P, L)
-        replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0), prefer_copy=True)
+        replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True)
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)
