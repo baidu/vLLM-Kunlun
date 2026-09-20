@@ -4,16 +4,22 @@
 
 All of the module's pure-Python machinery (``UvaBufferPool``,
 ``UvaBackedTensor``, dataclasses, constants) is left alone. Only the two Triton
-kernel launch sites are overridden with torch-native equivalents:
+kernel launch sites are overridden:
 
 * ``StagedWriteTensor.apply_write`` — applies staged row/segment writes to a
-  device tensor. Replaces ``_apply_write_kernel``.
+  device tensor. Replaces ``_apply_write_kernel`` with the Kunlun native op
+  ``torch.ops.xspeedgate_ops.apply_write``. The native op takes the same
+  ``(indices, starts, contents, cu_lens)`` staging layout the upstream kernel
+  does; the only adaptation is that it requires a 2-D ``output``, so 1-D buffers
+  (``total_len``, ``num_computed_tokens``) are passed through an ``[N, 1]`` view
+  (``stride(0) == 1``), which reproduces the kernel's flat
+  ``row * stride(0) + start`` addressing exactly.
 * ``FusedStagedWriter.apply`` — upstream fuses writes across several tensors
   through raw pointers. Kunlun never calls it because the Kunlun
   ``BlockTables.apply_staged_writes`` override loops ``apply_write`` per group
-  instead (raw-pointer fan-out is not expressible in torch-native). It is
-  overridden here to raise, so an accidental caller fails loudly rather than
-  launching an uncompilable Triton kernel.
+  instead (the native ``apply_write`` is single-group only). It is overridden
+  here to raise, so an accidental caller fails loudly rather than launching an
+  uncompilable Triton kernel.
 
 UVA handling: upstream ``UvaBuffer`` hard-raises when ``is_uva_available()`` is
 False. Kunlun XPU presents as CUDA (``torch_xmlir``); when UVA is available the
@@ -29,40 +35,41 @@ import logging
 import torch
 import vllm.v1.worker.gpu.buffer_utils as _up
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    async_tensor_h2d,
+    get_accelerator_view_from_cpu_tensor,
+)
 
 logger = logging.getLogger("vllm_kunlun")
 
 
 def _apply_write(self) -> None:
-    """torch-native replacement of ``StagedWriteTensor.apply_write``.
+    """Native-op replacement of ``StagedWriteTensor.apply_write``.
 
-    For each staged write ``i`` the upstream Triton kernel writes
-    ``contents[cu_start:cu_end]`` into the flat device buffer at offset
-    ``indices[i] * gpu.stride(0) + starts[i]``. This reproduces it with slice
-    assignments on ``self.gpu`` (contiguous, so a flattened view + linear
-    offset matches the kernel's pointer arithmetic exactly).
+    For each staged write ``p`` the upstream Triton kernel writes
+    ``contents[cu_start:cu_end]`` into the device buffer at row
+    ``indices[p]``, column ``starts[p]``. The native op takes exactly the same
+    staging arrays -- built here the same way upstream ``apply_write`` builds
+    them (``copy_to_uva`` for the int32 metadata, ``async_tensor_h2d`` for the
+    contents) -- and requires a 2-D ``output``. 1-D buffers are viewed as
+    ``[N, 1]`` (contiguous, so ``stride(0) == 1``), which makes the op's
+    ``row * stride(0) + start`` arithmetic match the kernel's flat addressing.
     """
     n = len(self._staged_write_indices)
     if n == 0:
         return
 
-    flat = self.gpu.view(-1)
-    stride0 = self.gpu.stride(0)
-    contents = torch.tensor(
-        self._staged_write_contents, dtype=self.dtype, device=self.device
+    indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
+    starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
+    cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+    write_contents = async_tensor_h2d(
+        self._staged_write_contents, device=self.device, dtype=self.dtype
     )
 
-    cu_start = 0
-    for i in range(n):
-        cu_end = self._staged_write_cu_lens[i]
-        length = cu_end - cu_start
-        if length > 0:
-            base = (
-                self._staged_write_indices[i] * stride0 + self._staged_write_starts[i]
-            )
-            flat[base : base + length] = contents[cu_start:cu_end]
-        cu_start = cu_end
+    out = self.gpu if self.gpu.dim() == 2 else self.gpu.view(self.gpu.shape[0], -1)
+    torch.ops.xspeedgate_ops.apply_write(
+        out, indices_uva, starts_uva, write_contents, cu_lens_uva
+    )
 
     self.clear_staged_writes()
 
