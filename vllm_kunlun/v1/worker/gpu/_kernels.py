@@ -1,10 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""torch-native stand-ins for the V2 model-runner Triton kernels.
+"""torch-native transcriptions of the V2 model-runner Triton kernels.
 
-Deliberately depends on ``torch`` only -- no ``vllm``, no ``kunlun_ops`` -- so
-these can be unit-tested on CPU without XPU hardware. Each function documents
-the upstream kernel it mirrors and any intentional semantic divergence.
+These began as the Kunlun stand-ins on the live path. They have since been
+superseded there by Kunlun native ops:
+
+* ``post_update``            -> ``xspeedgate_ops.post_update``
+                                (installed in ``gpu/input_batch.py``)
+* ``scatter_num_accepted``   -> ``xspeedgate_ops.scatter_num_accepted_kernel``
+                                (installed in ``model_states/mamba_hybrid.py``)
+* ``prepare_rope_positions`` -> ``xspeedgate_ops.prepare_rope_positions``
+                                (installed in ``gpu/mm/rope.py``)
+
+They are kept here as the **CPU parity oracle** for the native ops: each is a
+vectorised, sync-free torch transcription of the upstream Triton kernel, and
+``tests/ut/test_mrv2_kernels.py`` checks them against a straight
+loop-transcription of that kernel. Because they depend on ``torch`` only -- no
+``vllm``, no ``kunlun_ops``, no ``xspeedgate_ops`` -- the tests run on CPU
+without XPU hardware, which the native ops cannot. ``TorchKernel`` is still
+imported live (it wraps ``scatter_num_accepted``'s native replacement so the
+kernel-object launch site in ``mamba_hybrid`` is left untouched).
+
+Each function documents the upstream kernel it mirrors and any intentional
+semantic divergence.
 """
 
 import torch
