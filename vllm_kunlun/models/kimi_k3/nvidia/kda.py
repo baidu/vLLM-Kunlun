@@ -562,7 +562,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        run_gemm_rs: bool = False,
     ) -> None:
+        # KDA (linear/delta attention) has no down-proj GEMM-RS fusion path;
+        # accept the arg passed by the base model to stay signature-compatible.
         super().__init__(config, vllm_config, prefix)
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]

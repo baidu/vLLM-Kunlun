@@ -123,6 +123,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         aux_stream: torch.cuda.Stream | None = None,
         use_rope: bool = False,
         non_causal_multi_token_decode: bool = False,
+        run_gemm_rs: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
