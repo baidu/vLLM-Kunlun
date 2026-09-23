@@ -812,6 +812,148 @@ _register_post_import_hook(
 )
 
 
+
+# --- hooks: Model Runner V2 Triton kernels -> xspeedgate_ops ----------------
+# The MRV2 worker path launches a Triton kernel at each of these sites, and
+# Kunlun XPU cannot JIT-compile Triton kernels. Each site is replaced by its
+# xspeedgate_ops equivalent. There is one hook per upstream module on purpose:
+# the replacement must be in place before any importer binds the name via
+# ``from <module> import <fn>``, and the dispatcher runs right after a module
+# is imported -- i.e. before its dependents import from it.
+def _mrv2_resolve(mod, names):
+    """Resolve ``names`` (optionally ``Class.attr``) to ``[(owner, attr), ...]``.
+
+    Returns ``None`` if any owning class is not defined yet. The dispatcher runs
+    after *every* import, including the one that is still executing the target
+    module's body, so a class defined further down the file is legitimately
+    missing at that point -- treat it as "not applied yet" and retry on the next
+    import instead of raising.
+    """
+    resolved = []
+    for name in names:
+        owner_name, _, attr = name.rpartition(".")
+        owner = getattr(mod, owner_name, None) if owner_name else mod
+        if owner is None:
+            return None
+        resolved.append((owner, attr or name))
+    return resolved
+
+
+def _mrv2_applied(mod, names):
+    resolved = _mrv2_resolve(mod, names)
+    if resolved is None:
+        return False
+    return all(
+        getattr(getattr(owner, attr, None), "_kunlun_patched", False)
+        for owner, attr in resolved
+    )
+
+
+def _mrv2_apply(mod, names, plugin_module):
+    resolved = _mrv2_resolve(mod, names)
+    if resolved is None:
+        return
+    impl = importlib.import_module(plugin_module)
+    for owner, attr in resolved:
+        setattr(owner, attr, getattr(impl, attr))
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched %s: %s -> xspeedgate_ops",
+        mod.__name__,
+        ", ".join(names),
+    )
+
+
+def _mrv2_hook(target, names, plugin_module):
+    _register_post_import_hook(
+        target,
+        lambda mod: _mrv2_applied(mod, names),
+        lambda mod: _mrv2_apply(mod, names, plugin_module),
+    )
+
+
+_mrv2_hook(
+    "vllm.v1.worker.gpu.metrics.logits",
+    ("get_num_nans",),
+    "vllm_kunlun.v1.worker.gpu.metrics.logits",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.min_p",
+    ("apply_min_p",),
+    "vllm_kunlun.v1.worker.gpu.sample.min_p",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.prompt_logprob",
+    ("get_prompt_logprobs_token_ids",),
+    "vllm_kunlun.v1.worker.gpu.sample.prompt_logprob",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.bad_words",
+    ("apply_bad_words",),
+    "vllm_kunlun.v1.worker.gpu.sample.bad_words",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.logit_bias",
+    ("apply_logit_bias",),
+    "vllm_kunlun.v1.worker.gpu.sample.logit_bias",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.penalties",
+    ("apply_penalties", "bincount"),
+    "vllm_kunlun.v1.worker.gpu.sample.penalties",
+)
+_mrv2_hook(
+    "vllm.utils.torch_utils",
+    ("get_accelerator_view_from_cpu_tensor",),
+    "vllm_kunlun.utils.torch_utils",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.buffer_utils",
+    ("UvaBufferPool.copy_to_uva", "StagedWriteTensor.apply_write"),
+    "vllm_kunlun.v1.worker.gpu.buffer_utils",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.gumbel",
+    ("apply_temperature", "gumbel_sample"),
+    "vllm_kunlun.v1.worker.gpu.sample.gumbel",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.sample.logprob",
+    ("compute_token_logprobs", "compute_topk_scores"),
+    "vllm_kunlun.v1.worker.gpu.sample.logprob",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.input_batch",
+    (
+        "prepare_prefill_inputs",
+        "prepare_pos_seq_lens",
+        "combine_sampled_and_draft_tokens",
+        "get_num_sampled_and_rejected",
+        "post_update",
+        "post_update_num_computed_tokens",
+        "expand_idx_mapping",
+    ),
+    "vllm_kunlun.v1.worker.gpu.input_batch",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.block_table",
+    (
+        "BlockTables.apply_staged_writes",
+        "BlockTables.gather_block_tables",
+        "BlockTables.compute_slot_mappings",
+    ),
+    "vllm_kunlun.v1.worker.gpu.block_table",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.structured_outputs",
+    ("StructuredOutputsWorker.apply_grammar_bitmask",),
+    "vllm_kunlun.v1.worker.gpu.structured_outputs",
+)
+_mrv2_hook(
+    "vllm.v1.worker.gpu.model_states.mamba_hybrid",
+    ("MambaHybridModelState.postprocess_state",),
+    "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
+)
+
 def register():
     """Register the Kunlun platform"""
 

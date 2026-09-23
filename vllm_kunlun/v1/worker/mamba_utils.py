@@ -76,7 +76,54 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 
 @dataclasses.dataclass
 class MambaSpecDecodeGPUContext:
-    pass
+    """Stub for the GPU spec-decode / ``mamba_cache_mode == "align"`` path.
+
+    This path is not implemented on Kunlun XPU. It is only reached when prefix
+    caching is enabled (which flips ``mamba_cache_mode`` to ``"align"``). The
+    class stays importable so ``mamba_hybrid`` loads under the non-align config
+    (``--no-enable-prefix-caching`` => ``mamba_cache_mode == "none"``); calling
+    into it fails loudly rather than silently producing wrong state.
+    """
+
+    @classmethod
+    def create(cls, *args, **kwargs) -> "MambaSpecDecodeGPUContext":
+        raise NotImplementedError(
+            "mamba_cache_mode='align' (GPU spec-decode align path) is not "
+            "implemented on Kunlun XPU. Run with --no-enable-prefix-caching so "
+            "mamba_cache_mode stays 'none'."
+        )
+
+
+class _UnsupportedTritonKernel:
+    """Importable placeholder for a Triton kernel that Kunlun does not run.
+
+    Mimics the ``kernel[grid](...)`` launch interface so any accidental use
+    fails with a clear message instead of an obscure ``TypeError``.
+    """
+
+    def __init__(self, name: str, reason: str):
+        self._name = name
+        self._reason = reason
+
+    def _fail(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"{self._name} is not supported on Kunlun XPU: {self._reason}"
+        )
+
+    def __getitem__(self, grid):
+        return self._fail
+
+    __call__ = _fail
+
+
+# Only invoked on the ``mamba_cache_mode == "align"`` path (prefix caching on),
+# which is unimplemented on Kunlun; kept importable for `mamba_hybrid`.
+preprocess_mamba_align_fused_kernel = _UnsupportedTritonKernel(
+    "preprocess_mamba_align_fused_kernel",
+    "mamba_cache_mode='align' GPU align preprocess is unimplemented; "
+    "run with --no-enable-prefix-caching so mamba_cache_mode stays 'none'.",
+)
+
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
