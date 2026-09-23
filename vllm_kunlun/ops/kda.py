@@ -226,11 +226,9 @@ def causal_conv1d_update(
 
     # In-place kernel, so run it on the caller's output buffer (or a copy) and
     # leave x untouched.
-    # buf = out if out is not None else torch.empty_like(x)
-    # buf = torch.empty_like(x)
-    buf = x
-    # if buf.data_ptr() != x.data_ptr():
-    #     buf.copy_(x)
+    buf = out if out is not None else torch.empty_like(x)
+    if buf.data_ptr() != x.data_ptr():
+        buf.copy_(x)
 
     # K3 keeps conv1d weights in fp32; the 20260818 kernel accumulates in fp32
     # and matches an fp64 reference to ~5e-4 that way, an order of magnitude

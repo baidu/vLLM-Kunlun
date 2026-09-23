@@ -992,7 +992,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 decode_conv_indices = non_spec_state_indices_tensor[
                     : mixed_qkv_ns.size(0)
                 ]
-                # packed_conv_out = torch.empty_like(mixed_qkv_ns)
+                packed_conv_out = torch.empty_like(mixed_qkv_ns)
                 mixed_qkv_ns = causal_conv1d_update(
                     mixed_qkv_ns,
                     conv_state,
@@ -1001,7 +1001,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     activation="silu",
                     conv_state_indices=decode_conv_indices,
                     validate_data=True,
-                    # out=packed_conv_out,
+                    out=packed_conv_out,
                 )
                 (
                     core_attn_out_non_spec,
