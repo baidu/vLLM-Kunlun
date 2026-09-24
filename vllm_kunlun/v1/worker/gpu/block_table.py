@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kunlun-specific replacements for ``vllm.v1.worker.gpu.block_table``.
 
-``BlockTables.apply_staged_writes``, ``gather_block_tables`` and
-``compute_slot_mappings`` launch Triton kernels upstream. Kunlun XPU cannot
-JIT-compile Triton kernels, so each is replaced by its xspeedgate_ops
-equivalent.
+``BlockTables.gather_block_tables`` and ``compute_slot_mappings`` launch Triton
+kernels upstream. Kunlun XPU cannot JIT-compile Triton kernels, so each is
+replaced by its xspeedgate_ops equivalent.
+
+``BlockTables.apply_staged_writes`` is **not** replaced: with the fused
+multi-group ``xspeedgate_ops.apply_write`` available, the upstream body works
+verbatim -- its single-group branch lands in ``StagedWriteTensor.apply_write``
+and its multi-group branch in ``FusedStagedWriter.apply``, both of which the
+``buffer_utils`` overlay redirects to the op.
 
 Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` flag.
 """
@@ -17,16 +22,6 @@ import torch
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 
 logger = logging.getLogger("vllm_kunlun")
-
-
-def apply_staged_writes(self) -> None:
-    if self.num_kv_cache_groups == 0:
-        return
-    # Per-group writes: there is no fused multi-group native op, and each
-    # group's staged writes are independent.
-    for block_table in self.block_tables:
-        block_table.apply_write()
-    self.num_blocks.copy_to_uva()
 
 
 def gather_block_tables(
@@ -80,6 +75,5 @@ def compute_slot_mappings(
     return slot_mappings[:, :num_tokens_padded]
 
 
-apply_staged_writes._kunlun_patched = True
 gather_block_tables._kunlun_patched = True
 compute_slot_mappings._kunlun_patched = True

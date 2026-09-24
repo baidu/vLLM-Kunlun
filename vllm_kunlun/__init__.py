@@ -908,7 +908,11 @@ _mrv2_hook(
 )
 _mrv2_hook(
     "vllm.v1.worker.gpu.buffer_utils",
-    ("UvaBufferPool.copy_to_uva", "StagedWriteTensor.apply_write"),
+    (
+        "UvaBufferPool.copy_to_uva",
+        "StagedWriteTensor.apply_write",
+        "FusedStagedWriter.apply",
+    ),
     "vllm_kunlun.v1.worker.gpu.buffer_utils",
 )
 _mrv2_hook(
@@ -937,7 +941,6 @@ _mrv2_hook(
 _mrv2_hook(
     "vllm.v1.worker.gpu.block_table",
     (
-        "BlockTables.apply_staged_writes",
         "BlockTables.gather_block_tables",
         "BlockTables.compute_slot_mappings",
     ),

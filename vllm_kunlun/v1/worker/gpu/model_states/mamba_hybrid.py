@@ -6,10 +6,10 @@
 ``_scatter_num_accepted_kernel`` / ``_fill_num_accepted_kernel`` upstream.
 Kunlun XPU cannot JIT-compile Triton kernels:
 
-  * the scatter path (``num_sampled`` is a tensor) is replaced by its
-    xspeedgate_ops equivalent;
-  * the fill path (``num_sampled`` is an int) has no op and keeps the torch
-    implementation, carried here as ``_fill_num_accepted_torch``.
+  * the scatter path (``num_sampled`` is a tensor) maps to
+    ``xspeedgate_ops.scatter_num_accepted_kernel``;
+  * the fill path (``num_sampled`` is an int) maps to
+    ``xspeedgate_ops.fill_num_accepted``.
 
 ``preprocess_state`` and the align branch of ``postprocess_state``
     Prefix caching forces ``mamba_cache_mode == "align"``, and upstream runs that
@@ -51,23 +51,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.v1.kv_cache_interface import MambaSpec
 
 logger = logging.getLogger("vllm_kunlun")
-
-
-def _fill_num_accepted_torch(
-    idx_mapping: torch.Tensor,
-    num_accepted: torch.Tensor,
-    num_sampled: int,
-) -> None:
-    """Pure-torch replacement for `_fill_num_accepted_kernel`.
-
-    For each batch row: `num_accepted[idx_mapping[row]] = num_sampled`, skipping
-    rows whose idx_mapping entry is a negative (-1) sentinel.
-    """
-    valid = idx_mapping >= 0
-    if not bool(valid.any()):
-        return
-    idx = idx_mapping[valid].to(torch.int64)
-    num_accepted.index_fill_(0, idx, num_sampled)
 
 
 class _AlignGroup(NamedTuple):
@@ -386,9 +369,10 @@ def postprocess_state(
             idx_mapping, num_sampled, self.num_accepted_tokens_gpu
         )
     else:
-        # Fill with single value.
-        _fill_num_accepted_torch(
-            idx_mapping, self.num_accepted_tokens_gpu, max(num_sampled, 1)
+        # Fill with single value. The op does not clamp, so clamp here exactly
+        # like the Triton kernel's caller upstream.
+        torch.ops.xspeedgate_ops.fill_num_accepted(
+            idx_mapping, max(num_sampled, 1), self.num_accepted_tokens_gpu
         )
 
     # Align: save the running state to the block-aligned position when
