@@ -1,25 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun torch-native overrides for ``vllm.v1.worker.gpu.sample.logprob``.
+"""Kunlun native-op overrides for ``vllm.v1.worker.gpu.sample.logprob``.
 
-Leaves the upstream ``LogprobTokenIdsState`` alone and reimplements the logprob
-computation (log-softmax gather + selected-token ranks) with torch ops. The
-custom per-request ``logprob_token_ids`` path is reimplemented with a small
-per-row loop.
+Reimplements selected-token log-softmax and rank calculation on
+``torch.ops.xspeedgate_ops.compute_token_logprobs`` / ``.ranks_kernel``. Both
+native ops require float32 logits, so ``compute_topk_logprobs`` creates one FP32
+view and shares it across top-k, logprob and rank work.
+
+For requests with custom ``logprob_token_ids``, the installed wheel provides
+``fill_logprob_token_ids``. Using it keeps the wrapper thin and avoids the
+per-row ``.tolist()`` synchronization in the old torch stand-in. Empty batches
+are handled before native dispatch, and invalid padded columns are masked to
+``-inf`` exactly as upstream requires.
 """
+
+import logging
 
 import torch
 import vllm.v1.worker.gpu.sample.logprob as _up
 from vllm.v1.outputs import LogprobsTensors
 
+logger = logging.getLogger("vllm_kunlun")
+
 
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
-    token_ids = token_ids.to(torch.int64)
-    lf = logits.to(torch.float32)
-    log_probs = lf - torch.logsumexp(lf, dim=-1, keepdim=True)
-    return torch.gather(log_probs, 1, token_ids)
+    if logits.shape[0] == 0:
+        return token_ids.new_empty(token_ids.shape, dtype=torch.float32)
+    return torch.ops.xspeedgate_ops.compute_token_logprobs(
+        logits.to(torch.float32), token_ids.to(torch.int64).contiguous()
+    )
 
 
 def compute_topk_logprobs(
@@ -32,50 +43,43 @@ def compute_topk_logprobs(
     max_per_req_token_ids: int = 0,
 ) -> LogprobsTensors:
     assert num_logprobs >= 0
-    batch_size, vocab_size = logits.shape
+    # Raw model logits may be FP16/BF16; both native logprobs and ranks
+    # require FP32. Share the conversion without changing the caller's logits.
     lf = logits.to(torch.float32)
-
+    batch_size = logits.shape[0]
     if max_per_req_token_ids == 0:
         logprob_token_ids = sampled_token_ids.unsqueeze(-1)
         if num_logprobs > 0:
-            topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
+            topk_indices = torch.topk(lf, num_logprobs, dim=-1).indices
             logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
-        logprobs = compute_token_logprobs(logits, logprob_token_ids)
+        logprobs = compute_token_logprobs(lf, logprob_token_ids)
     else:
         assert logprob_token_ids_state is not None
         assert expanded_idx_mapping is not None
         num_cols = max(num_logprobs, max_per_req_token_ids)
-        logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
-        valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
-        logprob_token_ids[:, 0] = sampled_token_ids
-        valid_mask[:, 0] = True
-
-        topk_token_ids = None
-        if num_logprobs > 0:
-            topk_token_ids = torch.topk(logits, num_logprobs, dim=-1).indices
-
-        idx = expanded_idx_mapping.to(torch.long)
-        num_custom = logprob_token_ids_state.num_token_ids.gpu[idx].tolist()
-        per_req = logprob_token_ids_state.token_ids.gpu
-        for b in range(batch_size):
-            nc = num_custom[b]
-            if nc > 0:
-                logprob_token_ids[b, 1 : 1 + nc] = per_req[idx[b], :nc].to(
-                    logprob_token_ids.dtype
-                )
-                valid_mask[b, 1 : 1 + nc] = True
-            elif num_logprobs > 0:
-                logprob_token_ids[b, 1 : 1 + num_logprobs] = topk_token_ids[b].to(
-                    logprob_token_ids.dtype
-                )
-                valid_mask[b, 1 : 1 + num_logprobs] = True
-        logprobs = compute_token_logprobs(logits, logprob_token_ids)
-        logprobs = logprobs.masked_fill(~valid_mask, float("-inf"))
-
-    # Selected-token ranks: count logits >= the sampled token's logit.
-    x = torch.gather(lf, 1, sampled_token_ids.view(-1, 1).to(torch.int64))
-    token_ranks = (lf >= x).sum(dim=-1).to(torch.int64)
-
+        topk_token_ids = torch.topk(lf, num_logprobs, dim=-1).indices.to(torch.int32)
+        if batch_size == 0:
+            logprob_token_ids = sampled_token_ids.new_empty((0, 1 + num_cols))
+            logprobs = logits.new_empty((0, 1 + num_cols), dtype=torch.float32)
+        else:
+            (
+                logprob_token_ids,
+                valid_mask,
+            ) = torch.ops.xspeedgate_ops.fill_logprob_token_ids(
+                sampled_token_ids,
+                topk_token_ids,
+                expanded_idx_mapping,
+                logprob_token_ids_state.num_token_ids.gpu,
+                logprob_token_ids_state.token_ids.gpu,
+                num_logprobs,
+                num_cols,
+            )
+            logprobs = compute_token_logprobs(lf, logprob_token_ids)
+            logprobs.masked_fill_(~valid_mask, float("-inf"))
+    if batch_size == 0:
+        token_ranks = sampled_token_ids.new_empty((0,))
+    else:
+        token_ranks = torch.ops.xspeedgate_ops.ranks_kernel(lf, sampled_token_ids)
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
         logprobs=logprobs,
@@ -84,8 +88,8 @@ def compute_topk_logprobs(
     )
 
 
-# Install into the upstream module's globals, so both its own code and the
-# consumers that bind these names on import (sample/sampler.py,
-# sample/prompt_logprob.py, spec_decode/rejection_sampler.py) get them.
+# Install into the upstream module's globals before the sampler, prompt-logprob
+# worker and rejection sampler bind these functions.
 _up.compute_token_logprobs = compute_token_logprobs
 _up.compute_topk_logprobs = compute_topk_logprobs
+logger.info("[KunlunPlugin] V2 logprob patched (xspeedgate_ops native)")
