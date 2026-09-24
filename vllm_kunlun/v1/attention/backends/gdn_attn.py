@@ -61,7 +61,8 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
-    # [Kunlun] CPU mirror — consumed as cache_indices_cpu / conv_state_indices_cpu
+    # [Kunlun] Prefill-only mirror, consumed by causal_conv1d_fn.
+    # The current decode causal_conv1d_update ABI consumes device indices only.
     non_spec_state_indices_tensor_cpu: torch.Tensor | None = None
 
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
@@ -437,7 +438,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
             )
-            non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
+            # fill_ with a device scalar extracts its value on the host. The
+            # matching CPU query boundaries are already available here.
+            non_spec_num_query_tokens = int(non_spec_query_start_loc_cpu[-1])
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
@@ -462,7 +465,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_tensor_cpu=(
                 non_spec_state_indices_tensor.cpu()
-                if non_spec_state_indices_tensor is not None
+                if num_prefills > 0 and non_spec_state_indices_tensor is not None
                 else None
             ),
             spec_sequence_masks=spec_sequence_masks,

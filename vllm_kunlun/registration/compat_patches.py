@@ -38,7 +38,7 @@ from types import ModuleType
 
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
-# Kunlun swaps the V2 Triton kernels for torch-native / kunlun_ops equivalents
+# Kunlun swaps the V2 Triton kernels for torch-native / XSpeedGate / kunlun_ops equivalents
 # (the ``vllm.v1.worker.gpu.*`` patches below), and ``vllm.config.vllm`` reads
 # ``HAS_TRITON`` only to veto V2, so forcing it True has no other side effect.
 # It has to be a post-import patch: ``check_and_update_config`` runs only from
@@ -65,8 +65,6 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     @functools.wraps(orig_unsupported)
     def _kunlun_mrv2_unsupported_features(self) -> list[str]:
         # These paths still depend on unsupported Triton kernels.
-        import vllm.envs as envs
-
         unsupported = orig_unsupported(self)
 
         if self.speculative_config is not None:
@@ -78,20 +76,6 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
         if self.parallel_config.decode_context_parallel_size > 1:
             unsupported.append(
                 "decode context parallelism (not replaced on Kunlun XPU P800)"
-            )
-
-        if (
-            self.cache_config is not None
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            unsupported.append(
-                "mamba align cache mode (its Triton launch sites are not "
-                "replaced on Kunlun XPU P800)"
-            )
-
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            unsupported.append(
-                "VLLM_COMPUTE_NANS_IN_LOGITS (not replaced on Kunlun XPU P800)"
             )
 
         return unsupported
@@ -528,6 +512,11 @@ def _v2_hook(kunlun_module: str, *paths: str):
 # kernels are left alone and the V2 spec-decode path stays unsupported.
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
+        "vllm.v1.worker.gpu.metrics.logits",
+        "vllm_kunlun.v1.worker.gpu.metrics.logits",
+        ("get_num_nans",),
+    ),
+    (
         "vllm.v1.worker.gpu.buffer_utils",
         "vllm_kunlun.v1.worker.gpu.buffer_utils",
         ("StagedWriteTensor.apply_write", "FusedStagedWriter.apply"),
@@ -558,6 +547,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "vllm.v1.worker.gpu.structured_outputs",
         "vllm_kunlun.v1.worker.gpu.structured_outputs",
         ("StructuredOutputsWorker.apply_grammar_bitmask",),
+    ),
+    (
+        "vllm.v1.worker.gpu.sample.sampler",
+        "vllm_kunlun.v1.worker.gpu.sample.sampler",
+        ("Sampler.sample",),
     ),
     (
         "vllm.v1.worker.gpu.sample.gumbel",

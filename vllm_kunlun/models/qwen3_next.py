@@ -649,9 +649,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 conv_state_indices=non_spec_state_indices_tensor[
                     : attn_metadata.num_decodes
                 ],
-                conv_state_indices_cpu=non_spec_state_indices_tensor_cpu[
-                    : attn_metadata.num_decodes
-                ],
                 validate_data=True,
             )
         else:
@@ -736,9 +733,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
             initial_state = initial_state.view(initial_state_shape)
 
-            initial_state = initial_state * has_initial_state.view(
-                has_initial_state.shape[0], 1, 1, 1
-            )
+            # Uninitialized/reused cache slots may contain NaN or Inf; * 0
+            # does not clear those values for requests without prior state.
+            fresh_mask = has_initial_state.view(-1, 1, 1, 1) == 0
+            initial_state = initial_state.masked_fill(fresh_mask, 0)
             initial_state = initial_state.transpose(-1, -2).contiguous()
 
             (
