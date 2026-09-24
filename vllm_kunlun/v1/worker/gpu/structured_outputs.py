@@ -13,6 +13,12 @@ Only ``StructuredOutputsWorker.apply_grammar_bitmask`` is overridden; the rest o
 the upstream class (buffers, sizing) is left untouched. The upstream side
 copy-stream is dropped: the H2D copies are issued on the current stream instead,
 which keeps the ordering trivially correct on XPU.
+
+The native op supports FP16/BF16. Each logits row is encoded as a one-token
+request so multiple positions cannot alias when a request has more positions
+than the bitmask word stride. FP32 remains on a torch fallback: downcasting raw
+logits would change sampling decisions. Both paths preserve the packed-bitmask
+semantics (set bit allowed, clear bit masked to ``-inf``).
 """
 
 import logging
@@ -34,7 +40,7 @@ def _apply_grammar_bitmask(
     grammar_req_ids: list[str],
     grammar_bitmask: np.ndarray,
 ) -> None:
-    """torch-native replacement of ``_apply_grammar_bitmask_kernel``.
+    """Native bitmask filtering, with a precision-preserving FP32 fallback.
 
     ``grammar_bitmask`` packs one bit per token id into int32 words; a zero bit
     means the token is disallowed and its logit must become ``-inf``. Row ``i``
@@ -58,7 +64,25 @@ def _apply_grammar_bitmask(
 
     rows = async_copy_to_gpu(
         np.asarray(mapping, dtype=np.int32), out=self.logits_indices[: len(mapping)]
-    ).to(torch.long)
+    )
+
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        # XSpeedGate encodes an index as request * mask_stride + local_pos.
+        # Treat each logits row as a one-token request, which also works when
+        # a request has more logits than the number of words in its bitmask.
+        stride = bitmask.shape[1]
+        encoded = rows * stride
+        cu_logits = torch.arange(
+            logits.shape[0] + 1, dtype=torch.int32, device=logits.device
+        )
+        torch.ops.xspeedgate_ops.apply_grammar_bitmask(
+            logits, bitmask, encoded, cu_logits, stride
+        )
+        return
+
+    # The installed native kernel supports FP16/BF16 only. Keep FP32 exact;
+    # casting the normal MRV2 FP32 logits to half would alter sampling.
+    rows = rows.to(torch.long)
 
     # Unpack the bitmask: bit j of word w covers token w * 32 + j. int32 right
     # shift is arithmetic, but the low bit of the result is still the wanted
@@ -74,4 +98,6 @@ def _apply_grammar_bitmask(
 
 
 _up.StructuredOutputsWorker.apply_grammar_bitmask = _apply_grammar_bitmask
-logger.info("[KunlunPlugin] V2 StructuredOutputsWorker patched (torch-native bitmask)")
+logger.info(
+    "[KunlunPlugin] V2 StructuredOutputsWorker patched (XSpeedGate / FP32 torch bitmask)"
+)

@@ -4,16 +4,24 @@
 
 All of the module's pure-Python machinery (``UvaBufferPool``,
 ``UvaBackedTensor``, dataclasses, constants) is left alone. Only the two Triton
-kernel launch sites are overridden with torch-native equivalents:
+kernel launch sites are overridden with Kunlun equivalents:
 
 * ``StagedWriteTensor.apply_write`` — applies staged row/segment writes to a
-  device tensor. Replaces ``_apply_write_kernel``.
+  device tensor. Replaces ``_apply_write_kernel`` with
+  ``torch.ops.xspeedgate_ops.apply_write``. The native op consumes the same
+  ``(indices, starts, contents, cu_lens)`` layout, but requires a 2-D output;
+  scalar-per-request buffers are therefore exposed as ``[N, 1]`` views.
 * ``FusedStagedWriter.apply`` — upstream fuses writes across several tensors
   through raw pointers. Kunlun never calls it because the Kunlun
   ``BlockTables.apply_staged_writes`` override loops ``apply_write`` per group
-  instead (raw-pointer fan-out is not expressible in torch-native). It is
+  instead (the native apply_write operator handles one tensor per launch). It is
   overridden here to raise, so an accidental caller fails loudly rather than
   launching an uncompilable Triton kernel.
+
+For long staged value lists, NumPy builds the typed CPU payload faster than
+per-scalar torch conversion. Native staged-write metadata uses mapped host
+allocations. Other buffers keep the upstream view or explicit-copy fallback
+because torch operators do not accept mapped host device pointers.
 
 UVA handling: upstream ``UvaBuffer`` hard-raises when ``is_uva_available()`` is
 False. Kunlun XPU presents as CUDA (``torch_xmlir``); when UVA is available the
@@ -24,8 +32,12 @@ deliberately not the multi-GB ``uva_instead_of_gpu`` ones -- see
 ``_uvabuffer_init`` for why the two roles differ.
 """
 
+import ctypes
 import logging
+import math
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 import vllm.v1.worker.gpu.buffer_utils as _up
 from vllm.utils.platform_utils import is_uva_available
@@ -33,37 +45,41 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = logging.getLogger("vllm_kunlun")
 
+_NUMPY_DTYPES = {
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.float32: np.float32,
+}
+
 
 def _apply_write(self) -> None:
-    """torch-native replacement of ``StagedWriteTensor.apply_write``.
+    """Native-op replacement of ``StagedWriteTensor.apply_write``.
 
-    For each staged write ``i`` the upstream Triton kernel writes
-    ``contents[cu_start:cu_end]`` into the flat device buffer at offset
-    ``indices[i] * gpu.stride(0) + starts[i]``. This reproduces it with slice
-    assignments on ``self.gpu`` (contiguous, so a flattened view + linear
-    offset matches the kernel's pointer arithmetic exactly).
+    For each staged write ``p``, copy
+    ``contents[cu_start:cu_end]`` into output row ``indices[p]`` starting at
+    column ``starts[p]``. Metadata is copied through the configured UVA pool;
+    long value lists retain the local NumPy fast path. One-dimensional output
+    buffers are viewed as ``[N, 1]`` to match the native ABI without copying.
     """
     n = len(self._staged_write_indices)
     if n == 0:
         return
-
-    flat = self.gpu.view(-1)
-    stride0 = self.gpu.stride(0)
-    contents = torch.tensor(
-        self._staged_write_contents, dtype=self.dtype, device=self.device
-    )
-
-    cu_start = 0
-    for i in range(n):
-        cu_end = self._staged_write_cu_lens[i]
-        length = cu_end - cu_start
-        if length > 0:
-            base = (
-                self._staged_write_indices[i] * stride0 + self._staged_write_starts[i]
-            )
-            flat[base : base + length] = contents[cu_start:cu_end]
-        cu_start = cu_end
-
+    indices = self.write_indices.copy_to_uva(self._staged_write_indices)
+    starts = self.write_starts.copy_to_uva(self._staged_write_starts)
+    cu_lens = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+    values = self._staged_write_contents
+    if len(values) >= 1024 and self.dtype in _NUMPY_DTYPES:
+        # Long Python lists are expensive for torch.tensor to unpack. NumPy
+        # creates the same typed CPU payload without scalar Torch conversion.
+        cpu = torch.from_numpy(np.asarray(values, dtype=_NUMPY_DTYPES[self.dtype]))
+        if _PINNED_OK:
+            cpu = cpu.pin_memory()
+        contents = cpu.to(self.device, non_blocking=_PINNED_OK)
+    else:
+        contents = _up.async_tensor_h2d(values, device=self.device, dtype=self.dtype)
+    # XSpeedGate requires 2D, including scalar-per-request state buffers.
+    output = self.gpu.unsqueeze(-1) if self.gpu.ndim == 1 else self.gpu
+    torch.ops.xspeedgate_ops.apply_write(output, indices, starts, contents, cu_lens)
     self.clear_staged_writes()
 
 
@@ -195,3 +211,134 @@ if not _uva_view_supported():
     _up.UvaBuffer.__init__ = _uvabuffer_init
     _up.UvaBufferPool.__init__ = _pool_init
     _up.UvaBufferPool.copy_to_uva = _pool_copy_to_uva
+
+
+class _Device(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _Dtype(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint8),
+        ("bits", ctypes.c_uint8),
+        ("lanes", ctypes.c_uint16),
+    ]
+
+
+class _Tensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _Device),
+        ("ndim", ctypes.c_int),
+        ("dtype", _Dtype),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("offset", ctypes.c_uint64),
+    ]
+
+
+class _Allocation:
+    def __init__(self, nbytes):
+        self.lib = ctypes.CDLL("libcudart.so.12")
+        self.free = self.lib.cudaFreeHost
+        self.free.argtypes = [ctypes.c_void_p]
+        self.free.restype = ctypes.c_int
+        alloc = self.lib.cudaHostAlloc
+        alloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        alloc.restype = ctypes.c_int
+        self.ptr = ctypes.c_void_p()
+        rc = alloc(ctypes.byref(self.ptr), max(nbytes, 1), 2)
+        if rc:
+            raise RuntimeError(f"cudaHostAllocMapped failed: {rc}")
+
+    def __del__(self):
+        if getattr(self, "ptr", None) and self.ptr.value:
+            self.free(self.ptr)
+
+
+def _mapped_host_buffer(size, dtype):
+    shape = (size,) if isinstance(size, int) else tuple(size)
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    allocation = _Allocation(nbytes)
+    host = (ctypes.c_byte * max(nbytes, 1)).from_address(allocation.ptr.value)
+    # frombuffer retains host, which owns the allocation.
+    host._allocation = allocation
+    cpu = torch.frombuffer(host, dtype=dtype, count=math.prod(shape)).reshape(shape)
+    cpu.zero_()
+    get = allocation.lib.cudaHostGetDevicePointer
+    get.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    get.restype = ctypes.c_int
+    ptr = ctypes.c_void_p()
+    rc = get(ctypes.byref(ptr), allocation.ptr, 0)
+    if rc:
+        raise RuntimeError(f"cudaHostGetDevicePointer failed: {rc}")
+    # Keep the original CPU tensor's DLPack deleter and owner. Only the exported
+    # view changes address/device; the allocation is freed after both views die.
+    capsule = torch.utils.dlpack.to_dlpack(cpu)
+    address = ctypes.pythonapi.PyCapsule_GetPointer
+    address.argtypes = [ctypes.py_object, ctypes.c_char_p]
+    address.restype = ctypes.c_void_p
+    tensor = _Tensor.from_address(address(capsule, b"dltensor"))
+    tensor.data = ptr.value
+    tensor.device = _Device(2, torch.cuda.current_device())
+    return cpu, torch.utils.dlpack.from_dlpack(capsule)
+
+
+class _NativeUvaBufferPool(_up.UvaBufferPool):
+    """Mapped metadata for native kernels; torch indexing still needs HBM."""
+
+    def __init__(self, size, dtype, max_concurrency):
+        self.size = size
+        self.dtype = dtype
+        self.max_concurrency = max_concurrency
+        self._curr = 0
+        self._uva_bufs = []
+        for _ in range(max_concurrency):
+            cpu, uva = _mapped_host_buffer(size, dtype)
+            self._uva_bufs.append(SimpleNamespace(cpu=cpu, np=cpu.numpy(), uva=uva))
+
+    def copy_to_uva(self, x):
+        self._curr = (self._curr + 1) % self.max_concurrency
+        buf = self._uva_bufs[self._curr]
+        n = len(x)
+        dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+        dst[:n] = x
+        return buf.uva[:n]
+
+
+_mapped_host_available = None
+
+
+def _native_pool(pool):
+    global _mapped_host_available
+    if _mapped_host_available is False:
+        return pool
+    try:
+        mapped = _NativeUvaBufferPool(pool.size, pool.dtype, pool.max_concurrency)
+        if _mapped_host_available is None:
+            logger.info("Mapped host metadata enabled for native MRV2 kernels")
+        _mapped_host_available = True
+        return mapped
+    except (OSError, RuntimeError) as e:
+        _mapped_host_available = False
+        logger.warning(
+            "Mapped host allocation unavailable; retaining H2D buffers: %s", e
+        )
+        return pool
+
+
+_original_staged_init = _up.StagedWriteTensor.__init__
+
+
+def _staged_init(self, *args, **kwargs):
+    _original_staged_init(self, *args, **kwargs)
+    self.write_indices = _native_pool(self.write_indices)
+    self.write_starts = _native_pool(self.write_starts)
+    self.write_cu_lens = _native_pool(self.write_cu_lens)
+
+
+_up.StagedWriteTensor.__init__ = _staged_init
