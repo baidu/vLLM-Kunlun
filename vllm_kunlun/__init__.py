@@ -950,7 +950,10 @@ _mrv2_hook(
 )
 _mrv2_hook(
     "vllm.v1.worker.gpu.model_states.mamba_hybrid",
-    ("MambaHybridModelState.postprocess_state",),
+    (
+        "MambaHybridModelState.preprocess_state",
+        "MambaHybridModelState.postprocess_state",
+    ),
     "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
 )
 
