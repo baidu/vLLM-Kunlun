@@ -31,6 +31,45 @@ import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 
 logger = logging.getLogger("vllm_kunlun")
 
+def _prepare_prefill_inputs_torch(
+    input_ids: torch.Tensor,
+    next_prefill_tokens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    prefill_len: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+) -> None:
+    """Pure-torch replacement for `_prepare_prefill_inputs_kernel`.
+
+    Deliberately the per-request loop: on this platform a vectorized (sync-free)
+    form is slower end to end at the configured batch size, because this loop's
+    device cost scales per request while the vectorized form pays a flat cost.
+    """
+    num_reqs = idx_mapping.shape[0]
+    num_lookahead = next_prefill_tokens.shape[0]
+    for batch_idx in range(num_reqs):
+        req_state_idx = int(idx_mapping[batch_idx])
+        p_len = int(prefill_len[req_state_idx])
+        num_computed = int(num_computed_tokens[req_state_idx])
+        if num_computed >= p_len:
+            # Not prefill.
+            continue
+
+        q_start = int(query_start_loc[batch_idx])
+        q_end = int(query_start_loc[batch_idx + 1])
+        q_len = q_end - q_start
+
+        row = all_token_ids[req_state_idx]
+        input_ids[q_start : q_start + q_len] = row[num_computed : num_computed + q_len]
+
+        # Store the next num_lookahead prefill tokens (0 when out of range).
+        base = num_computed + q_len
+        for lookahead in range(num_lookahead):
+            pos = base + lookahead
+            next_prefill_tokens[lookahead][req_state_idx] = (
+                row[pos] if pos < p_len else 0
+            )
 
 def prepare_prefill_inputs(
     input_ids: torch.Tensor,
@@ -41,7 +80,7 @@ def prepare_prefill_inputs(
     prefill_len: torch.Tensor,
     num_computed_tokens: torch.Tensor,
 ) -> None:
-    torch.ops.xspeedgate_ops.prepare_prefill_inputs(
+    _prepare_prefill_inputs_torch(
         input_ids,
         next_prefill_tokens,
         idx_mapping,
