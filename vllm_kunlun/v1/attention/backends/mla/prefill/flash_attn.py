@@ -195,31 +195,28 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     def run_prefill_context_chunk(
         self,
-        chunk_idx: int,
+        chunk,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefill = self._prefill_metadata
-        assert prefill.chunked_context is not None
-        # K/V are the gathered context for this chunk, laid out per the chunk's
-        # context cu_seq_lens (not the query LOD). Pass it as context_kvlen_lod so
-        # the kernel segments K/V by context length instead of query length.
-        kv_lod_xpu = prefill.chunked_context.cu_seq_lens[chunk_idx]
-        kv_lod_cpu = getattr(prefill.chunked_context, "cu_seq_lens_cpu", None)
-        if kv_lod_cpu is not None:
-            kv_lod_cpu = kv_lod_cpu[chunk_idx]
-        else:
-            kv_lod_cpu = kv_lod_xpu.cpu()
+        # [KUNLUN] 0.28 passes a ContextChunk object (not an index). The query
+        # LOD is chunk.query_start_loc; the context (K/V) LOD is chunk.cu_seq_lens
+        # -- pass the latter as context_kvlen_lod so the kernel segments K/V by
+        # context length rather than query length. This runs in the eager
+        # chunked-context path, so the host copies via .cpu() are acceptable.
+        q_lod_xpu = chunk.query_start_loc
+        kv_lod_xpu = chunk.cu_seq_lens
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
             v=v,
-            context_seq_lod_xpu=prefill.query_start_loc,
-            context_seq_lod_cpu=self._query_start_loc_cpu(),
+            context_seq_lod_xpu=q_lod_xpu,
+            context_seq_lod_cpu=q_lod_xpu.cpu(),
             softmax_scale=self.scale,
             causal=False,  # context is unmasked
             return_softmax_lse=True,
             context_kvlen_lod_xpu=kv_lod_xpu,
-            context_kvlen_lod_cpu=kv_lod_cpu,
+            context_kvlen_lod_cpu=kv_lod_xpu.cpu(),
         )

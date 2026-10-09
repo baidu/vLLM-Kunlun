@@ -314,6 +314,10 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         out = out.view(num_tokens, num_heads, self.kv_lora_rank)
 
         if self.need_to_return_lse_for_decode:
-            # KLX helper currently returns None for lse; DCP path is not wired.
+            # [KUNLUN][DCP] flash_mla_with_kvcache returns the unpadded LSE as
+            # [num_heads, num_tokens]; the DCP combine (cp_lse_ag_out_rs) wants
+            # [num_tokens(B), num_heads(H)]. Transpose to match.
+            assert lse is not None
+            lse = lse.transpose(0, 1).contiguous()
             return out, lse
         return out, None
