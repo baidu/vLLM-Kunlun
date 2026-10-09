@@ -960,6 +960,219 @@ _mrv2_hook(
     "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
 )
 
+# --- hook: DCP local seq_lens Triton kernel -> torch (P800) ----------------
+# vllm.v1.worker.gpu.cp_utils.prepare_dcp_local_seq_lens launches the Triton
+# kernel _dcp_local_seq_lens_kernel via `kernel[(grid,)](...)`. Kunlun XPU
+# cannot JIT Triton, so the launch raises "'function' object is not
+# subscriptable" during cudagraph capture. Replace it with an in-place torch
+# equivalent (CUDA-graph safe: writes the persistent buffer, no host sync).
+def _dcp_local_seqlens_applied(mod):
+    fn = getattr(mod, "prepare_dcp_local_seq_lens", None)
+    return fn is None or getattr(fn, "_kunlun_patched", False)
+
+
+def _dcp_local_seqlens_apply(mod):
+    import torch
+
+    def prepare_dcp_local_seq_lens(
+        dcp_local_seq_lens, seq_lens, num_reqs, dcp_size, dcp_rank, cp_interleave
+    ):
+        if dcp_size == 1:
+            return
+        max_num_reqs = dcp_local_seq_lens.shape[0]
+        period = dcp_size * cp_interleave
+        sl = seq_lens[:max_num_reqs].to(torch.int64)
+        rounds = sl // period
+        remainder = sl % period
+        remainder = (remainder - dcp_rank * cp_interleave).clamp_(
+            min=0, max=cp_interleave
+        )
+        local = rounds * cp_interleave + remainder
+        # [KUNLUN] XPU `where` rejects int tensors; zero the padding rows by
+        # a static slice assignment instead (num_reqs is a python int).
+        if num_reqs < max_num_reqs:
+            local[num_reqs:] = 0
+        dcp_local_seq_lens.copy_(local.to(dcp_local_seq_lens.dtype))
+
+    prepare_dcp_local_seq_lens._kunlun_patched = True
+    mod.prepare_dcp_local_seq_lens = prepare_dcp_local_seq_lens
+    # Rebind in modules that did `from cp_utils import prepare_dcp_local_seq_lens`.
+    import sys as _sys
+    for importer in (
+        "vllm.v1.worker.gpu.cudagraph_utils",
+        "vllm.v1.worker.gpu.pcp_manager",
+        "vllm.v1.worker.gpu.model_runner",
+    ):
+        im = _sys.modules.get(importer)
+        if im is not None and hasattr(im, "prepare_dcp_local_seq_lens"):
+            im.prepare_dcp_local_seq_lens = prepare_dcp_local_seq_lens
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched cp_utils.prepare_dcp_local_seq_lens -> torch"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.cp_utils",
+    _dcp_local_seqlens_applied,
+    _dcp_local_seqlens_apply,
+)
+
+
+# --- hook: DCP attn-out correction Triton kernel -> torch (P800) -----------
+# vllm.v1.attention.ops.common.correct_attn_out launches the Triton
+# _correct_attn_cp_out_kernel to merge per-DCP-rank attention outputs by LSE.
+# Kunlun XPU cannot JIT Triton ("function not subscriptable" at kernel[grid]).
+# Replace with a torch online-softmax merge that mirrors the kernel exactly
+# (nan/+inf -> -inf sanitising, max-shift, base-e or base-2 log-sum-exp, then
+# scale THIS rank's output by exp(local_lse - global_lse)). _cp_lse_common calls
+# correct_attn_out by bare name, so patching the module global is enough.
+def _correct_attn_out_applied(mod):
+    fn = getattr(mod, "correct_attn_out", None)
+    return fn is None or getattr(fn, "_kunlun_patched", False)
+
+
+def _correct_attn_out_apply(mod):
+    import torch
+
+    def correct_attn_out(out, lses, cp_rank, ctx=None, is_lse_base_on_e=True):
+        if out.ndim == 4 and out.shape[1] == 1:
+            out = out.squeeze(1)
+        if lses.ndim == 4 and lses.shape[-1] == 1:
+            lses = lses.squeeze(-1)
+        if lses.ndim == 4 and lses.shape[1] == 1:
+            lses = lses.squeeze(1)
+        lf = lses.to(torch.float32)
+        neg_inf = float("-inf")
+        lf = lf.masked_fill(torch.isnan(lf) | (lf == float("inf")), neg_inf)
+        lse_max = lf.max(dim=0).values
+        lse_max = lse_max.masked_fill(lse_max == neg_inf, 0.0)
+        shifted = lf - lse_max
+        if is_lse_base_on_e:
+            glse = shifted.exp().sum(dim=0).log()
+        else:
+            glse = torch.exp2(shifted).sum(dim=0).log2()
+        glse = glse + lse_max
+        lse_fin = lf[cp_rank] - glse
+        lse_fin = lse_fin.masked_fill(
+            torch.isnan(lse_fin) | (lse_fin == float("inf")), neg_inf
+        )
+        factor = lse_fin.exp() if is_lse_base_on_e else torch.exp2(lse_fin)
+        corrected = out.to(torch.float32) * factor.unsqueeze(-1)
+        corrected = corrected.masked_fill((factor == 0).unsqueeze(-1), 0.0)
+        out.copy_(corrected.to(out.dtype))
+        return out, glse.to(lses.dtype)
+
+    correct_attn_out._kunlun_patched = True
+    mod.correct_attn_out = correct_attn_out
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched common.correct_attn_out -> torch (DCP LSE merge)"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.attention.ops.common",
+    _correct_attn_out_applied,
+    _correct_attn_out_apply,
+)
+
+
+# --- hook: InputBatch index tensors -> int32 (P800 root fix) ----------------
+# ROOT CAUSE of the many "inputs must be int32" / "scalar_type == kInt32"
+# errors: vllm builds InputBatch.idx_mapping (and expanded_idx_mapping, which
+# derives from it) as int64 (np.intp -> int64 at model_runner.py, torch.int64
+# at the dummy builder), while every Kunlun xspeedgate index op asserts int32.
+# All other metadata (query_start_loc / seq_lens / num_computed_tokens /
+# cu_num_logits) is already int32. Both the real and dummy paths construct the
+# InputBatch dataclass, so coercing these two fields in __init__ fixes every
+# downstream op in one place -- no per-call-site casts needed.
+def _inputbatch_i32_applied(mod):
+    cls = getattr(mod, "InputBatch", None)
+    return cls is None or getattr(cls.__init__, "_kunlun_i32", False)
+
+
+def _inputbatch_i32_apply(mod):
+    import torch
+
+    cls = getattr(mod, "InputBatch", None)
+    if cls is None:
+        return
+    _orig_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        im = self.idx_mapping
+        if im is not None and im.dtype != torch.int32:
+            self.idx_mapping = im.to(torch.int32)
+        eim = self.expanded_idx_mapping
+        if eim is not None and eim.dtype != torch.int32:
+            self.expanded_idx_mapping = eim.to(torch.int32)
+
+    __init__._kunlun_i32 = True
+    cls.__init__ = __init__
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched InputBatch.__init__: idx_mapping / "
+        "expanded_idx_mapping -> int32 (root int32 fix)"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.input_batch",
+    _inputbatch_i32_applied,
+    _inputbatch_i32_apply,
+)
+
+
+# --- hook: idx_mapping_np -> int32 at the batch-state source (P800 root fix) -
+# The GPU idx_mapping consumed INSIDE prepare_inputs (expand_idx_mapping,
+# prepare_pos_seq_lens, combine_sampled_and_draft_tokens, ...) is built from
+# BatchReqState.idx_mapping_np (np.intp -> int64) BEFORE the InputBatch is
+# constructed, so the InputBatch.__init__ coercion does not reach it. Coerce the
+# numpy source to int32 here so the whole real-path data flow is int32; the
+# InputBatch hook then also covers the dummy/profiling path. Together these two
+# are the single root fix -- no per-op casts needed. BatchReqState is a
+# NamedTuple, so rebuild it via _replace. int32 is safe: every idx_mapping use
+# is Triton pointer math or int32-accepting numpy/torch indexing.
+def _batchreqstate_i32_applied(mod):
+    cls = getattr(mod, "GPUModelRunner", None)
+    return cls is None or getattr(
+        getattr(cls, "gather_batch_req_state", None), "_kunlun_i32", False
+    )
+
+
+def _batchreqstate_i32_apply(mod):
+    import numpy as np
+
+    cls = getattr(mod, "GPUModelRunner", None)
+    if cls is None or not hasattr(cls, "gather_batch_req_state"):
+        return
+    _orig = cls.gather_batch_req_state
+
+    def gather_batch_req_state(self, *args, **kwargs):
+        batch_state, count = _orig(self, *args, **kwargs)
+        # batch_state is None on the dummy/profiling run (no real requests).
+        if batch_state is not None:
+            im = batch_state.idx_mapping_np
+            if im is not None and im.dtype != np.int32:
+                batch_state = batch_state._replace(
+                    idx_mapping_np=im.astype(np.int32)
+                )
+        return batch_state, count
+
+    gather_batch_req_state._kunlun_i32 = True
+    cls.gather_batch_req_state = gather_batch_req_state
+    logging.getLogger("vllm_kunlun").info(
+        "[KunlunPlugin] patched GPUModelRunner.gather_batch_req_state: "
+        "idx_mapping_np -> int32 (root int32 fix)"
+    )
+
+
+_register_post_import_hook(
+    "vllm.v1.worker.gpu.model_runner",
+    _batchreqstate_i32_applied,
+    _batchreqstate_i32_apply,
+)
+
+
 def register():
     """Register the Kunlun platform"""
 

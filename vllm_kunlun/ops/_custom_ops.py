@@ -3069,3 +3069,34 @@ def gather_and_maybe_dequant_cache(
         scale=scale,
         seq_starts=seq_starts,
     )
+
+# ``_C_cache_ops::cp_gather_cache`` gathers THIS DCP rank's local context KV
+# shard into a contiguous bf16 workspace; upstream reaches it from
+# ``MLACommonBaseImpl._context_parallel_compute_prefill_context``. P800 has no
+# native op, so gather in torch: derive the per-dst-token sequence index from
+# ``cu_seq_lens`` (dst is pre-sliced to the token count, so no host sync), add
+# the per-request ``seq_starts`` source offset, then index the paged cache.
+@custom_op("_C_cache_ops::cp_gather_cache", mutates_args=())
+def cp_gather_cache(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    batch_size: int,
+    seq_starts: Optional[torch.Tensor] = None,
+) -> None:
+    block_size = src_cache.shape[1]
+    num_tokens = dst.shape[0]
+    device = dst.device
+    csl = cu_seq_lens.to(torch.int64)
+    tok = torch.arange(num_tokens, device=device)
+    # dst token -> request index (bucket by the cumulative dst offsets).
+    seq = torch.searchsorted(csl, tok, right=True) - 1
+    seq = seq.clamp_(0, batch_size - 1)
+    local_pos = tok - csl[seq]
+    if seq_starts is not None:
+        local_pos = local_pos + seq_starts.to(torch.int64)[seq]
+    blk = block_table[seq, local_pos // block_size].to(torch.int64)
+    off = (local_pos % block_size).to(torch.int64)
+    gathered = src_cache[blk, off]
+    dst.copy_(gathered.reshape(dst.shape).to(dst.dtype))
