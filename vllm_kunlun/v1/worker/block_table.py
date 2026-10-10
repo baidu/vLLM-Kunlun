@@ -29,9 +29,20 @@ def _compute_slot_mapping(self, num_reqs, query_start_loc, positions):
     num_tokens = positions.shape[0]
     total_cp_world_size = self.pcp_world_size * self.dcp_world_size
     total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-    block_sizes = torch.tensor(
-        [self.block_size], dtype=torch.int32, device=self.block_table.gpu.device
-    )
+    # block_size is constant; building this device tensor every step does a
+    # CPU->device H2D copy whose implicit cudaStreamSynchronize stalls the CPU
+    # on whatever is already queued (e.g. the PP sampled-token broadcast),
+    # showing up as a large bubble at the start of a new request. Cache it so
+    # only the first call pays the H2D; subsequent calls reuse the device
+    # tensor and keep compute_slot_mapping fully async.
+    block_sizes = getattr(self, "_kunlun_block_sizes_dev", None)
+    if block_sizes is None or block_sizes.device != self.block_table.gpu.device:
+        block_sizes = torch.tensor(
+            [self.block_size],
+            dtype=torch.int32,
+            device=self.block_table.gpu.device,
+        )
+        self._kunlun_block_sizes_dev = block_sizes
     kunlun_ops.compute_slot_mappings(
         [self.slot_mapping.gpu],  # list
         [self.block_table.gpu],  # list

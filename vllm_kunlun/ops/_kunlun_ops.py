@@ -19,7 +19,6 @@
 
 from typing import Optional
 
-import cocopod  # noqa
 import torch
 import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
@@ -619,6 +618,477 @@ class KunlunOps:
             )
 
             return output
+
+    @staticmethod
+    def fused_moe_ct_w4a16(
+        hidden_states: torch.Tensor,
+        w13_weight_packed_signed: torch.Tensor,
+        w2_weight_packed_signed: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        router_logits: torch.Tensor,
+        moe_top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Optimized fused_moe with preprocessed packed int4 weights.
+
+        Args:
+            hidden_states: Input hidden states [M, N]
+            w13_weight_packed_signed: Preprocessed w13 weights [E, up_gate_size, hidden_dim//2], int8
+            w2_weight_packed_signed: Preprocessed w2 weights [E, hidden_dim, intermediate_size//TP//2], int8
+            w13_scale: Preprocessed w13 scale (multiplied by 7.0, float32)
+            w2_scale: Preprocessed w2 scale (multiplied by 7.0, float32)
+            router_logits: Router logits for expert selection
+            moe_top_k: Number of top experts to select
+            renormalize: Whether to renormalize expert weights
+            use_grouped_topk: Whether to use grouped topk
+            num_expert_group: Number of expert groups for grouped topk
+            topk_group: Number of top groups for grouped topk
+            scoring_func: Scoring function ("softmax" or "sigmoid")
+            e_score_correction_bias: Bias for sigmoid scoring
+
+        Returns:
+            Output tensor [M, N]
+        """
+        # Get shapes from packed weights
+        global_num_experts = w13_weight_packed_signed.shape[0]
+        up_gate_size = w13_weight_packed_signed.shape[1]
+        M, N = hidden_states.shape
+        hidden_dim = w2_weight_packed_signed.shape[1]
+
+        # Initialize tensors for topk selection
+        normed_score = torch.empty(
+            M, moe_top_k, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            M, moe_top_k, dtype=torch.int32, device=hidden_states.device
+        )
+
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks,
+            global_num_experts,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+
+        # TopK routing
+        router_logits = router_logits.to(torch.float)
+        if scoring_func == "softmax":
+            torch.ops._C.moe_softmax_topk_norm(
+                x=router_logits,
+                normed_score=normed_score,
+                topk_index=topk_ids,
+                block_statistic=None,
+                stable=True,
+            )
+        elif scoring_func == "sigmoid":
+            # The fused XPU kernel `moe_sigmoid_group_topk_norm` only supports
+            # up to 512 experts; for larger expert counts it silently fails
+            # (returns non-zero and leaves topk_index uninitialized), so fall
+            # back to a pure-torch implementation of sigmoid + group-topk + norm.
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                topk_index=topk_ids,
+                norm_score=normed_score,
+                block_static=block_statistic,
+                bias=e_score_correction_bias,
+                scale=1.0,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+            )
+        else:
+            raise ValueError(f"Unsupported scoring_func: {scoring_func}")
+
+        # Generate block statistic
+        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+
+        # Pre-sort tokens by expert
+        moe_expand = torch.empty(
+            (M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        expert_m = torch.zeros(
+            global_num_experts, dtype=torch.int32, device=hidden_states.device
+        )
+        sorted_tokens_num_lod = torch.zeros(
+            global_num_experts + 1, dtype=torch.int32, device=hidden_states.device
+        )
+        sorted_tokens_idx = torch.zeros(
+            M * moe_top_k, dtype=torch.int32, device=hidden_states.device
+        )
+
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
+        del expert_m, block_statistic  # Release after moe_pre_sorted
+
+        # First FC layer (w13) - use preprocessed weights directly
+        y = torch.empty(
+            M * moe_top_k,
+            up_gate_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # Use preprocessed weights and scale directly (no XOR or type conversion needed)
+        torch.ops._C.moe_fc_v3(
+            x=moe_expand,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=None,
+            w_perchannel_max=w13_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del moe_expand  # Release after first FC
+
+        # Activation: silu_and_mul
+        d = y.shape[-1] // 2
+        output_shape = y.shape[:-1] + (d,)
+        out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
+        torch.ops._C.silu_and_mul(out1, y)
+        del y  # Release y after silu_and_mul
+
+        # Second FC layer (w2) - use preprocessed weights directly
+        out = torch.empty(
+            M * moe_top_k,
+            hidden_dim,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        out1 = out1.reshape(-1, out1.shape[-1])
+
+        # Use preprocessed weights and scale directly (no XOR or type conversion needed)
+        torch.ops._C.moe_fc_v3(
+            x=out1,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=None,
+            w_perchannel_max=w2_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+
+        del out1
+
+        # Post-processing: reshape and weight by normed_score
+        dequant_scale = torch.ones(
+            [M, moe_top_k], dtype=torch.float32, device=out.device
+        )
+        output = torch.empty(
+            [M, N], dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
+
+        # Reshape out to 3D for moe_post
+        out = out.view(M, moe_top_k, hidden_dim)
+
+        torch.ops._C.moe_post(
+            x=out,
+            moe_index=sorted_tokens_idx,
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+
+        return output
+
+    @staticmethod
+    def fused_moe_ct_w4a8(
+        hidden_states: torch.Tensor,
+        w13_weight_packed_signed: torch.Tensor,
+        w2_weight_packed_signed: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        router_logits: torch.Tensor,
+        moe_top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """W4A8 fused MoE: per-channel int4 weights, dynamic per-token int8 acts.
+
+        Same routing and weight layout as ``fused_moe_ct_w4a16``; the difference
+        is that each GEMM input is quantized to int8 per row right before the
+        GEMM (``kunlun_ops.quant2d``) and passed to ``moe_fc_v3`` together with
+        its per-token absmax. Verified convention (probe_moe_w4a8.py, relative
+        error 3.2e-4): the kernel applies ``x_absmax / 127`` and ``w_scale / 7``,
+        so hand it the raw absmax and the already-``* 7.0`` weight scale.
+
+        Args:
+            hidden_states: Input hidden states [M, N].
+            w13_weight_packed_signed: [E, up_gate_size, N // 2] int8, packed int4.
+            w2_weight_packed_signed: [E, hidden_dim, inter // 2] int8, packed int4.
+            w13_scale: [E, up_gate_size, 1] float32, already multiplied by 7.0.
+            w2_scale: [E, hidden_dim, 1] float32, already multiplied by 7.0.
+            router_logits: Router logits for expert selection.
+            moe_top_k: Number of experts per token.
+            renormalize: Whether to renormalize expert weights.
+            use_grouped_topk: Whether to use grouped topk.
+            num_expert_group: Number of expert groups for grouped topk.
+            topk_group: Number of top groups for grouped topk.
+            scoring_func: "softmax" or "sigmoid".
+            e_score_correction_bias: Bias for sigmoid scoring.
+
+        Returns:
+            Output tensor [M, N].
+        """
+        dev = hidden_states.device
+        global_num_experts = w13_weight_packed_signed.shape[0]
+        up_gate_size = w13_weight_packed_signed.shape[1]
+        M, N = hidden_states.shape
+        hidden_dim = w2_weight_packed_signed.shape[1]
+
+        normed_score = torch.empty(M, moe_top_k, dtype=torch.float32, device=dev)
+        topk_ids = torch.empty(M, moe_top_k, dtype=torch.int32, device=dev)
+
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks, global_num_experts, dtype=torch.int32, device=dev
+        )
+
+        router_logits = router_logits.to(torch.float)
+        if scoring_func == "softmax":
+            torch.ops._C.moe_softmax_topk_norm(
+                x=router_logits,
+                normed_score=normed_score,
+                topk_index=topk_ids,
+                block_statistic=None,
+                stable=True,
+            )
+        elif scoring_func == "sigmoid":
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                x=router_logits,
+                topk_index=topk_ids,
+                norm_score=normed_score,
+                block_static=block_statistic,
+                bias=e_score_correction_bias,
+                scale=1.0,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+            )
+        else:
+            raise ValueError(f"Unsupported scoring_func: {scoring_func}")
+
+        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+
+        moe_expand = torch.empty(
+            (M * moe_top_k, N), dtype=hidden_states.dtype, device=dev
+        )
+        expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=dev)
+        sorted_tokens_num_lod = torch.zeros(
+            global_num_experts + 1, dtype=torch.int32, device=dev
+        )
+        sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=dev)
+
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
+        del expert_m, block_statistic
+
+        # A8: quantize the already expert-sorted activations per row. Done after
+        # the scatter so every expanded row carries its own scale; the scatter
+        # itself stays in the model dtype.
+        x_q = torch.empty((M * moe_top_k, N), dtype=torch.int8, device=dev)
+        x_max = torch.empty(M * moe_top_k, dtype=torch.float32, device=dev)
+        torch.ops._C.quant2d(moe_expand, x_q, x_max)
+        del moe_expand
+
+        y = torch.empty(
+            M * moe_top_k, up_gate_size, dtype=hidden_states.dtype, device=dev
+        )
+        torch.ops._C.moe_fc_v3(
+            x=x_q,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=x_max,
+            w_perchannel_max=w13_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del x_q, x_max
+
+        d = y.shape[-1] // 2
+        out1 = torch.empty(y.shape[:-1] + (d,), dtype=y.dtype, device=dev)
+        torch.ops._C.silu_and_mul(out1, y)
+        del y
+
+        out1 = out1.reshape(-1, out1.shape[-1])
+        h_q = torch.empty(out1.shape, dtype=torch.int8, device=dev)
+        h_max = torch.empty(out1.shape[0], dtype=torch.float32, device=dev)
+        torch.ops._C.quant2d(out1, h_q, h_max)
+        del out1
+
+        out = torch.empty(
+            M * moe_top_k, hidden_dim, dtype=hidden_states.dtype, device=dev
+        )
+        torch.ops._C.moe_fc_v3(
+            x=h_q,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=h_max,
+            w_perchannel_max=w2_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del h_q, h_max
+
+        dequant_scale = torch.ones([M, moe_top_k], dtype=torch.float32, device=dev)
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=dev)
+        torch.ops._C.moe_post(
+            x=out.view(M, moe_top_k, hidden_dim),
+            moe_index=sorted_tokens_idx.view(M, moe_top_k),
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+
+        return output
+
+    @staticmethod
+    def moe_ct_w4a16_experts(
+        hidden_states: torch.Tensor,
+        w13_weight_packed_signed: torch.Tensor,
+        w2_weight_packed_signed: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        moe_top_k: int,
+    ) -> torch.Tensor:
+        """Expert compute without routing, for vLLM's modular MoE path.
+
+        Identical to the second half of fused_moe_ct_w4a16, except that
+        topk_ids / topk_weights are supplied by the caller (vLLM's
+        select_experts plus the expert_map remap). Under EP, w13/w2 only hold
+        this rank's experts, so topk_ids must already be local ids.
+        """
+        dev = hidden_states.device
+        num_local_experts = w13_weight_packed_signed.shape[0]
+        up_gate_size = w13_weight_packed_signed.shape[1]
+        M, N = hidden_states.shape
+        hidden_dim = w2_weight_packed_signed.shape[1]
+
+        ids = topk_ids.to(torch.int32).contiguous()
+        normed_score = topk_weights.to(torch.float32).contiguous()
+
+        block_statistic = torch.zeros(
+            12, num_local_experts, dtype=torch.int32, device=dev
+        )
+        torch.ops._C.gen_block_statistic(ids, block_statistic)
+
+        moe_expand = torch.empty(
+            (M * moe_top_k, N), dtype=hidden_states.dtype, device=dev
+        )
+        expert_m = torch.zeros(num_local_experts, dtype=torch.int32, device=dev)
+        sorted_tokens_num_lod = torch.zeros(
+            num_local_experts + 1, dtype=torch.int32, device=dev
+        )
+        sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=dev)
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+        )
+        del expert_m, block_statistic
+
+        # Must be zeros, not empty: under the EP shapes / expert
+        # distribution (112 local experts, very skewed per-expert row counts)
+        # moe_fc_v3 leaves part of its output tensor untouched. With empty,
+        # the NaNs sitting in uninitialized device memory flow straight into
+        # silu_and_mul / moe_post and the whole layer output becomes NaN.
+        y = torch.zeros(
+            M * moe_top_k, up_gate_size, dtype=hidden_states.dtype, device=dev
+        )
+        torch.ops._C.moe_fc_v3(
+            x=moe_expand,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=None,
+            w_perchannel_max=w13_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del moe_expand
+
+        d = y.shape[-1] // 2
+        out1 = torch.empty(y.shape[:-1] + (d,), dtype=y.dtype, device=dev)
+        torch.ops._C.silu_and_mul(out1, y)
+        del y
+
+        # Must be zeros, not empty: under the EP shapes / expert
+        # distribution (112 local experts, very skewed per-expert row counts)
+        # moe_fc_v3 leaves part of its output tensor untouched. With empty,
+        # the NaNs sitting in uninitialized device memory flow straight into
+        # silu_and_mul / moe_post and the whole layer output becomes NaN.
+        out = torch.zeros(
+            M * moe_top_k, hidden_dim, dtype=hidden_states.dtype, device=dev
+        )
+        out1 = out1.reshape(-1, out1.shape[-1])
+        torch.ops._C.moe_fc_v3(
+            x=out1,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=None,
+            w_perchannel_max=w2_scale,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+        del out1
+
+        dequant_scale = torch.ones([M, moe_top_k], dtype=torch.float32, device=dev)
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=dev)
+        torch.ops._C.moe_post(
+            x=out.view(M, moe_top_k, hidden_dim),
+            moe_index=sorted_tokens_idx.view(M, moe_top_k),
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output,
+        )
+        return output
 
     @staticmethod
     def fused_moe_ep(

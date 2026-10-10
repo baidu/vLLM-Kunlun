@@ -51,17 +51,36 @@ vllm_port = envs.VLLM_PORT
 
 
 def _get_open_port() -> int:
+    """Return a port this process just verified as bindable.
+
+    The previous version returned ``vllm_port + 1`` -- a port it had never
+    bound -- and crashed outright when VLLM_PORT was unset (``bind(("", None))``
+    raises TypeError). Scan upward from VLLM_PORT instead, which is also what
+    upstream ``vllm.utils.network_utils._get_open_port`` does, so concurrent
+    data-parallel engine cores settle on distinct ports.
+    """
     global vllm_port
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", vllm_port))
-            vllm_port += 1
-            return vllm_port
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    if vllm_port is not None:
+        port = vllm_port
+        for _ in range(1000):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", port))
+                    vllm_port = port + 1
+                    return port
+            except OSError:
+                port += 1
+        raise RuntimeError(
+            "no free port found after 1000 attempts from %d" % vllm_port
+        )
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                return s.getsockname()[1]
+        except OSError:
+            continue
+    raise RuntimeError("no free ephemeral port available")
 
 
 _wrapped = SimpleNamespace(**_orig.__dict__)

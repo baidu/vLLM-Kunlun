@@ -92,14 +92,25 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    softmax_lse = None
+    # [KUNLUN][DCP] Produce the softmax LSE so decode can be merged across DCP
+    # ranks. Unpadded layout [num_heads, num_q_tokens] (seq_len_q == 1 => one
+    # column per request), matching the prefill path's unpadded_lse contract.
+    softmax_lse = torch.full(
+        (q.size(2), q.size(0) * q.size(1)),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
     out = torch.ones(
         q.size(0), q.size(1), q.size(2), head_dim_v, dtype=q.dtype, device=q.device
     )
     kv_lora_rank = head_dim_v
     qk_rope_head_dim = q.size(3) - head_dim_v
-    head_dim = k_cache.shape[3]
+    # vLLM's MLA cache is [num_blocks, page_block_size, head_dim] (a single
+    # latent "head"); the upstream flash_mla signature is 4D with an explicit
+    # num_heads_k. Accept both.
     page_block_size = k_cache.shape[1]
+    head_dim = k_cache.shape[-1]
     k_cache = k_cache.view(-1, 1, page_block_size, head_dim)
 
     # todo: optimize memcp
@@ -124,6 +135,8 @@ def flash_mla_with_kvcache(
         qk_rope_head_dim,
         softmax_scale,
         q_r=q,
+        softmax_lse=softmax_lse,
+        unpadded_lse=True,
     )
     return out, softmax_lse
 

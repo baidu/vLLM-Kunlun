@@ -6,7 +6,7 @@ import psutil
 import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -179,104 +179,145 @@ class KunlunPlatform(Platform):
         return DeviceCapability(major=major, minor=minor)
 
     @classmethod
-    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        """
-        TODO Update here for v0.15.1
-
-        Update default values across different config sections.
-
-        If certain fields are not specified, this function will automatically
-        choose appropriate defaults based on runtime conditions.
-
-        - If the cache block size is not set, it defaults to 16.
-        - If MLA is enabled and `VLLM_ATTENTION_BACKEND` is not set or is set
-        to "FLASHMLA", the cache block size will be updated to 64.
-        - When running with the DeepEP high-throughput backend, data parallelism
-        greater than 1, and CUDA graph mode, eager execution will be enforced.
-        This is because DP + DeepEP high-throughput kernels are not compatible
-        with CUDA graphs. The DeepEP low-latency kernels should be used instead.
-
-        Args:
-            vllm_config (VllmConfig): The vLLM configuration object.
-
-        Raises:
-            NotImplementedError:
-                If multi-step scheduling is used in vLLM V1.
-                Please remove the `--num-scheduler-steps` argument.
-            NotImplementedError:
-                If MLA is used in vLLM V1 without setting the
-                `VLLM_ATTENTION_BACKEND` environment variable.
-
-        Returns:
-            None.
-        """
-        parallel_config = vllm_config.parallel_config  # Not use scheduler_config
-        # scheduler_config = vllm_config.scheduler_config
+    def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        parallel_config = vllm_config.parallel_config
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
-            # v0.15.1 do not support v0.15.1, remove the if condition
-            if vllm_config.speculative_config:
-                # if envs.VLLM_USE_V1:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
-            else:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
-        cache_config = vllm_config.cache_config
-        if cache_config and cache_config.block_size is None:
-            cache_config.block_size = 16
-
-        # TODO(lucas): handle this more gracefully
+        scheduler_config = vllm_config.scheduler_config
         # Note: model_config may be None during testing
-        if model_config is not None and model_config.use_mla:
-            # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
-            # we default to FlashMLA backend, so we need to force the blocksize
-            # here
-            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+        if (
+            model_config is not None
+            and model_config.is_mm_prefix_lm
+            and scheduler_config.is_multimodal_model
+            and not scheduler_config.disable_chunked_mm_input
+        ):
+            logger.warning_once(
+                "Forcing --disable_chunked_mm_input for models "
+                "with multimodal-bidirectional attention."
             )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
-
-            if (
-                use_flashmla
-                and is_flashmla_supported()[0]
-                and cache_config.block_size != 64
-            ):
-                cache_config.block_size = 64
-                logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
-            if use_sparse and cache_config.block_size != 64:
-                cache_config.block_size = 64
-                logger.info(
-                    "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
-                )
-
-        from vllm.config import CUDAGraphMode
+            scheduler_config.disable_chunked_mm_input = True
 
         if (
-            getattr(envs, "VLLM_ALL2ALL_BACKEND", None) == "deepep_high_throughput"
-            and parallel_config.data_parallel_size > 1
-            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            in_wsl()
+            and vllm_config.offload_config.uva.cpu_offload_gb > 0
+            and bool(vllm_config.compilation_config.cudagraph_mode)
         ):
-            logger.info(
-                "Data Parallel: Forcing enforce eager to be True since DP "
-                "with DeepEP high-throughput kernels are not CUDA Graph "
-                "compatible. The DeepEP low-latency kernels are CUDA Graph "
-                "compatible. Set the all_to_all backend to deepep_low_latency "
-                "to use those kernels instead."
+            logger.warning_once(
+                "--cpu-offload-gb is enabled with CUDA graphs on WSL2. "
+                "This combination requires pinned (page-locked) memory "
+                "allocations. WARNING: Windows (WDDM) enforces a hard "
+                "system-wide cap of roughly 50%% of physical RAM on pinned "
+                "memory shared across ALL processes by default (limit can "
+                "changed via %%USERPROFILE%%\\.wslconfig). "
+                "Excessive use of page-locked memory can prevent Windows "
+                "from reclaiming memory under load, which can cause the "
+                "entire host OS to become unresponsive and may require a "
+                "hard reboot to recover. Proceed at your own risk. "
+                "To raise the WSL2 VM memory ceiling, increase the `memory` "
+                "setting in %%USERPROFILE%%\\.wslconfig and run "
+                "`wsl --shutdown`."
             )
-            vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-            vllm_config.model_config.enforce_eager = True
-            # TODO (varun): Turning this ON gives incorrect results for the
-            # Deepseek-V2-lite model.
-            # Note: use_inductor removed in v0.15.1, use backend="eager" instead
-            vllm_config.compilation_config.backend = "eager"
-        # v0.15.1: set backend="eager" to avoid inductor/Triton
-        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            vllm_config.compilation_config.custom_ops = ["all"]
-            vllm_config.compilation_config.pass_config.enable_fusion = False
-            vllm_config.compilation_config.backend = "eager"
+    # def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+    #     """
+    #     TODO Update here for v0.15.1
+
+    #     Update default values across different config sections.
+
+    #     If certain fields are not specified, this function will automatically
+    #     choose appropriate defaults based on runtime conditions.
+
+    #     - If the cache block size is not set, it defaults to 16.
+    #     - If MLA is enabled and `VLLM_ATTENTION_BACKEND` is not set or is set
+    #     to "FLASHMLA", the cache block size will be updated to 64.
+    #     - When running with the DeepEP high-throughput backend, data parallelism
+    #     greater than 1, and CUDA graph mode, eager execution will be enforced.
+    #     This is because DP + DeepEP high-throughput kernels are not compatible
+    #     with CUDA graphs. The DeepEP low-latency kernels should be used instead.
+
+    #     Args:
+    #         vllm_config (VllmConfig): The vLLM configuration object.
+
+    #     Raises:
+    #         NotImplementedError:
+    #             If multi-step scheduling is used in vLLM V1.
+    #             Please remove the `--num-scheduler-steps` argument.
+    #         NotImplementedError:
+    #             If MLA is used in vLLM V1 without setting the
+    #             `VLLM_ATTENTION_BACKEND` environment variable.
+
+    #     Returns:
+    #         None.
+    #     """
+    #     parallel_config = vllm_config.parallel_config  # Not use scheduler_config
+    #     # scheduler_config = vllm_config.scheduler_config
+    #     model_config = vllm_config.model_config
+
+    #     if parallel_config.worker_cls == "auto":
+    #         # v0.15.1 do not support v0.15.1, remove the if condition
+    #         if vllm_config.speculative_config:
+    #             # if envs.VLLM_USE_V1:
+    #             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+    #         else:
+    #             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+    #     cache_config = vllm_config.cache_config
+    #     if cache_config and cache_config.block_size is None:
+    #         cache_config.block_size = 16
+
+    #     # TODO(lucas): handle this more gracefully
+    #     # Note: model_config may be None during testing
+    #     if model_config is not None and model_config.use_mla:
+    #         # if `VLLM_ATTENTION_BACKEND` is not set and we are using MLA, then
+    #         # we default to FlashMLA backend, so we need to force the blocksize
+    #         # here
+    #         use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+    #         use_flashmla = (
+    #             envs.VLLM_ATTENTION_BACKEND is None
+    #             or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
+    #         )
+    #         from vllm.attention.ops.flashmla import is_flashmla_supported
+
+    #         if (
+    #             use_flashmla
+    #             and is_flashmla_supported()[0]
+    #             and cache_config.block_size != 64
+    #         ):
+    #             cache_config.block_size = 64
+    #             logger.info("Forcing kv cache block size to 64 for FlashMLA backend.")
+    #         if use_sparse and cache_config.block_size != 64:
+    #             cache_config.block_size = 64
+    #             logger.info(
+    #                 "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
+    #             )
+
+    #     from vllm.config import CUDAGraphMode
+
+    #     if (
+    #         getattr(envs, "VLLM_ALL2ALL_BACKEND", None) == "deepep_high_throughput"
+    #         and parallel_config.data_parallel_size > 1
+    #         and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+    #     ):
+    #         logger.info(
+    #             "Data Parallel: Forcing enforce eager to be True since DP "
+    #             "with DeepEP high-throughput kernels are not CUDA Graph "
+    #             "compatible. The DeepEP low-latency kernels are CUDA Graph "
+    #             "compatible. Set the all_to_all backend to deepep_low_latency "
+    #             "to use those kernels instead."
+    #         )
+    #         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    #         vllm_config.model_config.enforce_eager = True
+    #         # TODO (varun): Turning this ON gives incorrect results for the
+    #         # Deepseek-V2-lite model.
+    #         # Note: use_inductor removed in v0.15.1, use backend="eager" instead
+    #         vllm_config.compilation_config.backend = "eager"
+    #     # v0.15.1: set backend="eager" to avoid inductor/Triton
+    #     if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+    #         vllm_config.compilation_config.custom_ops = ["all"]
+    #         vllm_config.compilation_config.pass_config.enable_fusion = False
+    #         vllm_config.compilation_config.backend = "eager"
 
     @classmethod
     def get_attn_backend_cls(
@@ -308,7 +349,12 @@ class KunlunPlatform(Platform):
                     "vllm_kunlun.v1.attention.backends.mla.flashmla_sparse."
                     "FlashMLASparseBackend"
                 )
-            return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
+            # Kimi-K3 non-sparse MLA -> Kunlun (P800) port of FlashAttnMLABackend.
+            logger.info_once("Using Kunlun FlashAttnMLABackend on V1 engine.")
+            return (
+                "vllm_kunlun.v1.attention.backends.mla.flashattn_mla."
+                "FlashAttnMLABackend"
+            )
         elif not attn_selector_config.use_mla:
             return (
                 "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
