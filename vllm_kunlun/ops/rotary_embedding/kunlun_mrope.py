@@ -51,6 +51,10 @@ class KunlunMRotaryEmbedding(MRotaryEmbedding):
         key: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Kunlun-optimized forward_oot for MRotaryEmbedding."""
+        # Official MRV2 MTP passes scalar text positions even when the target
+        # uses three-axis M-RoPE. Use upstream's torch implementation here.
+        if positions.ndim == 1:
+            return self.forward_native(positions, query, key)
         assert positions.ndim == 2
         assert key is not None
 

@@ -570,7 +570,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
-        spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
@@ -598,28 +597,39 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
             else:
-                mixed_qkv_spec = mixed_qkv[spec_token_masks]
-                mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            spec_tokens = attn_metadata.num_spec_decode_tokens
+            mixed_qkv_spec = mixed_qkv_spec[:spec_tokens]
+            if attn_metadata.spec_pad_gather_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(
+                    0, attn_metadata.spec_pad_gather_idx)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
+                conv_state_indices=attn_metadata.spec_conv_state_indices_tensor[
                     : attn_metadata.num_spec_decodes
                 ],
-                num_accepted_tokens=num_accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens[
+                    : attn_metadata.num_spec_decodes
+                ],
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+
+            if attn_metadata.spec_unpad_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(
+                    0, attn_metadata.spec_unpad_idx)
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
@@ -649,9 +659,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 conv_state_indices=non_spec_state_indices_tensor[
                     : attn_metadata.num_decodes
                 ],
-                conv_state_indices_cpu=non_spec_state_indices_tensor_cpu[
-                    : attn_metadata.num_decodes
-                ],
                 validate_data=True,
             )
         else:
@@ -669,15 +676,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                g_spec = g
-                beta_spec = beta
+                g_spec = g[:, :spec_tokens]
+                beta_spec = beta[:, :spec_tokens]
                 g_non_spec = None
                 beta_non_spec = None
             else:
-                g_spec = g[:, spec_token_masks]
-                beta_spec = beta[:, spec_token_masks]
-                g_non_spec = g[:, ~spec_token_masks]
-                beta_non_spec = beta[:, ~spec_token_masks]
+                g_spec = g.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                g_non_spec = g.index_select(1, non_spec_token_indx)
+                beta_non_spec = beta.index_select(1, non_spec_token_indx)
         else:
             g_spec = None
             beta_spec = None
@@ -736,9 +743,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             )
             initial_state = initial_state.view(initial_state_shape)
 
-            initial_state = initial_state * has_initial_state.view(
-                has_initial_state.shape[0], 1, 1, 1
-            )
+            # Uninitialized/reused cache slots may contain NaN or Inf; * 0
+            # does not clear those values for requests without prior state.
+            fresh_mask = has_initial_state.view(-1, 1, 1, 1) == 0
+            initial_state = initial_state.masked_fill(fresh_mask, 0)
             initial_state = initial_state.transpose(-1, -2).contiguous()
 
             (
