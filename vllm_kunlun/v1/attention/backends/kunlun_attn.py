@@ -563,6 +563,11 @@ class KunlunAttentionMetadataBuilder:
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
         attn_metadata.seq_lens_tensor.fill_(1)
+        # The host lengths bound the captured kernel's launch configuration.
+        # Keep device lengths small for capture, but cover every replay length.
+        attn_metadata.seq_lens_tensor_cpu = torch.full_like(
+            attn_metadata.seq_lens_tensor_cpu, attn_metadata.max_model_len
+        )
         return attn_metadata
 
     def build_for_drafting(
@@ -598,12 +603,19 @@ class KunlunAttentionMetadataBuilder:
         slot_mapping = common_attn_metadata.slot_mapping
 
         query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
-        )
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
 
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        # MRV2 keeps an optimistic CPU length mirror. Without speculative
+        # decoding there are no rejected draft tokens, so it is exact (padded
+        # requests remain zero). Avoid the lazy seq_lens_cpu property's D2H
+        # synchronization in that case. Speculative runs retain the exact
+        # device readback; an upper bound is insufficient for the XFA ABI.
+        cpu_lengths = common_attn_metadata.seq_lens_cpu_upper_bound
+        if self.vllm_config.num_speculative_tokens == 0 and cpu_lengths is not None:
+            seq_lens_cpu = cpu_lengths
+        else:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
