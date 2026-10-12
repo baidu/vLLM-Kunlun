@@ -809,8 +809,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         query = query.view(-1, self.num_heads, self.head_size)
         if output is None:
             output = torch.empty_like(query)
+        # Kernels leave padded tokens and zero-length graph requests untouched.
+        # Downstream layers (including MoE routing) consume the padded extent,
+        # so initialize it on every invocation, including graph replays.
+        output.zero_()
         if attn_metadata is None:
-            # Profiling run.
             return output.view(-1, self.num_heads * self.head_size)
         if key is not None:
             assert value is not None

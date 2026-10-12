@@ -51,6 +51,18 @@ def gumbel_sample(
 ) -> torch.Tensor:
     if logits.shape[0] == 0:
         return logits.new_empty((0,), dtype=torch.int64)
+    if output_processed_logits is not None:
+        return torch.ops.xspeedgate_ops.gumbel_sample_kernel(
+            logits.float(),
+            expanded_idx_mapping,
+            temperature,
+            seed,
+            pos,
+            apply_temperature,
+            output_processed_logits,
+            output_processed_logits_col,
+            use_fp64,
+        )
     sampled = torch.ops.xspeedgate_ops.gumbel_sample(
         logits,
         expanded_idx_mapping,

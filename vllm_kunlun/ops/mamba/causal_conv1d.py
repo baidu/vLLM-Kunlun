@@ -2,7 +2,6 @@ from typing import Optional, Union
 
 import kunlun_ops
 import torch
-import torch.nn.functional as F
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 
@@ -66,47 +65,6 @@ def causal_conv1d_fn(
     )
 
     return out
-
-
-def torch_causal_conv1d_update_spec(
-    hidden_states,
-    conv_state,
-    weight,
-    bias=None,
-    activation=None,
-    conv_state_indices=None,
-    num_accepted_tokens=None,
-):
-    out = torch.empty_like(hidden_states)
-    _, seq_len, hidden_size = hidden_states.shape
-    for i in range(hidden_states.shape[0]):
-        tmp_conv_state = conv_state[conv_state_indices[i]]
-        state_len = tmp_conv_state.shape[-2]
-        hidden_states_i = hidden_states[i]
-        hidden_states_new = torch.cat(
-            [tmp_conv_state[: (2 + num_accepted_tokens[i]), :], hidden_states_i], dim=0
-        ).to(weight.dtype)
-
-        hidden_states_new = hidden_states_new.unsqueeze(0)
-
-        conv_state[conv_state_indices[i]] = hidden_states_new[:, -state_len:, :]
-        for j in range(seq_len):
-            if j == seq_len - 1:
-                hidden_states_new_j = hidden_states_new
-            else:
-                hidden_states_new_j = hidden_states_new[:, : (1 - seq_len + j)]
-            hidden_states_new_j = hidden_states_new_j.transpose(-1, -2).contiguous()
-            out_i = F.conv1d(
-                hidden_states_new_j,
-                weight.unsqueeze(1),
-                bias,
-                padding=0,
-                groups=hidden_size,
-            )
-            out_i = F.silu(out_i[:, :, -1:])
-            out_i = out_i.to(hidden_states.dtype).squeeze(-1).unsqueeze(0)
-            out[i, j] = out_i
-    return out.view(-1, hidden_size)
 
 
 def causal_conv1d_update(
@@ -205,12 +163,12 @@ def causal_conv1d_update(
         )
         return x.squeeze(1)
     else:
-        return torch_causal_conv1d_update_spec(
+        return torch.ops.xspeedgate_ops.causal_conv1d_update_kernel(
             x,
             conv_state,
             weight,
             bias,
-            activation,
-            conv_state_indices=conv_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
+            conv_state_indices,
+            num_accepted_tokens,
+            activation in ("silu", "swish"),
         )

@@ -1,41 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun overrides for ``vllm.v1.worker.mamba_utils``.
+"""Kunlun Mamba state-copy, align processing and initialization helpers.
 
-Exactly two things differ from upstream on Kunlun XPU:
-
-* ``batch_memcpy`` must go through ``torch.ops.xspeedgate_ops.batch_memcpy``
-  instead of launching the Triton ``batch_memcpy_kernel``.
-* ``MambaCopyBuffers.create`` allocates ``int64`` pointer/size buffers, which is
-  what the xspeedgate op expects (upstream uses ``uint64``/``int32``).
-
-Everything else -- the 5 Triton kernels, ``MambaSpecDecodeGPUContext``,
-``MambaBuffers``, and the V1 pre/postprocess helpers -- is left untouched.
-
-That is safe because ``@triton.jit`` is lazy: decorating a kernel compiles
-nothing, only a ``kernel[grid](...)`` launch does. The kernels we do not
-replace are reachable only from the mamba "align" cache mode, which requires
-prefix caching to be enabled.
-
-This replaces a 396-line fork of an *older* upstream revision that was missing
-12 symbols the current upstream imports. Two of them broke Qwen3.5 outright::
-
-    vllm/v1/worker/gpu/model_states/mamba_hybrid.py:27
-    ImportError: cannot import name 'MambaSpecDecodeGPUContext'
-
-and four more were latent ``AttributeError``s on the V1 path
-(``gpu_model_runner.py`` lines 1547, 1570, 2098, 4258). Patching the two real
-deltas in place, instead of hand-maintaining a whole export surface, removes
-that class of failure entirely.
-
-Also dropped here: ``get_hybrid_attention_mamba_layout`` and
-``postprocess_mamba``, two symbols the old fork carried that exist neither
-upstream nor in any caller.
+The upstream state-management classes and scheduling remain in use. Their
+copy and align launch sites call XSpeedGate kernels through this module.
+MambaStateZeroer reuses a bounded zero buffer to clear selected state rows
+without allocating a tensor the size of the cache pool.
 """
 
 import logging
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import vllm.v1.worker.mamba_utils as _up
 
@@ -92,10 +68,10 @@ def _initialize_from_forward_context(original):
             from vllm.model_executor.layers.mamba.mamba_utils import (
                 is_conv_state_dim_first,
             )
-
-            dim_first = is_conv_state_dim_first()
-        except Exception:
+        except (ImportError, AttributeError):
             dim_first = False
+        else:
+            dim_first = is_conv_state_dim_first()
         metas = []
         for group_local_idx, group_id in enumerate(self.mamba_group_ids):
             group = kv_cache_config.kv_cache_groups[group_id]
@@ -136,12 +112,21 @@ def _initialize_from_forward_context(original):
                 raise ValueError("Invalid Mamba state layout")
             channels = state.shape[1 if dim_first else 2] if meta.is_conv else 0
             width = state.shape[2 if dim_first else 1] if meta.is_conv else 0
-            layouts.append([
-                state.data_ptr(), state.stride(0) * state.element_size(),
-                inner * state.element_size(), state.element_size(),
-                channels, width, int(dim_first), table.data_ptr(),
-                table.shape[1], state.shape[0], capacity,
-            ])
+            layouts.append(
+                [
+                    state.data_ptr(),
+                    state.stride(0) * state.element_size(),
+                    inner * state.element_size(),
+                    state.element_size(),
+                    channels,
+                    width,
+                    int(dim_first),
+                    table.data_ptr(),
+                    table.shape[1],
+                    state.shape[0],
+                    capacity,
+                ]
+            )
         self._kunlun_mamba_layouts = torch.tensor(
             layouts, dtype=torch.int64, device=self.num_accepted_tokens_out.device
         )
@@ -202,9 +187,7 @@ def _run_fused_postprocess_align(
 
 
 def _patch_mamba_align_xspeedgate() -> None:
-    _up.preprocess_mamba_align_fused_kernel = _TorchKernel(
-        _preprocess_mamba_align
-    )
+    _up.preprocess_mamba_align_fused_kernel = _TorchKernel(_preprocess_mamba_align)
     context = _up.MambaSpecDecodeGPUContext
     if not getattr(context, "_kunlun_align_xspeedgate_patched", False):
         context.initialize_from_forward_context = _initialize_from_forward_context(
@@ -296,3 +279,90 @@ logger.info(
 logger.info(
     "[KunlunPlugin] mamba align patched (complete XSpeedGate wheel)",
 )
+
+
+class MambaStateZeroer:
+    """Reuse one zero row as the source of bounded, strided state writes.
+
+    Called outside graph capture on the runner's current stream. Keep the zero
+    source alive for the runner lifetime: batch_memcpy consumes raw pointers.
+    """
+
+    def __init__(self):
+        self._zero = None
+
+    def clear(self, state_blocks):
+        plans = {}
+        device = None
+        max_bytes = 0
+        # Validate the complete plan before modifying any state.
+        for state, block_ids in state_blocks:
+            blocks = sorted(set(block_ids) - {0})
+            if not blocks:
+                continue
+            if state.ndim < 2:
+                raise ValueError("Mamba state must have a block dimension")
+            inner = 1
+            for dim in range(state.ndim - 1, 0, -1):
+                if state.stride(dim) != inner:
+                    raise ValueError("Mamba state rows must be contiguous")
+                inner *= state.shape[dim]
+            if state.stride(0) < inner:
+                raise ValueError("Mamba state rows must not overlap")
+            if blocks[0] < 0 or blocks[-1] >= state.shape[0]:
+                raise ValueError("Mamba state block index out of bounds")
+            if device is not None and device != state.device:
+                raise ValueError("Mamba states must be on the same device")
+            device = state.device
+            size = inner * state.element_size()
+            if not size:
+                continue
+            max_bytes = max(max_bytes, size)
+            stride = state.stride(0) * state.element_size()
+            key = (state.data_ptr(), stride, size)
+            plans.setdefault(key, set()).update(blocks)
+        if not plans:
+            return
+        if device.type != "cuda":
+            raise ValueError("MambaStateZeroer requires the Kunlun CUDA shim")
+
+        # Conv and SSM commonly occupy adjacent intervals in the same page.
+        # Combine only exact adjacency with identical selected rows; preserve
+        # all padding and any state belonging to another request.
+        merged = []
+        for (address, stride, size), blocks in sorted(
+            plans.items(), key=lambda item: (item[0][1], item[0][0])
+        ):
+            if merged:
+                prev_address, prev_stride, prev_size, prev_blocks = merged[-1]
+                if (
+                    stride == prev_stride
+                    and address == prev_address + prev_size
+                    and blocks == prev_blocks
+                    and prev_size + size <= stride
+                ):
+                    merged[-1] = (prev_address, stride, prev_size + size, blocks)
+                    max_bytes = max(max_bytes, prev_size + size)
+                    continue
+            merged.append((address, stride, size, blocks))
+        if (
+            self._zero is None
+            or self._zero.device != device
+            or self._zero.numel() < max_bytes
+        ):
+            self._zero = torch.zeros(max_bytes, dtype=torch.uint8, device=device)
+        count = sum(len(blocks) for _, _, _, blocks in merged)
+        host = np.empty((3, count), dtype=np.int64)
+        host[0].fill(self._zero.data_ptr())
+        offset = 0
+        for address, stride, size, blocks in merged:
+            end = offset + len(blocks)
+            host[1, offset:end] = (
+                address
+                + np.fromiter(sorted(blocks), dtype=np.int64, count=len(blocks))
+                * stride
+            )
+            host[2, offset:end] = size
+            offset = end
+        metadata = torch.from_numpy(host).to(device=device)
+        torch.ops.xspeedgate_ops.batch_memcpy(metadata[0], metadata[1], metadata[2])
