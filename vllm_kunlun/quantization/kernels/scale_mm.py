@@ -19,15 +19,20 @@
 from typing import Optional
 
 import torch
+from torch.library import custom_op
 from vllm.model_executor.kernels.linear import (
     CutlassInt8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
+    MPLinearKernel,
+    MPLinearLayerConfig,
 )
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
+
+from .quant_ops import convert_packed_int4
 
 
 class KunlunScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
-
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
@@ -98,3 +103,125 @@ class KunlunScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
             #     out_dtype=x.dtype,
             #     bias=bias.to(torch.float32).contiguous() if bias is not None else None,
             # )
+
+
+@custom_op("vllm::kunlun_w4a8_int_linear", mutates_args=())
+def w4a8_int_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_max: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # kunlun_ops loads the dependent libraries before importing the binding.
+    import kunlun_ops
+    import xpu_kunlun_ops
+
+    x2 = x.reshape(-1, x.shape[-1]).contiguous()
+    out = torch.empty((x2.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    if x2.shape[0] != 0:
+        xq = torch.empty_like(x2, dtype=torch.int8)
+        xmax = torch.empty((x2.shape[0], 1), dtype=torch.float32, device=x.device)
+        kunlun_ops.quant2d(x2, xq, xmax, force_sdnn=True)
+        if weight_max.shape[-1] > 1:
+            # matmul_v2's packed INT4 path consumes per-channel maxima.
+            # Use a single expert with explicit K-group scales for Dense.
+            kunlun_ops.moe_fc_v3(
+                x=xq,
+                weight=weight.unsqueeze(0),
+                sorted_tokens_num_lod=torch.arange(
+                    2, dtype=torch.int32, device=x.device
+                )
+                * x2.shape[0],
+                sorted_tokens_idx=torch.arange(
+                    x2.shape[0], dtype=torch.int32, device=x.device
+                ),
+                moe_topk=1,
+                y=out,
+                x_perchannel_max=xmax.expand(-1, weight_max.shape[-1]).contiguous(),
+                w_perchannel_max=weight_max.unsqueeze(0),
+                bias=None if bias is None else bias.float().contiguous(),
+                tgemm_type="int8_wo_t",
+                scale_n=1,
+                scale_k=2 * weight.shape[-1] // weight_max.shape[-1],
+                use_pack_int4=True,
+            )
+            return out.reshape(*x.shape[:-1], weight.shape[0])
+        # Final bool selects packed INT4. Scale arguments are maxima, not steps:
+        # activations use 127 * step and signed INT4 weights use 7 * step.
+        xpu_kunlun_ops.matmul_v2(
+            xq,
+            weight,
+            out,
+            False,
+            True,
+            1.0,
+            0.0,
+            None if bias is None else bias.float().contiguous(),
+            None,
+            None,
+            xmax,
+            weight_max,
+            0,
+            True,
+        )
+    return out.reshape(*x.shape[:-1], weight.shape[0])
+
+
+@w4a8_int_linear.register_fake
+def _fake_w4a8_int_linear(x, weight, weight_max, bias=None):
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+class KunlunW4A8IntLinearKernel(MPLinearKernel):
+    """Kunlun W4A8 GEMM for packed INT4 checkpoints."""
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 1
+
+    @classmethod
+    def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if not current_platform.is_out_of_tree():
+            return False, "Kunlun W4A8 requires the OOT platform"
+        if c.weight_type != scalar_types.int4:
+            return False, "Kunlun W4A8 requires signed INT4 weights"
+        if c.act_type not in (torch.float16, torch.bfloat16):
+            return False, "Kunlun W4A8 requires FP16 or BF16 activations"
+        if c.out_type not in (None, c.act_type):
+            return False, "Kunlun W4A8 requires output dtype to match activations"
+        if c.zero_points or c.has_g_idx:
+            return False, "Kunlun W4A8 requires symmetric weights without actorder"
+        k = c.partition_weight_shape[0]
+        if k % 8:
+            return False, "Packed W4A8 requires K partitions divisible by 8"
+        if c.group_size != -1 and (
+            c.group_size <= 0 or c.group_size % 2 or k % c.group_size
+        ):
+            return (
+                False,
+                "Kunlun packed W4A8 requires even group sizes aligned with TP partitions",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight, scale, _, _ = self._get_weight_params(layer)
+        packed = torch.nn.Parameter(convert_packed_int4(weight), requires_grad=False)
+        setattr(layer, self.w_q_name, packed)
+        if hasattr(layer, "weight_shape"):
+            del layer.weight_shape
+        setattr(
+            layer,
+            self.w_s_name,
+            torch.nn.Parameter(
+                scale.float().mul(7.0).contiguous(), requires_grad=False
+            ),
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight, scale, _, _ = self._get_weight_params(layer)
+        return w4a8_int_linear(x, weight, scale, bias)

@@ -4,11 +4,16 @@ import pytest
 
 
 def boolean_names(envs_module):
-    """Every entry except the one string-valued variable."""
+    """Flags using the common true/1 parsing contract."""
     return [
         name
         for name in envs_module.xvllm_environment_variables
-        if name != "VLLM_MULTI_LOGPATH"
+        if name
+        not in {
+            "VLLM_MULTI_LOGPATH",
+            "VLLM_KUNLUN_DSPARK_TOPK",
+            "VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK",
+        }
     ]
 
 
@@ -90,3 +95,36 @@ class TestMaybeConvertInt:
     def test_rejects_a_non_numeric_value(self, envs_module):
         with pytest.raises(ValueError):
             envs_module.maybe_convert_int("not-a-number")
+
+
+class TestDSparkSettings:
+    def test_defaults(self, clean_env):
+        assert clean_env.VLLM_KUNLUN_DSPARK_TOPK is None
+        assert clean_env.VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK is False
+
+    @pytest.mark.parametrize(
+        "value, expected", [("", None), ("  ", None), ("1024", 1024)]
+    )
+    def test_optional_topk(self, clean_env, monkeypatch, value, expected):
+        monkeypatch.setenv("VLLM_KUNLUN_DSPARK_TOPK", value)
+        assert clean_env.VLLM_KUNLUN_DSPARK_TOPK == expected
+
+    def test_invalid_topk(self, clean_env, monkeypatch):
+        monkeypatch.setenv("VLLM_KUNLUN_DSPARK_TOPK", "invalid")
+        with pytest.raises(ValueError):
+            _ = clean_env.VLLM_KUNLUN_DSPARK_TOPK
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("0", False),
+            (" false ", False),
+            ("OFF", False),
+            ("1", True),
+            ("true", True),
+            ("", True),
+        ],
+    )
+    def test_preserves_tp_local_parsing(self, clean_env, monkeypatch, value, expected):
+        monkeypatch.setenv("VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK", value)
+        assert clean_env.VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK is expected

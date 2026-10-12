@@ -26,7 +26,6 @@ def dequant_int4(
     int4_signed: bool = False,
     use_mode_fast: bool = False,
 ) -> torch.Tensor:
-
     fpweight = torch.empty(
         (
             qweight.shape[0],
@@ -84,3 +83,11 @@ def dequant_int4_native(weight_packed_uint8: torch.Tensor, scale: torch.Tensor):
         1, 1, weight_upacked_fp16.shape[-1] // scale.shape[-1]
     )
     return weight_upacked_fp16
+
+
+def convert_packed_int4(weight: torch.Tensor) -> torch.Tensor:
+    """Convert offset-binary INT32 packing to signed INT4 bytes in place."""
+    if weight.dtype != torch.int32 or not weight.is_contiguous():
+        raise ValueError("Packed W4A8 weights must be contiguous INT32 tensors")
+    # Flip each nibble's sign bit (0x88 per byte); retain the same allocation.
+    return weight.view(torch.int8).bitwise_xor_(-120)

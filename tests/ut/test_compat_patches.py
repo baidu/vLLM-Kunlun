@@ -6,10 +6,38 @@ passes in, so no vLLM module has to be importable here.
 
 import logging
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from vllm_kunlun.registration import compat_patches
+
+
+class FakeVllmConfig:
+    def _get_v2_model_runner_unsupported_features(self):
+        return []
+
+    def __post_init__(self):
+        pass
+
+
+def make_dspark_config(*, num_speculative_tokens=7, tensor_parallel_size=2):
+    config = FakeVllmConfig()
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        rejection_sample_method="standard",
+        num_speculative_tokens=num_speculative_tokens,
+        draft_sample_method="greedy",
+    )
+    config.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(model_type="qwen3_5")
+    )
+    config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    return config
 
 
 class TestDefaultHooks:
@@ -23,6 +51,34 @@ class TestDefaultHooks:
         targets = [target for target, _, _ in compat_patches.DEFAULT_HOOKS]
 
         assert len(set(targets)) == len(targets)
+
+
+class TestMrv2CapabilityGate:
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
+    def test_dspark_does_not_restrict_num_speculative_tokens(
+        self, module_factory, num_speculative_tokens
+    ):
+        module = module_factory(HAS_TRITON=False, VllmConfig=FakeVllmConfig)
+        compat_patches._apply_mrv2_gate(module)
+        config = make_dspark_config(
+            num_speculative_tokens=num_speculative_tokens,
+            tensor_parallel_size=2,
+        )
+
+        assert config._get_v2_model_runner_unsupported_features() == []
+
+    @pytest.mark.parametrize("tensor_parallel_size", [1, 4, 8])
+    def test_dspark_does_not_restrict_tensor_parallel_size(
+        self, module_factory, tensor_parallel_size
+    ):
+        module = module_factory(HAS_TRITON=False, VllmConfig=FakeVllmConfig)
+        compat_patches._apply_mrv2_gate(module)
+        config = make_dspark_config(
+            num_speculative_tokens=7,
+            tensor_parallel_size=tensor_parallel_size,
+        )
+
+        assert config._get_v2_model_runner_unsupported_features() == []
 
 
 class TestSideEffectImportPatches:
@@ -182,3 +238,34 @@ class TestOotRegistrations:
         module = module_factory(CustomOp=object(), PluggableLayer=object())
 
         assert compat_patches._oot_registrations_applied(module) is True
+
+
+class TestRmsNormImportOrder:
+    def test_patch_defers_kernel_import_until_first_call(
+        self, module_factory, monkeypatch
+    ):
+        import builtins
+
+        original_import = builtins.__import__
+        attempts = []
+        calls = []
+        kernel_module = SimpleNamespace(rms_norm=lambda *args: calls.append(args))
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "vllm_kunlun.ops.layernorm":
+                attempts.append(name)
+                return kernel_module
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        module = module_factory(rms_norm=lambda *args: None)
+        compat_patches._apply_rms_norm_abi(module)
+        assert attempts == []
+        assert compat_patches._rms_norm_abi_applied(module)
+        patched = module.rms_norm
+        compat_patches._apply_rms_norm_abi(module)
+        assert module.rms_norm is patched
+        module.rms_norm("out", "input", "weight", 1e-6)
+        module.rms_norm("out", "input", "weight", 1e-6)
+        assert len(attempts) == 1
+        assert calls == [("out", "input", "weight", 1e-6)] * 2

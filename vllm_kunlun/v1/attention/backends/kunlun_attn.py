@@ -16,6 +16,7 @@
 #
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -228,6 +229,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     num_prefills: int = 0
     num_decodes: int = 0
     is_speculative: Optional[bool] = False
+    # DFlash/DSpark draft query blocks are non-causal; target remains causal.
+    causal: bool = True
     max_model_len: int = 0
 
     def __post_init__(self):
@@ -325,11 +328,16 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             kv_lod_xpu = None
         else:
             start = -(self.num_prefills + 1)
-            base_cpu = self.kv_lod_cpu[start]
-            kv_lod_cpu = self.kv_lod_cpu[start:] - base_cpu
-
-            base_xpu = self.kv_lod_xpu[start]
-            kv_lod_xpu = self.kv_lod_xpu[start:] - base_xpu
+            if self.num_prefills + 1 == self.kv_lod_cpu.numel():
+                # Full-prefill DSpark query: preserve the registered device
+                # buffer address so a captured graph observes runtime updates.
+                kv_lod_cpu = self.kv_lod_cpu
+                kv_lod_xpu = self.kv_lod_xpu
+            else:
+                base_cpu = self.kv_lod_cpu[start]
+                kv_lod_cpu = self.kv_lod_cpu[start:] - base_cpu
+                base_xpu = self.kv_lod_xpu[start]
+                kv_lod_xpu = self.kv_lod_xpu[start:] - base_xpu
 
         # Construct & cache prefill-phase attention metadata structure
         self._cached_prefill_metadata = KunlunMetadata(
@@ -341,6 +349,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             slot_mapping=slot_mapping,
             seq_lens=seq_lens,
             seq_lens_tensor=seq_lens_tensor,
+            seq_lens_tensor_cpu=self.seq_lens_tensor_cpu,
             seq_start_loc=None,
             kv_lod_cpu=kv_lod_cpu,
             kv_lod_xpu=kv_lod_xpu,
@@ -365,6 +374,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             enable_kv_scales_calculation=False,
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
+            causal=self.causal,
+            max_model_len=self.max_model_len,
         )
         return self._cached_prefill_metadata
 
@@ -438,6 +449,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             enable_kv_scales_calculation=False,
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
+            causal=self.causal,
             max_model_len=self.max_model_len,
         )
         return self._cached_decode_metadata
@@ -559,10 +571,23 @@ class KunlunAttentionMetadataBuilder:
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> KunlunMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
-        # When doing full graph capture, setting seq_lens to
-        # max_model_len will cause graph capture to be extremely
-        # slow, so here we set it to 1.
+        # Graph-safe DSpark attention consumes seq_lens_tensor directly through
+        # speculative_attention. Keep legacy LOD buffers valid for metadata
+        # construction, but they no longer size the captured attention launch.
         attn_metadata.seq_lens_tensor.fill_(1)
+        # The host lengths bound the captured kernel's launch configuration.
+        # Keep device lengths small for capture, but cover every replay length.
+        attn_metadata.seq_lens_tensor_cpu = torch.full_like(
+            attn_metadata.seq_lens_tensor_cpu, attn_metadata.max_model_len
+        )
+        if not common_attn_metadata.causal and attn_metadata.kv_lod_xpu is not None:
+            capture_lod = torch.arange(
+                common_attn_metadata.num_reqs + 1, dtype=torch.int32
+            )
+            attn_metadata.kv_lod_cpu.copy_(capture_lod)
+            attn_metadata.kv_lod_xpu.copy_(
+                capture_lod.to(self.device, non_blocking=True)
+            )
         return attn_metadata
 
     def build_for_drafting(
@@ -598,25 +623,64 @@ class KunlunAttentionMetadataBuilder:
         slot_mapping = common_attn_metadata.slot_mapping
 
         query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
-        )
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
 
         seq_lens = common_attn_metadata.seq_lens
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        # DSpark registers an address-stable KV LOD buffer populated directly
+        # by the XSpeedGate input-preparation kernel. XFA uses device LOD for
+        # actual cache addressing; its host LOD is only a launch descriptor, so
+        # the optimistic CPU upper bound is safe here and avoids the D2H sync.
+        try:
+            from vllm_kunlun.v1.worker.gpu.spec_decode.dspark_buffers import (
+                get_or_create_kv_lod,
+                lookup_kv_lod,
+            )
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
+            persistent_kv_lod = lookup_kv_lod(seq_lens)
+            # DSpark FULL graphs are captured before the first real proposal,
+            # so input preparation has not had a chance to register its LOD
+            # buffer yet. Allocate it here while constructing capture metadata;
+            # runtime preparation then updates this exact address before replay.
+            if persistent_kv_lod is None and not common_attn_metadata.causal:
+                persistent_kv_lod = get_or_create_kv_lod(
+                    seq_lens,
+                    int(self.vllm_config.scheduler_config.max_num_seqs),
+                )
+        except ImportError:
+            persistent_kv_lod = None
+        cpu_lengths = common_attn_metadata.seq_lens_cpu_upper_bound
+        if persistent_kv_lod is not None and cpu_lengths is not None:
+            seq_lens_cpu = cpu_lengths
+        elif self.vllm_config.num_speculative_tokens == 0 and cpu_lengths is not None:
+            seq_lens_cpu = cpu_lengths
+        else:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+
+        if not common_attn_metadata.causal:
+            # DSpark/DFlash query blocks are bidirectional. The speculative
+            # decode kernel applies a causal mask, so use the paged prefill
+            # kernel which explicitly supports is_causal=False.
+            num_decodes, num_prefills = 0, num_reqs
+            num_decode_tokens, num_prefill_tokens = 0, num_actual_tokens
+        else:
+            (
+                num_decodes,
+                num_prefills,
+                num_decode_tokens,
+                num_prefill_tokens,
+            ) = split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold or 1,
                 require_uniform=True,
             )
-        )
 
         if num_prefill_tokens > 0:
             kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
             kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-            kv_lod_xpu = kv_lod_cpu.to(self.device, non_blocking=True)
+            if persistent_kv_lod is not None:
+                kv_lod_xpu = persistent_kv_lod[: num_reqs + 1]
+            else:
+                kv_lod_xpu = kv_lod_cpu.to(self.device, non_blocking=True)
         else:
             kv_lod_cpu = None
             kv_lod_xpu = None
@@ -663,6 +727,7 @@ class KunlunAttentionMetadataBuilder:
             use_cuda_graph=False,
             use_cascade=use_cascade,
             is_speculative=self.reorder_batch_threshold > 1,
+            causal=bool(common_attn_metadata.causal),
             max_model_len=self.vllm_config.model_config.max_model_len,
         )
         return attn_metadata
@@ -778,6 +843,33 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             self._sinks_fp32 = self.sinks.to(torch.float32)
         return self._sinks_fp32
 
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write precomputed DFlash context K/V into the paged cache.
+
+        The official DFlash model calls this hook outside the normal attention
+        forward.  Keep the same cache layout and padding contract as the
+        regular path; PAD_SLOT_ID entries are ignored by the cache operator.
+        """
+        del layer
+        if kv_cache.numel() == 0:
+            return
+        key_cache, value_cache = PagedAttention.split_kv_cache(kv_cache=kv_cache)
+        kunlun_ops.reshape_and_cache_flash(
+            key.contiguous(),
+            value.contiguous(),
+            key_cache,
+            value_cache,
+            slot_mapping,
+            BLHD_LAYOUT=False,
+        )
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -797,8 +889,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         query = query.view(-1, self.num_heads, self.head_size)
         if output is None:
             output = torch.empty_like(query)
+        # Kernels leave padded tokens and zero-length graph requests untouched.
+        # Downstream layers (including MoE routing) consume the padded extent,
+        # so initialize it on every invocation, including graph replays.
+        output.zero_()
         if attn_metadata is None:
-            # Profiling run.
             return output.view(-1, self.num_heads * self.head_size)
         if key is not None:
             assert value is not None
@@ -859,54 +954,145 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                 else prefill_meta.block_tables * block_table_scale
             )
 
-            # Prefix cache or KV sharing layers (must read K/V from cache).
-            # KV sharing layers receive raw (un-normed, un-roped) k/v from the
-            # model, so they must always read the target layer's cache.
-            is_kv_sharing = self.kv_sharing_target_layer_name is not None
-            if (
-                is_kv_sharing
-                or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
-            ):
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=key_cache,  # Key Cache [block_num, head, block_size, dim]
-                    v=value_cache,
-                    out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    is_prefix_cache=True,
-                    alpha=self.prefill_alpha,
-                    block_table=tmp_block_tables,
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
-                    context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
-                    sink=self._get_sinks_fp32(),
+            # DSpark query attention is bidirectional over a fixed query block.
+            # Reinterpret every query as an independent qlen=1 speculative
+            # request reading the same complete paged KV sequence. This exactly
+            # removes the intra-block causal mask while keeping all variable
+            # lengths on device, so FULL graph replay is safe for every context
+            # length supported by the target model.
+            if not prefill_meta.causal:
+                batch_size = prefill_meta.num_prefills
+                query_per_req = prefill_query.shape[0] // batch_size
+                virtual_batch = batch_size * query_per_req
+                expanded_lens = torch.empty(
+                    virtual_batch,
+                    dtype=prefill_meta.seq_lens_tensor.dtype,
+                    device=prefill_meta.seq_lens_tensor.device,
                 )
+                expanded_tables = torch.empty(
+                    (virtual_batch, tmp_block_tables.shape[1]),
+                    dtype=tmp_block_tables.dtype,
+                    device=tmp_block_tables.device,
+                )
+                expand_op = getattr(
+                    torch.ops.xspeedgate_ops,
+                    "dspark_expand_attention_inputs",
+                    None,
+                )
+                if (
+                    expand_op is not None
+                    and tmp_block_tables.shape[1] <= 1024
+                    and os.getenv("KUNLUN_DSPARK_ATTN_EXPAND_XSG", "1") == "1"
+                ):
+                    expand_op(
+                        prefill_meta.seq_lens_tensor,
+                        tmp_block_tables,
+                        expanded_lens,
+                        expanded_tables,
+                        query_per_req,
+                        2,
+                    )
+                else:
+                    expanded_lens.copy_(
+                        prefill_meta.seq_lens_tensor.repeat_interleave(query_per_req)
+                    )
+                    expanded_tables.copy_(
+                        tmp_block_tables.repeat_interleave(query_per_req, dim=0)
+                    )
+                host_lens = prefill_meta.seq_lens_tensor_cpu.repeat_interleave(
+                    query_per_req
+                )
+                q_view = prefill_query.view(
+                    virtual_batch, 1, self.num_heads, self.head_size
+                )
+                out_view = output[
+                    num_decode_tokens : attn_metadata.num_actual_tokens
+                ].view(virtual_batch, 1, self.num_heads, self.head_size)
+                # XFA can create the same qlen=1 plan for hundreds of virtual
+                # requests on an otherwise empty device, but plan creation may
+                # fail after the target runner has captured all of its graphs.
+                # Static chunking is captured as part of this one FULL graph;
+                # replay still has no Python dispatch or host synchronization.
+                q1_chunk = max(1, int(os.getenv("KUNLUN_DSPARK_Q1_CHUNK", "128")))
+                for q1_start in range(0, virtual_batch, q1_chunk):
+                    q1_end = min(q1_start + q1_chunk, virtual_batch)
+                    kunlun_ops.speculative_attention(
+                        out=out_view[q1_start:q1_end],
+                        q=q_view[q1_start:q1_end],
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        context_lens_cpu=host_lens[q1_start:q1_end],
+                        context_lens_xpu=expanded_lens[q1_start:q1_end],
+                        batch_num=q1_end - q1_start,
+                        qlen=1,
+                        max_context_len=prefill_meta.max_model_len,
+                        head_num=self.num_heads,
+                        head_dim=self.head_size,
+                        scale=self.scale,
+                        kv_head_num=self.num_kv_heads,
+                        block_size=key_cache.shape[2],
+                        max_num_blocks_per_seq=expanded_tables.shape[1],
+                        max_window_size=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        block_tables=expanded_tables[q1_start:q1_end],
+                        sink=self._get_sinks_fp32(),
+                    )
             else:
-                kunlun_ops.prefill_attention(
-                    q=prefill_query,
-                    k=prefill_key,
-                    v=prefill_value,
-                    out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
-                    alpha=self.prefill_alpha,
-                    context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
-                    context_qlen_lod_xpu=prefill_meta.query_start_loc,
-                    alibi_slopes=self.alibi_slopes,
-                    softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
-                    sink=self._get_sinks_fp32(),
-                )
-
+                # Prefix cache or KV sharing layers (must read K/V from cache).
+                # KV sharing layers receive raw (un-normed, un-roped) k/v from the
+                # model, so they must always read the target layer's cache.
+                is_kv_sharing = self.kv_sharing_target_layer_name is not None
+                if (
+                    is_kv_sharing
+                    or prefill_meta.query_start_loc_host[-1]
+                    != prefill_meta.kv_lod_cpu[-1]
+                ):
+                    kunlun_ops.prefill_attention(
+                        q=prefill_query,
+                        k=key_cache,  # Key Cache [block_num, head, block_size, dim]
+                        v=value_cache,
+                        out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
+                        is_causal=prefill_meta.causal,
+                        is_prefix_cache=True,
+                        alpha=self.prefill_alpha,
+                        block_table=tmp_block_tables,
+                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                        context_kvlen_lod_cpu=prefill_meta.kv_lod_cpu,
+                        context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
+                        alibi_slopes=self.alibi_slopes,
+                        softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=self._get_sinks_fp32(),
+                    )
+                else:
+                    kunlun_ops.prefill_attention(
+                        q=prefill_query,
+                        k=prefill_key,
+                        v=prefill_value,
+                        out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
+                        is_causal=prefill_meta.causal,
+                        alpha=self.prefill_alpha,
+                        context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
+                        context_qlen_lod_xpu=prefill_meta.query_start_loc,
+                        alibi_slopes=self.alibi_slopes,
+                        softmax_lse=None,
+                        swa_left=(
+                            self.sliding_window
+                            if self.sliding_window is not None
+                            else -1
+                        ),
+                        swa_right=0 if self.sliding_window is not None else -1,
+                        sink=self._get_sinks_fp32(),
+                    )
         if decode_meta := attn_metadata.decode_metadata:
             assert (
                 attn_type != AttentionType.ENCODER_ONLY

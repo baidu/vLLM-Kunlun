@@ -30,6 +30,7 @@ OOT Mechanism:
 """
 
 import logging
+import weakref
 from typing import Optional, Union
 
 import torch
@@ -181,3 +182,73 @@ class KunlunGemmaRMSNorm(GemmaRMSNorm):
 logger.info(
     "[KunlunOOT] Registered KunlunRMSNorm and KunlunGemmaRMSNorm via CustomOp.register_oot"
 )
+
+
+# Each entry keeps only a weak reference to the source parameter. This prevents
+# stale hits if a model is unloaded and a later tensor reuses the same address.
+_WEIGHT_FP32_CACHE: dict[
+    tuple[str, int | None, int],
+    tuple[weakref.ReferenceType[torch.Tensor], int, torch.Tensor],
+] = {}
+
+
+def _cached_fp32_weight(weight: torch.Tensor) -> torch.Tensor:
+    key = (weight.device.type, weight.device.index, weight.data_ptr())
+    version = int(weight._version)
+    entry = _WEIGHT_FP32_CACHE.get(key)
+    if entry is not None and entry[0]() is weight and entry[1] == version:
+        return entry[2]
+
+    converted = weight.float().contiguous()
+
+    def evict(dead_ref, *, cache_key=key):
+        cached = _WEIGHT_FP32_CACHE.get(cache_key)
+        if cached is not None and cached[0] is dead_ref:
+            _WEIGHT_FP32_CACHE.pop(cache_key, None)
+
+    source_ref = weakref.ref(weight, evict)
+    _WEIGHT_FP32_CACHE[key] = (source_ref, version, converted)
+    return converted
+
+
+def rms_norm(out, input, weight, epsilon):
+    """Adapt the upstream RMSNorm tensor contract to Kunlun kernels."""
+    # The DSpark hidden-state norm is a conventional 2-D RMSNorm.
+    if (
+        input.ndim == 2
+        and weight.ndim == 1
+        and input.is_contiguous()
+        and out.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        import kunlun_ops
+
+        kunlun_ops.rmsnorm(input, _cached_fp32_weight(weight), out, epsilon)
+        return
+
+    # DFlash context K uses one independent RMSNorm weight per layer.
+    if (
+        input.ndim >= 3
+        and weight.ndim == 2
+        and input.shape[0] == weight.shape[0]
+        and input.shape[-1] == weight.shape[-1]
+        and input.is_contiguous()
+        and out.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        rows_per_layer = input.numel() // (input.shape[0] * input.shape[-1])
+        implementation = 1 if rows_per_layer <= 512 else 0
+        torch.ops.xspeedgate_ops.dflash_grouped_rmsnorm(
+            out, input, weight, epsilon, implementation
+        )
+        return
+
+    # Reference fallback for shapes outside the optimized DFlash contract.
+    x = input.float()
+    variance = x.square().mean(dim=-1, keepdim=True)
+    w = weight.float()
+    if w.ndim == 1:
+        w = w.view(*([1] * (input.ndim - 1)), w.shape[0])
+    elif w.ndim == 2 and input.ndim >= 3:
+        w = w.view(w.shape[0], *([1] * (input.ndim - 3)), 1, w.shape[1])
+    out.copy_((x * torch.rsqrt(variance + epsilon) * w).to(dtype=out.dtype))
