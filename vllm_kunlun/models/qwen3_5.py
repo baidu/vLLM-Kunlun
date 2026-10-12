@@ -57,6 +57,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
     _require_is_multimodal,
@@ -301,6 +302,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
         self.vocab_size = config.vocab_size
 
@@ -522,6 +524,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
 ):
@@ -577,6 +580,9 @@ class Qwen3_5ForCausalLMBase(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
 
     def forward(
         self,

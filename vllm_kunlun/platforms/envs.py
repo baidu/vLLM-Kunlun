@@ -32,6 +32,13 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 # begin-env-vars-definition
 
 xvllm_environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_KUNLUN_DSPARK_TOPK": lambda: maybe_convert_int(
+        os.environ.get("VLLM_KUNLUN_DSPARK_TOPK", "").strip() or None
+    ),
+    "VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK": lambda: (
+        os.environ.get("VLLM_KUNLUN_DSPARK_TP_LOCAL_TOPK", "0").strip().lower()
+        not in {"0", "false", "off"}
+    ),
     # path to the logs of redirect-output, abstrac of related are ok
     "VLLM_MULTI_LOGPATH": lambda: os.environ.get("VLLM_MULTI_LOGPATH", "./logs"),
     # turn on / off multi-log of multi nodes & multi cards
