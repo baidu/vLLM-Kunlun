@@ -7,8 +7,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import kunlun_ops
 import torch
+import xspeedgate_ops  # noqa: F401 - register the native XSG operator
 
 
 class FusedRecurrentFunction(torch.autograd.Function):
@@ -29,20 +29,34 @@ class FusedRecurrentFunction(torch.autograd.Function):
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
-        o, ht_output = kunlun_ops.fused_recurrent_gated_delta_rule_fwdv2(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            g.contiguous(),
-            beta.contiguous(),
+        q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
+        o = torch.zeros_like(v)
+        if inplace_final_state:
+            ht_output = initial_state
+        else:
+            batch, tokens, _, key_dim = q.shape
+            value_heads, value_dim = v.shape[2:]
+            state_count = batch * tokens if cu_seqlens is None else tokens
+            ht_output = q.new_empty(
+                state_count, value_heads, key_dim, value_dim, dtype=torch.float32
+            )
+        torch.ops.xspeedgate_ops.fused_recurrent_gated_delta_rule_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            o,
+            ht_output,
+            beta.ndim == v.ndim,
+            use_qk_l2norm_in_kernel,
+            inplace_final_state,
+            True,
             scale,
+            cu_seqlens,
+            num_accepted_tokens,
             initial_state,
-            inplace_final_state=inplace_final_state,
-            cu_seqlens=cu_seqlens,
-            h0_indices=ssm_state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            is_h0_transposed=True,
+            ssm_state_indices,
         )
         return o, (initial_state if inplace_final_state else ht_output)
 
