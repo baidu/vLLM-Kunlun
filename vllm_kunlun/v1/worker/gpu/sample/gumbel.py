@@ -14,11 +14,11 @@ Preconditions the op enforces (adapted here):
     fp32 copy made for the in-place sampling chain.
   * ``gumbel_sample`` needs contiguous fp32 logits (the fp16/bf16 widening is
     exact and this op only reads logits), int64 ``pos``, and an int64
-    ``output_processed_logits_col`` (the dspark speculator passes int32 step
+    ``logits_cache_col`` (the dspark speculator passes int32 step
     columns). It returns ``[num_tokens, 1]``; flattened to keep the 1-D contract.
 
 The op's RNG is the Philox4x32-10 stream the upstream kernel used, and it stores
-the *temperature-applied* logits into ``output_processed_logits`` -- which is
+the *temperature-applied* logits into ``logits_cache`` -- which is
 exactly the contract on this vllm version.
 
 Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` flag.
@@ -50,8 +50,8 @@ def gumbel_sample(
     seed: torch.Tensor,
     pos: torch.Tensor,
     apply_temperature: bool,
-    output_processed_logits: torch.Tensor | None = None,
-    output_processed_logits_col: torch.Tensor | None = None,
+    logits_cache: torch.Tensor | None = None,
+    logits_cache_col: torch.Tensor | None = None,
     use_fp64: bool = False,
 ) -> torch.Tensor:
     if logits.dtype != torch.float32:
@@ -59,10 +59,10 @@ def gumbel_sample(
     if not logits.is_contiguous():
         logits = logits.contiguous()
     if (
-        output_processed_logits_col is not None
-        and output_processed_logits_col.dtype != torch.int64
+        logits_cache_col is not None
+        and logits_cache_col.dtype != torch.int64
     ):
-        output_processed_logits_col = output_processed_logits_col.to(torch.int64)
+        logits_cache_col = logits_cache_col.to(torch.int64)
     sampled = torch.ops.xspeedgate_ops.gumbel_sample(
         logits,
         expanded_idx_mapping,
@@ -70,8 +70,8 @@ def gumbel_sample(
         seed,
         pos.to(torch.int64),
         apply_temperature,
-        output_processed_logits,
-        output_processed_logits_col,
+        logits_cache,
+        logits_cache_col,
         use_fp64,
     )
     return sampled.view(-1)

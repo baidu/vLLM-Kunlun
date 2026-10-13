@@ -1,41 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun-specific replacements for ``vllm.v1.worker.gpu.model_states.mamba_hybrid``.
+"""P800 MRV2 Mamba state operations.
 
-``MambaHybridModelState.postprocess_state`` launches the Triton
-``_scatter_num_accepted_kernel`` / ``_fill_num_accepted_kernel`` upstream.
-Kunlun XPU cannot JIT-compile Triton kernels:
-
-  * the scatter path (``num_sampled`` is a tensor) maps to
-    ``xspeedgate_ops.scatter_num_accepted_kernel``;
-  * the fill path (``num_sampled`` is an int) maps to
-    ``xspeedgate_ops.fill_num_accepted``.
-
-``preprocess_state`` and the align branch of ``postprocess_state``
-    Prefix caching forces ``mamba_cache_mode == "align"``, and upstream runs that
-    state migration as fused GPU kernels driven by raw state addresses
-    (``MambaSpecDecodeGPUContext`` -> ``preprocess_mamba_align_fused_kernel`` /
-    ``precopy_mamba_align_fused_kernel`` / ``postprocess_mamba_fused_kernel``).
-    Those kernels exist only to avoid a CPU-GPU sync around the V1 copy specs, so
-    the same semantics are reimplemented natively here: the per-request decisions
-    are tensor arithmetic on the state-slot arrays, and every (request, layer,
-    state-type) block copy is issued as one ``xspeedgate_ops.batch_memcpy`` per
-    mamba group, over int64 addresses built on device. Torch op *count* is what
-    costs on this platform (~20us of dispatch each, regardless of shape), so the
-    per-state layout is pre-combined into broadcastable columns.
-
-    Nothing picks rows or states on the host: a boolean-mask select would need a
-    ``nonzero`` and therefore a CPU-GPU sync every step, which ``--async-
-    scheduling`` cannot afford. Rows that must not copy carry a zero byte count
-    instead, which ``batch_memcpy`` skips.
-
-    Speculative decoding is *not* covered: it is the only thing that needs
-    ``token_bias > 0`` (and the DS conv layout). The bias arithmetic is carried
-    here anyway so the copy matches the fused kernels, but since this path no
-    longer goes through ``MambaSpecDecodeGPUContext`` (which used to raise for
-    it), ``_build_align_groups`` refuses a spec-decode config itself.
-
-Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` flag.
+Acceptance fill/scatter use xspeedgate_ops. Align-mode preprocessing, precopy
+and postprocessing all use the native fused ops. SD precopy uses a flat
+one-row DS byte-copy view because the installed native SD branch does not
+implement window shifts. The physical state layout stays SD. Hybrid speculative
+decoding and physical DS-conv serving remain unsupported here.
 """
 
 import logging
@@ -54,20 +25,9 @@ logger = logging.getLogger("vllm_kunlun")
 
 
 class _AlignGroup(NamedTuple):
-    """Per-(layer, state-type) copy metadata for one mamba KV-cache group.
+    """Retain state tensors referenced by native copy metadata."""
 
-    The same fields ``MambaSpecDecodeGPUContext.initialize_from_forward_context``
-    flattens into device arrays, pre-combined so that a copy costs as few torch
-    ops as possible: every tensor is int64 ``[num_states, 1]`` and broadcasts
-    against the per-request row vectors.
-    """
-
-    states: tuple[torch.Tensor, ...]  # keeps the state tensors (and addresses) alive
-    base_ptrs: torch.Tensor  # data_ptr of each state tensor
-    block_strides: torch.Tensor  # bytes between consecutive state blocks
-    size_base: torch.Tensor  # bytes copied at bias 0 (page strides can exceed it)
-    bias_scale: torch.Tensor  # bytes the conv window shifts per bias token
-    col_shift: torch.Tensor  # 1 where the bias selects the src block column (temporal)
+    states: tuple[torch.Tensor, ...]
 
 
 def _scan_mamba_groups(kv_cache_config, cache_config=None):
@@ -115,7 +75,7 @@ def _scan_mamba_groups(kv_cache_config, cache_config=None):
 
 
 def _build_align_groups(self, kv_cache_config):
-    """Flatten the mamba state layout into the device arrays `_align_copy` needs."""
+    """Collect state tensors and validate supported layouts for native copies."""
     if self.vllm_config.num_speculative_tokens > 0:
         # The copy below carries the ``token_bias`` arithmetic the fused kernels
         # use for accepted draft tokens, but the rest of hybrid spec decode is
@@ -130,18 +90,9 @@ def _build_align_groups(self, kv_cache_config):
     copy_funcs = self.model.get_mamba_state_copy_func()
     mamba_group_ids, mamba_spec = _scan_mamba_groups(kv_cache_config, self.cache_config)
 
-    def column(values):
-        """A [num_states, 1] device column, to broadcast against the row vectors."""
-        return torch.tensor(values, dtype=torch.int64, device=self.device).unsqueeze(1)
-
     groups = []
     for mamba_group_id in mamba_group_ids:
         states: list[torch.Tensor] = []
-        base_ptrs: list[int] = []
-        block_strides: list[int] = []
-        size_base: list[int] = []
-        bias_scale: list[int] = []
-        col_shift: list[int] = []
         layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
         for layer_name in layer_names:
             kv_caches: list[torch.Tensor] = forward_context[layer_name].kv_cache
@@ -160,80 +111,9 @@ def _build_align_groups(self, kv_cache_config):
                         raise ValueError(
                             f"expected 3D conv state cache, got {tuple(state.shape)}"
                         )
-                elem_size = state.element_size()
-                block_elems = state.stride(0) if state.dim() > 1 else state.numel()
-                # Conv: the window is `conv_width` positions of `stride(1)`
-                # elements, and a bias of n tokens drops n of them. Temporal:
-                # the natural (unpadded) block, selected by block column
-                # instead of by byte offset.
-                inner_bytes = state.stride(1) * elem_size if is_conv else 0
-                natural_bytes = (state[0].numel() if state.dim() > 1 else 1) * elem_size
                 states.append(state)
-                base_ptrs.append(state.data_ptr())
-                block_strides.append(block_elems * elem_size)
-                size_base.append(
-                    state.size(1) * inner_bytes if is_conv else natural_bytes
-                )
-                bias_scale.append(inner_bytes)
-                col_shift.append(0 if is_conv else 1)
-
-        groups.append(
-            _AlignGroup(
-                states=tuple(states),
-                base_ptrs=column(base_ptrs),
-                block_strides=column(block_strides),
-                size_base=column(size_base),
-                bias_scale=column(bias_scale),
-                col_shift=column(col_shift),
-            )
-        )
+        groups.append(_AlignGroup(states=tuple(states)))
     return groups, mamba_spec, mamba_group_ids
-
-
-def _scatter_ones(self, idx_mapping, selected, num_reqs) -> None:
-    """Reset ``num_accepted_tokens`` to the neutral 1 on the selected rows.
-
-    A plain ``arr[req_idx] = ...`` cannot express "skip this row": the rows it
-    must skip would still have to name some slot, and under PP (where
-    idx_mapping carries -1 sentinels) two rows could then name the same slot and
-    race. The scatter op already skips negative entries, so hide the unselected
-    rows behind the same sentinel.
-    """
-    torch.ops.xspeedgate_ops.scatter_num_accepted_kernel(
-        torch.where(selected, idx_mapping, self._align_skip[:num_reqs]),
-        self._align_ones[:num_reqs],
-        self.num_accepted_tokens_gpu,
-    )
-
-
-def _align_copy(self, rows, src_cols, dst_cols, biases, should_copy) -> None:
-    """Copy one state block per (row, layer, state-type), one memcpy per group.
-
-    The column/bias inputs are device tensors with one entry per batch row.
-    `rows` are batch rows (the block tables are batch-ordered) and
-    `src_cols`/`dst_cols` are block columns, so `block_table[row, col]` matches
-    the fused kernels' addressing. Conv states shift their window by `biases`
-    tokens; temporal states use `biases` to select the accepted speculative
-    column. Everything stays in torch broadcasts over int64: selecting the rows
-    that copy would need a `nonzero`, i.e. a CPU-GPU sync on every step.
-    """
-    # Rows that must not copy still address the block table, so keep them in
-    # range: a bias is only bounded on rows that do copy (postprocess leaves a
-    # negative one behind otherwise), while a column is at worst the -1 of a
-    # fresh request, which indexes the last column. Those rows then copy zero
-    # bytes, which is what ``batch_memcpy`` skips on.
-    biases = biases * should_copy
-
-    for group, block_table in zip(self._align_groups, self._mamba_block_tables):
-        shift_bytes = biases * group.bias_scale
-        src_ids = block_table[rows, src_cols + biases * group.col_shift]
-        dst_ids = block_table[rows, dst_cols]
-        src_ptrs = src_ids * group.block_strides + (group.base_ptrs + shift_bytes)
-        dst_ptrs = dst_ids * group.block_strides + group.base_ptrs
-        sizes = (group.size_base - shift_bytes) * should_copy
-        torch.ops.xspeedgate_ops.batch_memcpy(
-            src_ptrs.reshape(-1), dst_ptrs.reshape(-1), sizes.reshape(-1)
-        )
 
 
 def preprocess_state(
@@ -245,11 +125,11 @@ def preprocess_state(
 ) -> None:
     """Native align-mode state migration across block boundaries (V1 semantics).
 
-    Stands in for `preprocess_mamba_align_fused_kernel` +
-    `precopy_mamba_align_fused_kernel`: snapshot the pre-advance running block and
-    accepted-token bias, advance the running block to the one this step writes
-    into, reset the accepted count when a boundary is crossed, then copy each
-    request's state into its new window block.
+    `preprocess_mamba_align_fused_kernel` snapshots the pre-advance running block
+    and accepted-token bias, advances the running block to the one this step
+    writes into, and resets the accepted count when a boundary is crossed;
+    `precopy_mamba_align_fused_kernel` then copies each request's temporal state
+    into its new window block; SD conv uses the same op with flat-row metadata.
     """
     if not self._align_mode:
         return
@@ -265,12 +145,12 @@ def preprocess_state(
         self._align_rows = torch.arange(
             self.max_num_reqs, dtype=torch.int64, device=self.device
         )
-        self._align_ones = torch.ones(
-            self.max_num_reqs,
+        self._align_skip = torch.full(
+            (self.max_num_reqs,),
+            -1,
             dtype=self.num_accepted_tokens_gpu.dtype,
             device=self.device,
         )
-        self._align_skip = self._align_ones.new_full((self.max_num_reqs,), -1)
     # `block_tables` are this step's batch-order slices of the persistent
     # input_block_tables, so they are re-read every step: their row count is
     # num_reqs_after_padding and shrinks/grows with the batch. postprocess_state
@@ -281,73 +161,179 @@ def preprocess_state(
     idx_mapping = input_batch.idx_mapping[:num_reqs]
     # idx_mapping is built from req_id_to_index here (unlike the one
     # postprocess_state gets under PP), so its entries are distinct and hold no
-    # -1 sentinels; guard the writes anyway, since a -1 would otherwise land on
-    # a real state slot.
-    valid = idx_mapping >= 0
+    # -1 sentinels; the op skips negative entries anyway.
     req_idx = idx_mapping.clamp(min=0)
 
-    # index_select over a gather (`arr[req_idx]`) is worth ~60us per call here.
-    state_idx = self._mamba_state_idx_gpu.index_select(0, req_idx)
-    num_accepted = self.num_accepted_tokens_gpu.index_select(0, req_idx)
-    # num_accepted is >= 1 by construction; clamp anyway, a negative bias
-    # would make the copy read before the block (upstream clamps too).
-    src_off = (num_accepted - 1).clamp(min=0)
-
-    query_start_loc = input_batch.query_start_loc
-    computed_after = num_computed_tokens.index_select(0, req_idx) + (
-        query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
-    )
-    # ceil(computed_after / block_size) - 1, in one division: a scheduled
-    # request always has computed_after >= 1.
-    new_state_idx = (computed_after - 1) // block_size
-    self._mamba_state_idx_gpu[req_idx] = torch.where(valid, new_state_idx, state_idx)
-
-    # A request whose running block moved re-reads its state from the new block
-    # start, so its accepted count goes back to the neutral 1.
-    crossed = valid & (state_idx >= 0) & (state_idx != new_state_idx)
-    _scatter_ones(self, idx_mapping, crossed, num_reqs)
-
-    _align_copy(
-        self, self._align_rows[:num_reqs], state_idx, new_state_idx, src_off, crossed
+    # Fused native decision: writes the pre-advance src column and accepted-token
+    # bias into the src_col/src_off buffers, advances _mamba_state_idx_gpu to the
+    # new running block, and resets num_accepted on a boundary crossing. Every
+    # per-request index stays on device, so there is no CPU-GPU sync per step.
+    torch.ops.xspeedgate_ops.preprocess_mamba_align_fused_kernel(
+        idx_mapping.to(torch.int32).contiguous(),
+        self._mamba_state_idx_gpu,
+        num_computed_tokens.to(torch.int32).contiguous(),
+        input_batch.query_start_loc.to(torch.int32).contiguous(),
+        self.num_accepted_tokens_gpu,
+        self._mamba_src_col_gpu,
+        self._mamba_src_off_gpu,
+        num_reqs,
+        block_size,
     )
 
+    # PP sampling can return an older batch after a newer prefill was prepared.
+    # Keep tables in request-slot order, then gather the matching postprocess
+    # batch rather than reusing the most recently prepared batch rows.
+    if getattr(self, "_mamba_slot_tables", None) is None:
+        self._mamba_slot_tables = [
+            torch.zeros((self.max_num_reqs, t.shape[1]), dtype=t.dtype,
+                        device=self.device) for t in self._mamba_block_tables
+        ]
+        self._mamba_post_tables = [torch.zeros_like(t) for t in self._mamba_slot_tables]
+        self._mamba_post_table_ptrs = torch.tensor(
+            [t.data_ptr() for t in self._mamba_post_tables],
+            dtype=torch.int64, device=self.device,
+        )
+    for slot_table, batch_table in zip(self._mamba_slot_tables, self._mamba_block_tables):
+        # preprocess receives distinct live request slots; PP -1 filtering only
+        # happens in the later postprocess batch.
+        slot_table.index_copy_(0, req_idx.to(torch.int64), batch_table[:num_reqs])
 
-def _align_postprocess(
-    self, idx_mapping: torch.Tensor, num_computed_tokens: torch.Tensor
-) -> None:
-    """Native stand-in for `postprocess_mamba_fused_kernel` (align mode).
+    # Temporal states use their natural layout. SD conv uses a one-row DS view
+    # of scalar elements, with its token bias scaled by the contiguous row size.
+    layout = _native_align_layout(self)
+    if layout["temporal"]:
+        if not getattr(self, "_native_precopy_logged", False):
+            logger.info(
+                "[KunlunPlugin] Mamba align native precopy active: "
+                "xspeedgate_ops.precopy_mamba_align_fused_kernel; "
+                "temporal states=%d; SD conv uses native flat-row precopy",
+                layout["temporal"][0].numel(),
+            )
+            self._native_precopy_logged = True
+        torch.ops.xspeedgate_ops.precopy_mamba_align_fused_kernel(
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            layout["table_ptrs"], layout["stride"], *layout["temporal"],
+            idx_mapping.to(torch.int32).contiguous(),
+            num_reqs, 1024, False, 1,
+        )
+    for inner_size, conv_metadata in layout["conv_flat"]:
+        torch.ops.xspeedgate_ops.precopy_mamba_align_fused_kernel(
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu * inner_size,
+            layout["table_ptrs"], layout["stride"], *conv_metadata,
+            idx_mapping.to(torch.int32).contiguous(),
+            num_reqs, 1024, True, 1,
+        )
+    if layout["conv_flat"] and not getattr(self, "_native_sd_precopy_logged", False):
+        logger.info(
+            "[KunlunPlugin] Mamba SD precopy active: "
+            "xspeedgate_ops.precopy_mamba_align_fused_kernel; "
+            "flat scalar-row view; groups=%d; no batch_memcpy",
+            len(layout["conv_flat"]),
+        )
+        self._native_sd_precopy_logged = True
 
-    When this step's accepted tokens leave the sequence exactly on a block
-    boundary, the running state is copied into that full block so a later
-    prefix-cache hit can resume from it. `num_computed_tokens` is slot-indexed
-    and already holds the post-step count.
+
+def _native_align_layout(self):
+    """Build native byte-copy metadata; retain every referenced state tensor."""
+    tables = self._mamba_block_tables
+    strides = {table.stride(0) for table in tables}
+    if len(strides) != 1 or any(table.dtype != torch.int32 or table.stride(1) != 1 for table in tables):
+        raise ValueError("native Mamba copy requires int32 tables with a shared row stride")
+    signature = tuple((t.data_ptr(), t.stride(0)) for t in tables)
+    cached = getattr(self, "_native_align_cached", None)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    values = [[] for _ in range(8)]
+    temporal = []
+    conv_groups = {}
+    copy_funcs = self.model.get_mamba_state_copy_func()
+    for group_id, group in enumerate(self._align_groups):
+        for i, state in enumerate(group.states):
+            conv = copy_funcs[i % len(copy_funcs)] is get_conv_copy_spec
+            row = [state.data_ptr(), state.stride(0) * state.element_size(),
+                   state.element_size(), state.stride(1) if conv else state[0].numel(),
+                   state.size(1) if conv else 0, group_id, 0, 0]
+            if conv:
+                if state.dim() != 3 or state.stride(2) != 1 or state.stride(1) != state.size(2):
+                    raise ValueError("native SD precopy requires contiguous token rows")
+                conv_groups.setdefault(state.size(2), []).append(len(values[0]))
+            else:
+                temporal.append(len(values[0]))
+            for target, value in zip(values, row):
+                target.append(value)
+    if len(values[0]) > 512 or len(tables) > 16:
+        raise ValueError("native Mamba metadata exceeds the installed op limits")
+    dtypes = (torch.int64, torch.int64, torch.int32, torch.int64,
+              torch.int32, torch.int32, torch.int32, torch.int64)
+    metadata = [torch.tensor(v, dtype=dt, device=self.device) for v, dt in zip(values, dtypes)]
+    temporal_metadata = [m[temporal].contiguous() for m in metadata] if temporal else []
+    if temporal_metadata:
+        temporal_metadata[2] = temporal_metadata[2].to(torch.int64)
+    # Keep the public postprocess metadata unchanged. Only precopy sees the
+    # synthetic DS layout: one scalar row, width W*D, bias b*D. Thus its source
+    # byte offset is b*D*elem_size and copy size is (W-b)*D*elem_size, exactly SD.
+    precopy_dtypes = list(dtypes)
+    precopy_dtypes[2] = torch.int64
+    conv_flat = []
+    for inner_size, indices in conv_groups.items():
+        flat_values = [[column[i] for i in indices] for column in values]
+        flat_values[3] = [1] * len(indices)
+        flat_values[4] = [values[4][i] * inner_size for i in indices]
+        flat_values[6] = [1] * len(indices)
+        flat_values[7] = [values[4][i] * inner_size * values[2][i] for i in indices]
+        conv_flat.append((inner_size, [
+            torch.tensor(v, dtype=dt, device=self.device)
+            for v, dt in zip(flat_values, precopy_dtypes)
+        ]))
+    layout = dict(table_ptrs=torch.tensor([t.data_ptr() for t in tables], dtype=torch.int64,
+                                         device=self.device),
+                  stride=next(iter(strides)), all=metadata, temporal=temporal_metadata,
+                  conv_flat=conv_flat)
+    self._native_align_cached = (signature, layout)
+    return layout
+
+
+def _align_postprocess(self, idx_mapping, num_computed_tokens):
+    """Gather slot data into dense batch rows before calling the native op.
+
+    Native per-request metadata is bounded by num_reqs. Real request slots can
+    exceed that bound (e.g. a one-request batch in slot 25), so passing the full
+    slot buffers and idx_mapping directly is unsafe. Preserve PP skip rows with
+    -1 in a dense identity mapping, then scatter the output counts back.
     """
+    layout = _native_align_layout(self)
     num_reqs = idx_mapping.shape[0]
-    block_size = self._align_spec.block_size
-    # Under PP, idx_mapping marks filtered rows with -1. Those read slot 0
-    # instead; every write below is masked by `valid` and writes the value it
-    # just read back, so the slot is left untouched.
-    valid = idx_mapping >= 0
-    req_idx = idx_mapping.clamp(min=0)
-
-    num_accepted = self.num_accepted_tokens_gpu.index_select(0, req_idx)
-    src_col = self._mamba_state_idx_gpu.index_select(0, req_idx)
-    new_computed = num_computed_tokens.index_select(0, req_idx)
-    running = new_computed - num_accepted + 1
-    last_full_block = new_computed // block_size
-    aligned = last_full_block * block_size
-    needs_copy = valid & (aligned >= running)
-    dst_col = last_full_block - 1
-    bias = aligned - running
-
-    # A copy that stays inside the running block changes no data, but it does
-    # reset the accepted count to the neutral value.
-    in_place = src_col == dst_col
-    reset = needs_copy & in_place
-    _scatter_ones(self, idx_mapping, reset, num_reqs)
-
-    copy = needs_copy & ~(in_place & (bias == 0))
-    _align_copy(self, self._align_rows[:num_reqs], src_col, dst_col, bias, copy)
+    req_idx = idx_mapping.clamp(min=0).to(torch.int64)
+    accepted = self.num_accepted_tokens_gpu.index_select(0, req_idx)
+    accepted_out = accepted.clone()
+    state_idx = self._mamba_state_idx_gpu.index_select(0, req_idx)
+    computed = num_computed_tokens.index_select(0, req_idx)
+    native_mapping = torch.where(
+        idx_mapping >= 0, self._align_rows[:num_reqs].to(torch.int32),
+        self._align_skip[:num_reqs],
+    )
+    for slot_table, post_table in zip(self._mamba_slot_tables, self._mamba_post_tables):
+        post_table[:num_reqs].copy_(slot_table.index_select(0, req_idx))
+    if not getattr(self, "_native_postprocess_logged", False):
+        logger.info(
+            "[KunlunPlugin] Mamba align native postprocess active: "
+            "xspeedgate_ops.postprocess_mamba; states=%d; dense batch mapping",
+            layout["all"][0].numel(),
+        )
+        self._native_postprocess_logged = True
+    torch.ops.xspeedgate_ops.postprocess_mamba(
+        accepted, state_idx, computed, computed, computed,
+        self._mamba_post_table_ptrs, self._mamba_post_tables[0].stride(0),
+        *layout["all"], accepted_out, native_mapping, num_reqs,
+        self._align_spec.block_size, True, False,
+    )
+    torch.ops.xspeedgate_ops.scatter_num_accepted_kernel(
+        idx_mapping, accepted_out, self.num_accepted_tokens_gpu,
+    )
 
 
 def postprocess_state(
