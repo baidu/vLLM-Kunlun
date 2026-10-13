@@ -41,16 +41,23 @@ def apply_grammar_bitmask(
     # Construct bitmask -> logits mapping. The kernel takes a packed index
     # `req_idx * mask_stride + position_idx` together with the per-request
     # logits prefix sums, rather than raw logits row indices.
+    # Use the upstream 0.28 mapping so adaptive verification and bonus-token
+    # slots obey the same contract as its Triton kernel.
+    from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
+
+    # Native ABI uses the bitmask row width as the mapping radix. Re-encode
+    # the upstream (request, position) pairs with that radix; it need not
+    # equal the upstream scheduled-position stride.
     mask_stride = bitmask.shape[1]
-    mapping: list[int] = []
-    req_ids = input_batch.req_ids
-    cu_num_logits = input_batch.cu_num_logits_np.tolist()
-    req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
-    for grammar_req_id in grammar_req_ids:
-        req_idx = req_id_to_idx[grammar_req_id]
-        base = req_idx * mask_stride
-        q_len = cu_num_logits[req_idx + 1] - cu_num_logits[req_idx]
-        mapping.extend(range(base, base + q_len))
+    if self.mask_stride > mask_stride:
+        bitmask = torch.nn.functional.pad(
+            bitmask, (0, self.mask_stride - mask_stride)
+        )
+        mask_stride = self.mask_stride
+    mapping = _build_grammar_mapping(
+        input_batch.req_ids, grammar_req_ids, input_batch.cu_num_logits_np,
+        input_batch.num_draft_tokens_per_req, self.num_bonus_tokens, mask_stride,
+    )
 
     # Asynchronously copy the mapping to GPU.
     with torch.cuda.stream(self.copy_stream):
@@ -67,13 +74,22 @@ def apply_grammar_bitmask(
 
     num_masks = bitmask.shape[0]
     assert num_masks == len(mapping)
+    # The native op supports half/bfloat16. For fp32 logits, generate only
+    # the exclusion mask in a half scratch tensor; retain every fp32 value.
+    native_logits = (
+        torch.zeros_like(logits, dtype=torch.float16)
+        if logits.dtype == torch.float32 else logits
+    )
     torch.ops.xspeedgate_ops.apply_grammar_bitmask(
-        logits,
+        native_logits,
         bitmask,
         logits_indices,
         input_batch.cu_num_logits,
         mask_stride,
     )
+
+    if native_logits is not logits:
+        logits.masked_fill_(torch.isneginf(native_logits), -float("inf"))
 
     # Ensure the copy stream waits for the device tensors to finish being used
     # before it re-uses or deallocates them

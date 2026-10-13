@@ -358,19 +358,20 @@ _register_post_import_hook(
 )
 
 
-# --- hook: kda_metadata mamba state-indices Triton -> torch (P800) --------
+# --- hook: kda_metadata mamba state-indices Triton -> xspeedgate (P800) ---
 # _mamba_get_block_table_tensor uses the Triton kernel
 # _get_aligned_state_indices_kernel, which does not run on P800. Replace it
-# with a torch-native gather: for each request take num_state_slots block ids
+# with the native gather: for each request take num_state_slots block ids
 # from block_table starting at the block holding the current mamba state
 # (col = max((seq_len - 1)//block_size, 0)).
 def _kda_state_indices_applied(mod):
     fn = getattr(mod, "_mamba_get_block_table_tensor", None)
-    return fn is None or getattr(fn, "_kunlun_torch_native", False)
+    return fn is None or getattr(fn, "_kunlun_xspeedgate_native", False)
 
 
 def _kda_state_indices_apply(mod):
     import torch
+    import xspeedgate_ops  # noqa: F401 (registers native ops)
 
     def _mamba_get_block_table_tensor(
         block_table, seq_lens, kv_cache_spec, mamba_cache_mode
@@ -378,18 +379,20 @@ def _kda_state_indices_apply(mod):
         if mamba_cache_mode in ("all", "none"):
             return block_table
         num_state_slots = 1 + kv_cache_spec.num_speculative_blocks
-        block_size = kv_cache_spec.block_size
-        first = torch.clamp((seq_lens.long() - 1) // block_size, min=0)
-        slots = torch.arange(num_state_slots, device=block_table.device)
-        cols = (first[:, None] + slots[None, :]).clamp_(
-            max=block_table.shape[1] - 1
+        if block_table.shape[0] == 0:
+            return block_table.new_empty((0, num_state_slots))
+        return torch.ops.xspeedgate_ops.mamba_get_block_table_tensor(
+            block_table,
+            seq_lens.to(torch.int32).contiguous(),
+            kv_cache_spec.block_size,
+            num_state_slots,
         )
-        return torch.gather(block_table, 1, cols.long())
 
-    _mamba_get_block_table_tensor._kunlun_torch_native = True
+    _mamba_get_block_table_tensor._kunlun_xspeedgate_native = True
     mod._mamba_get_block_table_tensor = _mamba_get_block_table_tensor
     logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched kda_metadata._mamba_get_block_table_tensor -> torch"
+        "[KunlunPlugin] patched kda_metadata._mamba_get_block_table_tensor "
+        "-> xspeedgate_ops.mamba_get_block_table_tensor"
     )
 
 
@@ -747,6 +750,56 @@ _register_post_import_hook(
     _dp_device_assign_applied,
     _dp_device_assign_apply,
 )
+
+
+# Relative imports can bypass _MODULE_MAPPINGS when the ops package is first
+# loaded through importlib. Patch every exporting namespace before consumers
+# bind attn_res, including the model namespace if it was already imported.
+def _attn_res_applied(mod):
+    fn = getattr(mod, "attn_res", None)
+    return getattr(fn, "__module__", "") == (
+        "vllm_kunlun.models.kimi_k3.nvidia.ops.attn_res"
+    )
+
+
+def _attn_res_apply(mod):
+    if not hasattr(mod, "attn_res"):
+        return
+    from vllm_kunlun.models.kimi_k3.nvidia.ops.attn_res import attn_res
+    mod.attn_res = attn_res
+
+
+for _attn_res_target in (
+    "vllm.models.kimi_k3.nvidia.ops.attn_res",
+    "vllm.models.kimi_k3.nvidia.ops",
+    "vllm.models.kimi_k3.nvidia.model",
+):
+    _register_post_import_hook(
+        _attn_res_target, _attn_res_applied, _attn_res_apply
+    )
+
+
+def _kimi_mla_applied(mod):
+    cls = getattr(mod, "MultiHeadLatentAttention", None)
+    return getattr(cls, "__module__", "") == (
+        "vllm_kunlun.models.kimi_k3.nvidia.mla"
+    )
+
+
+def _kimi_mla_apply(mod):
+    if not hasattr(mod, "MultiHeadLatentAttention"):
+        return
+    from vllm_kunlun.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+    mod.MultiHeadLatentAttention = MultiHeadLatentAttention
+
+
+for _kimi_mla_target in (
+    "vllm.models.kimi_k3.nvidia.mla",
+    "vllm.models.kimi_k3.nvidia.model",
+):
+    _register_post_import_hook(
+        _kimi_mla_target, _kimi_mla_applied, _kimi_mla_apply
+    )
 
 
 # --- hook: route DeepEP all2all managers to Kunlun's BufferV2 --------------
