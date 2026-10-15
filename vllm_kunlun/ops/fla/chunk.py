@@ -10,7 +10,6 @@
 import warnings
 from typing import Optional
 
-import cocopod  # noqa
 import torch
 import xspeedgate_ops  # noqa
 from einops import rearrange
