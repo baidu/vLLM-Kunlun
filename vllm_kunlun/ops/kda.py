@@ -224,9 +224,9 @@ def causal_conv1d_update(
     if isinstance(activation, bool):
         activation = "silu" if activation else None
 
-    # In-place kernel, so run it on the caller's output buffer (or a copy) and
-    # leave x untouched.
-    buf = out if out is not None else torch.empty_like(x)
+    # The updated kernel supports token-strided input. Reuse x unless the
+    # caller explicitly requests a separate output buffer.
+    buf = out if out is not None else x
     if buf.data_ptr() != x.data_ptr():
         buf.copy_(x)
 
@@ -298,6 +298,7 @@ def causal_conv1d_update(
                 x.shape[0], device=x.device, dtype=torch.int32
             ),
             is_ncw=True,
+            tok_stride=buf.unsqueeze(-1).stride(0),
             pad_slot_id=-1,
         )
         # write the updated conv bytes back and scatter whole rows (recurrent
@@ -315,6 +316,7 @@ def causal_conv1d_update(
         cache_seqlens=None,
         conv_state_indices=indices,
         is_ncw=True,
+        tok_stride=buf.unsqueeze(-1).stride(0),
         pad_slot_id=-1,
     )
     return buf
