@@ -1226,6 +1226,32 @@ _register_post_import_hook(
 )
 
 
+# --- hook: KV-xfer finished stale req_id guard --------------------------
+# vllm Scheduler._update_from_kv_xfer_finished asserts ``req_id in
+# self.requests`` while consuming finished_recving / finished_sending. When a
+# client batch-abort and a late KV-transfer-finished event land in the same
+# scheduler step, the req was already removed and the assert kills EngineCore
+# (EngineDeadError). The patch filters such stale req_ids so the asserts never
+# fire; present req_ids are untouched. See vllm_kunlun/sched_kvxfer_guard.py.
+def _kvxfer_guard_applied(mod):
+    sched = getattr(mod, "Scheduler", None)
+    fn = getattr(sched, "_update_from_kv_xfer_finished", None)
+    return fn is None or getattr(fn, "_kunlun_kvxfer_guard", False)
+
+
+def _kvxfer_guard_apply(mod):
+    if not hasattr(mod, "Scheduler"):
+        return
+    import vllm_kunlun.sched_kvxfer_guard  # noqa: F401  (self-applies on import)
+
+
+_register_post_import_hook(
+    "vllm.v1.core.sched.scheduler",
+    _kvxfer_guard_applied,
+    _kvxfer_guard_apply,
+)
+
+
 def register():
     """Register the Kunlun platform"""
 
