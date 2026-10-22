@@ -74,6 +74,57 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 #        dst = _make_uint8_view_from_ptr(dst_ptr, size, device)
 #        dst.copy_(src, non_blocking=True)
 
+@dataclasses.dataclass
+class MambaSpecDecodeGPUContext:
+    """Stub for the GPU spec-decode fused path on hybrid Mamba models.
+
+    ``mamba_cache_mode == "align"`` (i.e. prefix caching) is implemented natively
+    in ``vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid``, so this context is
+    only needed when speculative decoding runs on a hybrid model -- which is not
+    implemented on Kunlun XPU. The class stays importable so ``mamba_hybrid``
+    loads; calling into it fails loudly rather than silently producing wrong
+    state.
+    """
+
+    @classmethod
+    def create(cls, *args, **kwargs) -> "MambaSpecDecodeGPUContext":
+        raise NotImplementedError(
+            "Speculative decoding on a hybrid Mamba model is not implemented on "
+            "Kunlun XPU (MambaSpecDecodeGPUContext). Prefix caching alone does "
+            "not need it."
+        )
+
+
+class _UnsupportedTritonKernel:
+    """Importable placeholder for a Triton kernel that Kunlun does not run.
+
+    Mimics the ``kernel[grid](...)`` launch interface so any accidental use
+    fails with a clear message instead of an obscure ``TypeError``.
+    """
+
+    def __init__(self, name: str, reason: str):
+        self._name = name
+        self._reason = reason
+
+    def _fail(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"{self._name} is not supported on Kunlun XPU: {self._reason}"
+        )
+
+    def __getitem__(self, grid):
+        return self._fail
+
+    __call__ = _fail
+
+
+# Only launched by ``MambaSpecDecodeGPUContext`` (spec decode + hybrid); the
+# align path itself is implemented natively in ``model_states/mamba_hybrid.py``.
+preprocess_mamba_align_fused_kernel = _UnsupportedTritonKernel(
+    "preprocess_mamba_align_fused_kernel",
+    "the fused align preprocess is only used by MambaSpecDecodeGPUContext "
+    "(speculative decoding on a hybrid model), which is unimplemented.",
+)
+
 
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
@@ -180,6 +231,7 @@ def preprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
+    align_ctx: MambaSpecDecodeGPUContext | None = None,
 ):
     """
     Copy the mamba state of previous step to the last
@@ -250,7 +302,9 @@ class MambaBuffers:
     """Single owner for all mamba-specific runner buffers.
 
     On Kunlun XPU, speculative decoding with hybrid models is not supported,
-    so postprocess_align is always None.
+    so postprocess_align is always None. Plain ``align`` mode (prefix caching)
+    needs no context here: it is handled by the model-state overlay
+    (``v1/worker/gpu/model_states/mamba_hybrid.py``).
     """
 
     preprocess: MambaCopyBuffers
