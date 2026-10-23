@@ -38,7 +38,7 @@ from types import ModuleType
 
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
-# Kunlun swaps the V2 Triton kernels for torch-native / kunlun_ops equivalents
+# Kunlun swaps the V2 Triton kernels for torch-native / XSpeedGate / kunlun_ops equivalents
 # (the ``vllm.v1.worker.gpu.*`` patches below), and ``vllm.config.vllm`` reads
 # ``HAS_TRITON`` only to veto V2, so forcing it True has no other side effect.
 # It has to be a post-import patch: ``check_and_update_config`` runs only from
