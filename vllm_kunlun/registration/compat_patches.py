@@ -78,15 +78,6 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
                 "decode context parallelism (not replaced on Kunlun XPU P800)"
             )
 
-        if (
-            self.cache_config is not None
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            unsupported.append(
-                "mamba align cache mode (its Triton launch sites are not "
-                "replaced on Kunlun XPU P800)"
-            )
-
         return unsupported
 
     module.VllmConfig._get_v2_model_runner_unsupported_features = (
