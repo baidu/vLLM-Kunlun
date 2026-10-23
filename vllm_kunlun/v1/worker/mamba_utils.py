@@ -4,6 +4,8 @@
 
 The upstream state-management classes and scheduling remain in use. Their
 copy and align launch sites call XSpeedGate kernels through this module.
+MambaStateZeroer reuses a bounded zero buffer to clear selected state rows
+without allocating a tensor the size of the cache pool.
 """
 
 import logging
@@ -262,3 +264,90 @@ logger.info(
 logger.info(
     "[KunlunPlugin] mamba align patched (complete XSpeedGate wheel)",
 )
+
+
+class MambaStateZeroer:
+    """Reuse one zero row as the source of bounded, strided state writes.
+
+    Called outside graph capture on the runner's current stream. Keep the zero
+    source alive for the runner lifetime: batch_memcpy consumes raw pointers.
+    """
+
+    def __init__(self):
+        self._zero = None
+
+    def clear(self, state_blocks):
+        plans = {}
+        device = None
+        max_bytes = 0
+        # Validate the complete plan before modifying any state.
+        for state, block_ids in state_blocks:
+            blocks = sorted(set(block_ids) - {0})
+            if not blocks:
+                continue
+            if state.ndim < 2:
+                raise ValueError("Mamba state must have a block dimension")
+            inner = 1
+            for dim in range(state.ndim - 1, 0, -1):
+                if state.stride(dim) != inner:
+                    raise ValueError("Mamba state rows must be contiguous")
+                inner *= state.shape[dim]
+            if state.stride(0) < inner:
+                raise ValueError("Mamba state rows must not overlap")
+            if blocks[0] < 0 or blocks[-1] >= state.shape[0]:
+                raise ValueError("Mamba state block index out of bounds")
+            if device is not None and device != state.device:
+                raise ValueError("Mamba states must be on the same device")
+            device = state.device
+            size = inner * state.element_size()
+            if not size:
+                continue
+            max_bytes = max(max_bytes, size)
+            stride = state.stride(0) * state.element_size()
+            key = (state.data_ptr(), stride, size)
+            plans.setdefault(key, set()).update(blocks)
+        if not plans:
+            return
+        if device.type != "cuda":
+            raise ValueError("MambaStateZeroer requires the Kunlun CUDA shim")
+
+        # Conv and SSM commonly occupy adjacent intervals in the same page.
+        # Combine only exact adjacency with identical selected rows; preserve
+        # all padding and any state belonging to another request.
+        merged = []
+        for (address, stride, size), blocks in sorted(
+            plans.items(), key=lambda item: (item[0][1], item[0][0])
+        ):
+            if merged:
+                prev_address, prev_stride, prev_size, prev_blocks = merged[-1]
+                if (
+                    stride == prev_stride
+                    and address == prev_address + prev_size
+                    and blocks == prev_blocks
+                    and prev_size + size <= stride
+                ):
+                    merged[-1] = (prev_address, stride, prev_size + size, blocks)
+                    max_bytes = max(max_bytes, prev_size + size)
+                    continue
+            merged.append((address, stride, size, blocks))
+        if (
+            self._zero is None
+            or self._zero.device != device
+            or self._zero.numel() < max_bytes
+        ):
+            self._zero = torch.zeros(max_bytes, dtype=torch.uint8, device=device)
+        count = sum(len(blocks) for _, _, _, blocks in merged)
+        host = np.empty((3, count), dtype=np.int64)
+        host[0].fill(self._zero.data_ptr())
+        offset = 0
+        for address, stride, size, blocks in merged:
+            end = offset + len(blocks)
+            host[1, offset:end] = (
+                address
+                + np.fromiter(sorted(blocks), dtype=np.int64, count=len(blocks))
+                * stride
+            )
+            host[2, offset:end] = size
+            offset = end
+        metadata = torch.from_numpy(host).to(device=device)
+        torch.ops.xspeedgate_ops.batch_memcpy(metadata[0], metadata[1], metadata[2])
