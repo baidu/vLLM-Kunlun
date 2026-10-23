@@ -65,8 +65,6 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     @functools.wraps(orig_unsupported)
     def _kunlun_mrv2_unsupported_features(self) -> list[str]:
         # These paths still depend on unsupported Triton kernels.
-        import vllm.envs as envs
-
         unsupported = orig_unsupported(self)
 
         if self.speculative_config is not None:
@@ -87,11 +85,6 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
             unsupported.append(
                 "mamba align cache mode (its Triton launch sites are not "
                 "replaced on Kunlun XPU P800)"
-            )
-
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            unsupported.append(
-                "VLLM_COMPUTE_NANS_IN_LOGITS (not replaced on Kunlun XPU P800)"
             )
 
         return unsupported
@@ -527,6 +520,11 @@ def _v2_hook(kunlun_module: str, *paths: str):
 # Spec-decode (rejection_sampler_utils) is a deferred milestone: its Triton
 # kernels are left alone and the V2 spec-decode path stays unsupported.
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "vllm.v1.worker.gpu.metrics.logits",
+        "vllm_kunlun.v1.worker.gpu.metrics.logits",
+        ("get_num_nans",),
+    ),
     (
         "vllm.v1.worker.gpu.buffer_utils",
         "vllm_kunlun.v1.worker.gpu.buffer_utils",
