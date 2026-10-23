@@ -560,6 +560,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("StructuredOutputsWorker.apply_grammar_bitmask",),
     ),
     (
+        "vllm.v1.worker.gpu.sample.sampler",
+        "vllm_kunlun.v1.worker.gpu.sample.sampler",
+        ("Sampler.sample",),
+    ),
+    (
         "vllm.v1.worker.gpu.sample.gumbel",
         "vllm_kunlun.v1.worker.gpu.sample.gumbel",
         ("apply_temperature", "gumbel_sample"),
