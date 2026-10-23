@@ -649,9 +649,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 conv_state_indices=non_spec_state_indices_tensor[
                     : attn_metadata.num_decodes
                 ],
-                conv_state_indices_cpu=non_spec_state_indices_tensor_cpu[
-                    : attn_metadata.num_decodes
-                ],
                 validate_data=True,
             )
         else:
