@@ -26,8 +26,8 @@ import logging
 
 import torch
 import vllm.v1.worker.gpu.model_states.mamba_hybrid as _up
-import vllm_kunlun.v1.worker.mamba_utils as _kunlun_mamba_utils
 
+import vllm_kunlun.v1.worker.mamba_utils as _kunlun_mamba_utils
 from vllm_kunlun.v1.worker.gpu._kernels import TorchKernel
 
 logger = logging.getLogger("vllm_kunlun")
@@ -57,18 +57,17 @@ _up.preprocess_mamba_align_fused_kernel = (
 # vllm_kunlun/models/qwen3_next.py). If that ordering ever inverts the isinstance
 # check silently fails and the spec-decode kwargs are dropped -- wrong results,
 # no error. Bind it explicitly so the check is order-independent.
-try:
-    from vllm_kunlun.v1.attention.backends.gdn_attn import (
-        GDNAttentionMetadataBuilder as _KunlunGDNBuilder,
-    )
+# isort: off
+from vllm_kunlun.v1.attention.backends.gdn_attn import (  # noqa: E402
+    GDNAttentionMetadataBuilder as _KunlunGDNBuilder,
+)
 
-    _up.GDNAttentionMetadataBuilder = _KunlunGDNBuilder
-except Exception:
-    logger.warning(
-        "[KunlunPlugin] could not bind the Kunlun GDN metadata builder into "
-        "mamba_hybrid; spec-decode extra attn kwargs may be dropped",
-        exc_info=True,
-    )
+# isort: on
+
+# This binding is correctness-critical: without it the upstream isinstance check
+# drops speculative-decode metadata. Let import-hook dispatch report and retry
+# an installation failure instead of continuing with potentially wrong results.
+_up.GDNAttentionMetadataBuilder = _KunlunGDNBuilder
 
 logger.info(
     "[KunlunPlugin] V2 MambaHybridModelState patched "
