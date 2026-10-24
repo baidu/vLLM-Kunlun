@@ -617,12 +617,15 @@ class KunlunAttentionMetadataBuilder:
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold or 1,
-                require_uniform=True,
-            )
+        (
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold or 1,
+            require_uniform=True,
         )
 
         if num_prefill_tokens > 0:
@@ -809,8 +812,11 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
         query = query.view(-1, self.num_heads, self.head_size)
         if output is None:
             output = torch.empty_like(query)
+        # Kernels leave padded tokens and zero-length graph requests untouched.
+        # Downstream layers (including MoE routing) consume the padded extent,
+        # so initialize it on every invocation, including graph replays.
+        output.zero_()
         if attn_metadata is None:
-            # Profiling run.
             return output.view(-1, self.num_heads * self.head_size)
         if key is not None:
             assert value is not None
