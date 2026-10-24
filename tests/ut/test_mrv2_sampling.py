@@ -95,3 +95,37 @@ def test_empty_batches_do_not_call_sampling_operators(sampling, native_ops):
     )
     assert result.shape == (0,) and result.dtype == torch.int64
     assert result.device.type == "cpu" and vars(native_ops) == {}
+
+
+@pytest.fixture
+def rejection_wrappers(load_kunlun_override, stub_module_tree, monkeypatch, native_ops):
+    stub_module_tree(
+        "vllm.v1.worker.gpu.input_batch",
+        InputBatch=type("InputBatch", (), {}),
+        get_num_sampled_and_rejected=Mock(),
+    )
+    stub_module_tree("vllm.v1.worker.gpu.metrics.logits", get_num_nans=Mock())
+    stub_module_tree("vllm.v1.worker.gpu.sample.output", SamplerOutput=SimpleNamespace)
+    sampler, upstream = load_kunlun_override(
+        "v1/worker/gpu/spec_decode/rejection_sampler.py",
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        RejectionSampler=type("RejectionSampler", (), {}),
+    )
+    return SimpleNamespace(
+        sampler=sampler,
+        upstream=upstream,
+    )
+
+
+def test_mtp_flatten_passes_padded_stride_to_native(rejection_wrappers, native_ops):
+    sampled = torch.zeros((2, 5), dtype=torch.int64)[:, :4]
+    flat = torch.full((6,), -999, dtype=torch.int64)
+    counts = torch.tensor([2, 1], dtype=torch.int32)
+    starts = torch.tensor([0, 4, 6], dtype=torch.int32)
+    native_ops.flatten_sampled_kernel = Mock()
+    kernel = rejection_wrappers.upstream._flatten_sampled_kernel
+    kernel[(1,)](flat, sampled, sampled.stride(0), counts, starts)
+    native_ops.flatten_sampled_kernel.assert_called_once()
+    args = native_ops.flatten_sampled_kernel.call_args.args
+    assert all(a is b for a, b in zip(args[:4], [flat, sampled, counts, starts]))
+    assert args[4:] == (2, 5)
