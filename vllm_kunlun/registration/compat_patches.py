@@ -67,11 +67,22 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
         # These paths still depend on unsupported Triton kernels.
         unsupported = orig_unsupported(self)
 
-        if self.speculative_config is not None:
-            unsupported.append(
-                "speculative decoding (Kunlun XPU P800 has no Triton and the "
-                "V2 rejection-sampler kernels are not replaced yet)"
+        spec = self.speculative_config
+        if spec is not None:
+            model_type = self.model_config.hf_text_config.model_type
+            mtp_ok = (
+                spec.method == "mtp"
+                and model_type
+                in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+                and spec.rejection_sample_method == "standard"
+                and self.parallel_config.pipeline_parallel_size == 1
+                and not self.parallel_config.enable_expert_parallel
             )
+            if not mtp_ok:
+                unsupported.append(
+                    "Kunlun MRV2 supports Qwen3.5 Dense/MoE MTP "
+                    "with PP1, no EP and standard rejection"
+                )
 
         if self.parallel_config.decode_context_parallel_size > 1:
             unsupported.append(
@@ -83,6 +94,7 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     module.VllmConfig._get_v2_model_runner_unsupported_features = (
         _kunlun_mrv2_unsupported_features
     )
+
     module._kunlun_v2_gate_installed = True
     logging.getLogger("vllm_kunlun").info(
         "[KunlunPlugin] Opened the Model Runner V2 Triton gate and installed "
