@@ -73,3 +73,14 @@ logger.info(
     "[KunlunPlugin] V2 MambaHybridModelState patched "
     "(XSpeedGate scatter_num_accepted and mamba align)"
 )
+
+# Request slots can be reused in cache mode "none" as well as "align".
+_original_add_request = _up.MambaHybridModelState.add_request
+
+
+def _add_request(self, req_index, new_req_data):
+    _original_add_request(self, req_index, new_req_data)
+    self.num_accepted_tokens_gpu[req_index] = 1
+
+
+_up.MambaHybridModelState.add_request = _add_request

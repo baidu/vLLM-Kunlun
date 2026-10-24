@@ -510,6 +510,11 @@ def _v2_hook(kunlun_module: str, *paths: str):
 # Upstream V2 module -> (Kunlun replacement, sentinel attribute paths).
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm_kunlun.v1.worker.gpu.model_runner",
+        ("GPUModelRunner.add_requests",),
+    ),
+    (
         "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
         "vllm_kunlun.v1.worker.gpu.spec_decode.autoregressive.speculator",
         (
