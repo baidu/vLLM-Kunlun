@@ -570,6 +570,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_pad_gather_idx = attn_metadata.spec_pad_gather_idx
+        spec_unpad_idx = attn_metadata.spec_unpad_idx
         spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
@@ -606,6 +608,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            if spec_pad_gather_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_pad_gather_idx)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -620,6 +624,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+            if spec_unpad_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_unpad_idx)
 
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
