@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Input-batch wrapper arguments, dtype adaptation and writeback on CPU."""
+
+from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -13,8 +16,16 @@ def input_batch(load_kunlun_override, native_ops):
     )
 
 
+@pytest.fixture
+def draft_inputs(load_kunlun_override, native_ops):
+    return load_kunlun_override(
+        "v1/worker/gpu/spec_decode/autoregressive/speculator.py",
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+    )
+
+
 def test_wrappers_are_registered(input_batch):
-    (module, upstream) = input_batch
+    module, upstream = input_batch
     for name in [
         "prepare_prefill_inputs",
         "prepare_pos_seq_lens",
@@ -29,7 +40,7 @@ def test_wrappers_are_registered(input_batch):
 
 @pytest.mark.parametrize("name", ["prepare_prefill_inputs", "prepare_pos_seq_lens"])
 def test_prepare_slices_graph_padded_starts(input_batch, native_ops, name):
-    (module, _) = input_batch
+    module, _ = input_batch
     mapping = torch.tensor([1, 0], dtype=torch.int32)
     starts = torch.tensor([0, 2, 3, 3, 3], dtype=torch.int32)
     buffers = [torch.zeros(4, dtype=torch.int32) for _ in range(5)]
@@ -60,7 +71,7 @@ def test_prepare_slices_graph_padded_starts(input_batch, native_ops, name):
 def test_combine_converts_readonly_tokens_and_returns_native_result(
     input_batch, native_ops, dtype, empty_drafts
 ):
-    (module, _) = input_batch
+    module, _ = input_batch
     tokens = torch.zeros(6, dtype=torch.int32)
     mapping = torch.tensor([1, 0], dtype=torch.int32)
     last = torch.tensor([[41], [42]], dtype=dtype)
@@ -69,7 +80,7 @@ def test_combine_converts_readonly_tokens_and_returns_native_result(
         if empty_drafts
         else torch.tensor([[51, 52], [61, 62]], dtype=dtype)
     )
-    (original_last, original_drafts) = (last.clone(), drafts.clone())
+    original_last, original_drafts = (last.clone(), drafts.clone())
     starts = torch.tensor([0, 3, 6], dtype=torch.int32)
     seq_lens = torch.tensor([4, 5], dtype=torch.int32)
     prefill = torch.tensor([1, 1], dtype=torch.int32)
@@ -105,7 +116,7 @@ def test_combine_converts_readonly_tokens_and_returns_native_result(
 def test_post_update_preserves_shape_and_copies_back(
     input_batch, native_ops, dtype, shape, with_bins
 ):
-    (module, _) = input_batch
+    module, _ = input_batch
     mapping = torch.tensor([2, -1], dtype=torch.int32)
     computed = torch.zeros(3, dtype=torch.int32)
     last = torch.full(shape, -1, dtype=dtype)
@@ -151,10 +162,10 @@ def test_post_update_preserves_shape_and_copies_back(
 
 
 def test_remaining_wrappers_forward_arguments_and_results(input_batch, native_ops):
-    (module, _) = input_batch
+    module, _ = input_batch
     mapping = torch.tensor([1, 0], dtype=torch.int32)
     values = [torch.zeros(3, dtype=torch.int32) for _ in range(4)]
-    (sampled, seq_lens, starts, prefill) = values
+    sampled, seq_lens, starts, prefill = values
     result = (sampled, torch.ones_like(sampled))
     native_ops.get_num_sampled_and_rejected = Mock(return_value=result)
     assert (
@@ -179,7 +190,7 @@ def test_remaining_wrappers_forward_arguments_and_results(input_batch, native_op
 
 
 def test_empty_batches_do_not_call_native_operators(input_batch, native_ops):
-    (module, _) = input_batch
+    module, _ = input_batch
     empty = torch.empty(0, dtype=torch.int32)
     starts = torch.zeros(3, dtype=torch.int32)
     pos = torch.full((3,), 777, dtype=torch.int64)
@@ -189,14 +200,14 @@ def test_empty_batches_do_not_call_native_operators(input_batch, native_ops):
     combined = module.combine_sampled_and_draft_tokens(
         empty, empty, empty, starts, empty, empty, empty, starts, 0
     )
-    (sampled, rejected) = module.get_num_sampled_and_rejected(
+    sampled, rejected = module.get_num_sampled_and_rejected(
         empty, empty, starts, empty, empty
     )
     module.post_update(
         empty, empty, empty, None, empty, empty, empty, None, empty, empty
     )
     module.post_update_num_computed_tokens(empty, empty, starts)
-    (expanded, local) = module.expand_idx_mapping(empty, 0, starts, 0)
+    expanded, local = module.expand_idx_mapping(empty, 0, starts, 0)
     assert combined.shape == (0,) and combined.dtype == torch.int64
     assert sampled is empty and rejected.shape == (0,)
     assert expanded.numel() == local.numel() == 0
@@ -205,6 +216,52 @@ def test_empty_batches_do_not_call_native_operators(input_batch, native_ops):
 
 
 def test_combine_rejects_invalid_sample_count(input_batch):
-    (module, _) = input_batch
+    module, _ = input_batch
     with pytest.raises(AssertionError, match="0 or 1"):
         module.combine_sampled_and_draft_tokens(*[None] * 8, 0, 2)
+
+
+@pytest.mark.parametrize("column", [False, True])
+def test_draft_prefill_accepts_last_sampled_layout(draft_inputs, native_ops, column):
+    module, _ = draft_inputs
+    n, capacity = 2, 4
+    ids = torch.arange(8, dtype=torch.int32)
+    positions = ids.long()
+    starts = torch.tensor([0, 4, 8], dtype=torch.int32)
+    seq_lens = torch.full((n,), 4, dtype=torch.int32)
+    buffers = SimpleNamespace(
+        input_ids=ids.clone(),
+        positions=positions.clone(),
+        query_start_loc=torch.empty(capacity + 1, dtype=torch.int32),
+        seq_lens=torch.empty(capacity, dtype=torch.int32),
+    )
+    batch = SimpleNamespace(
+        input_ids=ids,
+        positions=positions,
+        query_start_loc=starts,
+        seq_lens=seq_lens,
+        idx_mapping=torch.arange(n, dtype=torch.int32),
+        num_reqs=n,
+    )
+    last = torch.arange(capacity, dtype=torch.int64) + 100
+    if column:
+        last = last[:, None]
+    indices = torch.empty(capacity, dtype=torch.int64)
+    native_ops.prepare_prefill_inputs_kernel = Mock()
+    result = module.prepare_prefill_inputs(
+        indices,
+        torch.tensor(0, dtype=torch.int64),
+        buffers,
+        batch,
+        torch.ones(n, dtype=torch.int32),
+        torch.zeros(n, dtype=torch.int32),
+        last,
+        torch.arange(capacity, dtype=torch.int32),
+        capacity,
+    )
+    native_ops.prepare_prefill_inputs_kernel.assert_called_once()
+    forwarded = native_ops.prepare_prefill_inputs_kernel.call_args.args[9]
+    assert forwarded.shape == (capacity,)
+    assert forwarded.data_ptr() == last.data_ptr()
+    assert torch.equal(forwarded, last.view(-1))
+    assert result is indices
