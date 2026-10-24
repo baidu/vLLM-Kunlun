@@ -64,7 +64,38 @@ def prepare_decode_inputs(
     )
 
 
+def update_draft_inputs(
+    draft_tokens,
+    current_draft_step,
+    hidden_states,
+    output_draft_tokens,
+    next_input_hidden_states,
+    input_buffers,
+    num_reqs,
+    max_model_len,
+    num_speculative_steps,
+    advance_draft_positions=True,
+):
+    torch.ops.xspeedgate_ops.update_draft_inputs_kernel(
+        draft_tokens,
+        current_draft_step,
+        hidden_states,
+        output_draft_tokens,
+        next_input_hidden_states,
+        input_buffers.input_ids,
+        input_buffers.positions,
+        input_buffers.seq_lens,
+        num_reqs,
+        max_model_len,
+        num_speculative_steps,
+        output_draft_tokens.stride(0),
+        hidden_states.shape[1] * hidden_states.element_size(),
+        hidden_states.stride(0) * hidden_states.element_size(),
+        next_input_hidden_states.stride(0) * next_input_hidden_states.element_size(),
+        advance_draft_positions,
+    )
+
+
 _up.prepare_prefill_inputs = prepare_prefill_inputs
-
-
 _up.prepare_decode_inputs = prepare_decode_inputs
+_up.update_draft_inputs = update_draft_inputs

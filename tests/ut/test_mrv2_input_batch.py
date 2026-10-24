@@ -267,6 +267,16 @@ def test_draft_prefill_accepts_last_sampled_layout(draft_inputs, native_ops, col
     assert result is indices
 
 
+def test_draft_input_wrappers_are_registered(draft_inputs):
+    module, upstream = draft_inputs
+    for name in (
+        "prepare_prefill_inputs",
+        "prepare_decode_inputs",
+        "update_draft_inputs",
+    ):
+        assert getattr(upstream, name) is getattr(module, name)
+
+
 @pytest.mark.parametrize(
     "batch,stride,advance", [(0, 1, True), (3, 0, False), (3, 3, True)]
 )
@@ -302,4 +312,62 @@ def test_draft_decode_forwards_count_and_stride(
     ]
     assert all(a is b for a, b in zip(args[:7], expected))
     assert args[7:] == (batch, capacity, max_len, stride, advance)
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "batch,dtype,advance",
+    [(0, torch.float16, False), (3, torch.float16, True), (3, torch.float32, False)],
+)
+def test_draft_update_forwards_hidden_bytes_and_row_strides(
+    draft_inputs, native_ops, batch, dtype, advance
+):
+    module, _ = draft_inputs
+    width, steps, max_len = 5, 3, 128
+    draft = torch.zeros(batch, dtype=torch.int64)
+    step = torch.tensor(1, dtype=torch.int64)
+    hidden = torch.empty((batch, width + 3), dtype=dtype)[:, :width]
+    next_hidden = torch.empty((batch, width + 7), dtype=dtype)[:, :width]
+    output = torch.empty((batch, steps + 4), dtype=torch.int64)[:, :steps]
+    buffers = SimpleNamespace(
+        input_ids=torch.empty(batch, dtype=torch.int32),
+        positions=torch.empty(batch, dtype=torch.int64),
+        seq_lens=torch.empty(batch, dtype=torch.int32),
+    )
+    native_ops.update_draft_inputs_kernel = Mock()
+    result = module.update_draft_inputs(
+        draft,
+        step,
+        hidden,
+        output,
+        next_hidden,
+        buffers,
+        batch,
+        max_len,
+        steps,
+        advance,
+    )
+    native_ops.update_draft_inputs_kernel.assert_called_once()
+    args = native_ops.update_draft_inputs_kernel.call_args.args
+    expected = [
+        draft,
+        step,
+        hidden,
+        output,
+        next_hidden,
+        buffers.input_ids,
+        buffers.positions,
+        buffers.seq_lens,
+    ]
+    assert all(a is b for a, b in zip(args[:8], expected))
+    assert args[8:] == (
+        batch,
+        max_len,
+        steps,
+        steps + 4,
+        width * hidden.element_size(),
+        (width + 3) * hidden.element_size(),
+        (width + 7) * next_hidden.element_size(),
+        advance,
+    )
     assert result is None

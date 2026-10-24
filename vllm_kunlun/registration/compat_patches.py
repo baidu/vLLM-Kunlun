@@ -508,9 +508,21 @@ def _v2_hook(kunlun_module: str, *paths: str):
 
 
 # Upstream V2 module -> (Kunlun replacement, sentinel attribute paths).
-# Spec-decode (rejection_sampler_utils) is a deferred milestone: its Triton
-# kernels are left alone and the V2 spec-decode path stays unsupported.
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        (
+            "prepare_prefill_inputs",
+            "prepare_decode_inputs",
+            "update_draft_inputs",
+        ),
+    ),
+    (
+        "vllm.model_executor.models.qwen3_5_mtp",
+        "vllm_kunlun.models.qwen3_5_mtp",
+        ("Qwen3_5DecoderLayer",),
+    ),
     (
         "vllm.v1.worker.gpu.metrics.logits",
         "vllm_kunlun.v1.worker.gpu.metrics.logits",
@@ -601,7 +613,7 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "vllm.v1.worker.gpu.model_states.mamba_hybrid",
         "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
-        ("_scatter_num_accepted_kernel",),
+        ("_scatter_num_accepted_kernel", "MambaHybridModelState.add_request"),
     ),
     # Shared by V1 and V2: xspeedgate batch_memcpy + int64 copy buffers.
     (
@@ -615,6 +627,7 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
+    ("vllm.v1.worker.gpu.attn_utils", _bind_kv_cache_applied, _apply_bind_kv_cache),
     (
         "vllm.utils.import_utils",
         _optional_dep_probe_applied,
