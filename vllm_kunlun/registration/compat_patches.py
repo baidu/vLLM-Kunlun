@@ -519,6 +519,16 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        ("rejection_sample",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.rejection_sampler",
+        ("RejectionSampler.__call__", "_flatten_sampled_kernel"),
+    ),
+    (
         "vllm.model_executor.models.qwen3_5_mtp",
         "vllm_kunlun.models.qwen3_5_mtp",
         ("Qwen3_5DecoderLayer",),

@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Sampling wrapper dispatch and output contracts on CPU."""
+
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -99,6 +102,15 @@ def test_empty_batches_do_not_call_sampling_operators(sampling, native_ops):
 
 @pytest.fixture
 def rejection_wrappers(load_kunlun_override, stub_module_tree, monkeypatch, native_ops):
+    utilities, utilities_upstream = load_kunlun_override(
+        "v1/worker/gpu/spec_decode/rejection_sampler_utils.py",
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_kunlun.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        utilities,
+    )
     stub_module_tree(
         "vllm.v1.worker.gpu.input_batch",
         InputBatch=type("InputBatch", (), {}),
@@ -112,9 +124,57 @@ def rejection_wrappers(load_kunlun_override, stub_module_tree, monkeypatch, nati
         RejectionSampler=type("RejectionSampler", (), {}),
     )
     return SimpleNamespace(
+        utilities=utilities,
+        utilities_upstream=utilities_upstream,
         sampler=sampler,
         upstream=upstream,
     )
+
+
+@pytest.mark.parametrize("all_greedy", [None, True, False])
+@pytest.mark.parametrize("temperature_values", [[0.0, 0.0], [0.5, 0.0]])
+def test_mtp_rejection_forwards_modes_and_native_result(
+    rejection_wrappers, native_ops, all_greedy, temperature_values
+):
+    module = rejection_wrappers.utilities
+    arrays = [torch.zeros(2, dtype=torch.int32) for _ in range(8)]
+    arrays[1] = None
+    arrays[5] = torch.tensor([1, 0], dtype=torch.int32)
+    temperature = torch.tensor(temperature_values)
+    seed = torch.tensor([17, 29])
+    result = (torch.tensor([[1, -1]]), torch.tensor([1]))
+    native_ops.rejection_sample_fused_kernel = Mock(return_value=result)
+    actual = module.rejection_sample(
+        *arrays, temperature, seed, 3, use_fp64=True, all_greedy=all_greedy
+    )
+    native_ops.rejection_sample_fused_kernel.assert_called_once()
+    args = native_ops.rejection_sample_fused_kernel.call_args.args
+    assert all(a is b for a, b in zip(args[:10], [*arrays, temperature, seed]))
+    expected_greedy = (
+        all(value == 0 for value in temperature_values)
+        if all_greedy is None
+        else all_greedy
+    )
+    assert args[10:] == (3, expected_greedy, True, 0) and actual is result
+    assert (
+        rejection_wrappers.utilities_upstream.rejection_sample
+        is module.rejection_sample
+    )
+
+
+@pytest.mark.parametrize("steps", [0, 33])
+def test_mtp_rejection_rejects_unsupported_step_counts(rejection_wrappers, steps):
+    with pytest.raises(ValueError, match="1 to 32"):
+        rejection_wrappers.utilities.rejection_sample(*([None] * 10), steps)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"synthetic_conditional_rates": [0.5]}, {"use_block_verification": True}],
+)
+def test_mtp_rejection_rejects_unsupported_modes(rejection_wrappers, options):
+    with pytest.raises(NotImplementedError, match="standard rejection only"):
+        rejection_wrappers.utilities.rejection_sample(*([None] * 10), 3, **options)
 
 
 def test_mtp_flatten_passes_padded_stride_to_native(rejection_wrappers, native_ops):
