@@ -265,3 +265,41 @@ def test_draft_prefill_accepts_last_sampled_layout(draft_inputs, native_ops, col
     assert forwarded.data_ptr() == last.data_ptr()
     assert torch.equal(forwarded, last.view(-1))
     assert result is indices
+
+
+@pytest.mark.parametrize(
+    "batch,stride,advance", [(0, 1, True), (3, 0, False), (3, 3, True)]
+)
+def test_draft_decode_forwards_count_and_stride(
+    draft_inputs, native_ops, batch, stride, advance
+):
+    module, _ = draft_inputs
+    capacity, max_len = batch + 2, 128
+    storage = torch.arange(max(1, batch * max(stride, 1)), dtype=torch.int64)
+    draft = storage.as_strided((batch,), (stride,))
+    target = torch.full((batch,), 7, dtype=torch.int32)
+    rejected = torch.zeros(batch, dtype=torch.int32)
+    buffers = SimpleNamespace(
+        input_ids=torch.empty(capacity, dtype=torch.int32),
+        positions=torch.empty(capacity, dtype=torch.int64),
+        query_start_loc=torch.empty(capacity + 1, dtype=torch.int32),
+        seq_lens=torch.empty(capacity, dtype=torch.int32),
+    )
+    native_ops.prepare_decode_inputs_kernel = Mock()
+    result = module.prepare_decode_inputs(
+        draft, target, rejected, buffers, max_len, capacity, advance
+    )
+    native_ops.prepare_decode_inputs_kernel.assert_called_once()
+    args = native_ops.prepare_decode_inputs_kernel.call_args.args
+    expected = [
+        draft,
+        target,
+        rejected,
+        buffers.input_ids,
+        buffers.positions,
+        buffers.query_start_loc,
+        buffers.seq_lens,
+    ]
+    assert all(a is b for a, b in zip(args[:7], expected))
+    assert args[7:] == (batch, capacity, max_len, stride, advance)
+    assert result is None
