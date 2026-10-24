@@ -1,18 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kunlun native-op overrides for ``vllm.v1.worker.gpu.sample.gumbel``.
-
-Replaces the two Triton Gumbel-max entry points with the Kunlun native ops
-``torch.ops.xspeedgate_ops.apply_temperature`` and ``.gumbel_sample``. The
-native ``gumbel_sample`` uses a seeded Philox stream, preserving per-request
-seed reproducibility, and implements the spec-decode processed-logits outputs
-and ``use_fp64`` reduction.
-
-The native sample result is ``[n, 1]`` while upstream callers require ``[n]``.
-The wrapper restores that contract, returns argmax for negative request IDs as
-upstream does, and preserves existing ``-inf`` masks around the current
-temperature kernel so excluded tokens cannot become NaN.
-"""
+"""Kunlun overrides for temperature scaling and Gumbel sampling."""
 
 import logging
 
@@ -51,20 +39,42 @@ def gumbel_sample(
 ) -> torch.Tensor:
     if logits.shape[0] == 0:
         return logits.new_empty((0,), dtype=torch.int64)
+    valid = expanded_idx_mapping >= 0
+    mapping = torch.where(valid, expanded_idx_mapping, temperature.numel())
+    extended_temperature = torch.cat((temperature, temperature.new_zeros(1)))
+    extended_seed = torch.cat((seed, seed.new_zeros(1)))
+    processed = logits.float()
+    if apply_temperature:
+        t = extended_temperature[mapping.long()]
+        processed = processed / torch.where(t != 0, t, 1)[:, None]
     sampled = torch.ops.xspeedgate_ops.gumbel_sample(
-        logits,
-        expanded_idx_mapping,
-        temperature,
-        seed,
+        processed.contiguous(),
+        mapping,
+        extended_temperature,
+        extended_seed,
         pos,
-        apply_temperature,
-        output_processed_logits,
-        output_processed_logits_col,
+        False,
+        None,
+        None,
         use_fp64,
     ).squeeze(-1)
-    # The wheel returns 0 for negative request IDs; upstream uses argmax.
-    # Match upstream without a device-to-host synchronization.
-    return torch.where(expanded_idx_mapping < 0, logits.argmax(dim=-1), sampled)
+    if output_processed_logits is not None:
+        vocab = processed.shape[1]
+        cache = output_processed_logits
+        columns = output_processed_logits_col
+        starts = torch.zeros_like(expanded_idx_mapping)
+        if columns is not None:
+            starts = starts + columns.to(torch.int32) * vocab
+        # MTP request padding occupies the tail; zero-length writes skip it.
+        ends = torch.cumsum(valid.to(torch.int32) * vocab, dim=0, dtype=torch.int32)
+        torch.ops.xspeedgate_ops.apply_write(
+            cache.view(cache.shape[0], -1),
+            expanded_idx_mapping.clamp_min(0),
+            starts,
+            processed.contiguous().view(-1),
+            ends,
+        )
+    return sampled
 
 
 # ``SamplingStates`` and the samplers bind these functions at import time, so

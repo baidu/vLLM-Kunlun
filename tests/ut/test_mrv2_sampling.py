@@ -12,10 +12,10 @@ import torch
 
 @pytest.fixture
 def sampling(load_kunlun_override, native_ops):
-    (gumbel, gumbel_upstream) = load_kunlun_override(
+    gumbel, gumbel_upstream = load_kunlun_override(
         "v1/worker/gpu/sample/gumbel.py", "vllm.v1.worker.gpu.sample.gumbel"
     )
-    (min_p, min_p_upstream) = load_kunlun_override(
+    min_p, min_p_upstream = load_kunlun_override(
         "v1/worker/gpu/sample/min_p.py", "vllm.v1.worker.gpu.sample.min_p"
     )
     return SimpleNamespace(
@@ -49,29 +49,37 @@ def test_temperature_restores_excluded_tokens(sampling, native_ops):
     assert torch.isneginf(logits[0, 1]) and (not bool(torch.isnan(logits).any()))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("use_fp64,apply_temperature", [(False, False), (True, True)])
-def test_gumbel_forwards_arguments_and_flattens_result(
-    sampling, native_ops, use_fp64, apply_temperature
+def test_gumbel_without_cache_reuses_existing_operator(
+    sampling, native_ops, dtype, use_fp64, apply_temperature
 ):
-    logits = torch.tensor([[1.0, 4.0, 2.0], [7.0, 1.0, 3.0], [1.0, 2.0, 9.0]])
+    logits = torch.tensor(
+        [[1.0, 4.0, 2.0], [7.0, 1.0, 3.0], [1.0, 2.0, 9.0]], dtype=dtype
+    )
     mapping = torch.tensor([1, 0, -1], dtype=torch.int32)
     temperature = torch.tensor([0.0, 0.5])
     seed = torch.tensor([17, 29], dtype=torch.int64)
     pos = torch.tensor([3, 4, 5], dtype=torch.int64)
-    native_ops.gumbel_sample = Mock(
-        return_value=torch.tensor([[2], [0], [0]], dtype=torch.int64)
-    )
+    expected = torch.tensor([[2], [0], [2]], dtype=torch.int64)
+    native_ops.gumbel_sample = Mock(return_value=expected)
     result = sampling.gumbel.gumbel_sample(
         logits, mapping, temperature, seed, pos, apply_temperature, use_fp64=use_fp64
     )
     native_ops.gumbel_sample.assert_called_once()
     args = native_ops.gumbel_sample.call_args.args
-    assert all(
-        (a is b for (a, b) in zip(args[:5], [logits, mapping, temperature, seed, pos]))
-    )
-    assert args[5:] == (apply_temperature, None, None, use_fp64)
+    processed = logits.float()
+    if apply_temperature:
+        processed = processed * torch.tensor([2.0, 1.0, 1.0])[:, None]
+    assert args[0].dtype == torch.float32 and args[0].is_contiguous()
+    torch.testing.assert_close(args[0], processed, rtol=0, atol=0)
+    assert args[1].tolist() == [1, 0, 2]
+    assert args[2].tolist() == [0.0, 0.5, 0.0]
+    assert args[3].tolist() == [17, 29, 0]
+    assert args[4] is pos and args[5:] == (False, None, None, use_fp64)
     assert result.shape == (3,) and result.dtype == torch.int64
-    assert result.tolist() == [2, 0, 2]
+    assert result.data_ptr() == expected.data_ptr()
+    assert "apply_write" not in vars(native_ops)
 
 
 def test_min_p_forwards_inputs_and_preserves_native_write(sampling, native_ops):
@@ -129,6 +137,80 @@ def rejection_wrappers(load_kunlun_override, stub_module_tree, monkeypatch, nati
         sampler=sampler,
         upstream=upstream,
     )
+
+
+def _apply_cached_logits(output, indices, starts, contents, ends):
+    begin = 0
+    for row, start, end in zip(indices.tolist(), starts.tolist(), ends.tolist()):
+        output[row, start : start + end - begin] = contents[begin:end]
+        begin = end
+
+
+@pytest.mark.parametrize("column", [None, 2, "vector"])
+@pytest.mark.parametrize("apply_temperature", [False, True])
+def test_mtp_gumbel_writes_cache_with_existing_operator(
+    sampling, native_ops, column, apply_temperature
+):
+    logits = torch.tensor([[1, 4, 2], [2, 1, 3], [1, 5, 2]], dtype=torch.float16)
+    mapping = torch.tensor([2, 0, -1], dtype=torch.int32)
+    temperature = torch.tensor([0.5, 1.0, 0.0])
+    seed, pos = torch.tensor([17, 29, 41]), torch.tensor([3, 4, 5])
+    cache = torch.full((3, 3, 3), 77.0)
+    columns = (
+        None
+        if column is None
+        else torch.tensor([2, 0, 1]) if column == "vector" else torch.tensor(column)
+    )
+    expected_cache = cache.clone()
+    first_col = 2 if column in (2, "vector") else 0
+    second_col = 2 if column == 2 else 0
+    expected_cache[2, first_col] = torch.tensor([1.0, 4.0, 2.0])
+    expected_cache[0, second_col] = torch.tensor(
+        [4.0, 2.0, 6.0] if apply_temperature else [2.0, 1.0, 3.0]
+    )
+    native_ops.gumbel_sample = Mock(return_value=torch.tensor([[1], [2], [1]]))
+    native_ops.apply_write = Mock(side_effect=_apply_cached_logits)
+    result = sampling.gumbel.gumbel_sample(
+        logits, mapping, temperature, seed, pos, apply_temperature, cache, columns, True
+    )
+    native_ops.gumbel_sample.assert_called_once()
+    sample_args = native_ops.gumbel_sample.call_args.args
+    assert sample_args[0].dtype == torch.float32
+    assert sample_args[1].tolist() == [2, 0, 3]
+    assert sample_args[2].tolist() == [0.5, 1.0, 0.0, 0.0]
+    assert sample_args[3].tolist() == [17, 29, 41, 0]
+    assert sample_args[4] is pos and sample_args[5:] == (False, None, None, True)
+    native_ops.apply_write.assert_called_once()
+    write_args = native_ops.apply_write.call_args.args
+    assert write_args[0].data_ptr() == cache.data_ptr()
+    assert (
+        write_args[1].dtype == write_args[2].dtype == write_args[4].dtype == torch.int32
+    )
+    assert write_args[4].tolist() == [3, 6, 6]
+    torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+    assert result.tolist() == [1, 2, 1]
+
+
+def test_mtp_gumbel_padding_preserves_cache(sampling, native_ops):
+    logits = torch.tensor([[1.0, 4.0, 2.0], [7.0, 1.0, 3.0]])
+    cache = torch.full((2, 3, 3), 77.0)
+    native_ops.gumbel_sample = Mock(
+        side_effect=lambda values, *_: values.argmax(-1)[:, None]
+    )
+    native_ops.apply_write = Mock(side_effect=_apply_cached_logits)
+    result = sampling.gumbel.gumbel_sample(
+        logits,
+        torch.full((2,), -1, dtype=torch.int32),
+        torch.tensor([0.5, 1.0]),
+        torch.tensor([17, 29]),
+        torch.tensor([3, 4]),
+        True,
+        cache,
+        torch.tensor(1),
+    )
+    assert result.tolist() == [1, 0]
+    torch.testing.assert_close(cache, torch.full_like(cache, 77.0), rtol=0, atol=0)
+    assert native_ops.apply_write.call_args.args[4].tolist() == [0, 0]
 
 
 @pytest.mark.parametrize("all_greedy", [None, True, False])
