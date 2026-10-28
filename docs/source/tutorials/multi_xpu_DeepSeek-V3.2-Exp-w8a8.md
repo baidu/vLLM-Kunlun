@@ -110,7 +110,6 @@ export XMLIR_ENABLE_FAST_FC=1 && \
 export XPU_USE_FAST_SWIGLU=1 && \
 export CUDA_GRAPH_OPTIMIZE_STREAM=1 && \
 export XMLIR_ENABLE_MOCK_TORCH_COMPILE=false && \
-export XPU_USE_MOE_SORTED_THRES=1 && \
 export USE_ORI_ROPE=1 && \
 export VLLM_USE_V1=1
 

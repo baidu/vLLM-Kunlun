@@ -1,4 +1,4 @@
-"""Extended ``get_rope()`` that supports custom RoPE scaling types on Kunlun.
+"""Extension point for custom ``get_rope()`` implementations on Kunlun.
 
 All concrete RoPE classes are imported lazily so that this module can be
 imported at any time without triggering CustomOp-related circular imports.
@@ -47,30 +47,10 @@ def _resolve_cls(entry: _RopeEntry):
 
 
 # ---------------------------------------------------------------------------
-# Built-in builders
-# ---------------------------------------------------------------------------
-
-
-def _build_proportional(
-    cls, head_size, max_position, is_neox_style, rope_parameters, dtype
-):
-    base = rope_parameters.get("rope_theta", 10000.0)
-    partial_factor = rope_parameters.get("partial_rotary_factor", 1.0)
-    rotary_dim = int(head_size * partial_factor)
-    return cls(head_size, rotary_dim, max_position, base, is_neox_style, dtype)
-
-
-# ---------------------------------------------------------------------------
 # Type registry — add new entries here
 # ---------------------------------------------------------------------------
 
-_ROPE_TYPE_REGISTRY: dict[str, _RopeEntry] = {
-    "proportional": _RopeEntry(
-        module="vllm_kunlun.ops.rotary_embedding.gemma4_rope",
-        cls_name="Gemma4RotaryEmbedding",
-        build=_build_proportional,
-    ),
-}
+_ROPE_TYPE_REGISTRY: dict[str, _RopeEntry] = {}
 
 
 # ---------------------------------------------------------------------------

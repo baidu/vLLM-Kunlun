@@ -1,0 +1,49 @@
+"kunlun-xpu":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "vllm_kunlun/**"
+          - "build.sh"
+          - "setup_env.sh"
+
+"ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "ci.yml"
+          - ".pre-commit-config.yaml"
+
+"documentation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - "docs/**"
+          - ".readthedocs.yaml"
+
+"tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "tests/**"
+          - "**/test_*.py"
+          - "**/*_test.py"
+
+"dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "requirements*.txt"
+          - "pyproject.toml"
+          - "setup.py"
+          - "setup.cfg"
+          - "uv.lock"
+
+"performance":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "benchmarks/**"
+          - "benchmark/**"
+          - "**/benchmark*.py"
+
+"examples":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "examples/**"
+          - "community/**"

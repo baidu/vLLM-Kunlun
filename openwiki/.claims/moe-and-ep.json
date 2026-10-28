@@ -1,0 +1,103 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "moe-and-ep.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "moe-001",
+      "statement": "MoE 的挂载点是 @CustomOp.register_oot(name=\"UnquantizedFusedMoEMethod\")，apply_monolithic 按 self.moe.use_ep 二分到 fused_moe 或 fused_moe_ep。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/fused_moe/layer.py#L16-L17",
+        "repo://vllm_kunlun/ops/fused_moe/layer.py#L43-L89"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-002",
+      "statement": "非 EP 路径的路由用 moe_softmax_topk_norm(stable=True) 或 moe_sigmoid_group_topk_norm（后者用于 DeepSeek 系分组 topk）。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/ops/_kunlun_ops.py#L377-L621"],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-003",
+      "statement": "同一个 MoE 层在 prefill 与 decode 下走两套不同 kernel，切换点是 M * moe_top_k > 768（M 为 token 数）：大于走 gen_block_statistic + moe_pre_sorted，否则走 moe_pre_small。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L528",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L547-L619"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-004",
+      "statement": "还有一条 M * moe_top_k < 400 的更小 batch 路径被整块注释掉。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/ops/_kunlun_ops.py#L478-L496"],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-005",
+      "statement": "代码刻意使用 moe_fc(act=None) + 显式 silu_and_mul 两步而非融合的 moe_fc(act=\"SWISH_GLU\")：源码 NOTE 指出融合版本对所有 M >= 1024 数值都是错的，且是多并发下输出乱码症状的根因。这是仓库中最重要的一条“不要优化掉”的注释。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/ops/_kunlun_ops.py#L505-L519"],
+      "confidence": "high",
+      "note": "该结论由源码 NOTE 逐字记录，非推断。"
+    },
+    {
+      "id": "moe-006",
+      "statement": "量化 int8 MoE 单体路径是非 EP fused_moe 的镜像实现，同样带 768 阈值，两份实现需同步维护。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L149-L321",
+        "repo://vllm_kunlun/quantization/compressed_tensors/compressed_tensors_moe.py#L200"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-007",
+      "statement": "EP 路径 fused_moe_ep 用 moe_softmax_topk 路由后是一个逐专家的 Python for 循环，即 num_local_experts 次独立 kernel launch，与非 EP 的单融合 kernel 存在量级上的性能不对称。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L623-L680",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L661-L673"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-008",
+      "statement": "特性矩阵声称专家并行支持，但全部 8 篇 tutorial 都是 TP-only，没有任何命令使用 --enable-expert-parallel 或 --data-parallel-size。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://docs/source/user_guide/support_matrix/supported_features.md#L8-L14",
+        "repo://docs/source/tutorials/index.md"
+      ],
+      "confidence": "high",
+      "note": "否定证据：对 docs/source/tutorials/ 下 8 个 tutorial 全文搜索 --enable-expert-parallel / --data-parallel-size 得到 0 命中。"
+    },
+    {
+      "id": "moe-009",
+      "statement": "check_and_update_config 对 DeepEP 高吞吐 + DP>1 的组合强制 full eager，说明该路径尚未与图捕获一起验证。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L257-L274"],
+      "confidence": "high"
+    },
+    {
+      "id": "moe-010",
+      "statement": "ENABLE_VLLM_MOE_FC_SORTED 在 platforms/envs.py 有声明但没有消费者；XPU_USE_MOE_SORTED_THRES 只控制 legacy moe_ffn_block，当前 vLLM-Kunlun fused MoE 路径不读取它。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/envs.py#L53",
+        "repo://vllm_kunlun/ops/_custom_ops.py#L819-L897",
+        "repo://docs/source/user_guide/configuration/env_vars.md"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

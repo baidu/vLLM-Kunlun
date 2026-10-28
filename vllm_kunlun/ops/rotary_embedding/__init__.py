@@ -31,9 +31,6 @@ OOT Mechanism:
 
 import logging
 
-from vllm_kunlun.ops.rotary_embedding.gemma4_rope import (  # noqa: F401
-    Gemma4RotaryEmbedding,
-)
 from vllm_kunlun.ops.rotary_embedding.kunlun_deepseek_rope import (  # noqa: F401
     KunlunDeepseekScalingRotaryEmbedding,
 )
@@ -47,8 +44,10 @@ from vllm_kunlun.ops.rotary_embedding.utils import Split_Norm_Rope  # noqa: F401
 
 logger = logging.getLogger("vllm_kunlun.ops.rotary_embedding")
 
-# Log that OOT registration is complete
+# Importing the modules above executes their registration decorators. This
+# confirms that the registrations were loaded, not that an OOT class has
+# already been instantiated by vLLM.
 logger.info(
-    "[KunlunOOT] Registered KunlunRotaryEmbedding, KunlunMRotaryEmbedding, "
-    "KunlunDeepseekScalingRotaryEmbedding via CustomOp.register_oot"
+    "[KunlunOOT] Loaded RotaryEmbedding, MRotaryEmbedding, and "
+    "DeepseekScalingRotaryEmbedding OOT registrations"
 )

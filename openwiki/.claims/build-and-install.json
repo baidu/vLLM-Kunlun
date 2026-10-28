@@ -1,0 +1,108 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "build-and-install.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "build-001",
+      "statement": "环境基线：Python 3.10.10（.python-version）、transformers 5.2.0 / pydantic 2.12.0 / compressed-tensors 0.13.0 / setuptools 80.9.0（requirements.txt）。",
+      "kind": "fact",
+      "evidence": ["repo://.python-version", "repo://requirements.txt"],
+      "confidence": "high"
+    },
+    {
+      "id": "build-002",
+      "statement": "vllm 不在 requirements.txt 中且 pyproject.toml 的 dependencies 为空；与 vLLM 的版本耦合唯一书面约定是 faqs.md 的一句散文——vllm-kunlun 版本与 vllm 版本相同。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://requirements.txt",
+        "repo://pyproject.toml#L16",
+        "repo://docs/source/faqs.md#L43"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-003",
+      "statement": "README 说构建后端是 hatchling，但 pyproject.toml 实际用 setuptools。",
+      "kind": "defect",
+      "evidence": ["repo://README.md", "repo://pyproject.toml#L6"],
+      "confidence": "high"
+    },
+    {
+      "id": "build-004",
+      "statement": "厂商闭源组件共四个：kunlun_ops 0.1.58+ee39020a、xspeedgate_ops 1.1.0+53992ca、cocopod 1.1.0（三个 wheel），以及提供 torch_xmlir 的 xpytorch（.run 安装包）。",
+      "kind": "fact",
+      "evidence": ["repo://docs/source/installation.md"],
+      "confidence": "high"
+    },
+    {
+      "id": "build-005",
+      "statement": "xpytorch 提供的 torch_xmlir 是整套 CUDA 伪装的基础：它让 torch.cuda.* 在 XPU 上可用，KunlunPlatform 才能声称 device_name = \"cuda\"。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://docs/source/installation.md",
+        "repo://vllm_kunlun/platforms/kunlun.py#L22-L29"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-006",
+      "statement": "安装期有两处 cp 文件覆盖：torch/_dynamo/eval_frame.py ← vllm_kunlun/patches/eval_frame.py，vllm/model_executor/layers/quantization/__init__.py ← vllm_kunlun/quantization/__init__.py。重装 torch 或 vLLM 后会被冲掉、必须重做；第二处是否生效可看目标文件 #L3 的 # patched by vLLM-Kunlun 标记。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://docs/source/installation.md#L100",
+        "repo://docs/source/installation.md#L106",
+        "repo://vllm_kunlun/quantization/__init__.py#L3"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-007",
+      "statement": "build.sh 不编译任何东西，只把源码树打成 tarball；唯一需要编译的是 vllm_kunlun/csrc/utils.cpp（32 行 weak_ref_tensor），由 setup.py 的 CppExtension 处理，但仓库内没有 Python 调用方。因此本插件基本是纯 Python，所有 kernel 都在厂商 wheel 里。",
+      "kind": "fact",
+      "evidence": [
+        "repo://build.sh#L22-L23",
+        "repo://setup.py#L25-L34",
+        "repo://vllm_kunlun/utils.py#L13"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-008",
+      "statement": "setup_env.sh 不再设置 XPU_USE_MOE_SORTED_THRES；该变量只影响当前主 MoE 路径未调用的 legacy moe_ffn_block。",
+      "kind": "fact",
+      "evidence": [
+        "repo://setup_env.sh",
+        "repo://docs/source/user_guide/configuration/env_vars.md",
+        "repo://vllm_kunlun/ops/_custom_ops.py#L819-L897"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-009",
+      "statement": "默认分支是 v0.25.1-dev 而非 main，但 CONTRIBUTING.md、docs/source/conf.py 与各 workflow 文件里写的仍是 main。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://CONTRIBUTING.md",
+        "repo://docs/source/conf.py"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "build-010",
+      "statement": "版本相关文档不完整：versioning_policy.md 与 release_notes.md 是 \"Coming soon...\" 占位，CHANGELOG.md 停在 0.1.0 - 2025-08-12。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://docs/source/community/versioning_policy.md",
+        "repo://docs/source/user_guide/release_notes.md",
+        "repo://CHANGELOG.md"
+      ],
+      "confidence": "high"
+    }
+  ]
+}

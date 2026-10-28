@@ -1,17 +1,32 @@
-import os as _q38_os
-# Q38 DIAG/FIX: XMLIR_FORCE_USE_XPU_GRAPH 决定 XPU graph replay 是否异步
-# （实测：有=0.1ms 异步入队，无=阻塞整图 36ms）。spawn 子进程链路疑似丢失
-# 该变量，这里 setdefault 兜底并打日志观测各进程的原始取值。
-_q38_os.environ.setdefault("XMLIR_FORCE_USE_XPU_GRAPH", "1")
-"""vllm kunlun init"""
+"""vLLM Kunlun plugin registration entrypoints.
 
-import builtins
-import importlib
+Keep platform discovery and the public registration wrappers here.  The
+implementation lives in the ``registration`` package: startup stages in
+``registration/bootstrap.py``, wholesale module replacements in
+``registration/module_redirects.py``, and post-import patches in
+``registration/compat_patches.py``.
+"""
+
 import logging
 import os
-import sys
 
-OLD_IMPORT_HOOK = builtins.__import__
+# XMLIR_FORCE_USE_XPU_GRAPH decides whether XPU graph replay is enqueued
+# asynchronously (measured: 0.1 ms enqueue with it, 36 ms blocking on the whole
+# graph without it). Spawned worker processes do not reliably inherit it, so
+# default it at plugin import time, before any torch_xmlir module reads it.
+os.environ.setdefault("XMLIR_FORCE_USE_XPU_GRAPH", "1")
+
+from .registration import bootstrap  # noqa: E402
+from .registration.import_hooks import (  # noqa: E402
+    dispatch_hooks,
+    install_import_hook,
+)
+
+# Platform discovery can call register() more than once in the same process,
+# including re-entrantly while the first call is importing vLLM modules.
+_REGISTER_STATE = "idle"
+_REGISTER_ERROR: BaseException | None = None
+_KUNLUN_PLATFORM = "vllm_kunlun.platforms.kunlun.KunlunPlatform"
 
 
 def _configure_kunlun_logger() -> logging.Logger:
@@ -20,569 +35,93 @@ def _configure_kunlun_logger() -> logging.Logger:
 
     vllm_logger = init_vllm_logger("vllm")
     kunlun_logger = logging.getLogger("vllm_kunlun")
-
     if not kunlun_logger.handlers:
         for handler in vllm_logger.handlers:
             kunlun_logger.addHandler(handler)
-
     kunlun_logger.setLevel(vllm_logger.getEffectiveLevel())
     kunlun_logger.propagate = False
     return kunlun_logger
 
 
-# Re-entry sentinel for the post-import hooks dispatcher. Some hooks
-# trigger their own imports (e.g. importing ``vllm_kunlun.v1.worker.utils``
-# to apply the KVBlockZeroer patch), which would re-enter
-# ``_custom_import`` recursively. A single dispatcher-level guard is
-# sufficient because all hooks are idempotent and we only need one to
-# run per real import event.
-_POST_IMPORT_DISPATCH_IN_PROGRESS = {"v": False}
+def _run_startup_stages(logger: logging.Logger) -> None:
+    """Run every startup stage in dependency order.
 
-
-_MODULE_MAPPINGS = {
-    "vllm.compilation.wrapper": "vllm_kunlun.compilation.wrapper",
-    "vllm.model_executor.model_loader.bitsandbytes_loader": "vllm_kunlun.models.model_loader.bitsandbytes_loader",
-    "vllm.v1.sample.ops.topk_topp_sampler": "vllm_kunlun.v1.sample.ops.topk_topp_sampler",
-    "vllm.v1.sample.ops.logprobs": "vllm_kunlun.v1.sample.ops.logprobs",
-    "vllm.v1.sample.rejection_sampler": "vllm_kunlun.v1.sample.rejection_sampler",
-    "vllm.attention.ops.merge_attn_states": "vllm_kunlun.ops.attention.merge_attn_states",
-    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
-    # "vllm.v1.worker.gpu_model_runner": "vllm_kunlun.v1.worker.gpu_model_runner",
-}
-
-
-# ---------------------------------------------------------------------------
-# Post-import hook registry
-# ---------------------------------------------------------------------------
-# Each entry: (target_module_name, applied_predicate, apply_callable).
-#
-#   target_module_name  upstream module that must be loaded for this hook
-#                       to be applicable. The hook only runs after this
-#                       module appears in ``sys.modules``.
-#   applied_predicate   ``fn(module) -> bool``. Return True if the patch
-#                       has already been applied (cheap, side-effect free).
-#                       Used both for idempotency and to short-circuit
-#                       once the hook has succeeded.
-#   apply_callable      ``fn(module) -> None``. Performs the actual
-#                       patch. Must set its own "applied" sentinel so
-#                       ``applied_predicate`` returns True afterwards.
-#
-# To add a new hook: write the apply function (in a dedicated module if
-# non-trivial; inline lambda for one-liners), then append a tuple here.
-# ---------------------------------------------------------------------------
-_POST_IMPORT_HOOKS: list = []
-
-
-def _register_post_import_hook(target, applied, apply):
-    _POST_IMPORT_HOOKS.append((target, applied, apply))
-
-
-def _dispatch_post_import_hooks():
-    """Run every registered post-import hook whose target is loaded.
-
-    Re-entrant safe: importing the kunlun replacement module from within
-    a hook re-triggers ``_custom_import`` -> this dispatcher; the
-    in-progress sentinel short-circuits the inner call.
+    Failure policy lives in the stages themselves: optional stages catch and
+    log their own errors, while load-bearing stages let them propagate to
+    ``register()``.
     """
-    if _POST_IMPORT_DISPATCH_IN_PROGRESS["v"]:
-        return
-    _POST_IMPORT_DISPATCH_IN_PROGRESS["v"] = True
-    try:
-        for target, applied, apply in _POST_IMPORT_HOOKS:
-            mod = sys.modules.get(target)
-            if mod is None:
-                continue
-            try:
-                if applied(mod):
-                    continue
-                apply(mod)
-            except Exception:
-                logging.getLogger("vllm_kunlun").exception(
-                    "[KunlunPlugin] post-import hook failed for target=%s", target
-                )
-    finally:
-        _POST_IMPORT_DISPATCH_IN_PROGRESS["v"] = False
+    # 1. Block CUDA extension imports before any vLLM kernel module loads.
+    bootstrap.stub_vllm_cuda_extensions()
+    # 2. Register bare custom ops before OOT layer imports need them.
+    bootstrap.register_custom_ops(logger)
+    # 3. Optional speculative-decoding compatibility patches.
+    bootstrap.load_spec_decode_compat(logger)
+    # 4. Provide the _C operator vLLM's CUDA-graph capture hardcodes.
+    bootstrap.register_weak_ref_tensor(logger)
+    # 5. Patch custom-op schema registration before any model loads.
+    bootstrap.load_schema_helpers(logger)
+    # 6. Install the import dispatcher, then patch the vLLM modules that
+    #    were already imported before it was installed.
+    install_import_hook()
+    dispatch_hooks()
+    logger.info("[KunlunPlugin] import hook installed")
+    # 7. Add torch_xmlir's missing memory-info API.
+    bootstrap.patch_memory_info(logger)
 
 
-# --- hook 1: KVBlockZeroer in vllm.v1.worker.utils ------------------------
-# Importing the kunlun replacement module triggers an in-place class
-# patch (``_kunlun_patched`` flag set on KVBlockZeroer). See
-# ``vllm_kunlun/v1/worker/utils.py`` for the actual patch body.
-def _kvblockzeroer_applied(mod):
-    cls = getattr(mod, "KVBlockZeroer", None)
-    return cls is None or getattr(cls, "_kunlun_patched", False)
-
-
-def _kvblockzeroer_apply(mod):
-    if not hasattr(mod, "KVBlockZeroer"):
-        return  # upstream module loaded before its class body executed
-    import vllm_kunlun.v1.worker.utils  # noqa: F401  (self-applies on import)
-
-
-_register_post_import_hook(
-    "vllm.v1.worker.utils", _kvblockzeroer_applied, _kvblockzeroer_apply
-)
-
-
-# --- hook 2: qwen3_vl HAS_TRITON ------------------------------------------
-# Triton kernel ``_bilinear_pos_embed_kernel`` is unsupported on Kunlun XPU.
-# Force the module to fall back to native pos-embed interpolation.
-def _qwen3vl_applied(mod):
-    return not getattr(mod, "HAS_TRITON", False)
-
-
-def _qwen3vl_apply(mod):
-    mod.HAS_TRITON = False
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] qwen3_vl HAS_TRITON forced to False"
-    )
-
-
-_register_post_import_hook(
-    "vllm.model_executor.models.qwen3_vl", _qwen3vl_applied, _qwen3vl_apply
-)
-
-
-# --- hook 3: BlockTable.compute_slot_mapping ------------------------------
-# Replace the upstream Triton kernel with a torch-native version.
-def _block_table_applied(mod):
-    cls = getattr(mod, "BlockTable", None)
-    return cls is None or getattr(cls, "_kunlun_slot_patched", False)
-
-
-def _block_table_apply(mod):
-    import vllm_kunlun.v1.worker.block_table  # noqa: F401  (self-applies on import)
-
-
-_register_post_import_hook(
-    "vllm.v1.worker.block_table", _block_table_applied, _block_table_apply
-)
-
-
-# --- hook 4: apply_grammar_bitmask in vllm.v1.structured_output.utils -----
-# Replace the upstream xgrammar auto backend with torch_native on Kunlun XPU.
-def _grammar_bitmask_applied(mod):
-    fn = getattr(mod, "apply_grammar_bitmask", None)
-    return fn is not None and getattr(fn, "_kunlun_patched", False)
-
-
-def _grammar_bitmask_apply(mod):
-    if not hasattr(mod, "apply_grammar_bitmask"):
-        return
-    import vllm_kunlun.v1.structured_output.utils  # noqa: F401
-
-
-_register_post_import_hook(
-    "vllm.v1.structured_output.utils", _grammar_bitmask_applied, _grammar_bitmask_apply
-)
-
-
-# --- hook 5: Worker._maybe_get_memory_pool_context -----------------------
-# vllm 0.25.1 _maybe_get_memory_pool_context() gates on is_cuda_alike() /
-# is_xpu(). KunlunPlatform is OOT so neither returns True, causing it to
-# fall through to get_mem_allocator_instance() which raises RuntimeError.
-# Patch the method to return nullcontext() for Kunlun.
-def _memory_pool_applied(mod):
-    cls = getattr(mod, "Worker", None)
-    return cls is None or getattr(cls, "_kunlun_memory_pool_patched", False)
-
-
-def _memory_pool_apply(mod):
-    from contextlib import nullcontext as _nullcontext
-
-    _orig = mod.Worker._maybe_get_memory_pool_context
-
-    def _patched(self, tag: str):
-        from vllm.platforms import current_platform
-
-        if type(current_platform).__name__ == "KunlunPlatform":
-            return _nullcontext()
-        return _orig(self, tag)
-
-    mod.Worker._maybe_get_memory_pool_context = _patched
-    mod.Worker._kunlun_memory_pool_patched = True
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched Worker._maybe_get_memory_pool_context"
-    )
-
-
-_register_post_import_hook(
-    "vllm.v1.worker.gpu_worker", _memory_pool_applied, _memory_pool_apply
-)
-
-
-# --- hook 6: skip qwen_triton_warmup on Kunlun XPU ---
-def _qwen_triton_warmup_applied(mod):
-    fn = getattr(mod, "qwen_triton_warmup", None)
-    return fn is not None and getattr(fn, "_kunlun_patched", False)
-
-
-def _qwen_triton_warmup_apply(mod):
-    def _noop(*args, **kwargs):
-        import logging
-
-        logging.getLogger("vllm_kunlun").info(
-            "[KunlunPlugin] Skipping qwen_triton_warmup"
+def register() -> str:
+    """Register the Kunlun platform and its compatibility patches."""
+    global _REGISTER_ERROR, _REGISTER_STATE
+    if _REGISTER_STATE == "failed":
+        raise RuntimeError(
+            "Kunlun plugin registration previously failed; " "retry in a fresh process"
+        ) from _REGISTER_ERROR
+    if _REGISTER_STATE != "idle":
+        logging.getLogger("vllm_kunlun").debug(
+            "[KunlunPlugin] register() skipped; state=%s", _REGISTER_STATE
         )
+        return _KUNLUN_PLATFORM
+    _REGISTER_STATE = "registering"
 
-    _noop._kunlun_patched = True
-    mod.qwen_triton_warmup = _noop
-    import logging
-
-    logging.getLogger("vllm_kunlun").info(
-        "[KunlunPlugin] patched kernel_warmup.qwen_triton_warmup -> no-op"
-    )
-
-
-_register_post_import_hook(
-    "vllm.model_executor.warmup.kernel_warmup",
-    _qwen_triton_warmup_applied,
-    _qwen_triton_warmup_apply,
-)
-
-
-# --- hook 6: select_int8_moe_backend in w8a8_int8 module ---------------
-# CompressedTensorsW8A8Int8MoEMethod.__init__ calls select_int8_moe_backend()
-# which only supports Triton/CUDA backends. On Kunlun XPU is_cuda()==False so
-# all backends get skipped, raising NotImplementedError.
-# The Kunlun class uses is_monolithic=True + apply_monolithic() with
-# torch.ops._C.moe_* custom ops — it never uses int8_backend or experts_cls.
-# We patch the LOCAL reference (from X import Y) in the caller module so that
-# super().__init__() falls through gracefully.  See hook comment block above
-# for the post-import hook contract.
-def _w8a8_int8_moe_applied(mod):
-    # Module may be partially initialized during circular imports
-    if not hasattr(mod, "select_int8_moe_backend"):
-        return False
-    return getattr(mod, "_kunlun_select_int8_patched", False)
-
-
-def _w8a8_int8_moe_apply(mod):
-    # Guard against partially initialized module during circular imports.
-    # When oracle.int8 triggers import of this module, select_int8_moe_backend
-    # may not be bound yet (the "from oracle.int8 import ..." is still in flight).
-    if not hasattr(mod, "select_int8_moe_backend"):
-        return
-
-    def _kunlun_select_int8_moe_backend(config, weight_key=None, activation_key=None):
-        return None, None
-
-    mod.select_int8_moe_backend = _kunlun_select_int8_moe_backend
-    mod._kunlun_select_int8_patched = True
-
-
-_register_post_import_hook(
-    "vllm.model_executor.layers.quantization.compressed_tensors."
-    "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8",
-    _w8a8_int8_moe_applied,
-    _w8a8_int8_moe_apply,
-)
-
-
-# --- hook 6: select_int8_moe_backend in w8a8_int8 module ---------------
-# CompressedTensorsW8A8Int8MoEMethod.__init__ calls select_int8_moe_backend()
-# which only supports Triton/CUDA backends. On Kunlun XPU is_cuda()==False so
-# all backends get skipped, raising NotImplementedError.
-# The Kunlun class uses is_monolithic=True + apply_monolithic() with
-# torch.ops._C.moe_* custom ops — it never uses int8_backend or experts_cls.
-# We patch the LOCAL reference (from X import Y) in the caller module so that
-# super().__init__() falls through gracefully.  See hook comment block above
-# for the post-import hook contract.
-def _w8a8_int8_moe_applied(mod):
-    # Module may be partially initialized during circular imports
-    if not hasattr(mod, "select_int8_moe_backend"):
-        return False
-    return getattr(mod, "_kunlun_select_int8_patched", False)
-
-
-def _w8a8_int8_moe_apply(mod):
-    # Guard against partially initialized module during circular imports.
-    # When oracle.int8 triggers import of this module, select_int8_moe_backend
-    # may not be bound yet (the "from oracle.int8 import ..." is still in flight).
-    if not hasattr(mod, "select_int8_moe_backend"):
-        return
-
-    def _kunlun_select_int8_moe_backend(config, weight_key=None, activation_key=None):
-        return None, None
-
-    mod.select_int8_moe_backend = _kunlun_select_int8_moe_backend
-    mod._kunlun_select_int8_patched = True
-
-
-_register_post_import_hook(
-    "vllm.model_executor.layers.quantization.compressed_tensors."
-    "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8",
-    _w8a8_int8_moe_applied,
-    _w8a8_int8_moe_apply,
-)
-
-
-def _preload_mapped(full_name):
-    """Load the kunlun replacement for ``full_name`` into sys.modules."""
-    if full_name in sys.modules:
-        return
-    target_module = _MODULE_MAPPINGS[full_name]
-    module = importlib.import_module(target_module)
-    sys.modules[full_name] = module
-    sys.modules[target_module] = module
-
-
-# --- hook 9: honor the checkpoint's mamba_ssm_dtype for Qwen4Exp ----------
-# Qwen3.8-Flash-Next's GDN temporal state is read-modify-written in place on
-# every decode step (fused_recurrent_gated_delta_rule(..., inplace_final_state=
-# True)), while prefill's chunk kernel rounds it only once at the end. Keeping
-# that state in bfloat16 therefore makes the rounding error compound with the
-# number of decode steps, which shows up as long greedy generations drifting off
-# and eventually looping. The checkpoint asks for float32 via
-# text_config.mamba_ssm_dtype; upstream vLLM applies it through
-# Qwen3_5ForConditionalGenerationConfig, but MODELS_CONFIG_MAP is keyed on arch
-# names this port does not use (it serves as Qwen4ExpForCausalLM via
-# --hf-overrides), so the hook never fired and the state silently stayed
-# bfloat16. Register the missing entries here.
-def _qwen4exp_ssm_dtype_applied(mod):
-    m = getattr(mod, "MODELS_CONFIG_MAP", None)
-    return m is None or "Qwen4ExpForCausalLM" in m
-
-
-def _qwen4exp_ssm_dtype_apply(mod):
-    _log = logging.getLogger("vllm_kunlun")
-
-    class _Qwen4ExpMambaSsmDtypeConfig(mod.VerifyAndUpdateConfig):
-        @staticmethod
-        def verify_and_update_config(vllm_config) -> None:
-            cache_config = vllm_config.cache_config
-            hf_text_config = vllm_config.model_config.hf_text_config
-            ssm_dtype = getattr(hf_text_config, "mamba_ssm_dtype", None)
-            if ssm_dtype is None:
-                return
-            if cache_config.mamba_ssm_cache_dtype == "auto":
-                cache_config.mamba_ssm_cache_dtype = ssm_dtype
-                _log.info(
-                    "[KunlunPlugin] mamba_ssm_cache_dtype -> '%s' (from the "
-                    "checkpoint's mamba_ssm_dtype)",
-                    ssm_dtype,
-                )
-            elif cache_config.mamba_ssm_cache_dtype != ssm_dtype:
-                _log.warning(
-                    "[KunlunPlugin] checkpoint specifies mamba_ssm_dtype='%s' "
-                    "but --mamba-ssm-cache-dtype='%s' was passed; using the "
-                    "user-specified value.",
-                    ssm_dtype,
-                    cache_config.mamba_ssm_cache_dtype,
-                )
-
-    for _arch in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"):
-        mod.MODELS_CONFIG_MAP.setdefault(_arch, _Qwen4ExpMambaSsmDtypeConfig)
-    _log.info("[KunlunPlugin] registered Qwen4Exp mamba_ssm_dtype config hook")
-
-
-_register_post_import_hook(
-    "vllm.model_executor.models.config",
-    _qwen4exp_ssm_dtype_applied,
-    _qwen4exp_ssm_dtype_apply,
-)
-
-
-def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
+    logger = logging.getLogger("vllm_kunlun")
     try:
-        if level == 0:
-            # Case 1: `from vllm.x.y import Z` / `import vllm.x.y`
-            # Here module_name is the full dotted path of the mapped module.
-            if module_name in _MODULE_MAPPINGS:
-                _preload_mapped(module_name)
-
-            # Case 2: `from vllm.x import y` where y itself is a mapped submodule.
-            # CPython calls __import__("vllm.x", fromlist=("y",)); module_name
-            # does not include "y", so we must check each fromlist entry.
-            if fromlist:
-                for name in fromlist:
-                    full = f"{module_name}.{name}"
-                    if full in _MODULE_MAPPINGS:
-                        _preload_mapped(full)
-    except Exception:
-        pass
-
-    result = OLD_IMPORT_HOOK(
-        module_name, globals=globals, locals=locals, fromlist=fromlist, level=level
-    )
-
-    # Run all registered post-import hooks. Each hook checks its own
-    # target module presence and idempotency flag; the dispatcher itself
-    # has a re-entry guard so hook-triggered imports do not recurse.
-    _dispatch_post_import_hooks()
-
-    return result
-
-
-def import_hook():
-    """Apply import hook for VLLM Kunlun"""
-    builtins.__import__ = _custom_import
-
-
-def register():
-    """Register the Kunlun platform"""
-
-    logger = _configure_kunlun_logger()
-    logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
-
-    # --- block vllm's NVIDIA prebuilt _C / _moe_C from being loaded ---
-    # These are imported (via top-level ``import vllm._C`` in
-    # ``vllm.platforms.cuda`` / inside ``Platform.import_kernels``) by
-    # multiple vllm code paths. On Kunlun XPU they are useless and would
-    # pre-register CUDA kernels that clash with the Kunlun
-    # ``@custom_op`` / ``@impl(..., "CUDA")`` registrations on
-    # PyTorch 2.9+. Stub them out NOW, before any other vllm import
-    # has a chance to load them.
-    import types as _types
-
-    for _stub in ("vllm._C", "vllm._moe_C"):
-        if _stub not in sys.modules:
-            sys.modules[_stub] = _types.ModuleType(_stub)
-
-    # --- eagerly register Kunlun custom ops ---
-    # We load ``vllm_kunlun/ops/_custom_ops.py`` DIRECTLY via
-    # ``spec_from_file_location`` under a private module name, instead of
-    # ``import vllm_kunlun.ops`` which would trigger
-    # ``vllm_kunlun/ops/__init__.py`` and transitively import
-    # ``vllm_kunlun.ops.fused_moe.layer`` →
-    # ``vllm.model_executor.layers.fused_moe.config`` →
-    # ``vllm.model_executor.layers.quantization.utils.quant_utils`` →
-    # ``vllm._custom_ops``. The last step calls
-    # ``current_platform.import_kernels()`` while the platform plugin is
-    # still mid-registration, which is fragile and was observed to leave
-    # the worker process without any custom ops registered.
-    #
-    # Loading just the bare file registers all 54 Kunlun ops to
-    # ``torch.ops._C`` / ``torch.ops._moe_C`` and avoids touching any
-    # other vllm internals.
-    try:
-        import importlib.util as _ilu
-        import os as _os
-
-        _ops_file = _os.path.join(
-            _os.path.dirname(_os.path.abspath(__file__)),
-            "ops",
-            "_custom_ops.py",
-        )
-        _private = "_vllm_kunlun_custom_ops_registration"
-        if _private not in sys.modules:
-            _spec = _ilu.spec_from_file_location(_private, _ops_file)
-            _mod = _ilu.module_from_spec(_spec)
-            sys.modules[_private] = _mod
-            _spec.loader.exec_module(_mod)
-        logger.info("[KunlunPlugin] vllm_kunlun custom ops registered")
-    except Exception:
-        logger.exception("[KunlunPlugin] custom ops registration failed")
+        # Repair the transformers class before configuring the vLLM logger or
+        # importing any startup-stage dependencies. ModelConfig derives MLA
+        # cache dimensions during config construction, so this must precede
+        # every path that could trigger a config load.
+        bootstrap.repair_glm_moe_dsa_head_dims(logger)
+        logger = _configure_kunlun_logger()
+        logger.info("[KunlunPlugin] register() pid=%s", os.getpid())
+        _run_startup_stages(logger)
+    except Exception as error:
+        if isinstance(error, bootstrap.CustomOpsRegistrationError):
+            _REGISTER_ERROR = error
+            _REGISTER_STATE = "failed"
+        else:
+            _REGISTER_STATE = "idle"
+        logger.exception("[KunlunPlugin] register() failed")
         raise
-
-    # --- load native extension to register torch.ops._C.weak_ref_tensor ---
-    try:
-        from . import _kunlun  # noqa: F401
-
-        logger.info("[KunlunPlugin] _kunlun native extension loaded")
-    except ImportError as e:
-        logger.warning("[KunlunPlugin] Failed to load _kunlun: %s", e)
-
-    # --- import wrapper & patch utils ---
-    try:
-        from .schema import direct_register_custom_op  # noqa: F401
-        from .schema import patch_annotations_for_schema  # noqa: F401
-
-        logger.info("[KunlunPlugin] vllm_utils_wrapper loaded and patched")
-    except Exception:
-        logger.exception("[KunlunPlugin] wrapper import/patch failed")
-        raise
-
-    # --- import hook ---
-    try:
-        import_hook()
-        logger.info("[KunlunPlugin] import_hook() ok")
-    except Exception:
-        logger.exception("[KunlunPlugin] import_hook() failed")
-        raise
-
-    # --- patch torch.accelerator.get_memory_info for Kunlun XPU ---
-    # vllm 0.25.1 uses torch.accelerator.get_memory_info() which does not exist
-    # in torch_xmlir 2.9. Patch it to use torch.cuda.mem_get_info which works on XPU.
-    try:
-        import torch as _torch
-
-        def _kunlun_get_memory_info(device=None):
-            if device is None:
-                idx = _torch.cuda.current_device()
-            elif isinstance(device, _torch.device):
-                idx = (
-                    device.index
-                    if device.index is not None
-                    else _torch.cuda.current_device()
-                )
-            elif isinstance(device, int):
-                idx = device
-            else:
-                idx = _torch.cuda.current_device()
-            return _torch.cuda.mem_get_info(idx)
-
-        _torch.accelerator.get_memory_info = _kunlun_get_memory_info
-        logger.info("[KunlunPlugin] patched torch.accelerator.get_memory_info")
-    except Exception:
-        logger.exception(
-            "[KunlunPlugin] failed to patch torch.accelerator.get_memory_info"
-        )
-        raise
-
-    # --- register reasoning parser override (lazy, to avoid circular import) ---
-    try:
-        from vllm.reasoning import ReasoningParserManager
-
-        # Override the lazy registration path with our custom parser.
-        # This happens before vllm's default lazy registration (which is
-        # triggered when vllm.reasoning module is imported), so our path
-        # takes precedence.
-        # Custom parser for Qwen3.5 support
-        ReasoningParserManager.register_lazy_module(
-            name="qwen3",
-            module_path="vllm_kunlun.reasoning.qwen3_reasoning_parser",
-            class_name="Qwen3ReasoningParser",
-        )
-        logger.info("[KunlunPlugin] registered Qwen3ReasoningParser override (lazy)")
-    except Exception:
-        logger.exception("[KunlunPlugin] Qwen3ReasoningParser registration failed")
-        # Non-fatal: continue without the override
-
+    _REGISTER_STATE = "registered"
     logger.info("[KunlunPlugin] register() done")
-    return "vllm_kunlun.platforms.kunlun.KunlunPlatform"
+    return _KUNLUN_PLATFORM
 
 
 def register_model():
-    """Register models for training and inference"""
-    from .models import register_model as _reg
+    """Register models for training and inference."""
+    from .models import register_model as _register
 
-    _reg()
+    _register()
 
 
 def register_reasoning_parser():
     """Register reasoning parsers for inference."""
-    from .reasoning import register_reasoning_parser as _reg_reasoning_parser
+    from .reasoning import register_reasoning_parser as _register
 
-    _reg_reasoning_parser()
+    _register()
 
 
 def register_tool_parser():
     """Register tool parsers for inference."""
-    from .entrypoints.openai.tool_parsers import (
-        register_tool_parser as _reg_tool_parser,
-    )
+    from .tool_parsers import register_tool_parser as _register
 
-    _reg_tool_parser()
-
-
-# --- qwen4_exp hooks (bridged for this image) ---
-from .qwen4_exp_patches import QWEN4_EXP_HOOKS as _QWEN4_EXP_HOOKS  # noqa: E402
-
-for _t, _a, _f in _QWEN4_EXP_HOOKS:
-    _register_post_import_hook(_t, _a, _f)
-
-
-# --- __Q38_NANWD__ 诊断看门狗（仅 Q38_NANWD=1 时注册）---
-
-# --- __Q38_MMWD__ 多模态数值看门狗（仅 Q38_MMWD=1 时注册）---
+    _register()

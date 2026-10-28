@@ -1,0 +1,178 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "attention-backend.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "attn-001",
+      "statement": "共有四个注册 backend：KunlunAttentionBackend（name \"CUSTOM\"）、FlashMLABackend（\"FLASHMLA\"）、FlashMLASparseBackend（\"FLASHMLA_SPARSE_VLLM_V1\"）、GDNAttentionBackend（\"GDN_ATTN\"，is_ssm() 返回 True）。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L62-L82",
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla.py#L30-L46",
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla_sparse.py#L63-L69",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L25-L36"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-002",
+      "statement": "还有第五条不经 backend 注册表的非 paged 编码器路径：强制 _Backend.FLASH_ATTN 并直接调用 flash_attn_func。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/ops/attention/layer.py#L129-L170"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-003",
+      "statement": "GDN backend 由模型声明 mamba_type() 选中，而非由平台分派；它在 import 时就地替换上游符号。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/models/qwen3_next.py#L264-L265",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L505-L512"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-004",
+      "statement": "标准 KV cache 布局是 (2, num_blocks, num_kv_heads, block_size, head_size) 的 BHLD；支持的 head size 为 [32,64,80,96,112,120,128,192,256,512]；_PARTITION_SIZE 为 512；reshape_and_cache_flash 以 BLHD_LAYOUT=False 调用。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/ops/paged_attn.py#L42-L55",
+        "repo://vllm_kunlun/ops/paged_attn.py#L36-L40",
+        "repo://vllm_kunlun/ops/paged_attn.py#L12",
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L820-L827"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-005",
+      "statement": "MLA 的 KV cache 布局是 (num_blocks, block_size, head_size)，head_size 为 576，dtype fp16/bf16。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/v1/attention/backends/mla/common.py#L280-L324"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-006",
+      "statement": "稀疏 MLA 的 KV cache 是 656 字节/token 的 fp8 布局或 bf16；默认 topk_tokens=2048、block_size=64。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla_sparse.py#L83-L104",
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla_sparse.py#L152-L182"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-007",
+      "statement": "GDN 使用 MambaSpec 而非 paged KV cache，且只接受 --mamba-cache-mode=align。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L98",
+        "repo://vllm_kunlun/models/qwen3_next.py#L1373-L1376"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-008",
+      "statement": "混合 KV cache 下 block table 需要运行时缩放（_get_block_table_scale），与 mamba_utils 里的 stride 改写必须保持一致。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L692-L713",
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L854-L855",
+        "repo://vllm_kunlun/v1/worker/mamba_utils.py#L315-L340"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-009",
+      "statement": "slot mapping 被换成原生 kunlun_ops.compute_slot_mappings，原因是 torch.searchsorted 在 XPU 上会静默回落到 CPU。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/worker/block_table.py#L3-L47"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-010",
+      "statement": "cascade attention 无条件不支持（use_cascade_attention 直接 return False）。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L992-L1013"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-011",
+      "statement": "KVBlockZeroer._zero_block_ids 被改成空实现，block 复用时不清零。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/v1/worker/utils.py#L110-L112"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-012",
+      "statement": "MLA chunked prefill 的 workspace 大小是 max(8*max_model_len, 4*max_num_seqs*block_size)，上限 64K。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/v1/attention/backends/mla/common.py#L466-L495"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-013",
+      "statement": "MLA 路径下 KV sharing 抛 NotImplementedError。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1024-L1025"],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-014",
+      "statement": "VLLM_KUNLUN_ENABLE_INT8_BMM 是唯一有真实消费者的自定义环境变量，开启时把 MLA 的 bmm 换成 kunlun_ops.mla_bmm_I8，并需要 kunlun_ops.quant2d 做 int8 权重预处理。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1152-L1172",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1459-L1484",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1969"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-015",
+      "statement": "MLA prefill helper _flash_attn_varlen_diff_headdims 把上游 FlashAttention 调用（已注释）换成 kunlun_ops.attention + 硬编码 ds_alpha = 1.8738542070926265 + 手工构造的 -inf LSE；稀疏 prefill 另有一处已记录的 LSE scale 不匹配（out_scale = 1/log2(e)）。这两处是数值对齐排查的首选起点。",
+      "kind": "caveat",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1272-L1305",
+        "repo://vllm_kunlun/v1/attention/backends/mla/common.py#L1280",
+        "repo://vllm_kunlun/ops/attention/flashmla.py#L256-L259"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-016",
+      "statement": "is_flashmla_supported() 永远返回 (True, None)；get_mla_metadata() 返回的是 sequence lengths 而不是 tile scheduler metadata，对应地 FlashMLA builder 的 CUDA-graph 持久 buffer 段被整块注释但 (num_sms, 8) buffer 仍在分配。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/ops/attention/flashmla.py#L34-L38",
+        "repo://vllm_kunlun/ops/attention/flashmla.py#L56-L58",
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla.py#L113-L138",
+        "repo://vllm_kunlun/v1/attention/backends/mla/flashmla.py#L81-L96"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-017",
+      "statement": "spec decode 的 attention 路径要求 query_seq_len 能被 batch_size 整除、以 scale=0.0 调用，并用 inspect.signature 运行时探测厂商 kernel 是否支持 max_window_size。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L663",
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L962-L987",
+        "repo://vllm_kunlun/v1/attention/backends/kunlun_attn.py#L913-L948"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "attn-018",
+      "statement": "test_prefill_attention_prefix_cache.py（469 行）不是 pytest，而是用退出码表达结果的硬件诊断脚本。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/tests/test_prefill_attention_prefix_cache.py"],
+      "confidence": "high"
+    }
+  ]
+}

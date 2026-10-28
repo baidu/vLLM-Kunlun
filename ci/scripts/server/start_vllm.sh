@@ -31,7 +31,6 @@ docker exec -d "${DOCKER_NAME}" bash -lc "
     --no-enable-chunked-prefill \
     --distributed-executor-backend mp \
     --served-model-name ${SERVED_MODEL_NAME} \
-    --compilation-config '{\"splitting_ops\": [\"vllm.unified_attention\",\"vllm.unified_attention_with_output\",\"vllm.unified_attention_with_output_kunlun\",\"vllm.mamba_mixer2\",\"vllm.mamba_mixer\",\"vllm.short_conv\",\"vllm.linear_attention\",\"vllm.plamo2_mamba_mixer\",\"vllm.gdn_attention\",\"vllm.sparse_attn_indexer\"]}' \
     2>&1 | tee ${VLLM_LOG}
 "
 

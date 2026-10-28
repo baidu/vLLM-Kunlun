@@ -1,0 +1,134 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "platform-contract.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "plat-001",
+      "statement": "KunlunPlatform 对外声称 device_name/device_type 均为 \"cuda\"、dispatch_key 为 \"CUDA\"，但 is_cuda() 与 is_cuda_alike() 都返回 False，is_out_of_tree() 与 is_kunlun() 返回 True，get_device_name() 返回 \"kunlun\"。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L22-L29",
+        "repo://vllm_kunlun/platforms/kunlun.py#L31-L38",
+        "repo://vllm_kunlun/platforms/kunlun.py#L67-L73",
+        "repo://vllm_kunlun/platforms/kunlun.py#L99-L105",
+        "repo://vllm_kunlun/platforms/kunlun.py#L111-L126"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-002",
+      "statement": "get_piecewise_backend_cls 与 get_static_graph_wrapper_cls 都返回上游 CUDA 实现（CUDAPiecewiseBackend / CUDAGraphWrapper），所以 \"Kunlun Graph\" 不是独立的图后端类。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L128-L130",
+        "repo://vllm_kunlun/platforms/kunlun.py#L132-L134"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-003",
+      "statement": "get_device_total_memory 返回宿主机内存（psutil.virtual_memory().total），不是设备显存。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L142-L163"],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-004",
+      "statement": "inference_mode 返回 torch.no_grad() 而不是 torch.inference_mode()。",
+      "kind": "fact",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L165-L173"],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-005",
+      "statement": "is_async_output_supported 返回 False。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L339-L356"],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-006",
+      "statement": "opaque_attention_op 返回 True，但该方法缺少 @classmethod 装饰器。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L407-L411"],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-007",
+      "statement": "check_and_update_config 单方面改写五处配置：worker_cls、block_size 默认 16、MLA 强制 block_size 64、DeepEP 高吞吐+DP>1 强制 full eager、任何 cudagraph mode 下强制 custom_ops=[\"all\"] / enable_fusion=False / backend=\"eager\"。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L181-L279",
+        "repo://vllm_kunlun/platforms/kunlun.py#L217-L223",
+        "repo://vllm_kunlun/platforms/kunlun.py#L225-L227",
+        "repo://vllm_kunlun/platforms/kunlun.py#L231-L253",
+        "repo://vllm_kunlun/platforms/kunlun.py#L257-L274",
+        "repo://vllm_kunlun/platforms/kunlun.py#L276-L279"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-008",
+      "statement": "稀疏 MLA（DeepSeek V3.2 DSA）的判定是 hasattr(hf_config, \"index_topk\")，不是版本号判断。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L235",
+        "repo://vllm_kunlun/platforms/kunlun.py#L304-L310"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-009",
+      "statement": "get_attn_backend_cls 完全忽略 selected_backend 参数，只按模型特征分派：MLA+sparse -> FlashMLASparseBackend、MLA -> FlashMLABackend、其他 -> KunlunAttentionBackend。VLLM_ATTENTION_BACKEND 只影响 block size 强制路径。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L281-L313",
+        "repo://vllm_kunlun/platforms/kunlun.py#L236-L239"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-010",
+      "statement": "worker_cls 的两个赋值分支给出同一个值（vllm.v1.worker.gpu_worker.Worker），分支结构是历史残留。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L217-L223"],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-011",
+      "statement": "运行时版本号 0.25.1 与构建元数据 0.25.1.dev0 不一致；没有任何运行时版本校验，vllm 不在 requirements.txt 中且 dependencies 为空，与 vLLM 的版本耦合只有一句散文约定。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/version.py#L3",
+        "repo://pyproject.toml#L10",
+        "repo://pyproject.toml#L16",
+        "repo://requirements.txt",
+        "repo://docs/source/faqs.md#L43"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-012",
+      "statement": "check_and_update_config 的 docstring 仍写 TODO Update here for v0.15.1，get_attn_backend_cls 的 docstring 也已过期。",
+      "kind": "defect",
+      "evidence": [
+        "repo://vllm_kunlun/platforms/kunlun.py#L183-L184",
+        "repo://vllm_kunlun/platforms/kunlun.py#L293-L299"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "plat-013",
+      "statement": "pre_register_and_update 是量化 config 的唯一注册入口，通过 import 5 个符号触发副作用。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/platforms/kunlun.py#L421-L431"],
+      "confidence": "high"
+    }
+  ]
+}

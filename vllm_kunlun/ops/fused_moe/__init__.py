@@ -1,16 +1,5 @@
-"""
-Kunlun FusedMoE CustomOp registration
-"""
+"""Load Kunlun FusedMoE OOT registrations."""
 
+from . import layer as _layer  # noqa: F401
 
-def register_kunlun_fused_moe_ops():
-    """Register Kunlun FusedMoE CustomOp"""
-    from .layer import KunlunUnquantizedFusedMoEMethod  # noqa: F401
-
-    print(
-        "[Kunlun Plugin] FusedMoE CustomOp registered: "
-        "UnquantizedFusedMoEMethod -> KunlunUnquantizedFusedMoEMethod"
-    )
-
-
-__all__ = ["register_kunlun_fused_moe_ops"]
+__all__ = []

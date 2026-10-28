@@ -215,12 +215,7 @@ class KunlunPlatform(Platform):
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
-            # v0.15.1 do not support v0.15.1, remove the if condition
-            if vllm_config.speculative_config:
-                # if envs.VLLM_USE_V1:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
-            else:
-                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
@@ -233,11 +228,19 @@ class KunlunPlatform(Platform):
             # we default to FlashMLA backend, so we need to force the blocksize
             # here
             use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
-            use_flashmla = (
-                envs.VLLM_ATTENTION_BACKEND is None
-                or envs.VLLM_ATTENTION_BACKEND == "FLASHMLA"
-            )
-            from vllm.attention.ops.flashmla import is_flashmla_supported
+            # vLLM 0.25.1 dropped the VLLM_ATTENTION_BACKEND env var; with no
+            # override present FlashMLA is the default. Same defensive getattr
+            # already used for VLLM_ALL2ALL_BACKEND below.
+            attention_backend = getattr(envs, "VLLM_ATTENTION_BACKEND", None)
+            use_flashmla = attention_backend in (None, "FLASHMLA")
+            # 0.25.1 moved this under vllm.v1.attention and renamed it for the
+            # dense/sparse split; keep the old path working on older installs.
+            try:
+                from vllm.v1.attention.ops.flashmla import (
+                    is_flashmla_dense_supported as is_flashmla_supported,
+                )
+            except ImportError:
+                from vllm.attention.ops.flashmla import is_flashmla_supported
 
             if (
                 use_flashmla
@@ -251,6 +254,36 @@ class KunlunPlatform(Platform):
                 logger.info(
                     "Forcing kv cache block size to 64 for FlashMLASparse " "backend."
                 )
+
+            # vLLM picks the MLA prefill backend from a CUDA/ROCm-only priority
+            # list, so `MLAAttention.__init__` dies with "No valid MLA prefill
+            # backend found" on Kunlun. Sparse MLA never invokes a prefill
+            # backend, so point it at ours explicitly. Dense MLA must keep its
+            # existing selection: the Kunlun placeholder deliberately raises
+            # if it is called. The class itself is registered in every process
+            # by the plugin bootstrap, because this function only runs in the
+            # API server process while the registry override dict is per-process.
+            attention_config = getattr(vllm_config, "attention_config", None)
+            if (
+                use_sparse
+                and attention_config is not None
+                and getattr(attention_config, "mla_prefill_backend", None) is None
+            ):
+                try:
+                    from vllm.v1.attention.backends.mla.prefill.registry import (
+                        MLAPrefillBackendEnum,
+                    )
+                except ImportError:
+                    logger.debug(
+                        "MLA prefill registry unavailable; preserving vLLM's "
+                        "default sparse MLA selection."
+                    )
+                else:
+                    attention_config.mla_prefill_backend = MLAPrefillBackendEnum.CUSTOM
+                    logger.info(
+                        "Using the Kunlun MLA prefill backend placeholder "
+                        "(sparse MLA never calls it)."
+                    )
 
         from vllm.config import CUDAGraphMode
 
@@ -272,7 +305,33 @@ class KunlunPlatform(Platform):
             # Deepseek-V2-lite model.
             # Note: use_inductor removed in v0.15.1, use backend="eager" instead
             vllm_config.compilation_config.backend = "eager"
-        # v0.15.1: set backend="eager" to avoid inductor/Triton
+        # Kunlun platform compilation strategy when CUDA Graph is enabled.
+        #
+        # Note: `backend` here selects the compiler used for EACH split
+        # subgraph under VLLM_COMPILE (piecewise) mode; it is NOT the overall
+        # Dynamo backend. The overall backend is always VllmBackend (which
+        # handles graph capture, splitting and CUDA Graph capture/replay),
+        # regardless of this field. Only two values are valid:
+        #
+        # - "eager" (the plugin's default): no code generation for subgraphs;
+        #   ops inside each piece run as-is on XPU kernels. Chosen to bypass
+        #   the Inductor -> Triton codegen path, since the triton-xpu port is
+        #   not fully validated for Inductor-generated kernels (coverage /
+        #   correctness). Performance comes from hand-written custom kernels
+        #   (see custom_ops below) plus piecewise CUDA Graph replay, not from
+        #   a compiler.
+        # - "inductor": subgraphs are compiled by Inductor into Triton
+        #   kernels (built for Kunlun via the triton-xpu backend), which can
+        #   fuse scattered elementwise ops inside a piece. Experimental on
+        #   this platform; fall back to "eager" on compile crashes or
+        #   accuracy issues.
+        #
+        # custom_ops=["all"]: route RMSNorm / SiLU-mul etc. to hand-written
+        #   Kunlun kernels instead of compiler-generated code. This is the
+        #   main reason performance stays acceptable with the "eager"
+        #   backend (fusion gains are already provided by these kernels).
+        # enable_fusion=False: disable vLLM's fusion passes (e.g.
+        #   RMSNorm+quant fusion), which are not adapted for Kunlun.
         if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             vllm_config.compilation_config.custom_ops = ["all"]
             vllm_config.compilation_config.pass_config.enable_fusion = False
@@ -404,9 +463,10 @@ class KunlunPlatform(Platform):
                 "Supported dtypes are: fp32, fp16, bf16, int8."
             )
 
+    @classmethod
     def opaque_attention_op(cls) -> bool:
         """
-        Ensure that V1 Graph uses `vllm.unified_attention_with_output_kunlun` as the split op on the Kunlun3 platform.
+        Ensure that V1 Graph uses `vllm::unified_attention_with_output` as the split op on the Kunlun3 platform.
         """
         return True
 

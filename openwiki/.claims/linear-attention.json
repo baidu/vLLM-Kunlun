@@ -1,0 +1,132 @@
+{
+  "schema": "openwiki/claims/v0.2",
+  "page": "linear-attention.md",
+  "evidence_version": {
+    "repo": "https://github.com/baidu/vLLM-Kunlun",
+    "ref": "v0.25.1-dev",
+    "commit": "c53e090ff8800f586bf9e36e0d876779981bfb20",
+    "observed_at": "2026-09-02"
+  },
+  "claims": [
+    {
+      "id": "lin-001",
+      "statement": "GDN 路径只被 qwen3_next 与 qwen3_5 使用（通过 mamba_type() 返回 \"gdn_attn\" 选中）；MiMoV2Flash 虽有线性注意力结构但不走这条路径。",
+      "kind": "fact",
+      "evidence": [
+        "repo://vllm_kunlun/models/qwen3_next.py#L264-L265",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L25-L36"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-002",
+      "statement": "GDN backend 在 import 时就地替换上游同名符号，而不是通过 backend 注册表被平台分派。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L505-L512"],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-003",
+      "statement": "ops/fla/chunk.py 把上游 FLA 的每一个 Triton kernel 逐个换成 xspeedgate_ops 调用：chunk_local_cumsum、chunk_scaled_dot_kkt_fwd、solve_tril_ns、recompute_w_u_fwd、chunk_gated_delta_rule_fwd_h、chunk_fwd_o。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/fla/chunk.py#L44-L51",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L53-L55",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L57",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L81-L90",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L101-L113",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L115-L125"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-004",
+      "statement": "FLA chunk 路径的 chunk_size 固定为 64；并断言 q.dtype 不是 float32、beta 必须是 3 维。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/ops/fla/chunk.py#L34",
+        "repo://vllm_kunlun/ops/fla/chunk.py#L258-L264"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-005",
+      "statement": "FLA chunk 路径传 cu_seqlens 时要求 batch size 为 1。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/ops/fla/chunk.py#L283-L293"],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-006",
+      "statement": "ops/fla/chunk.py 里有一段 if False: 包住的死分支。",
+      "kind": "defect",
+      "evidence": ["repo://vllm_kunlun/ops/fla/chunk.py#L297-L321"],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-007",
+      "statement": "causal_conv1d 的厂商 kernel 需要 query_start_loc / cache_indices / has_initial_state 的 CPU 镜像与 XPU 版本成对传入，这是 GDNAttentionMetadata 被扩展出多个 *_cpu 字段的原因。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/mamba/causal_conv1d.py#L46-L66",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L50-L51",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L57-L58",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L64-L65",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L76-L78"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-008",
+      "statement": "GDN metadata builder 断言普通 decode 与 spec decode 不能同时出现（assert not (num_decodes > 0 and num_spec_decodes > 0)），并把非 spec 的 decode 重新归类为 prefill。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L369-L371",
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L246-L250"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-009",
+      "statement": "混合 Mamba 模型上的投机解码明确未实现：mamba_utils.py 抛 NotImplementedError 并注明需要实现 MambaSpecDecodeGPUContext。",
+      "kind": "constraint",
+      "evidence": ["repo://vllm_kunlun/v1/worker/mamba_utils.py#L277-L281"],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-010",
+      "statement": "ops/native_ops.py 是一条纯 PyTorch 调试旁路，docstring 自述用途是绕开所有 XPU kernel 以隔离状态污染 bug；仓库中没有任何导入方。",
+      "kind": "caveat",
+      "evidence": ["repo://vllm_kunlun/ops/native_ops.py#L1-L9"],
+      "confidence": "high",
+      "note": "无导入方通过全仓搜索该模块名得到 0 命中确认。"
+    },
+    {
+      "id": "lin-011",
+      "statement": "GDN 使用 MambaSpec 状态而非 paged KV cache，且模型侧只接受 --mamba-cache-mode=align。",
+      "kind": "constraint",
+      "evidence": [
+        "repo://vllm_kunlun/v1/attention/backends/gdn_attn.py#L98",
+        "repo://vllm_kunlun/models/qwen3_next.py#L1373-L1376"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-012",
+      "statement": "GDN decode 路径用融合 kernel：kunlun_ops.fused_gdn_gating 与 fused_recurrent_gated_delta_rule_fwd。",
+      "kind": "mechanism",
+      "evidence": [
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L756-L769",
+        "repo://vllm_kunlun/ops/_kunlun_ops.py#L771-L801"
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "lin-013",
+      "statement": "gdn_attention_core 是 Kunlun 自定义的切图算子，用于在 piecewise 图中切分 GDN 层。",
+      "kind": "mechanism",
+      "evidence": ["repo://vllm_kunlun/models/qwen3_next.py#L1471-L1508"],
+      "confidence": "high"
+    }
+  ]
+}

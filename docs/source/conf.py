@@ -65,17 +65,17 @@ myst_substitutions = {
     # the branch of vllm, used in vllm clone
     # - main branch: 'main'
     # - vX.Y.Z branch: 'vX.Y.Z'
-    "vllm_version": "v0.15.1",
+    "vllm_version": "v0.25.1",
     # the branch of vllm-kunlun, used in vllm-kunlun clone and image tag
     # - main branch: 'main'
     # - vX.Y.Z branch: latest vllm-kunlun release tag
     "vllm_kunlun_version": "main",
     # the newest release version of vllm-kunlun and matched vLLM, used in pip install.
     # This value should be updated when cut down release.
-    "pip_vllm_kunlun_version": "0.15.1",
-    "pip_vllm_version": "0.15.1",
+    "pip_vllm_kunlun_version": "0.25.1",
+    "pip_vllm_version": "0.25.1",
     # vllm version in ci
-    "ci_vllm_version": "v0.15.1",
+    "ci_vllm_version": "v0.25.1",
 }
 
 # For cross-file header anchors
