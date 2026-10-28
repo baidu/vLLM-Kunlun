@@ -10,8 +10,14 @@ implementation lives in the ``registration`` package: startup stages in
 import logging
 import os
 
-from .registration import bootstrap
-from .registration.import_hooks import dispatch_hooks, install_import_hook
+# XMLIR_FORCE_USE_XPU_GRAPH decides whether XPU graph replay is enqueued
+# asynchronously (measured: 0.1 ms enqueue with it, 36 ms blocking on the whole
+# graph without it). Spawned worker processes do not reliably inherit it, so
+# default it at plugin import time, before any torch_xmlir module reads it.
+os.environ.setdefault("XMLIR_FORCE_USE_XPU_GRAPH", "1")
+
+from .registration import bootstrap  # noqa: E402
+from .registration.import_hooks import dispatch_hooks, install_import_hook  # noqa: E402
 
 # Platform discovery can call register() more than once in the same process,
 # including re-entrantly while the first call is importing vLLM modules.

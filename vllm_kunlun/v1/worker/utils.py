@@ -26,7 +26,10 @@ def _init_meta(
     runner_only_attn_layers,
     static_forward_context,
 ):
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    # Imported in the function body, not at module scope, so the hardware-free
+    # unit tests can import this module without torch installed.
+    import torch
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     kv_entries = []
     # Dedup by Python object identity rather than ``data_ptr()``: K and V
@@ -37,6 +40,24 @@ def _init_meta(
     seen_ids = set()
     for group in attn_groups_iter:
         spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            # Mamba state tensors are blocks-first.
+            for layer_name in group.layer_names:
+                if layer_name in runner_only_attn_layers:
+                    continue
+                state_list = static_forward_context[layer_name].kv_cache
+                if not isinstance(state_list, (list, tuple)):
+                    state_list = [state_list]
+                for state in state_list:
+                    if not isinstance(state, torch.Tensor):
+                        continue
+                    key = id(state)
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    if state.ndim > 0:
+                        kv_entries.append((state, 0, 1))
+            continue
         if type(spec) is not FullAttentionSpec:
             continue
         if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -108,9 +129,12 @@ def _init_meta(
 
 
 def _zero_block_ids(self, block_ids):
-    # //todo because ssm_state dtype is only fp16, so zero_block_ids is not needed
-    return
-    if not block_ids or not getattr(self, "_kv_entries", None):
+    if not block_ids:
+        return
+    # Do not call upstream here: its Triton CUDA kernel is unsupported on
+    # Kunlun XPU (CUDA_ERROR_NOT_SUPPORTED).  The entries below cover both
+    # ordinary KV tensors and Mamba state tensors using torch-native zeroing.
+    if not getattr(self, "_kv_entries", None):
         return
     for kv, block_dim, ratio in self._kv_entries:
         dim_size = kv.shape[block_dim]

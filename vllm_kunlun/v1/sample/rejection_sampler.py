@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
+import kunlun_ops
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -19,10 +22,21 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_kunlun.v1.sample.q38_partial_topk import wrap_rejection_mask
+
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
 logger = init_logger(__name__)
+apply_top_k_top_p = wrap_rejection_mask(apply_top_k_top_p)
+
+_Q38_RS_KERNEL = os.environ.get("Q38_RS_KERNEL", "1") == "1"
+# Q38 全词表 exponential 噪声：torch 的 exponential_（philox4x32_10）在
+# [batch, vocab=248320] fp32 上只有 ~22GB/s（B=32 实测 1442us）。改用已随包发布的
+# xspeedgate_ops.inplace_exponential（同为 Exp(1)，mean/var 1.000）——实测 10.8x（→133us）。
+# 只换 RNG 源、分布等价；seeded 请求仍逐个带 generator（该 op 支持 generator，
+# topk_topp_sampler 早已在用）。Q38_RS_FASTEXP=0 回退 torch.exponential_。
+_Q38_RS_FASTEXP = os.environ.get("Q38_RS_FASTEXP", "1") == "1"
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
@@ -418,7 +432,24 @@ def rejection_sample(
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
-        if (
+        if _Q38_RS_KERNEL and not synthetic_mode:
+            # Q38: native kernel (ref: 参考实现 rejection_sample)。synthetic 模式
+            # kernel 不支持，走原 pytorch 兜底。Q38_RS_KERNEL=0 回退。
+            _bonus_1d = (
+                bonus_token_ids.squeeze(1)
+                if bonus_token_ids.ndim == 2
+                else bonus_token_ids
+            )
+            kunlun_ops.rejection_greedy_sample(
+                output_token_ids,
+                cu_num_draft_tokens.to(torch.int32),
+                draft_token_ids.to(torch.int32),
+                target_argmax.to(torch.int32),
+                _bonus_1d.to(torch.int32),
+                is_greedy,
+                max_spec_len,
+            )
+        elif (
             min(num_draft_tokens) == 1
             and max(num_draft_tokens) == 1
             and sampling_metadata.all_greedy
@@ -462,22 +493,43 @@ def rejection_sample(
         device,
     )
 
-    rejection_random_sample_pytorch(
-        output_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        bonus_token_ids,
-        recovered_token_ids,
-        uniform_probs,
-        is_greedy,
-        max_spec_len,
-        vocab_size,
-        synthetic_conditional_rates,
-        IS_NGRAM=draft_probs is None,
-        SYNTHETIC_MODE=synthetic_mode,
-    )
+    if _Q38_RS_KERNEL and not synthetic_mode:
+        _bonus_1d = (
+            bonus_token_ids.squeeze(1) if bonus_token_ids.ndim == 2 else bonus_token_ids
+        )
+        kunlun_ops.rejection_random_sample(
+            output_token_ids,
+            cu_num_draft_tokens.to(torch.int32),
+            draft_token_ids.to(torch.int32),
+            draft_probs,
+            target_probs,
+            _bonus_1d.to(torch.int32),
+            recovered_token_ids.to(torch.int32),
+            uniform_probs,
+            is_greedy,
+            max_spec_len,
+            vocab_size,
+            no_draft_probs=draft_probs is None,
+            threshold_single=1.0,
+            draft_prob_val=1.0,
+        )
+    else:
+        rejection_random_sample_pytorch(
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            bonus_token_ids,
+            recovered_token_ids,
+            uniform_probs,
+            is_greedy,
+            max_spec_len,
+            vocab_size,
+            synthetic_conditional_rates,
+            IS_NGRAM=draft_probs is None,
+            SYNTHETIC_MODE=synthetic_mode,
+        )
     return output_token_ids
 
 
@@ -571,6 +623,9 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
+    if _Q38_RS_KERNEL and x.dtype in (torch.int32, torch.float32):
+        kunlun_ops.expand_tokens(expanded_x, x, cu_num_tokens, replace_from, replace_to)
+        return expanded_x
     expand_pytorch(
         expanded_x,
         x,
@@ -654,24 +709,43 @@ def sample_recovered_tokens(
         dtype=torch.float32,
         device=device,
     )
-    q.exponential_()
+    (
+        q.exponential_()
+        if not _Q38_RS_FASTEXP
+        else torch.ops.xspeedgate_ops.inplace_exponential(q)
+    )
     for i, generator in sampling_metadata.generators.items():
         # Do not generate random numbers for requests with no draft tokens.
         # This can be important for reproducibility.
         if num_draft_tokens[i] > 0:
-            q[i].exponential_(generator=generator)
+            if _Q38_RS_FASTEXP:
+                torch.ops.xspeedgate_ops.inplace_exponential(q[i], 1.0, generator)
+            else:
+                q[i].exponential_(generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    sample_recovered_tokens_pytorch(
-        recovered_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        q,
-        vocab_size,
-        IS_NGRAM=draft_probs is None,
-    )
+    if _Q38_RS_KERNEL:
+        kunlun_ops.sample_recovered_tokens(
+            recovered_token_ids,
+            cu_num_draft_tokens.to(torch.int32),
+            draft_token_ids.to(torch.int32),
+            draft_probs,
+            target_probs,
+            q,
+            vocab_size,
+            no_draft_probs=draft_probs is None,
+        )
+    else:
+        sample_recovered_tokens_pytorch(
+            recovered_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            q,
+            vocab_size,
+            IS_NGRAM=draft_probs is None,
+        )
     return recovered_token_ids
 
 
@@ -896,3 +970,50 @@ def sample_recovered_tokens_pytorch(
 
             if IS_NGRAM:
                 target_probs[token_idx, draft_token_id] = orig_prob
+
+
+# ---- Q38 P1: sort-free renorm compute_probs (enable with Q38_RS_RENORM=1) -----
+# The shipped compute_probs above calls apply_top_k_top_p, which sorts the full
+# vocabulary (sort_stable_int_idx_radix8, ~23 ms/step at c=128 MTP3). The normal
+# decode path never sorts; it renormalizes with kunlun_ops.top_{k,p}_renorm_probs.
+# This override makes MTP verification use those same fused kernels, producing the
+# identical target distribution without a sort. Numerically gated: max L1 2.7e-6,
+# zero argmax mismatch vs the sort path. Graph-external, so no CUDA-graph impact.
+
+if os.environ.get("Q38_RS_RENORM", "0") == "1":
+    _q38_native_compute_probs = compute_probs
+
+    def compute_probs(logits, cu_num_draft_tokens, sampling_metadata):  # noqa: F811
+        assert logits.ndim == 2
+        assert cu_num_draft_tokens.ndim == 1
+        if sampling_metadata.all_greedy:
+            return logits
+        num_tokens = logits.shape[0]
+        temperature = expand_batch_to_tokens(
+            sampling_metadata.temperature,
+            cu_num_draft_tokens,
+            num_tokens,
+            replace_from=GREEDY_TEMPERATURE,
+            replace_to=1,
+        )
+        logits.div_(temperature.unsqueeze(-1))
+        top_k = None
+        if sampling_metadata.top_k is not None:
+            top_k = expand_batch_to_tokens(
+                sampling_metadata.top_k, cu_num_draft_tokens, num_tokens
+            )
+        top_p = None
+        if sampling_metadata.top_p is not None:
+            top_p = expand_batch_to_tokens(
+                sampling_metadata.top_p, cu_num_draft_tokens, num_tokens
+            )
+        if top_k is None and top_p is None:
+            return logits.softmax(dim=-1, dtype=torch.float32)
+        probs = logits.softmax(dim=-1, dtype=torch.float32)
+        if top_k is not None:
+            probs = kunlun_ops.top_k_renorm_probs(probs, top_k.to(torch.int32))
+        if top_p is not None:
+            probs = kunlun_ops.top_p_renorm_probs(probs, top_p.to(torch.float32))
+        return probs
+
+    print("[Q38-RS-RENORM] compute_probs -> sort-free renorm kernels", flush=True)

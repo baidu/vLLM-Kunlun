@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -66,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from vllm.model_executor.models.interfaces import EagleModelMixin  # __Q38_AUX_PATCH__
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -100,6 +102,104 @@ from vllm_kunlun.ops.fla import (
 )
 from vllm_kunlun.ops.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+# __Q38_IDXSEL__: 用 index_select 替掉布尔掩码索引（Q38_IDXSEL=1 开）
+_Q38_IDXSEL = os.environ.get("Q38_IDXSEL") == "1"
+
+# __Q38_FLATSEL__: GDN prefill 初态 gather 的三条实现，Q38_INITGATHER 选择。
+#   flatsel（默认）：连续 2D 视图 + index_select，复杂度 O(选中行)
+#   idxsel        ：直接 index_select，几何不满足时由 flatsel 兜底同样处理
+#   gatherwin     ：旧路径，reshape_and_cache_flash 当 gather 用，复杂度 O(pool)
+_Q38_INITGATHER = os.environ.get("Q38_INITGATHER", "flatsel")
+_Q38_INITVERIFY = int(os.environ.get("Q38_INITVERIFY", "0") or 0)
+_q38_verify_n = [0]
+_q38_flat_warned = [False]
+
+
+def _q38_gather_gatherwin(ssm_state, idx, out_shape):
+    """旧路径。算子的源行号只有 16 位有符号，>=32768 的行会被当 pad 静默跳过，
+    所以按 32768 行分窗，切片视图让行号重新归零。"""
+    slot_mapping = torch.full(
+        (ssm_state.shape[0],), -1, dtype=torch.int32, device=ssm_state.device,
+    )
+    slot_mapping[idx] = torch.arange(
+        len(idx), dtype=torch.int32, device=ssm_state.device,
+    )
+    # zeros 兜底：scatter 万一有空洞也不会读到未初始化显存
+    out = torch.zeros(out_shape, dtype=ssm_state.dtype, device=ssm_state.device)
+    out = out.view(out.shape[0], 1, -1, out.shape[-1])
+    cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
+    win = 32768
+    rows = cast_ssm_state.shape[0]
+    for lo in range(0, rows, win):
+        hi = min(lo + win, rows)
+        src = cast_ssm_state[lo:hi]
+        kunlun_ops.reshape_and_cache_flash(
+            src, src, out, out, slot_mapping[lo:hi],
+        )
+    return out.view(out_shape)
+
+
+def _q38_gather_flatsel(ssm_state, idx, out_shape):
+    """新路径：连续 2D 视图 + index_select。几何不满足时返回 None 由调用方兜底。"""
+    rs = ssm_state.stride(0)
+    inner_len = 1
+    exp = 1
+    for d, st in zip(reversed(ssm_state.shape[1:]), reversed(ssm_state.stride()[1:])):
+        if st != exp:
+            return None  # 行内不连续，撑不起 2D 视图
+        exp *= d
+        inner_len *= d
+    off = ssm_state.storage_offset()
+    inner = off % rs
+    base = off - inner
+    if inner + inner_len > rs:
+        return None
+    n_elem = ssm_state.untyped_storage().size() // ssm_state.element_size()
+    if base + ssm_state.shape[0] * rs > n_elem:
+        return None
+    flat = torch.as_strided(ssm_state, (ssm_state.shape[0], rs), (rs, 1), base)
+    return flat.index_select(0, idx)[:, inner : inner + inner_len].reshape(out_shape)
+
+
+def _q38_init_gather(ssm_state, idx, out_shape):
+    mode = _Q38_INITGATHER
+    out = None
+    if mode == "flatsel":
+        out = _q38_gather_flatsel(ssm_state, idx, out_shape)
+        if out is None and not _q38_flat_warned[0]:
+            _q38_flat_warned[0] = True
+            print("[FLATSEL] geometry unsupported, fallback to gatherwin", flush=True)
+    elif mode == "idxsel":
+        out = ssm_state.index_select(0, idx)
+    if out is None:
+        out = _q38_gather_gatherwin(ssm_state, idx, out_shape)
+    elif _Q38_INITVERIFY and _q38_verify_n[0] < max(_Q38_INITVERIFY, 12):
+        _q38_verify_n[0] += 1
+        ref = _q38_gather_gatherwin(ssm_state, idx, out_shape)
+        # 第三方裁判：逐行基本切片，既不走高级索引也不走算子
+        k = min(4, idx.numel())
+        rows = [int(r) for r in idx[:k].tolist()]
+        ref3 = torch.stack([ssm_state[r].clone() for r in rows]) if k else None
+        d = (out.float() - ref.float()).abs()
+        if ref3 is not None:
+            d_flat = (out[:k].float() - ref3.float()).abs()
+            d_gw = (ref[:k].float() - ref3.float()).abs()
+            print(
+                "[INITVERIFY] n=%d rows=%d idx0=%s | flat_vs_gw max=%.3e mism=%d/%d"
+                " | flat_vs_rowcopy max=%.3e | gw_vs_rowcopy max=%.3e"
+                % (
+                    _q38_verify_n[0], idx.numel(), rows,
+                    float(d.max()) if d.numel() else 0.0,
+                    int((d > 0).sum()), d.numel(),
+                    float(d_flat.max()), float(d_gw.max()),
+                ),
+                flush=True,
+            )
+    return out
+
+
+
 
 logger = init_logger(__name__)
 
@@ -570,6 +670,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
         spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_pad_gather_idx = attn_metadata.spec_pad_gather_idx
+        spec_unpad_idx = attn_metadata.spec_unpad_idx
         spec_token_masks = attn_metadata.spec_token_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
@@ -598,14 +700,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
             else:
-                mixed_qkv_spec = mixed_qkv[spec_token_masks]
-                mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
+                if _Q38_IDXSEL:
+                    # __Q38_IDXSEL__ 与上游一致：index_select 而非布尔掩码
+                    mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                    mixed_qkv_non_spec = mixed_qkv.index_select(
+                        0, non_spec_token_indx
+                    )
+                else:
+                    mixed_qkv_spec = mixed_qkv[spec_token_masks]
+                    mixed_qkv_non_spec = mixed_qkv[~spec_token_masks]
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            if spec_pad_gather_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_pad_gather_idx)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -620,7 +731,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
-
+            if spec_unpad_idx is not None:
+                mixed_qkv_spec = mixed_qkv_spec.index_select(0, spec_unpad_idx)
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             # - "cache_indices" updates the conv_state cache in positions
@@ -664,7 +776,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         beta = b.sigmoid()
 
-        g = ops.fused_gdn_gating(self.A_log.float(), a, self.dt_bias.float())
+        _gf32 = getattr(self, "_q38_gating_f32", None)
+        if _gf32 is None:
+            # Q38 FUSE: 权重加载后不变，缓存 fp32 拷贝省 2 次/步/层 cast kernel
+            _gf32 = (self.A_log.float(), self.dt_bias.float())
+            self._q38_gating_f32 = _gf32
+        g = ops.fused_gdn_gating(_gf32[0], a, _gf32[1])
         g, beta = map(lambda x: rearrange(x, "l d -> 1 l d"), (g, beta))
 
         if spec_sequence_masks is not None:
@@ -674,10 +791,17 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 g_non_spec = None
                 beta_non_spec = None
             else:
-                g_spec = g[:, spec_token_masks]
-                beta_spec = beta[:, spec_token_masks]
-                g_non_spec = g[:, ~spec_token_masks]
-                beta_non_spec = beta[:, ~spec_token_masks]
+                if _Q38_IDXSEL:
+                    # __Q38_IDXSEL__
+                    g_spec = g.index_select(1, spec_token_indx)
+                    beta_spec = beta.index_select(1, spec_token_indx)
+                    g_non_spec = g.index_select(1, non_spec_token_indx)
+                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                else:
+                    g_spec = g[:, spec_token_masks]
+                    beta_spec = beta[:, spec_token_masks]
+                    g_non_spec = g[:, ~spec_token_masks]
+                    beta_non_spec = beta[:, ~spec_token_masks]
         else:
             g_spec = None
             beta_spec = None
@@ -709,35 +833,27 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             # initial_state = ssm_state[non_spec_state_indices_tensor]
             # initial_state[~has_initial_state] = 0
             # initial_state = initial_state.transpose(-1, -2).contiguous()
-            slot_mapping = torch.full(
-                (ssm_state.shape[0],), -1, dtype=torch.int32, device=ssm_state.device,
-            )
-            slot_mapping[non_spec_state_indices_tensor] = torch.arange(
-                len(non_spec_state_indices_tensor), dtype=torch.int32, device=ssm_state.device,
-            )
-
             initial_state_shape = (
                 non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
             )
-            initial_state = torch.empty(
-                initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
+            # __Q38_FLATSEL__: 取本步 prefill 请求的 mamba 初态。
+            # flatsel 走 index_select，复杂度 O(选中行)；旧的 gatherwin 把
+            # reshape_and_cache_flash 当 gather 用，要扫整个状态池 O(pool)。
+            # 开 prefix caching 后状态按 block 存，池子从 max_num_seqs 涨到
+            # 块数量级，gatherwin 变成 ceil(pool/32768) x 36 层 次/step。
+            initial_state = _q38_init_gather(
+                ssm_state, non_spec_state_indices_tensor, initial_state_shape
             )
-            initial_state = initial_state.view(
-                initial_state.shape[0], 1, -1, initial_state.shape[-1]
-            )
-            cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
 
-            kunlun_ops.reshape_and_cache_flash(
-                cast_ssm_state,
-                cast_ssm_state,
+            # __Q38_MASKFIX__: 状态页回收时从不清零，脏页可能带 NaN/Inf。
+            # 乘法掩码把 0*NaN 算成 NaN，等于把脏页永久传染给新请求；
+            # 改成 where 选择，has_initial_state==0 的行直接取 0。
+            initial_state = torch.where(
+                has_initial_state.view(
+                    has_initial_state.shape[0], 1, 1, 1).to(torch.bool),
                 initial_state,
-                initial_state,
-                slot_mapping,
-            )
-            initial_state = initial_state.view(initial_state_shape)
-
-            initial_state = initial_state * has_initial_state.view(
-                has_initial_state.shape[0], 1, 1, 1
+                torch.zeros((), dtype=initial_state.dtype,
+                            device=initial_state.device),
             )
             initial_state = initial_state.transpose(-1, -2).contiguous()
 
@@ -754,6 +870,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc,
+                # __Q38_NOSYNC__: 复用 build 阶段算好的主机镜像，
+                # 免掉每层一次 cu_seqlens.cpu() 的阻塞同步。
+                cu_seqlens_cpu=non_spec_query_start_loc_cpu,
             )
             # Init cache
             # ssm_state[non_spec_state_indices_tensor] = (
@@ -1122,7 +1241,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextModel(nn.Module):
+class Qwen3NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1181,11 +1300,18 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -1193,6 +1319,8 @@ class Qwen3NextModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
@@ -1449,6 +1577,15 @@ class Qwen3NextForCausalLM(
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
+    @classmethod
+    def get_mamba_state_copy_funcs(cls, mamba_types):
+        funcs = cls.get_mamba_state_copy_func()
+        short = MambaStateCopyFuncCalculator.short_conv_state_copy_func()
+        return {
+            mamba_type: (short if getattr(mamba_type, "name", "") == "SHORT_CONV" else funcs)
+            for mamba_type in mamba_types
+        }
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1505,3 +1642,42 @@ direct_register_custom_op(
     mutates_args=["core_attn_out"],
     fake_impl=gdn_attention_core_fake,
 )
+
+
+# __Q38_FUSED_SNR__ : optional fused split+norm+rope path for GatedAttention.
+
+_q38_attn_forward_nonfused = Qwen3NextAttention.forward
+
+
+def _q38_attn_forward_fused(self, positions, output, hidden_states):
+    if os.environ.get("KUNLUN_Q38_FUSED_SNR", "0") != "1":
+        return _q38_attn_forward_nonfused(self, positions, output, hidden_states)
+
+    qkv, _ = self.qkv_proj(hidden_states)
+    # text-only MRoPE: rows of [3, N] positions are identical -> use row 0.
+    pos1d = positions if positions.dim() == 1 else positions[0].contiguous()
+    q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
+        qkv=qkv,
+        q_weights=self.q_norm.weight,
+        k_weights=self.k_norm.weight,
+        positions=pos1d,
+        cos_sin_cache=self.rotary_emb.cos_sin_cache,
+        q_size=self.q_size,
+        kv_size=self.kv_size,
+        num_q_heads=self.num_heads,
+        num_kv_heads=self.num_kv_heads,
+        head_dim=self.head_dim,
+        rotary_dim=self.rotary_dim,
+        attn_output_gate=self.attn_output_gate,
+    )
+
+    attn_output = self.attn(q, k, v)
+
+    if self.attn_output_gate:
+        gate = torch.sigmoid(gate)
+        attn_output = attn_output * gate
+
+    output[:], _ = self.o_proj(attn_output)
+
+
+Qwen3NextAttention.forward = _q38_attn_forward_fused
