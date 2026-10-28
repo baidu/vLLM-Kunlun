@@ -15,6 +15,7 @@
 # This file is a part of the vllm-kunlun project.
 #
 import copy
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -598,26 +599,56 @@ class KunlunAttentionMetadataBuilder:
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
-            self.device, non_blocking=True
+        # Opt-in candidate: leave the default path's classification order intact.
+        skip_pure_decode_prefill_metadata = (
+            os.getenv("Q38_SKIP_PURE_DECODE_PREFILL_METADATA", "0") == "1"
         )
+        elide_prefill_metadata = False
+        if skip_pure_decode_prefill_metadata:
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold or 1,
+                    require_uniform=True,
+                )
+            )
+            elide_prefill_metadata = (
+                num_prefills == 0
+                and num_prefill_tokens == 0
+                and num_reqs > 0
+                and num_decode_tokens > 0
+            )
+
+        # Keep the host view available to consumers; do not modify common metadata.
+        query_start_loc_host = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        query_start_loc = None
+        if not elide_prefill_metadata:
+            query_start_loc = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
+                self.device, non_blocking=True
+            )
 
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
-        kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
-        kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
-        kv_lod_xpu = kv_lod_cpu.to(self.device)
+        if elide_prefill_metadata:
+            # Decode consumes seq_lens_tensor{,_cpu}, not cumulative KV LoD.
+            kv_lod_cpu = None
+            kv_lod_xpu = None
+        else:
+            kv_lod_cpu = torch.zeros(num_reqs + 1, dtype=torch.int32, device="cpu")
+            kv_lod_cpu[1:] = seq_lens_cpu.to(torch.int32).cumsum(dim=0)
+            kv_lod_xpu = kv_lod_cpu.to(self.device)
 
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=self.reorder_batch_threshold or 1,
-                require_uniform=True,
+        if not skip_pure_decode_prefill_metadata:
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=self.reorder_batch_threshold or 1,
+                    require_uniform=True,
+                )
             )
-        )
 
         num_scheduled_tokens = np.diff(
             common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
@@ -663,6 +694,32 @@ class KunlunAttentionMetadataBuilder:
             is_speculative=self.reorder_batch_threshold > 1,
             max_model_len=self.vllm_config.model_config.max_model_len,
         )
+        if skip_pure_decode_prefill_metadata:
+            # Per-builder counters measure successful builds, not flag activation.
+            self._q38_prefill_metadata_builds = (
+                getattr(self, "_q38_prefill_metadata_builds", 0) + 1
+            )
+            if elide_prefill_metadata:
+                self._q38_prefill_metadata_elided_builds = (
+                    getattr(self, "_q38_prefill_metadata_elided_builds", 0) + 1
+                )
+                elided_builds = self._q38_prefill_metadata_elided_builds
+                if elided_builds == 1 or elided_builds % 1000 == 0:
+                    logger.info(
+                        "Q38_SKIP_PURE_DECODE_PREFILL_METADATA "
+                        "enabled_builds=%d elided_builds=%d retained_builds=%d "
+                        "num_reqs=%d num_decodes=%d num_decode_tokens=%d "
+                        "num_prefills=%d num_prefill_tokens=%d "
+                        "query_start_loc_h2d=0 kv_lod_build_h2d=0",
+                        self._q38_prefill_metadata_builds,
+                        elided_builds,
+                        self._q38_prefill_metadata_builds - elided_builds,
+                        num_reqs,
+                        num_decodes,
+                        num_decode_tokens,
+                        num_prefills,
+                        num_prefill_tokens,
+                    )
         return attn_metadata
 
     def update_block_table(
@@ -917,7 +974,10 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     in inspect.signature(kunlun_ops.speculative_attention).parameters
                 )
                 setattr(self, "_spec_attn_has_max_window_size", has_max_window_size)
-            if has_max_window_size:
+            # MTP verify steps feed qlen == 1 + num_spec tokens per decode
+            # request; the max_window_size variant below hardcodes qlen=1 and
+            # silently drops the extra tokens, so only take it for qlen == 1.
+            if has_max_window_size and num_decode_tokens == attn_metadata.num_decodes:
                 # kunlun_ops.speculative_attention is not support max_window_size parameter in torch29
                 kunlun_ops.speculative_attention(
                     out=output[:num_decode_tokens],

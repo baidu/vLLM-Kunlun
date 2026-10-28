@@ -29,9 +29,14 @@ def _compute_slot_mapping(self, num_reqs, query_start_loc, positions):
     num_tokens = positions.shape[0]
     total_cp_world_size = self.pcp_world_size * self.dcp_world_size
     total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-    block_sizes = torch.tensor(
-        [self.block_size], dtype=torch.int32, device=self.block_table.gpu.device
-    )
+    block_sizes = getattr(self, "_q38_bs_t", None)  # __Q38_BT_DIRTY__
+    if block_sizes is None:
+        block_sizes = torch.tensor(
+            [self.block_size],
+            dtype=torch.int32,
+            device=self.block_table.gpu.device,
+        )
+        self._q38_bs_t = block_sizes
     kunlun_ops.compute_slot_mappings(
         [self.slot_mapping.gpu],  # list
         [self.block_table.gpu],  # list
@@ -118,3 +123,33 @@ if not getattr(_upstream_cls, "_kunlun_slot_patched", False):
         "[KunlunPlugin] BlockTable.compute_slot_mapping patched "
         "in vllm_kunlun/v1/worker/block_table.py"
     )
+
+
+# __Q38_BT_DIRTY__: decode 稳态下 block 表多数步不变，全量 H2D 拷贝浪费。
+# 所有 CPU 侧改写方法置脏标记，commit 时不脏则跳过。
+# get_numpy_array/get_cpu_tensor 无调用方，无裸写入路径（已审计）。
+import os as _q38_os
+
+if _q38_os.environ.get("Q38_BT_DIRTY_SKIP", "1") == "1":
+
+    def _q38_wrap_mut(_name):
+        _orig = getattr(_upstream_cls, _name)
+
+        def _f(self, *a, **kw):
+            self._q38_bt_dirty = True
+            return _orig(self, *a, **kw)
+
+        return _f
+
+    for _n in ("append_row", "add_row", "clear_row",
+               "move_row", "swap_row", "clear"):
+        setattr(_upstream_cls, _n, _q38_wrap_mut(_n))
+
+    _q38_orig_commit = _upstream_cls.commit_block_table
+
+    def _q38_commit(self, num_reqs):
+        if getattr(self, "_q38_bt_dirty", True):
+            _q38_orig_commit(self, num_reqs)
+            self._q38_bt_dirty = False
+
+    _upstream_cls.commit_block_table = _q38_commit

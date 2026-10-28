@@ -1,3 +1,8 @@
+import os as _q38_os
+# Q38 DIAG/FIX: XMLIR_FORCE_USE_XPU_GRAPH 决定 XPU graph replay 是否异步
+# （实测：有=0.1ms 异步入队，无=阻塞整图 36ms）。spawn 子进程链路疑似丢失
+# 该变量，这里 setdefault 兜底并打日志观测各进程的原始取值。
+_q38_os.environ.setdefault("XMLIR_FORCE_USE_XPU_GRAPH", "1")
 """vllm kunlun init"""
 
 import builtins
@@ -322,6 +327,62 @@ def _preload_mapped(full_name):
     sys.modules[target_module] = module
 
 
+# --- hook 9: honor the checkpoint's mamba_ssm_dtype for Qwen4Exp ----------
+# Qwen3.8-Flash-Next's GDN temporal state is read-modify-written in place on
+# every decode step (fused_recurrent_gated_delta_rule(..., inplace_final_state=
+# True)), while prefill's chunk kernel rounds it only once at the end. Keeping
+# that state in bfloat16 therefore makes the rounding error compound with the
+# number of decode steps, which shows up as long greedy generations drifting off
+# and eventually looping. The checkpoint asks for float32 via
+# text_config.mamba_ssm_dtype; upstream vLLM applies it through
+# Qwen3_5ForConditionalGenerationConfig, but MODELS_CONFIG_MAP is keyed on arch
+# names this port does not use (it serves as Qwen4ExpForCausalLM via
+# --hf-overrides), so the hook never fired and the state silently stayed
+# bfloat16. Register the missing entries here.
+def _qwen4exp_ssm_dtype_applied(mod):
+    m = getattr(mod, "MODELS_CONFIG_MAP", None)
+    return m is None or "Qwen4ExpForCausalLM" in m
+
+
+def _qwen4exp_ssm_dtype_apply(mod):
+    _log = logging.getLogger("vllm_kunlun")
+
+    class _Qwen4ExpMambaSsmDtypeConfig(mod.VerifyAndUpdateConfig):
+        @staticmethod
+        def verify_and_update_config(vllm_config) -> None:
+            cache_config = vllm_config.cache_config
+            hf_text_config = vllm_config.model_config.hf_text_config
+            ssm_dtype = getattr(hf_text_config, "mamba_ssm_dtype", None)
+            if ssm_dtype is None:
+                return
+            if cache_config.mamba_ssm_cache_dtype == "auto":
+                cache_config.mamba_ssm_cache_dtype = ssm_dtype
+                _log.info(
+                    "[KunlunPlugin] mamba_ssm_cache_dtype -> '%s' (from the "
+                    "checkpoint's mamba_ssm_dtype)",
+                    ssm_dtype,
+                )
+            elif cache_config.mamba_ssm_cache_dtype != ssm_dtype:
+                _log.warning(
+                    "[KunlunPlugin] checkpoint specifies mamba_ssm_dtype='%s' "
+                    "but --mamba-ssm-cache-dtype='%s' was passed; using the "
+                    "user-specified value.",
+                    ssm_dtype,
+                    cache_config.mamba_ssm_cache_dtype,
+                )
+
+    for _arch in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"):
+        mod.MODELS_CONFIG_MAP.setdefault(_arch, _Qwen4ExpMambaSsmDtypeConfig)
+    _log.info("[KunlunPlugin] registered Qwen4Exp mamba_ssm_dtype config hook")
+
+
+_register_post_import_hook(
+    "vllm.model_executor.models.config",
+    _qwen4exp_ssm_dtype_applied,
+    _qwen4exp_ssm_dtype_apply,
+)
+
+
 def _custom_import(module_name, globals=None, locals=None, fromlist=(), level=0):
     try:
         if level == 0:
@@ -513,3 +574,15 @@ def register_tool_parser():
     )
 
     _reg_tool_parser()
+
+
+# --- qwen4_exp hooks (bridged for this image) ---
+from .qwen4_exp_patches import QWEN4_EXP_HOOKS as _QWEN4_EXP_HOOKS  # noqa: E402
+
+for _t, _a, _f in _QWEN4_EXP_HOOKS:
+    _register_post_import_hook(_t, _a, _f)
+
+
+# --- __Q38_NANWD__ 诊断看门狗（仅 Q38_NANWD=1 时注册）---
+
+# --- __Q38_MMWD__ 多模态数值看门狗（仅 Q38_MMWD=1 时注册）---

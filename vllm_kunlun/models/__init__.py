@@ -112,6 +112,35 @@ def register_model():
         "vllm_kunlun.models.gemma4_mm:Gemma4ForConditionalGeneration",
     )
 
+    ModelRegistry.register_model(
+        "Qwen4ExpForCausalLM", "vllm_kunlun.models.qwen4_exp:Qwen4ExpForCausalLM"
+    )
+
+    # __Q38_MM_REG__: 注册 VL 架构，恢复多模态入口（视觉塔与 qwen3_5 同款）
+    ModelRegistry.register_model(
+        "Qwen4ExpForConditionalGeneration",
+        "vllm_kunlun.models.qwen4_exp:Qwen4ExpForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "Qwen4ExpMTP", "vllm_kunlun.models.qwen4_exp:Qwen4ExpMTP"
+    )
+    _register_qwen4_exp_configs()
+
 
 def register_quant_method():
     """to do"""
+
+
+
+def _register_qwen4_exp_configs():
+    """把 qwen4_exp 的 config 类注册进 vLLM 的 config 注册表。"""
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
+    )
+
+    _CONFIG_REGISTRY["qwen4_exp"] = Qwen4ExpConfig
+    _CONFIG_REGISTRY["qwen4_exp_text"] = Qwen4ExpTextConfig

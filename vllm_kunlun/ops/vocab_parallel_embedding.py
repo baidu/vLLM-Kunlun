@@ -55,6 +55,39 @@ _oot_vocab_embedding_init_logged = False
 # =============================================================================
 
 
+def _masked_input_and_mask_torch(
+    input_: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """与 vLLM 参考实现逐位一致的 torch 兜底。
+
+    老部署容器的算子提供方是 cocopod，没有 get_masked_input_and_mask。
+    """
+    org_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
+    added_mask = (input_ >= added_vocab_start_index) & (
+        input_ < added_vocab_end_index
+    )
+    added_offset = (
+        added_vocab_start_index
+        - (org_vocab_end_index - org_vocab_start_index)
+        - num_org_vocab_padding
+    )
+    valid_offset = org_vocab_start_index * org_mask + added_offset * added_mask
+    vocab_mask = org_mask | added_mask
+    return vocab_mask * (input_ - valid_offset), ~vocab_mask
+
+
+# 只在 import 时探一次：_OpNamespace 的属性查找失败不会被缓存，放在热路径里
+# 每步都要付一次查找开销。
+_HAS_XSG_MASKED_OP = hasattr(
+    torch.ops.xspeedgate_ops, "get_masked_input_and_mask"
+)
+
+
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -63,6 +96,24 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # xspeedgate_ops.get_masked_input_and_mask 只接受 1D int32 输入：2D 会报
+    # "input_ must be 1D tensor"。qwen4_exp 的 PLE n-gram 查表输入是 2D
+    # [tokens, ngram_heads]，而该算子是逐元素 mask，展平后调用再还原形状与逐行
+    # 调用等价。
+    if input_.dtype != torch.int32:
+        input_ = input_.to(torch.int32)
+    if not _HAS_XSG_MASKED_OP:
+        return _masked_input_and_mask_torch(
+            input_,
+            org_vocab_start_index,
+            org_vocab_end_index,
+            num_org_vocab_padding,
+            added_vocab_start_index,
+            added_vocab_end_index,
+        )
+    original_shape = tuple(input_.shape)
+    if input_.dim() != 1:
+        input_ = input_.reshape(-1)
     input_, vocab_mask = torch.ops.xspeedgate_ops.get_masked_input_and_mask(
         input_,
         org_vocab_start_index,
@@ -71,6 +122,9 @@ def get_masked_input_and_mask(
         added_vocab_start_index,
         added_vocab_end_index,
     )
+    if len(original_shape) != 1:
+        input_ = input_.view(original_shape)
+        vocab_mask = vocab_mask.view(original_shape)
     return input_, vocab_mask
 
 

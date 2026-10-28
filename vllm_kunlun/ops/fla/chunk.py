@@ -10,14 +10,47 @@
 import warnings
 from typing import Optional
 
-import cocopod  # noqa
 import torch
-import xspeedgate_ops  # noqa
 from einops import rearrange
+
+# Q38 XPU PORT: 算子统一由 xspeedgate whl 提供——官方 whl 里除了 xspeedgate_ops 还打进
+# 一个二进制 cocopod 包，并在 xspeedgate_ops/__init__.py 里 import 它，把那批算子注册进
+# 同一个 xspeedgate_ops 命名空间。所以这里只 import xspeedgate_ops 就够了；直接再 import
+# 一份会 def() 同名算子，撞上 torch 的 "Duplicate registration" 并**直接 abort**
+# （c10::Error 走 terminate，没有 python traceback，表现为进程静默退出）。
+try:
+    import xspeedgate_ops  # noqa: F401
+except ImportError:  # 旧镜像里只有 cocopod
+    import cocopod  # noqa: F401
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .l2norm import l2norm_fwd
 from .utils import SUPPRESS_LEVEL, input_guard
+
+
+def _chunk_scaled_dot_kkt_fwd(k, beta, g_cumsum, cu_seqlens, chunk_indices, chunk_size):
+    """挑一个能跑当前入参的 chunk_scaled_dot_kkt_fwd 实现。
+
+    Q38 XPU PORT: 随 whl 分发的 cocopod 版只支持 fp16、且必须给 cu_seqlens；XSpeedGate 里
+    补的 chunk_scaled_dot_kkt_fwd_v2 支持 fp16/bf16/fp32 且 cu_seqlens 可为空（名字带 _v2
+    是因为同名 schema 在两个 .so 里注册会让 import 阶段 abort）。为了不改既有 fp16 varlen
+    调用方的行为，只在 cocopod 版覆盖不到的入参上才走 v2。
+    """
+    ops = torch.ops.xspeedgate_ops
+    if k.dtype is torch.float16 and cu_seqlens is not None:
+        return ops.chunk_scaled_dot_kkt_fwd(
+            k, beta, g_cumsum, cu_seqlens, chunk_indices, chunk_size
+        )
+    try:
+        return ops.chunk_scaled_dot_kkt_fwd_v2(
+            k, beta, g_cumsum, cu_seqlens, chunk_indices, chunk_size
+        )
+    except (AttributeError, RuntimeError) as exc:
+        raise NotImplementedError(
+            "cocopod 版 chunk_scaled_dot_kkt_fwd 只支持 fp16 + varlen，当前 "
+            f"dtype={k.dtype}、cu_seqlens={'None' if cu_seqlens is None else 'given'}；"
+            "需要算子包提供 chunk_scaled_dot_kkt_fwd_v2"
+        ) from exc
 
 
 def chunk_gated_delta_rule_fwd(
@@ -50,9 +83,7 @@ def chunk_gated_delta_rule_fwd(
         head_first=False,
     )
 
-    A = torch.ops.xspeedgate_ops.chunk_scaled_dot_kkt_fwd(
-        k, beta, g, cu_seqlens, chunk_indices, chunk_size
-    )
+    A = _chunk_scaled_dot_kkt_fwd(k, beta, g, cu_seqlens, chunk_indices, chunk_size)
 
     torch.ops.xspeedgate_ops.solve_tril_ns(A, cu_seqlens, chunk_indices, chunk_size)
 
@@ -178,6 +209,41 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return o.to(q.dtype), final_state
 
 
+# __Q38_NOSYNC__: 融合 chunk kernel 要主机侧 cu_seqlens。原来每层现场
+# `cu_seqlens.cpu()`，在含 prefill 的 step 上队列很深，一次 2~5 个 int 的 D2H
+# 要等 ~800us 的 cudaStreamSynchronize（36 层 = mixed step 同步时间的一半）。
+# GDNAttentionMetadata.non_spec_query_start_loc_cpu 已经是同一份主机镜像
+# （同样 int32、同样 cumsum），直接透传。Q38_CUSEQ_CPU=0 回到旧行为。
+import os as _q38_os_ck
+
+_Q38_CUSEQ_CPU = _q38_os_ck.environ.get("Q38_CUSEQ_CPU", "1") == "1"
+
+
+def _q38_cu_seqlens_host(cu_seqlens, cu_seqlens_cpu):
+    if cu_seqlens is None:
+        return None
+    if (
+        _Q38_CUSEQ_CPU
+        and cu_seqlens_cpu is not None
+        and cu_seqlens_cpu.device.type == "cpu"
+        and cu_seqlens_cpu.shape == cu_seqlens.shape
+        and cu_seqlens_cpu.dtype == cu_seqlens.dtype
+    ):
+        return cu_seqlens_cpu
+    return cu_seqlens.cpu()
+
+
+def _q38_fused_cgdr_enabled() -> bool:
+    """Q38 XPU PORT: 是否用 kunlun_ops 融合 chunk_gated_delta_rule 替代 fla 路径。
+
+    原因见下面 chunk_gated_delta_rule 里的注释：fla 路径的
+    chunk_scaled_dot_kkt_fwd 在本镜像只支持 float16。
+    """
+    import os
+
+    return os.environ.get("Q38_FUSED_CGDR", "1") == "1"
+
+
 @torch.compiler.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -189,6 +255,7 @@ def chunk_gated_delta_rule(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,  # __Q38_NOSYNC__
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ):
@@ -294,13 +361,32 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    if False:
+    if _q38_fused_cgdr_enabled():
+        # Q38 XPU PORT: fla 版 chunk 路径依赖 xspeedgate_ops.chunk_scaled_dot_kkt_fwd，
+        # 该算子在本镜像里只注册了 float16（bfloat16 直接报
+        # chunk_scaled_dot_kkt_fwd not support dtype），而 Qwen3.8-Flash-Next 按
+        # bfloat16 部署。改走 kunlun_ops 的融合 chunk_gated_delta_rule：实测支持
+        # q/k/v=bfloat16 + g/beta/initial_state=float32，这里统一入参 dtype，
+        # 出参 final_state 再转回调用方的 dtype。Q38_FUSED_CGDR=0 可关掉回到 fla 路径。
+        # Q38 FP16: kernel 要求 dtype 全套一致——q=bf16 时 g/beta/state 用 fp32，
+        # q=fp16 时全 fp16（混搭一律报 unsupported dtype combination）。
+        _aux_dtype = torch.float16 if q.dtype == torch.float16 else torch.float32
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        g = g.contiguous()
-        beta = beta.contiguous()
-        initial_state = initial_state.contiguous()
+        g = g.to(_aux_dtype).contiguous()
+        beta = beta.to(_aux_dtype).contiguous()
+        if initial_state is None:
+            num_seqs = 1 if cu_seqlens is None else len(cu_seqlens) - 1
+            state_dtype = _aux_dtype
+            initial_state = torch.zeros(
+                (num_seqs, v.shape[2], v.shape[3], k.shape[3]),
+                dtype=_aux_dtype,
+                device=v.device,
+            )
+        else:
+            state_dtype = initial_state.dtype
+            initial_state = initial_state.to(_aux_dtype).contiguous()
 
         o = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
@@ -316,9 +402,11 @@ def chunk_gated_delta_rule(
             initial_state,
             o,
             final_state,
-            cu_seqlens.cpu(),
+            _q38_cu_seqlens_host(cu_seqlens, cu_seqlens_cpu),  # __Q38_NOSYNC__
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+        if final_state.dtype != state_dtype:
+            final_state = final_state.to(state_dtype)
     else:
         o, final_state = ChunkGatedDeltaRuleFunction.apply(
             q,

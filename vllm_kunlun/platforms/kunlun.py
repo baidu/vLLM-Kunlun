@@ -310,9 +310,7 @@ class KunlunPlatform(Platform):
                 )
             return "vllm_kunlun.v1.attention.backends.mla.flashmla.FlashMLABackend"
 
-        return (
-            "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
-        )
+        return "vllm_kunlun.v1.attention.backends.kunlun_attn.KunlunAttentionBackend"
 
     @classmethod
     def get_current_memory_usage(
@@ -415,6 +413,18 @@ class KunlunPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        """Register vllm_kunlun's out-of-tree KVCacheSpec classes.
+
+        vLLM calls this from the tail of ``register_all_kvcache_specs``, which is
+        the only safe point: the registry short-circuits its built-in
+        registration once it is non-empty.
+        """
+        from vllm_kunlun.v1.kv_cache_specs import register_custom_kv_cache_specs
+
+        register_custom_kv_cache_specs(vllm_config)
 
     @classmethod
     def support_static_graph_mode(cls) -> bool:

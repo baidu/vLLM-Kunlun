@@ -24,7 +24,11 @@ def causal_conv1d_fn(
 ):
     if not x.is_contiguous():
         x = x.contiguous()
-
+    if cache_indices is not None and not cache_indices.is_contiguous():
+        cache_indices = cache_indices.contiguous()
+    if cache_indices_cpu is not None and not cache_indices_cpu.is_contiguous():
+        cache_indices_cpu = cache_indices_cpu.contiguous()
+        
     out = torch.empty_like(x)
 
     x_shape = x.shape
@@ -66,6 +70,85 @@ def causal_conv1d_fn(
     )
 
     return out
+
+
+# __Q38_CONV_SPEC_KERNEL__: spec(MTP) 路径改走原生内核的开关与 bias fp32 缓存
+import os as _q38_os_conv
+
+_Q38_CONV_SPEC_KERNEL = _q38_os_conv.environ.get("Q38_CONV_SPEC_KERNEL", "1") == "1"
+_Q38_BIAS_F32_CACHE: dict = {}
+
+
+def torch_causal_conv1d_update_spec_graphsafe(
+    hidden_states,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+    conv_state_indices=None,
+    num_accepted_tokens=None,
+):
+    """Vectorized, CUDA-graph-safe equivalent of
+    ``torch_causal_conv1d_update_spec``.
+
+    The loop version slices ``conv_state[: 2 + num_accepted[i]]`` per request,
+    which is data-dependent shape logic and cannot be captured in a CUDA
+    graph (and crashes when the capture pads the batch). This rewrite keeps
+    the exact same semantics with static shapes: per-token windows and the
+    state writeback are expressed as ``gather`` over a request-aligned
+    [history | current] buffer, with the accepted-token rollback folded into
+    the gather indices. Only static python loops over the spec length L and
+    the conv width W remain. Verified bit-equivalent on the state and within
+    1-2 bf16 ulps on the output vs the loop implementation (/tmp/conv_spec_vec.py).
+    """
+    N, L, dim = hidden_states.shape
+    W = weight.shape[1]
+    # The callers may pass padded persistent buffers (CUDA-graph capture);
+    # only the first N entries belong to real spec requests.
+    raw_idx = conv_state_indices.long()[:N]
+    # Graph replays pad the spec batch; padded rows carry PAD_SLOT_ID (-1).
+    # Read from line 0 for them and mask their writeback below.
+    valid = raw_idx >= 0
+    idx = torch.where(valid, raw_idx, torch.zeros_like(raw_idx))
+    # index_select instead of fancy indexing (XPU materializes the whole
+    # paged pool on advanced indexing over a non-contiguous view).
+    from vllm_kunlun.models.qwen4_exp.nvidia.ple_xpu_state import (
+        gather_rows as _q38_gather_rows,
+        scatter_rows_ as _q38_scatter_rows_,
+    )
+
+    state = _q38_gather_rows(conv_state, idx)     # (N, state_len, dim)
+    state_len = state.shape[1]
+    acc = num_accepted_tokens.to(hidden_states.device).long()[:N].view(N, 1)
+    keep = (2 + acc).clamp(max=state_len)         # (N,1) valid history rows
+    combined = torch.cat(
+        [state.to(weight.dtype), hidden_states.to(weight.dtype)], dim=1
+    )                                             # (N, state_len+L, dim)
+    arange_w = torch.arange(W, device=hidden_states.device).view(1, W)
+    wt = weight.t().view(1, W, dim)
+    outs = []
+    for j in range(L):                            # static loop: graph-safe
+        logical = keep + j - (W - 1) + arange_w   # (N, W)
+        phys = torch.where(logical < keep, logical, state_len + logical - keep)
+        phys = phys.clamp(min=0)
+        win = combined.gather(1, phys.unsqueeze(-1).expand(N, W, dim))
+        o = (win.float() * wt.float()).sum(1)
+        if bias is not None:
+            o = o + bias.float()
+        outs.append(F.silu(o.to(weight.dtype)))
+    out = torch.stack(outs, dim=1).to(hidden_states.dtype)
+    total = keep + L
+    p = torch.arange(state_len, device=hidden_states.device).view(1, state_len)
+    logical = total - state_len + p
+    phys = torch.where(logical < keep, logical, state_len + logical - keep)
+    phys = phys.clamp(min=0)
+    new_state = combined.gather(1, phys.unsqueeze(-1).expand(N, state_len, dim))
+    _q38_scatter_rows_(
+        conv_state,
+        idx,
+        torch.where(valid.view(N, 1, 1), new_state.to(conv_state.dtype), state),
+    )
+    return out.view(-1, dim)
 
 
 def torch_causal_conv1d_update_spec(
@@ -205,7 +288,54 @@ def causal_conv1d_update(
         )
         return x.squeeze(1)
     else:
-        return torch_causal_conv1d_update_spec(
+        # __Q38_CONV_SPEC_KERNEL__: 原生 spec 内核。
+        # /tmp/ut_conv_spec.py + ut_conv_view.py 验证：状态位级一致、输出
+        # fp16/bf16 舍入级差异；kv_cache 切片视图与 storage-offset 池均正确；
+        # pad 行内核会写 0 号行（FULL 图 padding 即 NULL 页 0，行为兼容）。
+        # bias 内核要求 fp32，按权重 id 缓存转换结果。
+        # Q38_CONV_SPEC_KERNEL=0 回退 torch graphsafe 兜底。
+        if _Q38_CONV_SPEC_KERNEL:
+            # 元数据里的 num_accepted_tokens/conv_state_indices 是按 token 数
+            # 填充的持久 buffer（FULL 图 staging），内核要求 numel == 请求数，
+            # 切到 x 的 batch 维（切片是静态形状视图，图安全）。
+            _n = x.shape[0]
+            if num_accepted_tokens.shape[0] != _n:
+                num_accepted_tokens = num_accepted_tokens[:_n]
+            if (conv_state_indices is not None
+                    and conv_state_indices.shape[0] != _n):
+                conv_state_indices = conv_state_indices[:_n]
+            # __Q38_CONV_CONTIG_FIX__: spec 路径传入的是
+            # spec_state_indices_tensor[:, 0] 列切片（stride=num_spec+1，
+            # 非连续）。原生内核按扁平 int32 指针线性读取，bs=1 只读
+            # 元素 0 恰好正确；bs>=2 时第 i 行读到 row0 的第 i 个 spec
+            # 槽位 -> 跨请求状态串用（并发精度灾难：空 think 塌缩/
+            # 重复 token/提前 EOS/乱码）。contiguous 拷贝为 gather
+            # kernel，FULL 图捕获后回放读持久 staging buffer，图安全。
+            if (conv_state_indices is not None
+                    and not conv_state_indices.is_contiguous()):
+                conv_state_indices = conv_state_indices.contiguous()
+            _b = bias
+            if _b is not None and _b.dtype != torch.float32:
+                _bc = _Q38_BIAS_F32_CACHE.get(id(_b))
+                if _bc is None:
+                    _bc = _b.float()
+                    _Q38_BIAS_F32_CACHE[id(_b)] = _bc
+                _b = _bc
+            _spec_state_len = width - 1 + (max_query_len - 1)
+            kunlun_ops.causal_conv1d_update(
+                x,
+                conv_state[:, :_spec_state_len, :],
+                weight,
+                bias=_b,
+                silu_activation=activation in ("silu", "swish"),
+                cache_seqlens=None,
+                conv_state_indices=conv_state_indices,
+                is_ncw=False,
+                pad_slot_id=pad_slot_id,
+                num_accepted_tokens=num_accepted_tokens,
+            )
+            return x.reshape(-1, dim)
+        return torch_causal_conv1d_update_spec_graphsafe(
             x,
             conv_state,
             weight,

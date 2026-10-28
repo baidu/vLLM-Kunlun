@@ -19,13 +19,30 @@
 
 from typing import Optional
 
-import cocopod  # noqa
 import torch
-import xspeedgate_ops  # noqa
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import current_workspace_manager
 
+# Q38 XPU PORT: cocopod 已废弃，算子统一由 xspeedgate whl 提供。两者 def() 同名算子，
+# 同一进程里都 import 会撞 torch 的 "Duplicate registration" 并直接 abort
+# （c10::Error → terminate，没有 python traceback）。优先 xspeedgate_ops。
+try:
+    import xspeedgate_ops  # noqa: F401
+except ImportError:  # 旧镜像里只有 cocopod
+    import cocopod  # noqa: F401
+
 logger = init_logger(__name__)
+
+# Q38 XPU PORT: moe_pre_small 只存在于 cocopod，新的 xspeedgate whl 里没有
+# （MoE 前处理换成了 moe_softmax_topk / make_row_id_map 那一套）。这里只在 import
+# 时探一次（_OpNamespace 查找失败不缓存，热路径里每步都要付一次开销），缺算子就
+# 让小 M 也走 torch.ops._C.gen_block_statistic + moe_pre_sorted 这条通用路径。
+_HAS_MOE_PRE_SMALL = hasattr(torch.ops.xspeedgate_ops, "moe_pre_small")
+if not _HAS_MOE_PRE_SMALL:
+    logger.info(
+        "xspeedgate_ops.moe_pre_small unavailable; fused_moe always uses the "
+        "moe_pre_sorted path"
+    )
 
 try:
     import kunlun_ops
@@ -517,7 +534,8 @@ class KunlunOps:
             #   workspace_b: y -> out
             workspace_a_numel = max(out1_numel, out_numel)
             workspace_b_numel = max(y_numel, out_numel)
-            if M * moe_top_k > 768:
+            use_pre_sorted = M * moe_top_k > 768 or not _HAS_MOE_PRE_SMALL
+            if use_pre_sorted:
                 workspace_a_numel = max(workspace_a_numel, moe_expand_numel)
 
             workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
@@ -525,7 +543,7 @@ class KunlunOps:
                 ((workspace_b_numel,), hidden_states.dtype),
             )
 
-            if M * moe_top_k > 768:
+            if use_pre_sorted:
                 expert_m = torch.zeros(
                     global_num_experts,
                     dtype=torch.int32,
@@ -761,6 +779,12 @@ class KunlunOps:
         threshold: float = 20.0,
     ) -> torch.Tensor:
         """fused_gdn_gating"""
+        # the XPU kernel ignores input strides and reads `a`
+        # contiguously; callers hand it a chunk() view with stride
+        # (2*HV, 1), which is only accidentally contiguous when
+        # num_tokens == 1 -- so prefill got a scrambled decay gate.
+        if not a.is_contiguous():
+            a = a.contiguous()
         output = kunlun_ops.fused_gdn_gating(
             A_log,
             a,
