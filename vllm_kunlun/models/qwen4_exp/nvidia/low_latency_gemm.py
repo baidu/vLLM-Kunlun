@@ -26,7 +26,6 @@ import os
 
 import torch
 from torch import nn
-
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # 上游的 plan 表在 XPU 上没有意义（不按 (N,K) + token 数选 kernel），保留空表只为
@@ -43,9 +42,7 @@ def _kunlun_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     flat = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
     if not flat.is_contiguous():
         flat = flat.contiguous()
-    out = torch.empty(
-        (flat.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((flat.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     kunlun_ops.matmul(flat, weight, out)
     if x.dim() == 2:
         return out
@@ -61,8 +58,6 @@ direct_register_custom_op(
     op_func=_kunlun_linear,
     fake_impl=_kunlun_linear_fake,
 )
-
-
 
 
 def enable_qwen4_exp_low_latency_gemm(module: nn.Module, dtype: torch.dtype) -> None:
@@ -111,4 +106,3 @@ def enable_qwen4_exp_low_latency_gemm(module: nn.Module, dtype: torch.dtype) -> 
         else:
             continue
         replaced += 1
-

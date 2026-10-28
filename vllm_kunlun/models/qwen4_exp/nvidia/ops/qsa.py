@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 
 import torch
-
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 

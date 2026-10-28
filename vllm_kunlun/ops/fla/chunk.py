@@ -7,6 +7,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
+
+import os
 import warnings
 from typing import Optional
 
@@ -214,9 +216,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 # 要等 ~800us 的 cudaStreamSynchronize（36 层 = mixed step 同步时间的一半）。
 # GDNAttentionMetadata.non_spec_query_start_loc_cpu 已经是同一份主机镜像
 # （同样 int32、同样 cumsum），直接透传。Q38_CUSEQ_CPU=0 回到旧行为。
-import os as _q38_os_ck
 
-_Q38_CUSEQ_CPU = _q38_os_ck.environ.get("Q38_CUSEQ_CPU", "1") == "1"
+_Q38_CUSEQ_CPU = os.environ.get("Q38_CUSEQ_CPU", "1") == "1"
 
 
 def _q38_cu_seqlens_host(cu_seqlens, cu_seqlens_cpu):

@@ -20,7 +20,6 @@ from typing import ClassVar
 
 import torch
 from torch import nn
-
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -35,11 +34,8 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheSpec,
-    MLAAttentionSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MLAAttentionSpec
+
 from vllm_kunlun.v1.kv_cache_layout import KVCacheLayout
 from vllm_kunlun.v1.kv_cache_specs import CircularBufferSpec
 
@@ -126,9 +122,10 @@ def _logical_positions_cpu(
     requests = torch.repeat_interleave(
         torch.arange(query_lens.numel(), dtype=torch.int64), query_lens.long()
     )[:num_mapped]
-    within = torch.arange(num_mapped, dtype=torch.int64) - query_start_loc_cpu.long()[
-        requests
-    ]
+    within = (
+        torch.arange(num_mapped, dtype=torch.int64)
+        - query_start_loc_cpu.long()[requests]
+    )
     out[:num_mapped] = (
         seq_lens_cpu.long()[requests] - query_lens.long()[requests] + within
     )
@@ -648,9 +645,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
             compress_ratio = _spec_compress_ratio(kv_cache_spec)
-            assert isinstance(compress_ratio, int), (
-                "QSA compression requires an integer compression ratio"
-            )
+            assert isinstance(
+                compress_ratio, int
+            ), "QSA compression requires an integer compression ratio"
             self.compress_ratio = compress_ratio
         else:
             self.compress_ratio = 1

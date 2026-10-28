@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
 import kunlun_ops
 import torch
-from vllm.model_executor.models.interfaces import EagleModelMixin  # __Q38_AUX_PATCH__
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
@@ -67,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from vllm.model_executor.models.interfaces import EagleModelMixin  # __Q38_AUX_PATCH__
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -100,17 +101,17 @@ from vllm_kunlun.ops.fla import (
     fused_recurrent_gated_delta_rule,
 )
 from vllm_kunlun.ops.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 # __Q38_IDXSEL__: 用 index_select 替掉布尔掩码索引（Q38_IDXSEL=1 开）
-import os as _q38_os_idx
-_Q38_IDXSEL = _q38_os_idx.environ.get("Q38_IDXSEL") == "1"
+_Q38_IDXSEL = os.environ.get("Q38_IDXSEL") == "1"
 
 # __Q38_FLATSEL__: GDN prefill 初态 gather 的三条实现，Q38_INITGATHER 选择。
 #   flatsel（默认）：连续 2D 视图 + index_select，复杂度 O(选中行)
 #   idxsel        ：直接 index_select，几何不满足时由 flatsel 兜底同样处理
 #   gatherwin     ：旧路径，reshape_and_cache_flash 当 gather 用，复杂度 O(pool)
-_Q38_INITGATHER = _q38_os_idx.environ.get("Q38_INITGATHER", "flatsel")
-_Q38_INITVERIFY = int(_q38_os_idx.environ.get("Q38_INITVERIFY", "0") or 0)
+_Q38_INITGATHER = os.environ.get("Q38_INITGATHER", "flatsel")
+_Q38_INITVERIFY = int(os.environ.get("Q38_INITVERIFY", "0") or 0)
 _q38_verify_n = [0]
 _q38_flat_warned = [False]
 
@@ -199,7 +200,6 @@ def _q38_init_gather(ssm_state, idx, out_shape):
 
 
 
-from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -1643,13 +1643,12 @@ direct_register_custom_op(
 
 
 # __Q38_FUSED_SNR__ : optional fused split+norm+rope path for GatedAttention.
-import os as _q38_os
 
 _q38_attn_forward_nonfused = Qwen3NextAttention.forward
 
 
 def _q38_attn_forward_fused(self, positions, output, hidden_states):
-    if _q38_os.environ.get("KUNLUN_Q38_FUSED_SNR", "0") != "1":
+    if os.environ.get("KUNLUN_Q38_FUSED_SNR", "0") != "1":
         return _q38_attn_forward_nonfused(self, positions, output, hidden_states)
 
     qkv, _ = self.qkv_proj(hidden_states)

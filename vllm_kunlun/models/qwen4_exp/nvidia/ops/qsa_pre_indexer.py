@@ -3,7 +3,6 @@
 """Fused QSA pre-indexer kernel for Qwen4Exp."""
 
 import torch
-
 from vllm.triton_utils import tl, triton
 
 

@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata

@@ -54,9 +54,6 @@ _MSA_TOPK_LIMIT = 200
 # Q38_QSA_TOPK_CAP=<=200：上下文超过上限时把稀疏预算降到 CAP 列继续跑（结果是近似，
 # 只保留 top-k 算子返回的前 CAP 个下标），默认 0 = 直接报错，不静默算错。
 _TOPK_CAP = int(os.environ.get("Q38_QSA_TOPK_CAP", "0") or 0)
-# Q38_QSA_DUMP=N：把前 N 次 qsa_sparse_paged_attention 的下标集合摘要打出来
-# （每行有效列数 vs 因果上界），用来判断"稀疏下标集合是否等于完整因果前缀"。
-_DUMP_LEFT = [int(os.environ.get("Q38_QSA_DUMP", "0") or 0)]
 
 
 def _sync(tag: str) -> None:
@@ -188,11 +185,11 @@ def expand_qsa_block_indices_cuda(
         tail_count = (qp + 1) - tail_start
 
         is_expanded = cols[None, :] < expanded_count
-        expanded = blocks_i32[start:stop].index_select(1, rank) * ratio + offset[None, :]
-        tail_offset = cols[None, :] - expanded_count
-        is_tail = (
-            ~is_expanded & (tail_offset < tail_count) & (tail_offset < ratio - 1)
+        expanded = (
+            blocks_i32[start:stop].index_select(1, rank) * ratio + offset[None, :]
         )
+        tail_offset = cols[None, :] - expanded_count
+        is_tail = ~is_expanded & (tail_offset < tail_count) & (tail_offset < ratio - 1)
         token = torch.where(is_expanded, expanded, tail_start + tail_offset)
         valid = (is_expanded | is_tail) & (token >= 0) & (token < seq)
         out[start:stop].copy_(torch.where(valid, token, torch.full_like(token, -1)))
@@ -368,8 +365,7 @@ def qsa_select_paged_tokens(
             sequence_lengths,
             ratio,
             query_positions_cpu=(
-                None if query_positions_cpu is None
-                else query_positions_cpu[start:stop]
+                None if query_positions_cpu is None else query_positions_cpu[start:stop]
             ),
         )
         # fast_topkv2_dynamic 只保证前 min(length, topk) 个槽位合法，
@@ -464,9 +460,9 @@ def qsa_sparse_paged_attention(
         cap = min(_TOPK_CAP, _MSA_TOPK_LIMIT)
         logical_indices = logical_indices[:, :cap].contiguous()
         topk_num = cap
-    counts = torch.bincount(
-        _safe_request(token_to_req, batch), minlength=batch
-    ).to(torch.int32)
+    counts = torch.bincount(_safe_request(token_to_req, batch), minlength=batch).to(
+        torch.int32
+    )
     lod_q = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
     lod_q[1:] = counts.cumsum(0).to(torch.int32)
     lod_kv = torch.zeros(batch + 1, dtype=torch.int32, device=q.device)
@@ -479,12 +475,6 @@ def qsa_sparse_paged_attention(
         .contiguous()
     )
     scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
-    dump = _DUMP_LEFT[0] > 0
-    if dump:
-        _DUMP_LEFT[0] -= 1
-        valid = (logical_indices >= 0).sum(dim=1)
-        first_rows = logical_indices[: min(4, tokens)]
-        contiguous_stride = k_cache.shape[1] * k_cache.shape[2] * k_cache.shape[3]
     mod.msa_sparse_attention(
         q,
         k_cache,
@@ -619,7 +609,6 @@ def qsa_compress_groups_with_ratio(
     if not rows:
         return pooled, first_positions
 
-    ring_size = compressor_state_cache.shape[1]
     num_requests = query_start_loc.shape[0] - 1
     num_blocks = compressor_state_cache.shape[0]
     request = _safe_request(token_to_req, num_requests)
@@ -657,8 +646,8 @@ def qsa_compress_groups_with_ratio(
     # 512 行 × 256 宽 bf16 ≈ 18 GiB，直接 OOM。所以统一从整块连续的
     # `kv_cache`（[blocks, ring, 1, width]，transpose 只换了 size-1 维的 stride，
     # 仍然连续）gather，再在只有 rows 行的结果上切列。
-    gather_base = state_cache_full if state_cache_full is not None else (
-        compressor_state_cache
+    gather_base = (
+        state_cache_full if state_cache_full is not None else (compressor_state_cache)
     )
     if not gather_base.is_contiguous():
         raise ValueError("QSA ring cache must be gathered through a contiguous cache")
@@ -682,7 +671,10 @@ def qsa_compress_groups_with_ratio(
         use_raw = position >= chunk_start
         raw_row = row_start + position - chunk_start
         raw_ok = (
-            valid_row & use_raw & (raw_row >= row_start) & (raw_row < row_end)
+            valid_row
+            & use_raw
+            & (raw_row >= row_start)
+            & (raw_row < row_end)
             & (raw_row < rows)
         )
         state_ok = valid_row & ~use_raw & valid_block
@@ -712,7 +704,10 @@ def qsa_compress_groups_with_ratio(
     first_from_raw = first_position >= chunk_start
     raw_first = row_start + first_position - chunk_start
     raw_ok = (
-        valid_row & first_from_raw & (raw_first >= row_start) & (raw_first < row_end)
+        valid_row
+        & first_from_raw
+        & (raw_first >= row_start)
+        & (raw_first < row_end)
         & (raw_first < rows)
     )
     raw_pos_flat = raw_positions.reshape(-1, raw_positions.shape[2])

@@ -5,10 +5,7 @@
 from typing import Any, ClassVar, cast
 
 from transformers import PretrainedConfig
-from transformers.models.qwen3_vl.configuration_qwen3_vl import (
-    Qwen3VLVisionConfig,
-)
-
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 
 _QSA_CONFIG_FIELDS = (

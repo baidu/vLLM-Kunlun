@@ -8,14 +8,11 @@ from typing import ClassVar, cast
 
 import torch
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.attention.attention import (
-    set_default_quant_scales,
-)
+from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -23,9 +20,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
-from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -47,11 +41,9 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheSpec,
-    get_kv_quant_mode,
-)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, get_kv_quant_mode
+
+from vllm_kunlun.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model

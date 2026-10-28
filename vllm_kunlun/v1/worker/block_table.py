@@ -16,6 +16,7 @@ and re-import via the ``_kunlun_slot_patched`` flag on the class.
 """
 
 import logging
+import os
 
 import kunlun_ops
 import torch
@@ -128,9 +129,8 @@ if not getattr(_upstream_cls, "_kunlun_slot_patched", False):
 # __Q38_BT_DIRTY__: decode 稳态下 block 表多数步不变，全量 H2D 拷贝浪费。
 # 所有 CPU 侧改写方法置脏标记，commit 时不脏则跳过。
 # get_numpy_array/get_cpu_tensor 无调用方，无裸写入路径（已审计）。
-import os as _q38_os
 
-if _q38_os.environ.get("Q38_BT_DIRTY_SKIP", "1") == "1":
+if os.environ.get("Q38_BT_DIRTY_SKIP", "1") == "1":
 
     def _q38_wrap_mut(_name):
         _orig = getattr(_upstream_cls, _name)
@@ -141,8 +141,7 @@ if _q38_os.environ.get("Q38_BT_DIRTY_SKIP", "1") == "1":
 
         return _f
 
-    for _n in ("append_row", "add_row", "clear_row",
-               "move_row", "swap_row", "clear"):
+    for _n in ("append_row", "add_row", "clear_row", "move_row", "swap_row", "clear"):
         setattr(_upstream_cls, _n, _q38_wrap_mut(_n))
 
     _q38_orig_commit = _upstream_cls.commit_block_table

@@ -40,7 +40,7 @@ import logging
 import sys
 from types import ModuleType
 
-from .qwen4_exp_patches import QWEN4_EXP_HOOKS
+from .qwen4_exp_patches import extend_hooks as _extend_qwen4_exp_hooks
 
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
@@ -681,8 +681,12 @@ DEFAULT_HOOKS = (
         _indexer_applied,
         _apply_indexer_patch,
     ),
-    *QWEN4_EXP_HOOKS,
 ) + tuple(
     (target, *_v2_hook(kunlun_module, *paths))
     for target, kunlun_module, paths in _V2_PATCHES
 )
+
+# Model-specific shims are merged by target: ``register_hook`` takes one
+# registration per module, so a shim landing on a target already covered above
+# is composed with it rather than appended.
+DEFAULT_HOOKS = _extend_qwen4_exp_hooks(DEFAULT_HOOKS)

@@ -8,14 +8,12 @@ from collections.abc import Iterable, Sequence
 import torch
 import torch.nn.functional as F
 from torch import nn
-
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.quantization.base_config import (
@@ -28,32 +26,26 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_weight_parameter,
     is_fp8,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    is_layer_skipped,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import PerTensorScaleParameter
-from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from .ple_xpu_state import (  # Q38 XPU PORT: 大 conv_state 的行级 gather/scatter
-    gather_rows as _q38_gather_rows,
-    scatter_rows_ as _q38_scatter_rows_,
-)
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+from vllm_kunlun.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 from vllm_kunlun.v1.attention.backends.ple_short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-
-from ..compat import short_conv_state_shape
 
 from ..common.ple import copy_ple_embedding_shard_
+from ..compat import short_conv_state_shape
+from .ple_xpu_state import (
+    gather_rows as _q38_gather_rows,  # Q38 XPU PORT: 大 conv_state 的行级 gather/scatter
+)
+from .ple_xpu_state import scatter_rows_ as _q38_scatter_rows_
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -791,9 +783,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # The equality is computed from CPU-side metadata (both operands are
         # Python ints), so this branch does not add a device synchronization.
         if num_prefills * max_len == num_prefill_tokens:
-            packed_tokens = x_p.reshape(
-                num_prefills, max_len, hidden_size
-            ).transpose(1, 2).contiguous()
+            packed_tokens = (
+                x_p.reshape(num_prefills, max_len, hidden_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
             if initial_state is not None:
                 history = torch.cat((initial_state, packed_tokens), dim=-1)
             else:
@@ -826,14 +820,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 )
                 existing_state = _q38_gather_rows(conv_state, state_indices)
                 existing_base_state = existing_state[..., : self.conv_state_len]
-                update_mask = valid_state & (
-                    lengths.to(device=conv_state.device) > 0
-                )
+                update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
                 safe_next_state = torch.where(
                     update_mask.view(num_prefills, 1, 1),
-                    next_state.to(
-                        device=conv_state.device, dtype=conv_state.dtype
-                    ),
+                    next_state.to(device=conv_state.device, dtype=conv_state.dtype),
                     existing_base_state,
                 )
                 existing_state[..., : self.conv_state_len] = safe_next_state
@@ -864,7 +854,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             if initial_state is not None:
                 state_col = src_col + self.conv_state_len
                 in_state = (src_col < 0) & (state_col >= 0)
-                picked = initial_state[req_indices, :, state_col.clamp(0, self.conv_state_len - 1)]
+                picked = initial_state[
+                    req_indices, :, state_col.clamp(0, self.conv_state_len - 1)
+                ]
                 gathered = gathered + picked * in_state.to(x_p.dtype).unsqueeze(-1)
             conv_acc = conv_acc + gathered * weight[:, kernel - 1 - tap]
         conv_values = F.silu(conv_acc)
@@ -889,9 +881,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             next_state = next_state * in_query.to(next_state.dtype).unsqueeze(1)
             if initial_state is not None:
                 in_state = rel < 0
-                state_col = (rel + self.conv_state_len).clamp(0, self.conv_state_len - 1)
-                picked = initial_state.gather(2, state_col.unsqueeze(1).expand_as(initial_state))
-                next_state = next_state + picked * in_state.to(picked.dtype).unsqueeze(1)
+                state_col = (rel + self.conv_state_len).clamp(
+                    0, self.conv_state_len - 1
+                )
+                picked = initial_state.gather(
+                    2, state_col.unsqueeze(1).expand_as(initial_state)
+                )
+                next_state = next_state + picked * in_state.to(picked.dtype).unsqueeze(
+                    1
+                )
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.

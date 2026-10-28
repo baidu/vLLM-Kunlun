@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Union
 
 import kunlun_ops
@@ -28,7 +29,7 @@ def causal_conv1d_fn(
         cache_indices = cache_indices.contiguous()
     if cache_indices_cpu is not None and not cache_indices_cpu.is_contiguous():
         cache_indices_cpu = cache_indices_cpu.contiguous()
-        
+
     out = torch.empty_like(x)
 
     x_shape = x.shape
@@ -73,9 +74,8 @@ def causal_conv1d_fn(
 
 
 # __Q38_CONV_SPEC_KERNEL__: spec(MTP) 路径改走原生内核的开关与 bias fp32 缓存
-import os as _q38_os_conv
 
-_Q38_CONV_SPEC_KERNEL = _q38_os_conv.environ.get("Q38_CONV_SPEC_KERNEL", "1") == "1"
+_Q38_CONV_SPEC_KERNEL = os.environ.get("Q38_CONV_SPEC_KERNEL", "1") == "1"
 _Q38_BIAS_F32_CACHE: dict = {}
 
 
@@ -114,21 +114,23 @@ def torch_causal_conv1d_update_spec_graphsafe(
     # paged pool on advanced indexing over a non-contiguous view).
     from vllm_kunlun.models.qwen4_exp.nvidia.ple_xpu_state import (
         gather_rows as _q38_gather_rows,
+    )
+    from vllm_kunlun.models.qwen4_exp.nvidia.ple_xpu_state import (
         scatter_rows_ as _q38_scatter_rows_,
     )
 
-    state = _q38_gather_rows(conv_state, idx)     # (N, state_len, dim)
+    state = _q38_gather_rows(conv_state, idx)  # (N, state_len, dim)
     state_len = state.shape[1]
     acc = num_accepted_tokens.to(hidden_states.device).long()[:N].view(N, 1)
-    keep = (2 + acc).clamp(max=state_len)         # (N,1) valid history rows
+    keep = (2 + acc).clamp(max=state_len)  # (N,1) valid history rows
     combined = torch.cat(
         [state.to(weight.dtype), hidden_states.to(weight.dtype)], dim=1
-    )                                             # (N, state_len+L, dim)
+    )  # (N, state_len+L, dim)
     arange_w = torch.arange(W, device=hidden_states.device).view(1, W)
     wt = weight.t().view(1, W, dim)
     outs = []
-    for j in range(L):                            # static loop: graph-safe
-        logical = keep + j - (W - 1) + arange_w   # (N, W)
+    for j in range(L):  # static loop: graph-safe
+        logical = keep + j - (W - 1) + arange_w  # (N, W)
         phys = torch.where(logical < keep, logical, state_len + logical - keep)
         phys = phys.clamp(min=0)
         win = combined.gather(1, phys.unsqueeze(-1).expand(N, W, dim))
@@ -301,8 +303,7 @@ def causal_conv1d_update(
             _n = x.shape[0]
             if num_accepted_tokens.shape[0] != _n:
                 num_accepted_tokens = num_accepted_tokens[:_n]
-            if (conv_state_indices is not None
-                    and conv_state_indices.shape[0] != _n):
+            if conv_state_indices is not None and conv_state_indices.shape[0] != _n:
                 conv_state_indices = conv_state_indices[:_n]
             # __Q38_CONV_CONTIG_FIX__: spec 路径传入的是
             # spec_state_indices_tensor[:, 0] 列切片（stride=num_spec+1，
@@ -311,8 +312,10 @@ def causal_conv1d_update(
             # 槽位 -> 跨请求状态串用（并发精度灾难：空 think 塌缩/
             # 重复 token/提前 EOS/乱码）。contiguous 拷贝为 gather
             # kernel，FULL 图捕获后回放读持久 staging buffer，图安全。
-            if (conv_state_indices is not None
-                    and not conv_state_indices.is_contiguous()):
+            if (
+                conv_state_indices is not None
+                and not conv_state_indices.is_contiguous()
+            ):
                 conv_state_indices = conv_state_indices.contiguous()
             _b = bias
             if _b is not None and _b.dtype != torch.float32:

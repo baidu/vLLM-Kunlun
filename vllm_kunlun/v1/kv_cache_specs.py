@@ -125,9 +125,9 @@ class CircularBufferManager(SingleTypeKVCacheManager):
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
-        assert isinstance(kv_cache_spec, CircularBufferSpec), (
-            "CircularBufferManager can only be used for circular buffer groups"
-        )
+        assert isinstance(
+            kv_cache_spec, CircularBufferSpec
+        ), "CircularBufferManager can only be used for circular buffer groups"
         del block_hashes, max_length, block_pool, drop_eagle_block
         del alignment_tokens, dcp_world_size, pcp_world_size
         return tuple([] for _ in kv_cache_group_ids)

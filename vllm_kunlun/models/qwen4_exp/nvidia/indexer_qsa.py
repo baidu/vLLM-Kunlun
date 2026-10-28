@@ -8,19 +8,15 @@ from typing import cast
 
 import torch
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.platforms import current_platform
-from vllm.model_executor.layers.rotary_embedding.mrope import (
-    apply_interleaved_rope,
-)
-from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
+
+from vllm_kunlun.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -403,9 +399,9 @@ class QSAIndexer(nn.Module):
         extra = {}
         if getattr(compressed_metadata, "logical_positions_cpu", None) is not None:
             if self.qsa_ops.__name__.endswith("qsa_kunlun"):
-                extra["query_positions_cpu"] = compressed_metadata.logical_positions_cpu[
-                    :num_tokens
-                ]
+                extra["query_positions_cpu"] = (
+                    compressed_metadata.logical_positions_cpu[:num_tokens]
+                )
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,

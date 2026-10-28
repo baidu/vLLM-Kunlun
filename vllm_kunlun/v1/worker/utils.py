@@ -13,8 +13,6 @@ hook is installed, ensuring upstream is loaded first.
 
 import logging
 
-import torch
-
 from vllm.v1.worker.utils import KVBlockZeroer as _upstream_cls
 
 logger = logging.getLogger("vllm_kunlun")
@@ -28,6 +26,9 @@ def _init_meta(
     runner_only_attn_layers,
     static_forward_context,
 ):
+    # Imported in the function body, not at module scope, so the hardware-free
+    # unit tests can import this module without torch installed.
+    import torch
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
     kv_entries = []
@@ -191,7 +192,6 @@ def bind_kv_cache(
 
 # Idempotent monkey-patch: safe under fork() and re-import.
 if not getattr(_upstream_cls, "_kunlun_patched", False):
-    _upstream_cls._kunlun_original_zero_block_ids = _upstream_cls.zero_block_ids
     _upstream_cls.init_meta = _init_meta
     _upstream_cls.zero_block_ids = _zero_block_ids
     _upstream_cls._kunlun_patched = True

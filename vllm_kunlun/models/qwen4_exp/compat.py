@@ -23,7 +23,6 @@ from collections.abc import Iterable, Iterator
 from typing import TypeAlias
 
 import torch
-
 from vllm.distributed import divide
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,

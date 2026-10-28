@@ -53,6 +53,7 @@ import os
 
 import torch
 
+
 def row_plan(src):
     """判断 dim0 的每一行是否是存储里的一个连续块，并给出内存序信息。
 
@@ -141,9 +142,7 @@ def gather_rows(src: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
             full, col0 = _full_view(src, plan)
             if full is not None:
                 rows = torch.index_select(full, 0, _safe_idx(src, idx1d))
-                got = (
-                    rows[:, col0 : col0 + row_numel].contiguous().view(k, *mem_shape)
-                )
+                got = rows[:, col0 : col0 + row_numel].contiguous().view(k, *mem_shape)
                 return got.permute(*_to_logical_axes(src.dim(), perm)).contiguous()
     idx = idx1d.tolist()
     if not idx:

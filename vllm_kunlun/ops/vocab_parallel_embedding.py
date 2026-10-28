@@ -68,9 +68,7 @@ def _masked_input_and_mask_torch(
     老部署容器的算子提供方是 cocopod，没有 get_masked_input_and_mask。
     """
     org_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
-    added_mask = (input_ >= added_vocab_start_index) & (
-        input_ < added_vocab_end_index
-    )
+    added_mask = (input_ >= added_vocab_start_index) & (input_ < added_vocab_end_index)
     added_offset = (
         added_vocab_start_index
         - (org_vocab_end_index - org_vocab_start_index)
@@ -83,9 +81,7 @@ def _masked_input_and_mask_torch(
 
 # 只在 import 时探一次：_OpNamespace 的属性查找失败不会被缓存，放在热路径里
 # 每步都要付一次查找开销。
-_HAS_XSG_MASKED_OP = hasattr(
-    torch.ops.xspeedgate_ops, "get_masked_input_and_mask"
-)
+_HAS_XSG_MASKED_OP = hasattr(torch.ops.xspeedgate_ops, "get_masked_input_and_mask")
 
 
 def get_masked_input_and_mask(

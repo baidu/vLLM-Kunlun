@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import dataclasses
+import os
 from dataclasses import dataclass
 
-import os
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
@@ -21,7 +22,6 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
-
 
 
 # __Q38_NST_PERM__
@@ -52,11 +52,10 @@ class GDNAttentionBackend(AttentionBackend):
 
 # __Q38_NOSYNC__: prefill step 上把 CPU 镜像提前到 build 阶段算。
 # Q38_MIRROR_EAGER=0 回到纯惰性行为。
-import os as _q38_os_me
 
-_Q38_MIRROR_EAGER = _q38_os_me.environ.get("Q38_MIRROR_EAGER", "1") == "1"
-_Q38_SPEC_PAD_LOG = _q38_os_me.environ.get("Q38_SPEC_PAD_LOG", "0") == "1"
-_Q38_SPEC_PAD_MAX = int(_q38_os_me.environ.get("Q38_SPEC_PAD_LOG_N", "20"))
+_Q38_MIRROR_EAGER = os.environ.get("Q38_MIRROR_EAGER", "1") == "1"
+_Q38_SPEC_PAD_LOG = os.environ.get("Q38_SPEC_PAD_LOG", "0") == "1"
+_Q38_SPEC_PAD_MAX = int(os.environ.get("Q38_SPEC_PAD_LOG_N", "20"))
 _Q38_SPEC_PAD_N = [0]
 
 
@@ -109,7 +108,6 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
-
 
     # Q38 PERF: 惰性 CPU 镜像。纯 decode FULL-graph 回放不执行 Python 前向，
     # 永远不会访问本属性 => 每步省一次阻塞 D2H 同步；eager/capture 路径首次
@@ -283,8 +281,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_masks = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = _q38_dense_indices(
-                block_table_tensor[:, 0])
+            non_spec_state_indices_tensor = _q38_dense_indices(block_table_tensor[:, 0])
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -339,8 +336,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = _q38_dense_indices(
-                    block_table_tensor[spec_sequence_masks_cpu,
-                                       : self.num_spec + 1])
+                    block_table_tensor[spec_sequence_masks_cpu, : self.num_spec + 1]
+                )
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
@@ -364,7 +361,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 ]
                 non_spec_mask_cpu = (~spec_sequence_masks_cpu) & (query_lens_cpu > 0)
                 non_spec_state_indices_tensor = _q38_dense_indices(
-                    block_table_tensor[non_spec_mask_cpu, 0])
+                    block_table_tensor[non_spec_mask_cpu, 0]
+                )
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -425,9 +423,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 # Keep the validity mask aligned with the non-spec rows passed
                 # to the prefill kernel; padded zero-length rows are omitted.
-                non_spec_mask_cpu = (~spec_sequence_masks_cpu) & (
-                    query_lens_cpu > 0
-                )
+                non_spec_mask_cpu = (~spec_sequence_masks_cpu) & (query_lens_cpu > 0)
                 has_initial_state = has_initial_state[non_spec_mask_cpu]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
@@ -440,7 +436,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state = None
 
         # __Q38_SLOTCOLL__: spec 的投机 scratch 列是否撞到 non-spec 的槽位
-
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -624,18 +619,15 @@ _upstream_gdn_attn.GDNAttentionMetadataBuilder = GDNAttentionMetadataBuilder
 _upstream_gdn_attn.GDNAttentionBackend = GDNAttentionBackend
 
 
-
 # __Q38_GDN_BUILD_CACHE__: 纯 spec-decode 步的跨 group 元数据缓存。
 # 36 个 GDN group 每步构建的元数据除 spec_state_indices（各组 block table
 # 不同）外完全相同；首个 builder 全量构建并缓存，其余复用，省 ~30 组 x
 # 十余个小 GPU 算子的派发开销。Q38_GDN_BUILD_CACHE=0 可关闭。
-import dataclasses as _q38_dc
-import os as _q38_os_c
 
 # __Q38_GDN_FASTIDX__: 跨 group 复用 gather index + gather out= + 免 fill。
 _Q38_GO_OK = [True]
 _Q38_GS = {"full": 0, "fast_out": 0, "fast_cp": 0, "fill": 0, "step": 0}
-_Q38_GS_N = int(_q38_os_c.environ.get("Q38_GDN_STAT", "0") or 0)
+_Q38_GS_N = int(os.environ.get("Q38_GDN_STAT", "0") or 0)
 
 
 def _q38_gs_step():
@@ -644,9 +636,18 @@ def _q38_gs_step():
     _Q38_GS["step"] += 1
     if _Q38_GS["step"] % _Q38_GS_N:
         return
-    print("[Q38-GDN] step=%d per%d full=%d fast_out=%d fast_cp=%d fill=%d"
-          % (_Q38_GS["step"], _Q38_GS_N, _Q38_GS["full"], _Q38_GS["fast_out"],
-             _Q38_GS["fast_cp"], _Q38_GS["fill"]), flush=True)
+    print(
+        "[Q38-GDN] step=%d per%d full=%d fast_out=%d fast_cp=%d fill=%d"
+        % (
+            _Q38_GS["step"],
+            _Q38_GS_N,
+            _Q38_GS["full"],
+            _Q38_GS["fast_out"],
+            _Q38_GS["fast_cp"],
+            _Q38_GS["fill"],
+        ),
+        flush=True,
+    )
     for k in ("full", "fast_out", "fast_cp", "fill"):
         _Q38_GS[k] = 0
 
@@ -666,9 +667,8 @@ def _q38_step_idx(pc, builder, m, n_spec):
     return idx
 
 
-
 # __Q38_GDN_VERIFY__: 快路径与参考路径逐元素比对（Q38_GDN_VERIFY=N）。
-_Q38_GV_N = int(_q38_os_c.environ.get("Q38_GDN_VERIFY", "0") or 0)
+_Q38_GV_N = int(os.environ.get("Q38_GDN_VERIFY", "0") or 0)
 _Q38_GV = {"n": 0, "bad": 0, "tbad": 0}
 
 
@@ -685,11 +685,17 @@ def _q38_gdn_verify(builder, m, mask_cpu, n_spec, sst_view):
     _Q38_GV["bad"] += bad
     _Q38_GV["tbad"] += tbad
     if bad or tbad:
-        print("[Q38-GDNV] BAD n_spec=%d bad=%d tail_bad=%d shape=%s"
-              % (n_spec, bad, tbad, tuple(sst_view.shape)), flush=True)
+        print(
+            "[Q38-GDNV] BAD n_spec=%d bad=%d tail_bad=%d shape=%s"
+            % (n_spec, bad, tbad, tuple(sst_view.shape)),
+            flush=True,
+        )
     if _Q38_GV["n"] % _Q38_GV_N == 0:
-        print("[Q38-GDNV] checks=%d mismatch=%d tail_bad=%d"
-              % (_Q38_GV["n"], _Q38_GV["bad"], _Q38_GV["tbad"]), flush=True)
+        print(
+            "[Q38-GDNV] checks=%d mismatch=%d tail_bad=%d"
+            % (_Q38_GV["n"], _Q38_GV["bad"], _Q38_GV["tbad"]),
+            flush=True,
+        )
 
 
 def _q38_gather_out(src, index, out):
@@ -699,11 +705,12 @@ def _q38_gather_out(src, index, out):
     try:
         torch.gather(src, 1, index, out=out)
         return True
-    except Exception:                                      # noqa: BLE001
+    except Exception:  # noqa: BLE001
         _Q38_GO_OK[0] = False
         return False
 
-if _q38_os_c.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
+
+if os.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
     _q38_orig_build_c = GDNAttentionMetadataBuilder.build
 
     def _q38_cached_build(
@@ -723,8 +730,8 @@ if _q38_os_c.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
             # 同一 builder 再次出现 => 新的一步，缓存失效
             c["seen"].clear()
             c["meta"] = None
-            c["plan"] = None                              # __Q38_GDN_FASTIDX__
-            _q38_gs_step()                                # __Q38_GDN_FASTIDX__
+            c["plan"] = None  # __Q38_GDN_FASTIDX__
+            _q38_gs_step()  # __Q38_GDN_FASTIDX__
         c["seen"].add(bid)
 
         m = common_attn_metadata
@@ -754,14 +761,12 @@ if _q38_os_c.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
             n_spec = _pc["n"]
             if n_spec == meta0.num_spec_decodes:
                 _q38_mode = self.vllm_config.cache_config.mamba_cache_mode
-                if (_q38_mode in ("all", "none")
-                        and _pc["all"]):
+                if _q38_mode in ("all", "none") and _pc["all"]:
                     # __Q38_FASTBT_NONE__: none/all 模式下 block_table 即
                     # 状态索引表（mamba_get 原样返回），前 n_spec 行连续时
                     # 等价于纯 narrow 切片，零内核零拷贝
                     sst = m.block_table_tensor[:n_spec, : self.num_spec + 1]
-                elif (_q38_mode == "align"
-                        and _pc["all"]):
+                elif _q38_mode == "align" and _pc["all"]:
                     # __Q38_FASTBT__: 稳态全 spec 批，免布尔 gather，
                     # 直接按 seq_lens 计算 align 槽位（等价于
                     # mamba_get_block_table_tensor + [mask] 切片）
@@ -802,14 +807,12 @@ if _q38_os_c.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
                     sst_view[n_spec:].fill_(NULL_BLOCK_ID)
                     self._q38_tail = (bs, n_spec)
                     _Q38_GS["fill"] += 1
-                if _Q38_GV_N:                     # __Q38_GDN_VERIFY__
+                if _Q38_GV_N:  # __Q38_GDN_VERIFY__
                     _q38_gdn_verify(self, m, mask_cpu, n_spec, sst_view)
-                return _q38_dc.replace(
-                    meta0, spec_state_indices_tensor=sst_view
-                )
+                return dataclasses.replace(meta0, spec_state_indices_tensor=sst_view)
 
-        self._q38_tail = None                             # __Q38_GDN_FASTIDX__
-        _Q38_GS["full"] += 1                              # __Q38_GDN_FASTIDX__
+        self._q38_tail = None  # __Q38_GDN_FASTIDX__
+        _Q38_GS["full"] += 1  # __Q38_GDN_FASTIDX__
         meta = _q38_orig_build_c(
             self,
             common_prefix_len,
@@ -832,6 +835,3 @@ if _q38_os_c.environ.get("Q38_GDN_BUILD_CACHE", "1") == "1":
         return meta
 
     GDNAttentionMetadataBuilder.build = _q38_cached_build
-
-
-import os as _q38_os

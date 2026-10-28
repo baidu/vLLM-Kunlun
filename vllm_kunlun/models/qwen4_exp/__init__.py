@@ -12,10 +12,7 @@ from .common.hyperconnection import (
 )
 
 if TYPE_CHECKING:
-    from .nvidia.model import (
-        Qwen4ExpForCausalLM,
-        Qwen4ExpForConditionalGeneration,
-    )
+    from .nvidia.model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
     from .nvidia.mtp import Qwen4ExpMTP
 
 
@@ -25,22 +22,13 @@ def __getattr__(name: str) -> Any:
         "Qwen4ExpForConditionalGeneration",
         "Qwen4ExpMTP",
     }:
-        from vllm.platforms import current_platform
-
-        if current_platform.is_xpu() or current_platform.is_tpu():
-            raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
-        if current_platform.is_rocm():
-            from .amd.model import (
-                Qwen4ExpForCausalLM,
-                Qwen4ExpForConditionalGeneration,
-            )
-            from .amd.mtp import Qwen4ExpMTP
-        else:
-            from .nvidia.model import (
-                Qwen4ExpForCausalLM,
-                Qwen4ExpForConditionalGeneration,
-            )
-            from .nvidia.mtp import Qwen4ExpMTP
+        # The subpackage is still named ``nvidia`` because it is a port of the
+        # reference CUDA implementation; on Kunlun the ops inside it are routed
+        # to kunlun_ops / XSpeedGate. The reference layout also has an ``amd``
+        # variant, which is not ported here. Imported lazily so that merely
+        # registering the architecture does not pull in the decoder stack.
+        from .nvidia.model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
+        from .nvidia.mtp import Qwen4ExpMTP
 
         return {
             "Qwen4ExpForCausalLM": Qwen4ExpForCausalLM,

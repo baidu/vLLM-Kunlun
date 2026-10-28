@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
+import kunlun_ops
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -15,10 +18,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-from vllm_kunlun.v1.sample.q38_partial_topk import wrap_rejection_mask
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+
+from vllm_kunlun.v1.sample.q38_partial_topk import wrap_rejection_mask
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -26,15 +30,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 apply_top_k_top_p = wrap_rejection_mask(apply_top_k_top_p)
 
-import os as _q38_os
-import kunlun_ops  # Q38: native rejection-sampling kernels
-_Q38_RS_KERNEL = _q38_os.environ.get("Q38_RS_KERNEL", "1") == "1"
+_Q38_RS_KERNEL = os.environ.get("Q38_RS_KERNEL", "1") == "1"
 # Q38 全词表 exponential 噪声：torch 的 exponential_（philox4x32_10）在
 # [batch, vocab=248320] fp32 上只有 ~22GB/s（B=32 实测 1442us）。改用已随包发布的
 # xspeedgate_ops.inplace_exponential（同为 Exp(1)，mean/var 1.000）——实测 10.8x（→133us）。
 # 只换 RNG 源、分布等价；seeded 请求仍逐个带 generator（该 op 支持 generator，
 # topk_topp_sampler 早已在用）。Q38_RS_FASTEXP=0 回退 torch.exponential_。
-_Q38_RS_FASTEXP = _q38_os.environ.get("Q38_RS_FASTEXP", "1") == "1"
+_Q38_RS_FASTEXP = os.environ.get("Q38_RS_FASTEXP", "1") == "1"
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = 0
@@ -433,8 +435,11 @@ def rejection_sample(
         if _Q38_RS_KERNEL and not synthetic_mode:
             # Q38: native kernel (ref: 参考实现 rejection_sample)。synthetic 模式
             # kernel 不支持，走原 pytorch 兜底。Q38_RS_KERNEL=0 回退。
-            _bonus_1d = (bonus_token_ids.squeeze(1)
-                         if bonus_token_ids.ndim == 2 else bonus_token_ids)
+            _bonus_1d = (
+                bonus_token_ids.squeeze(1)
+                if bonus_token_ids.ndim == 2
+                else bonus_token_ids
+            )
             kunlun_ops.rejection_greedy_sample(
                 output_token_ids,
                 cu_num_draft_tokens.to(torch.int32),
@@ -489,8 +494,9 @@ def rejection_sample(
     )
 
     if _Q38_RS_KERNEL and not synthetic_mode:
-        _bonus_1d = (bonus_token_ids.squeeze(1)
-                     if bonus_token_ids.ndim == 2 else bonus_token_ids)
+        _bonus_1d = (
+            bonus_token_ids.squeeze(1) if bonus_token_ids.ndim == 2 else bonus_token_ids
+        )
         kunlun_ops.rejection_random_sample(
             output_token_ids,
             cu_num_draft_tokens.to(torch.int32),
@@ -618,8 +624,7 @@ def expand_batch_to_tokens(
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
     if _Q38_RS_KERNEL and x.dtype in (torch.int32, torch.float32):
-        kunlun_ops.expand_tokens(
-            expanded_x, x, cu_num_tokens, replace_from, replace_to)
+        kunlun_ops.expand_tokens(expanded_x, x, cu_num_tokens, replace_from, replace_to)
         return expanded_x
     expand_pytorch(
         expanded_x,
@@ -704,8 +709,11 @@ def sample_recovered_tokens(
         dtype=torch.float32,
         device=device,
     )
-    q.exponential_() if not _Q38_RS_FASTEXP else \
-        torch.ops.xspeedgate_ops.inplace_exponential(q)
+    (
+        q.exponential_()
+        if not _Q38_RS_FASTEXP
+        else torch.ops.xspeedgate_ops.inplace_exponential(q)
+    )
     for i, generator in sampling_metadata.generators.items():
         # Do not generate random numbers for requests with no draft tokens.
         # This can be important for reproducibility.
@@ -971,9 +979,8 @@ def sample_recovered_tokens_pytorch(
 # This override makes MTP verification use those same fused kernels, producing the
 # identical target distribution without a sort. Numerically gated: max L1 2.7e-6,
 # zero argmax mismatch vs the sort path. Graph-external, so no CUDA-graph impact.
-import os as _q38_rs_os
 
-if _q38_rs_os.environ.get("Q38_RS_RENORM", "0") == "1":
+if os.environ.get("Q38_RS_RENORM", "0") == "1":
     _q38_native_compute_probs = compute_probs
 
     def compute_probs(logits, cu_num_draft_tokens, sampling_metadata):  # noqa: F811

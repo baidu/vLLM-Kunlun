@@ -37,10 +37,13 @@ sigmoid 门实现（参数名仍为 ``norm.weight``，权重加载不受影响�
 的 forward_static。
 """
 
+import os
+
 import torch
 from torch import nn
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
-import os as _q38_os
+from vllm_kunlun.models.qwen3_next import Qwen3NextGatedDeltaNet
 
 try:
     import kunlun_ops as _q38_kunlun_ops
@@ -49,11 +52,8 @@ except ImportError:
 
 # Q38 FUSE: 置 Q38_GDN_FUSED=0 回退原始逐算子实现
 _Q38_GDN_FUSED = (
-    _q38_os.environ.get("Q38_GDN_FUSED", "1") == "1" and _q38_kunlun_ops is not None
+    os.environ.get("Q38_GDN_FUSED", "1") == "1" and _q38_kunlun_ops is not None
 )
-
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-from vllm_kunlun.models.qwen3_next import Qwen3NextGatedDeltaNet
 
 
 class SigmoidGatedRMSNorm(nn.Module):
@@ -69,9 +69,7 @@ class SigmoidGatedRMSNorm(nn.Module):
         self.group_size = None
         self.norm_before_gate = True
         self.activation = "sigmoid"
-        self.weight = nn.Parameter(
-            torch.empty(hidden_size, device=device, dtype=dtype)
-        )
+        self.weight = nn.Parameter(torch.empty(hidden_size, device=device, dtype=dtype))
         self.register_parameter("bias", None)
         torch.nn.init.ones_(self.weight)
 
@@ -131,7 +129,6 @@ class KunlunGDNNonInterleaved(Qwen3NextGatedDeltaNet):
         a = a.reshape(n, self.num_v_heads // self.tp_size)
         return query, key, value, z, b, a
 
-
     def forward(self, hidden_states, output):
         # Q38 FUSE: q/k/v 本就是 in_proj_qkvz 输出的前三个连续列块，一次
         # contiguous 切片替代基类的 3 次 reshape 拷贝 + 1 次 cat。
@@ -151,9 +148,7 @@ class KunlunGDNNonInterleaved(Qwen3NextGatedDeltaNet):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        torch.ops.vllm.gdn_attention_core(
-            mixed_qkv, b, a, core_attn_out, self.prefix
-        )
+        torch.ops.vllm.gdn_attention_core(mixed_qkv, b, a, core_attn_out, self.prefix)
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)

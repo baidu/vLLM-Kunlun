@@ -69,9 +69,10 @@ def fused_recurrent_gated_delta_rule(
             f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
             f"Please flatten variable-length inputs before processing."
         )
-    if num_accepted_tokens is not None and os.environ.get(
-        "KUNLUN_SPEC_KERNEL_RECURRENT", "0"
-    ) != "1":
+    if (
+        num_accepted_tokens is not None
+        and os.environ.get("KUNLUN_SPEC_KERNEL_RECURRENT", "0") != "1"
+    ):
         # MTP/spec-decode path: the kunlun fwdv2 kernel has a known writeback
         # column-mapping bug (col 0 <- S_{num_accepted-1} instead of S_0; see
         # 单测报告_fwdv2_spec回写列映射bug.md) plus a value-dependent fp16
@@ -245,6 +246,8 @@ def torch_fused_recurrent_gated_delta_rule(
     # advanced indexing, which OOMs during FULL cudagraph capture.
     from vllm_kunlun.models.qwen4_exp.nvidia.ple_xpu_state import (
         gather_rows as _q38_gather_rows,
+    )
+    from vllm_kunlun.models.qwen4_exp.nvidia.ple_xpu_state import (
         scatter_rows_ as _q38_scatter_rows_,
     )
 
@@ -311,13 +314,26 @@ _q38_xsg_prev = fused_recurrent_gated_delta_rule
 _Q38_FWDV2_XSG = os.environ.get("Q38_FWDV2_XSG", "1") == "1"
 
 
-def _q38_xsg_fwd(q, k, v, g, beta, scale, h0_source, inplace_final_state,
-                 cu_seqlens, h0_indices, num_accepted_tokens,
-                 use_qk_l2norm_in_kernel, is_h0_transposed=True):
+def _q38_xsg_fwd(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    h0_source,
+    inplace_final_state,
+    cu_seqlens,
+    h0_indices,
+    num_accepted_tokens,
+    use_qk_l2norm_in_kernel,
+    is_h0_transposed=True,
+):
     # Mirrors kunlun_ops._xflashinfer_fusion.fused_recurrent_gated_delta_rule_fwdv2
     # but calls the col0-fixed xspeedgate_ops kernel instead.
     import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
-    B, T, H, K, V = *k.shape, v.shape[-1]
+
+    B, T, _H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     o = torch.zeros_like(v)
     if inplace_final_state and h0_source is not None:
@@ -327,19 +343,41 @@ def _q38_xsg_fwd(q, k, v, g, beta, scale, h0_source, inplace_final_state,
             ht_output = q.new_empty(B * T, HV, K, V, dtype=torch.float32)
         else:
             ht_output = q.new_empty(T, HV, K, V, dtype=torch.float32)
-    is_beta_headwise = (beta.ndim == v.ndim)
+    is_beta_headwise = beta.ndim == v.ndim
     torch.ops.xspeedgate_ops.fused_recurrent_gated_delta_rule_fwd(
-        q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous(), beta.contiguous(),
-        o, ht_output, is_beta_headwise, use_qk_l2norm_in_kernel,
-        inplace_final_state, is_h0_transposed, scale, cu_seqlens,
-        num_accepted_tokens, h0_source, h0_indices)
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        o,
+        ht_output,
+        is_beta_headwise,
+        use_qk_l2norm_in_kernel,
+        inplace_final_state,
+        is_h0_transposed,
+        scale,
+        cu_seqlens,
+        num_accepted_tokens,
+        h0_source,
+        h0_indices,
+    )
     return o, ht_output
 
 
 def fused_recurrent_gated_delta_rule(  # noqa: F811
-    q, k, v, g, beta=None, scale=None, initial_state=None,
-    inplace_final_state=True, cu_seqlens=None, ssm_state_indices=None,
-    num_accepted_tokens=None, use_qk_l2norm_in_kernel=False,
+    q,
+    k,
+    v,
+    g,
+    beta=None,
+    scale=None,
+    initial_state=None,
+    inplace_final_state=True,
+    cu_seqlens=None,
+    ssm_state_indices=None,
+    num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False,
 ):
     # Q38 FP16: fwdv2/xsg kernel 在 q=fp16 时要求 g/beta 也为 fp16
     # （host 检查 not support q/ht_output/g dtype）。bf16 部署不受影响。
@@ -348,19 +386,42 @@ def fused_recurrent_gated_delta_rule(  # noqa: F811
             g = g.half()
         if beta is not None and beta.dtype != torch.float16:
             beta = beta.half()
-    if (_Q38_FWDV2_XSG and num_accepted_tokens is not None
-            and cu_seqlens is not None and ssm_state_indices is not None):
+    if (
+        _Q38_FWDV2_XSG
+        and num_accepted_tokens is not None
+        and cu_seqlens is not None
+        and ssm_state_indices is not None
+    ):
         if scale is None:
             scale = k.shape[-1] ** -0.5
         if beta is None:
             beta = torch.ones_like(q[..., 0])
-        return _q38_xsg_fwd(q, k, v, g, beta, scale, initial_state,
-                            inplace_final_state, cu_seqlens, ssm_state_indices,
-                            num_accepted_tokens, use_qk_l2norm_in_kernel,
-                            is_h0_transposed=True)
+        return _q38_xsg_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            inplace_final_state,
+            cu_seqlens,
+            ssm_state_indices,
+            num_accepted_tokens,
+            use_qk_l2norm_in_kernel,
+            is_h0_transposed=True,
+        )
     return _q38_xsg_prev(
-        q, k, v, g, beta=beta, scale=scale, initial_state=initial_state,
-        inplace_final_state=inplace_final_state, cu_seqlens=cu_seqlens,
+        q,
+        k,
+        v,
+        g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        inplace_final_state=inplace_final_state,
+        cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )

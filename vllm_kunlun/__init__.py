@@ -17,10 +17,7 @@ import os
 os.environ.setdefault("XMLIR_FORCE_USE_XPU_GRAPH", "1")
 
 from .registration import bootstrap  # noqa: E402
-from .registration.import_hooks import (  # noqa: E402
-    dispatch_hooks,
-    install_import_hook,
-)
+from .registration.import_hooks import dispatch_hooks, install_import_hook  # noqa: E402
 
 # Platform discovery can call register() more than once in the same process,
 # including re-entrantly while the first call is importing vLLM modules.

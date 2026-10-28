@@ -8,11 +8,9 @@ from itertools import islice
 
 import torch
 from torch import nn
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
-from ..compat import is_model_fused_shared_expert_compatible
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -42,9 +40,9 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
 )
-from vllm.model_executor.models.qwen3_next import (
-    Qwen3NextMLP,
-)
+from vllm.model_executor.models.qwen3_next import Qwen3NextMLP
+
+from ..compat import is_model_fused_shared_expert_compatible
 
 # Q38 XPU PORT: 注意力与 MoE 块改用 vllm_kunlun 的 qwen3_next 实现。
 # 原因：上游 vllm/model_executor/models/qwen3_next.py 的 SparseMoeBlock 走
@@ -62,6 +60,7 @@ except ImportError:  # 非昆仑环境保持上游行为
         Qwen3NextAttention,
         Qwen3NextSparseMoeBlock,
     )
+
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionTransformer,
     Qwen3VLDummyInputsBuilder,
@@ -82,18 +81,16 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
-from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
+
+from vllm_kunlun.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from ..compat import (
     MambaStateCopyFuncsByType,
     maybe_fuse_shared_experts,
     short_conv_state_shape,
 )
-
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -107,6 +104,7 @@ def _gdn_needs_output_arg(cls: type) -> bool:
     import inspect
 
     return "output" in inspect.signature(cls.forward).parameters
+
 
 def _qsa_disabled() -> bool:
     """Q38 XPU PORT: 是否禁用 QSA（稀疏 indexer 注意力）。
@@ -258,9 +256,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             # 权重布局同为 in_proj_qkvz / in_proj_ba，可直接对上 packed_modules_mapping。
             kunlun_gdn = None
             try:
-                from .gdn_noninterleaved import (
-                    KunlunGDNNonInterleaved as kunlun_gdn,
-                )
+                from .gdn_noninterleaved import KunlunGDNNonInterleaved as kunlun_gdn
             except ImportError:
                 pass
             if kunlun_gdn is not None:

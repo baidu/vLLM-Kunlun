@@ -35,7 +35,6 @@ import functools
 import logging
 from types import ModuleType
 
-
 # --- vllm.v1.core.single_type_kv_cache_manager: 补 _allocated_block_reqs ----
 
 
@@ -127,9 +126,7 @@ def apply_speculative_config(module: ModuleType) -> None:
             text_config = getattr(hf_config, "text_config", None)
             n_predict = getattr(text_config, "mtp_num_hidden_layers", None) or 1
             hf_config.model_type = "qwen4_exp_mtp"
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["Qwen4ExpMTP"]}
-            )
+            hf_config.update({"n_predict": n_predict, "architectures": ["Qwen4ExpMTP"]})
             logging.getLogger("vllm_kunlun").info(
                 "[KunlunPlugin] qwen4_exp MTP draft: architectures -> "
                 "['Qwen4ExpMTP'], n_predict=%s",
@@ -306,6 +303,30 @@ def apply_ssm_dtype_config(module: ModuleType) -> None:
     logger.info("[KunlunPlugin] registered Qwen4Exp mamba_ssm_dtype config hook")
 
 
+# --- vllm.v1.worker.gpu_model_runner: 两处补丁合成一个 hook ------------------
+#
+# ``import_hooks.register_hook`` 一个 target 只接受一次注册（重复注册直接
+# ValueError），而 runner 这个 target 既有本模块的两处补丁，上游
+# ``compat_patches`` 里也已经有一处（tolerant ``bind_kv_cache``）。
+# 下面的 ``extend_hooks()`` 负责按 target 合并，而不是在表里追加。
+
+
+def _compose(applied_a, apply_a, applied_b, apply_b):
+    """把同一个 target 上的两对补丁合成一对，各自仍然幂等、按序施加。"""
+
+    def applied(module):
+        return applied_a(module) and applied_b(module)
+
+    def apply(module):
+        # 任一处在 target 还没执行完模块体时会自行早退，由下一轮 dispatch 重试。
+        if not applied_a(module):
+            apply_a(module)
+        if not applied_b(module):
+            apply_b(module)
+
+    return applied, apply
+
+
 # (target module, is_applied, apply_patch)，由 registration.compat_patches 汇总。
 QWEN4_EXP_HOOKS = (
     (
@@ -335,3 +356,26 @@ QWEN4_EXP_HOOKS = (
         apply_ssm_dtype_config,
     ),
 )
+
+
+def extend_hooks(hooks):
+    """把 ``QWEN4_EXP_HOOKS`` 并进一张现成的 hook 表。
+
+    ``register_hook`` 一个 target 只允许注册一次，所以落在表里已有 target 上的
+    钩子会与原有那一对合成（见 ``_compose``），而不是追加成第二条；新 target
+    才追加。同一 target 内的施加顺序为：原表在前，本模块在后。
+    """
+    merged = list(hooks)
+    index = {entry[0]: i for i, entry in enumerate(merged)}
+    for target, applied, apply in QWEN4_EXP_HOOKS:
+        if target in index:
+            position = index[target]
+            _, prev_applied, prev_apply = merged[position]
+            merged[position] = (
+                target,
+                *_compose(prev_applied, prev_apply, applied, apply),
+            )
+        else:
+            index[target] = len(merged)
+            merged.append((target, applied, apply))
+    return tuple(merged)

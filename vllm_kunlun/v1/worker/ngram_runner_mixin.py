@@ -34,7 +34,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from vllm.distributed import get_pp_group
 
 

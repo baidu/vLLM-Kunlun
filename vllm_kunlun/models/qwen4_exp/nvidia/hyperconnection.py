@@ -22,19 +22,6 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
-import torch
-from torch import nn
-
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-)
-from vllm.model_executor.models.utils import maybe_prefix
-
-from ..common.hyperconnection import (
-    GroupedGemmaRMSNorm,
-    HyperConnectionConfig,
-)
 # Q38 XPU PORT: HC 算子默认走 XSpeedGate 融合实现（ops/hc_xsg.py），算子不在包里
 # 时它自己退回 ops/hc_torch.py 的纯 torch 兜底。
 # 原因：上游 ops/hc.py 是 triton kernel，昆仑 P800 上 triton 可以编译但
@@ -42,6 +29,16 @@ from ..common.hyperconnection import (
 # 表现为 forward 阶段崩在 _grouped_gemma_rmsnorm_kernel。
 # 置 Q38_XSG_HC=0 强制走纯 torch；置 Q38_TORCH_HC=0 回到 triton 路径。
 import os as _q38_os  # noqa: E402
+
+import torch
+from torch import nn
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
+from vllm.model_executor.models.utils import maybe_prefix
+
+from ..common.hyperconnection import GroupedGemmaRMSNorm, HyperConnectionConfig
 
 if _q38_os.environ.get("Q38_TORCH_HC", "1") == "1":
     from .ops.hc_xsg import (

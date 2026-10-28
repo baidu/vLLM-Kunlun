@@ -18,11 +18,9 @@ from collections.abc import Iterable
 import regex as re
 import torch
 from torch import nn
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
-from ..compat import is_model_fused_shared_expert_compatible
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -43,11 +41,9 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from ..compat import maybe_fuse_shared_experts
-from vllm_kunlun.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
+from vllm_kunlun.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
+from ..compat import is_model_fused_shared_expert_compatible, maybe_fuse_shared_experts
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .model import (
