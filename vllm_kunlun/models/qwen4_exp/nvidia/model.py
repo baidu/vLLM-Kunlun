@@ -107,21 +107,27 @@ def _gdn_needs_output_arg(cls: type) -> bool:
 
 
 def _qsa_disabled() -> bool:
-    """Q38 XPU PORT: 是否禁用 QSA（稀疏 indexer 注意力）。
+    """Q38 XPU PORT: 是否禁用 QSA（稀疏 indexer 注意力）。**默认禁用。**
 
     昆仑 P800 上既没有 FlashAttention varlen kernel，也没有 QSA 的 triton 稀疏实现，
     构造 Qwen4ExpQSAFlashAttentionImpl 会直接抛
-    ``NotImplementedError: Qwen4Exp QSA requires FlashAttention``。
-    置 ``Q38_DISABLE_QSA=1`` 后 full_attention 层退化为上游自带的 Qwen3Next dense
-    注意力分支（上游本就用 ``indexer_n_heads is None`` 走这条路）。
+    ``NotImplementedError: Qwen4Exp QSA requires FlashAttention``。禁用后
+    full_attention 层退化为上游自带的 Qwen3Next dense 注意力分支（上游本就用
+    ``indexer_n_heads is None`` 走这条路）。
+
+    默认禁用的原因：本移植的稀疏路径走 ``kunlun_ops.msa_sparse_attention``，该
+    算子的 topk 实测上限是 200（见 ``ops/qsa_kunlun.py`` 的 ``_MSA_TOPK_LIMIT``），
+    而模型配置的稀疏预算是 2048，上下文一过 200 token 就必然抛
+    ``NotImplementedError``。交付配置因此一直跑 dense；要试稀疏路径需显式置
+    ``Q38_DISABLE_QSA=0``，并把上下文压到算子上限以内。
 
     语义影响：QSA 只在序列长度超过 ``indexer_budget``(2048) 时才做 token 选择，
     因此在 ``max_model_len <= 2048`` 时 dense 与稀疏等价；更长上下文下 dense 会
-    读取全部 KV，属于近似实现，仅用于功能验证。
+    读取全部 KV，属于近似实现。
     """
     import os
 
-    return os.environ.get("Q38_DISABLE_QSA", "0") == "1"
+    return os.environ.get("Q38_DISABLE_QSA", "1") == "1"
 
 
 def without_modelopt_fp4(

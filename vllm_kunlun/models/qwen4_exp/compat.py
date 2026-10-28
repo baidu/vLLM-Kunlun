@@ -9,31 +9,37 @@ qwen4_exp 是跟着上游一个尚未合入的 PR 一起下来的模型，它引
 * ``is_model_fused_shared_expert_compatible`` —— 上游
   ``vllm.model_executor.layers.fused_moe.utils``
 * ``maybe_fuse_shared_experts`` —— 上游 ``vllm.model_executor.models.utils``
-* ``MambaStateCopyFuncs`` / ``MambaStateCopyFuncsByType`` —— 上游
-  ``vllm.model_executor.layers.mamba.mamba_utils``
 * ``short_conv_state_shape`` —— 上游同名 classmethod 增加了 ``num_spec``
   预留长度；随包版本没有这个入参，这里按上游公式重算，卷积状态的
   DS/SD 朝向仍然复用 vllm 的 ``_orient_conv_shape``，保证与随包实现一致。
+
+``MambaStateCopyFunc`` / ``MambaStateCopyFuncs`` / ``MambaStateCopyFuncsByType``
+随包 vLLM 0.25.1 已经有了（``vllm/model_executor/layers/mamba/mamba_utils.py``），
+这里只做转发、不重新声明——同名但不同一的 TypeAlias 会让人误以为随包版本缺
+这几个名字。
 
 一旦随包 vLLM 升级到带这些定义的版本，本模块应删除，模型侧改回直接 import
 上游位置。
 """
 
 from collections.abc import Iterable, Iterator
-from typing import TypeAlias
 
 import torch
 from vllm.distributed import divide
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
+    MambaStateCopyFuncs,
+    MambaStateCopyFuncsByType,
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-MambaStateCopyFuncs: TypeAlias = tuple[MambaStateCopyFunc, ...]
-MambaStateCopyFuncsByType: TypeAlias = dict[
-    MambaAttentionBackendEnum, MambaStateCopyFuncs
+__all__ = [
+    "MambaAttentionBackendEnum",
+    "MambaStateCopyFunc",
+    "MambaStateCopyFuncs",
+    "MambaStateCopyFuncsByType",
 ]
 
 
