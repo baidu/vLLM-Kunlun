@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MLAAttentionS
 
 from vllm_kunlun.v1.kv_cache_layout import KVCacheLayout
 from vllm_kunlun.v1.kv_cache_specs import CircularBufferSpec
+from vllm_kunlun.v1.worker.gpu._kernels import segment_ids
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -585,7 +586,16 @@ def _build_qsa_metadata_torch(
             k_work_metadata_buffer.shape[0],
             device=k_work_metadata_buffer.device,
         )
-        requests = torch.searchsorted(k_start_loc[1:], work, right=True)
+        # Device-side equivalent of
+        # ``searchsorted(k_start_loc[1:], work, right=True)``.
+        # torch.searchsorted has no Kunlun XPU kernel and silently falls back
+        # to CPU, which costs a host sync plus a D2H/H2D round trip of the
+        # whole work array on every compressed-side cache build.
+        # ``query_lens.shape[0] + 1`` segments, not ``query_lens.shape[0]``:
+        # the final boundary ``k_start_loc[-1]`` has to stay in so that rows
+        # past the last unit of work still land on ``query_lens.shape[0]``,
+        # matching searchsorted exactly.
+        requests = segment_ids(k_start_loc, query_lens.shape[0] + 1, work.shape[0])
         active = work < k_start_loc[-1]
         work_in_request = (
             work - k_start_loc[requests.clamp_max(query_lens.shape[0] - 1)]
