@@ -39,6 +39,7 @@ from vllm_kunlun.v1.attention.backends.ple_short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
+from vllm_kunlun.v1.worker.gpu._kernels import segment_ids
 
 from ..common.ple import copy_ple_embedding_shard_
 from ..compat import short_conv_state_shape
@@ -379,8 +380,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         positions = self.positions_buffer[:num_tokens]
         packed = self.padded_buffer[:num_reqs, :num_tokens]
         packed.fill_(self.eos_token_id)
-        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
-        request_indices.clamp_(max=num_reqs - 1)
+        # Not torch.searchsorted: it has no Kunlun XPU kernel and silently
+        # falls back to CPU, costing a host sync plus a D2H/H2D round trip of
+        # the whole position array -- here once per PLE layer per forward.
+        # segment_ids() is the device-side equivalent and is already bounded by
+        # num_reqs - 1, so the clamp_() this replaces is unnecessary.
+        request_indices = segment_ids(query_start_loc, num_reqs, num_tokens)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
@@ -840,7 +845,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+        # Device-side equivalent of
+        # ``searchsorted(q_starts[1:], positions, right=True)``; see the note
+        # on the PLE embedding path above for why searchsorted is avoided.
+        req_indices = segment_ids(q_starts, num_prefills, num_prefill_tokens)
         col_indices = positions - q_starts[req_indices]
         conv_acc = torch.zeros(
             (num_prefill_tokens, hidden_size), dtype=x_p.dtype, device=x_p.device
@@ -951,7 +959,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         )
         # Route graph-padded token rows to the discarded dummy request so that
         # they cannot overwrite real packed data.
-        req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+        # ``num_reqs + 1`` segments, not ``num_reqs``: the boundary at
+        # ``q_starts[num_reqs] == total_real_tokens`` has to stay in, so that
+        # padded rows past it still land on ``num_reqs`` and are caught by the
+        # ``req_indices < num_reqs`` test below.
+        req_indices = segment_ids(q_starts, num_reqs + 1, x_spec.size(0))
         valid_tokens = (positions < total_real_tokens) & (req_indices < num_reqs)
         clamped_req_indices = req_indices.clamp_max(max(num_reqs - 1, 0))
         col_indices = (positions - q_starts[clamped_req_indices]).clamp_(0, max_len - 1)
