@@ -35,6 +35,13 @@ MODULE_MAPPINGS: dict[str, str] = {
     "vllm.v1.attention.ops.merge_attn_states": (
         "vllm_kunlun.ops.attention.merge_attn_states"
     ),
+    # The mamba "align" cache mode -- reached whenever prefix caching is on for
+    # a hybrid model -- drives its state copies from Triton kernels that fail
+    # on Kunlun with CUDA_ERROR_NOT_SUPPORTED, so the whole module is replaced
+    # rather than only the two symbols the ``_V2_PATCHES`` entry in
+    # ``compat_patches`` covers.  The replacement keeps upstream's export
+    # surface and reimplements the align postprocess as a device-side plan.
+    "vllm.v1.worker.mamba_utils": "vllm_kunlun.v1.worker.mamba_utils",
 }
 
 
