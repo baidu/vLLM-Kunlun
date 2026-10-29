@@ -43,10 +43,22 @@ class FusedRecurrentFunction(torch.autograd.Function):
                 state_count, value_heads, key_dim, value_dim, dtype=torch.float32
             )
         torch.ops.xspeedgate_ops.fused_recurrent_gated_delta_rule_fwd(
-            q, k, v, g, beta, o, ht_output,
-            beta.ndim == v.ndim, use_qk_l2norm_in_kernel,
-            inplace_final_state, True, scale, cu_seqlens,
-            num_accepted_tokens, initial_state, ssm_state_indices,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            o,
+            ht_output,
+            beta.ndim == v.ndim,
+            use_qk_l2norm_in_kernel,
+            inplace_final_state,
+            True,
+            scale,
+            cu_seqlens,
+            num_accepted_tokens,
+            initial_state,
+            ssm_state_indices,
         )
         return o, (initial_state if inplace_final_state else ht_output)
 

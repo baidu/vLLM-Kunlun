@@ -60,9 +60,7 @@ def _initialize_from_forward_context(original):
         original(self, *args, **kwargs)
         if initialized and hasattr(self, "_kunlun_align_buffers"):
             return
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            is_conv_state_dim_first,
-        )
+        from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
         elem_sizes = self.state_elem_sizes.long()
         rows = self.state_dim_row_count
@@ -81,8 +79,12 @@ def _initialize_from_forward_context(original):
         self._kunlun_postprocess_metadata = elem_sizes.int(), rows, row_strides
         capacity = self.num_accepted_tokens_out.numel()
         device = self.num_accepted_tokens_out.device
-        self._kunlun_align_rows = torch.arange(capacity, dtype=torch.int32, device=device)
-        self._kunlun_align_buffers = torch.empty((4, capacity), dtype=torch.int32, device=device)
+        self._kunlun_align_rows = torch.arange(
+            capacity, dtype=torch.int32, device=device
+        )
+        self._kunlun_align_buffers = torch.empty(
+            (4, capacity), dtype=torch.int32, device=device
+        )
         # padding 请求写入额外槽位，避免覆盖有效 slot 0。
         self._kunlun_align_accepted_staging = torch.empty(
             capacity + 1, dtype=torch.int32, device=device

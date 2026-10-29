@@ -5,6 +5,7 @@
 import numpy as np
 import torch
 import vllm.v1.worker.gpu.sample.sampler as _up
+
 from vllm_kunlun.v1.sample.ops.topk_topp_sampler import flashinfer_sample
 
 _original_init = _up.Sampler.__init__

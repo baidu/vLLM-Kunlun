@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Mamba registration, cached layouts and request-slot adaptation on CPU."""
+
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -17,7 +19,7 @@ def mamba(load_kunlun_override, stub_module_tree, native_ops):
         "vllm.model_executor.layers.mamba.mamba_utils",
         is_conv_state_dim_first=lambda: False,
     )
-    (module, upstream) = load_kunlun_override(
+    module, upstream = load_kunlun_override(
         "v1/worker/mamba_utils.py",
         "vllm.v1.worker.mamba_utils",
         MambaSpecDecodeGPUContext=Context,
@@ -46,7 +48,7 @@ def make_context(mamba, capacity=8):
 
 
 def test_real_module_registers_existing_entry_points_once(mamba):
-    (module, upstream) = (mamba.module, mamba.upstream)
+    module, upstream = (mamba.module, mamba.upstream)
     context = upstream.MambaSpecDecodeGPUContext
     initializer = context.initialize_from_forward_context
     assert (
@@ -67,7 +69,7 @@ def test_real_module_registers_existing_entry_points_once(mamba):
 def test_layout_cache_preserves_original_metadata_and_rebuilds(mamba, dim_first):
     mamba.layout.is_conv_state_dim_first = lambda: dim_first
     context = make_context(mamba)
-    (pre, post) = (
+    pre, post = (
         context._kunlun_precopy_metadata,
         context._kunlun_postprocess_metadata,
     )
@@ -110,7 +112,7 @@ def test_preprocess_uses_existing_operator_and_preserves_buffers(mamba, native_o
 def test_precopy_uses_cached_metadata_and_active_mapping(mamba, native_ops):
     context = make_context(mamba)
     mapping = torch.tensor([6, 0, -1, -1], dtype=torch.int32)
-    (state, source, bias) = [torch.zeros(8, dtype=torch.int32) for _ in range(3)]
+    state, source, bias = [torch.zeros(8, dtype=torch.int32) for _ in range(3)]
     native_ops.precopy_mamba_align_fused_kernel = Mock()
     context.run_fused_precopy(3, state, source, bias, mapping)
     native_ops.precopy_mamba_align_fused_kernel.assert_called_once()
@@ -147,7 +149,7 @@ def test_postprocess_packs_slots_and_writes_only_valid_results(
     accepted = torch.arange(10, 18, dtype=torch.int32)
     state = torch.arange(20, 28, dtype=torch.int32)
     computed = torch.arange(30, 38, dtype=torch.int32)
-    (before, old_state, old_computed) = (
+    before, old_state, old_computed = (
         accepted.clone(),
         state.clone(),
         computed.clone(),
