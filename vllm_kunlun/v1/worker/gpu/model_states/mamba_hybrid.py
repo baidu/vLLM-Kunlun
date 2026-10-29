@@ -12,7 +12,7 @@ Upstream has three Triton launch sites in this module:
 Align mode requires prefix caching (``models/config.py:596-600`` forces
 ``mamba_cache_mode="none"`` otherwise, which leaves ``_align_mode`` False at
 ``mamba_hybrid.py:86``), so only the scatter kernel is live in a
-prefix-caching-off configuration. It is replaced with a torch-native scatter.
+prefix-caching-off configuration. It is replaced with an XSpeedGate scatter.
 
 We patch the module-level *kernel object* rather than the method that launches
 it: ``MambaHybridModelState.postprocess_state`` is defined in the upstream
@@ -24,13 +24,27 @@ and the align branch -- completely untouched.
 
 import logging
 
+import torch
 import vllm.v1.worker.gpu.model_states.mamba_hybrid as _up
 
-from vllm_kunlun.v1.worker.gpu._kernels import TorchKernel, scatter_num_accepted
+import vllm_kunlun.v1.worker.mamba_utils as _kunlun_mamba_utils
+from vllm_kunlun.v1.worker.gpu._kernels import TorchKernel
 
 logger = logging.getLogger("vllm_kunlun")
 
-_up._scatter_num_accepted_kernel = TorchKernel(scatter_num_accepted)
+
+def _scatter_num_accepted(idx_mapping, num_sampled, num_accepted) -> None:
+    if idx_mapping.numel() == 0:
+        return
+    torch.ops.xspeedgate_ops.scatter_num_accepted_kernel(
+        idx_mapping, num_sampled, num_accepted
+    )
+
+
+_up._scatter_num_accepted_kernel = TorchKernel(_scatter_num_accepted)
+_up.preprocess_mamba_align_fused_kernel = (
+    _kunlun_mamba_utils._up.preprocess_mamba_align_fused_kernel
+)
 
 # ``MambaHybridAttnMetadata.get_extra_attn_kwargs`` (:47-64) decides whether to
 # forward ``num_accepted_tokens`` / ``num_decode_draft_tokens_cpu`` by doing an
@@ -43,20 +57,30 @@ _up._scatter_num_accepted_kernel = TorchKernel(scatter_num_accepted)
 # vllm_kunlun/models/qwen3_next.py). If that ordering ever inverts the isinstance
 # check silently fails and the spec-decode kwargs are dropped -- wrong results,
 # no error. Bind it explicitly so the check is order-independent.
-try:
-    from vllm_kunlun.v1.attention.backends.gdn_attn import (
-        GDNAttentionMetadataBuilder as _KunlunGDNBuilder,
-    )
+# isort: off
+from vllm_kunlun.v1.attention.backends.gdn_attn import (  # noqa: E402
+    GDNAttentionMetadataBuilder as _KunlunGDNBuilder,
+)
 
-    _up.GDNAttentionMetadataBuilder = _KunlunGDNBuilder
-except Exception:
-    logger.warning(
-        "[KunlunPlugin] could not bind the Kunlun GDN metadata builder into "
-        "mamba_hybrid; spec-decode extra attn kwargs may be dropped",
-        exc_info=True,
-    )
+# isort: on
+
+# This binding is correctness-critical: without it the upstream isinstance check
+# drops speculative-decode metadata. Let import-hook dispatch report and retry
+# an installation failure instead of continuing with potentially wrong results.
+_up.GDNAttentionMetadataBuilder = _KunlunGDNBuilder
 
 logger.info(
     "[KunlunPlugin] V2 MambaHybridModelState patched "
-    "(torch-native scatter_num_accepted)"
+    "(XSpeedGate scatter_num_accepted and mamba align)"
 )
+
+# Request slots can be reused in cache mode "none" as well as "align".
+_original_add_request = _up.MambaHybridModelState.add_request
+
+
+def _add_request(self, req_index, new_req_data):
+    _original_add_request(self, req_index, new_req_data)
+    self.num_accepted_tokens_gpu[req_index] = 1
+
+
+_up.MambaHybridModelState.add_request = _add_request
