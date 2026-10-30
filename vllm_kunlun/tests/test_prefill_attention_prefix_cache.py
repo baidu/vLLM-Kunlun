@@ -18,7 +18,6 @@ from dataclasses import asdict, dataclass
 import torch
 
 try:
-    import cocopod  # noqa: F401
     import kunlun_ops
 except Exception as exc:  # pragma: no cover - diagnostic script
     print(f"[ERROR] failed to import kunlun_ops: {exc}", file=sys.stderr)
