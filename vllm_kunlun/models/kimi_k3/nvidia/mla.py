@@ -32,16 +32,25 @@ Out of scope (extension points, not wired here): prefill context parallelism
 import math
 from typing import TYPE_CHECKING, cast
 
+# [KUNLUN] NV-only fused kernels are unavailable on P800. Call sites below are
+# replaced by kunlun_ops / torch.ops.xspeedgate_ops (bf16) or raise
+# NotImplementedError (fp8). Imports commented out so module load does not pull
+# in CUDA-only code.
+# from vllm.models.common.ops import fused_q_kv_rmsnorm
+# from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
+#     fused_mla_decode_q_concat_kv_cache_insert,
+#     fused_mla_key_concat_ds_mla_insert,
+#     fused_mla_key_concat_kv_cache_insert,
+#     fused_mla_kv_concat,
+#     fused_mla_kv_concat_quant_fp8,
+#     fused_mla_qkv_quant_kv_cache_fp8_insert,
+# )
+import kunlun_ops  # [KUNLUN] KLX attention + fused cache-insert custom ops
 import torch
 from torch import nn
-
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import (
-    CacheConfig,
-    VllmConfig,
-    get_current_vllm_config,
-)
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -70,32 +79,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.utils import replace_parameter
-# [KUNLUN] NV-only fused kernels are unavailable on P800. Call sites below are
-# replaced by kunlun_ops / torch.ops.xspeedgate_ops (bf16) or raise
-# NotImplementedError (fp8). Imports commented out so module load does not pull
-# in CUDA-only code.
-# from vllm.models.common.ops import fused_q_kv_rmsnorm
-# from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
-#     fused_mla_decode_q_concat_kv_cache_insert,
-#     fused_mla_key_concat_ds_mla_insert,
-#     fused_mla_key_concat_kv_cache_insert,
-#     fused_mla_kv_concat,
-#     fused_mla_kv_concat_quant_fp8,
-#     fused_mla_qkv_quant_kv_cache_fp8_insert,
-# )
-import kunlun_ops  # [KUNLUN] KLX attention + fused cache-insert custom ops
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
-from vllm.utils.torch_utils import (
-    is_quantized_kv_cache,
-    kv_cache_dtype_str_to_dtype,
-)
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionType,
-    MLAAttentionImpl,
-)
+from vllm.utils.torch_utils import is_quantized_kv_cache, kv_cache_dtype_str_to_dtype
+from vllm.v1.attention.backend import AttentionBackend, AttentionType, MLAAttentionImpl
 from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
 from vllm.v1.attention.ops.dcp_utils import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -436,9 +424,13 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # (L, N, V) -> (N, L, V)
         # [KUNLUN] .contiguous(): XPU torch.bmm rejects the non-contiguous
         # transposed/permuted absorbed-weight views.
-        replace_parameter(self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True)
+        replace_parameter(
+            self, "W_UV", W_UV.transpose(0, 1).contiguous(), prefer_copy=True
+        )
         # (L, N, P) -> (N, P, L)
-        replace_parameter(self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True)
+        replace_parameter(
+            self, "W_UK_T", W_UK.permute(1, 2, 0).contiguous(), prefer_copy=True
+        )
 
         quant_method = (
             self.quant_config.get_quant_method(self, prefix=self.layer_name)

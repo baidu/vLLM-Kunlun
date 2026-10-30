@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger

@@ -16,7 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-kunlun project.
 
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -320,19 +320,20 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // weight_quant.num_bits
         self.strategy = weight_quant.strategy
-        assert self.strategy in ("group", "channel"), (
-            f"Unsupported strategy: {self.strategy}, expected 'group' or 'channel'"
-        )
+        assert self.strategy in (
+            "group",
+            "channel",
+        ), f"Unsupported strategy: {self.strategy}, expected 'group' or 'channel'"
         self.group_size = weight_quant.group_size if self.strategy == "group" else -1
-        assert weight_quant.actorder != "group", (
-            "grouped actorder isn't supported by this kernel"
-        )
-        assert weight_quant.symmetric, (
-            "Only symmetric quantization is supported for MoE"
-        )
-        assert self.num_bits in WNA16_SUPPORTED_BITS, (
-            f"Unsupported num_bits: {self.num_bits}, expected {WNA16_SUPPORTED_BITS}"
-        )
+        assert (
+            weight_quant.actorder != "group"
+        ), "grouped actorder isn't supported by this kernel"
+        assert (
+            weight_quant.symmetric
+        ), "Only symmetric quantization is supported for MoE"
+        assert (
+            self.num_bits in WNA16_SUPPORTED_BITS
+        ), f"Unsupported num_bits: {self.num_bits}, expected {WNA16_SUPPORTED_BITS}"
         # We skip the parent __init__ (it selects a GPU marlin/flashinfer
         # backend via an oracle and asserts group-only). Newer vllm's inherited
         # create_weights / get_weight_shape need these attributes explicitly.
@@ -342,7 +343,6 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         self.symmetric = weight_quant.symmetric
         self.actorder = weight_quant.actorder
         self.is_transposed = True
-
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Preprocess loaded weights for ``ops.fused_moe_ct_w4a16``.
@@ -465,9 +465,11 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
             # Spread them round-robin by pair index: the total row count stays
             # M*topk while per-expert row counts stay close to the TP case.
             n_local = layer.w13_weight_packed.shape[0]
-            filler = torch.arange(
-                local.numel(), device=local.device, dtype=local.dtype
-            ).remainder_(n_local).view_as(local)
+            filler = (
+                torch.arange(local.numel(), device=local.device, dtype=local.dtype)
+                .remainder_(n_local)
+                .view_as(local)
+            )
             ids = torch.where(keep, local, filler)
         return ops.moe_ct_w4a16_experts(
             hidden_states=x,
@@ -535,9 +537,9 @@ class KunlunCompressedTensorsW4A8Int8MoEMethod(KunlunCompressedTensorsWNA16MoEMe
     ):
         super().__init__(weight_quant, input_quant, moe, layer_name)
         assert input_quant is not None, "W4A8 needs input_activations"
-        assert input_quant.num_bits == 8, (
-            f"Unsupported activation bits: {input_quant.num_bits}, expected 8"
-        )
+        assert (
+            input_quant.num_bits == 8
+        ), f"Unsupported activation bits: {input_quant.num_bits}, expected 8"
         assert input_quant.dynamic, "only dynamic activation quantization"
         assert input_quant.strategy == "token", (
             f"Unsupported activation strategy: {input_quant.strategy}, "
@@ -714,9 +716,7 @@ def _kunlun_experts_cls():
                 # per-expert row count close to the non-EP case.
                 n_local = w1.shape[0]
                 filler = (
-                    torch.arange(
-                        local.numel(), device=local.device, dtype=local.dtype
-                    )
+                    torch.arange(local.numel(), device=local.device, dtype=local.dtype)
                     .remainder_(n_local)
                     .view_as(local)
                 )
@@ -890,12 +890,13 @@ def _kunlun_batched_experts_cls():
             expert_tokens_meta,
             apply_router_weight_on_input,
         ):
-            assert expert_tokens_meta is not None, (
-                "batched experts need expert_num_tokens from the dispatch"
-            )
-            assert hidden_states.ndim == 3, (
-                "batched experts expect [num_local_experts, tokens, K], got %s"
-                % (tuple(hidden_states.shape),)
+            assert (
+                expert_tokens_meta is not None
+            ), "batched experts need expert_num_tokens from the dispatch"
+            assert (
+                hidden_states.ndim == 3
+            ), "batched experts expect [num_local_experts, tokens, K], got %s" % (
+                tuple(hidden_states.shape),
             )
             masked_m = expert_tokens_meta.expert_num_tokens
 
@@ -959,4 +960,3 @@ def _kunlun_batched_experts_cls():
 
     _KUNLUN_BATCHED_EXPERTS_CLS = KunlunW4A16BatchedExperts
     return _KUNLUN_BATCHED_EXPERTS_CLS
-

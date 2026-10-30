@@ -30,7 +30,6 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 from vllm.utils.torch_utils import async_tensor_h2d
 

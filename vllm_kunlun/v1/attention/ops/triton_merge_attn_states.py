@@ -28,4 +28,6 @@ def mask_empty_context(
         context_start_loc: Chunk context cumulative offsets,
             shape [num_reqs + 1]; an empty chunk has a zero-length span.
     """
-    torch.ops.xspeedgate_ops.mask_empty_context(lse, output, query_start_loc, context_start_loc)
+    torch.ops.xspeedgate_ops.mask_empty_context(
+        lse, output, query_start_loc, context_start_loc
+    )

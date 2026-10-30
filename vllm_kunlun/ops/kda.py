@@ -32,7 +32,6 @@ Recurrence ported from
 
 import kunlun_ops
 import torch
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -257,9 +256,7 @@ def causal_conv1d_update(
         # internally contiguous; gathering on the transposed view instead would
         # reorder bytes into a different convention than the prefill writes.
         native = (
-            conv_state
-            if conv_state.stride(-1) == 1
-            else conv_state.transpose(-1, -2)
+            conv_state if conv_state.stride(-1) == 1 else conv_state.transpose(-1, -2)
         )
         # Padded decode lanes carry NULL_BLOCK_ID (0), a block the pool never
         # hands out, so packing them along with the real slots only scribbles on
@@ -332,7 +329,9 @@ def gather_initial_states(
     Per-slot basic indexing: ``state.index_select`` copies the whole paged cache
     on XPU (see fused_recurrent_kda_packed_decode).
     """
-    return torch.ops.xspeedgate_ops.gather_initial_states(state, indices, has_initial_state)
+    return torch.ops.xspeedgate_ops.gather_initial_states(
+        state, indices, has_initial_state
+    )
 
 
 def prepare_chunk_indices(
@@ -556,12 +555,12 @@ def chunk_kda_fwd_intra(
         # triangle is masked off below, so clamping it at 0 only keeps a long
         # decay run from overflowing on its way to being discarded.
         decay = torch.exp2((g_i.unsqueeze(-2) - g_i.unsqueeze(-3)).clamp_max(0.0))
-        Aqk_t[:, :, rows, rows] = (
-            q_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)
-        ).sum(-1)
-        Akk_t[:, :, rows, rows] = (
-            k_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)
-        ).sum(-1)
+        Aqk_t[:, :, rows, rows] = (q_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)).sum(
+            -1
+        )
+        Akk_t[:, :, rows, rows] = (k_i.unsqueeze(-2) * decay * k_i.unsqueeze(-3)).sum(
+            -1
+        )
         if i_c:
             # Earlier sub-blocks: factor the decay through this sub-block's first
             # gate, which turns the pairwise term into a matmul. For a valid row
@@ -571,9 +570,7 @@ def chunk_kda_fwd_intra(
             cols = slice(0, i_c * bc)
             g_ref = g_i[:, :, :1]
             lhs_decay = torch.exp2((g_i - g_ref).clamp_max(0.0))
-            rhs = k_t[:, :, cols] * torch.exp2(
-                (g_ref - g_t[:, :, cols]).clamp_max(0.0)
-            )
+            rhs = k_t[:, :, cols] * torch.exp2((g_ref - g_t[:, :, cols]).clamp_max(0.0))
             rhs = rhs.transpose(-1, -2)
             Aqk_t[:, :, rows, cols] = (q_i * lhs_decay) @ rhs
             Akk_t[:, :, rows, cols] = (k_i * lhs_decay) @ rhs
@@ -880,9 +877,7 @@ def chunk_kda_with_fused_gate(
         A_log=A_log,
         g_bias=g_bias,
         scale=scale,
-        initial_state=initial_state.contiguous()
-        if initial_state is not None
-        else None,
+        initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=output_final_state,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
@@ -957,9 +952,7 @@ def fused_recurrent_kda(
         first = 0 if accepted is None else accepted[i] - 1
         state = initial_state[index_rows[i][first]].float()
         for t in range(begin, end):
-            state = _delta_rule_scan(
-                qf, kf, vf, decay, beta, state, t, t + 1, result
-            )
+            state = _delta_rule_scan(qf, kf, vf, decay, beta, state, t, t + 1, result)
             slot = index_rows[i][t - begin]
             if slot > 0:  # 0 is NULL_BLOCK_ID, where padded lanes are parked
                 initial_state[slot] = state.to(initial_state.dtype)

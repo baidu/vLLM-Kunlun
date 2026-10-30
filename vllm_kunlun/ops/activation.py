@@ -26,6 +26,7 @@ from vllm.model_executor.layers.activation import SituAndMul as _upstream_situ_c
 
 logger = logging.getLogger("vllm_kunlun")
 
+
 def _silu_forward_native(self, x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     output_shape = x.shape[:-1] + (d,)

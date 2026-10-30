@@ -14,7 +14,6 @@ import logging
 
 import numpy as np
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -50,13 +49,15 @@ def apply_grammar_bitmask(
     # equal the upstream scheduled-position stride.
     mask_stride = bitmask.shape[1]
     if self.mask_stride > mask_stride:
-        bitmask = torch.nn.functional.pad(
-            bitmask, (0, self.mask_stride - mask_stride)
-        )
+        bitmask = torch.nn.functional.pad(bitmask, (0, self.mask_stride - mask_stride))
         mask_stride = self.mask_stride
     mapping = _build_grammar_mapping(
-        input_batch.req_ids, grammar_req_ids, input_batch.cu_num_logits_np,
-        input_batch.num_draft_tokens_per_req, self.num_bonus_tokens, mask_stride,
+        input_batch.req_ids,
+        grammar_req_ids,
+        input_batch.cu_num_logits_np,
+        input_batch.num_draft_tokens_per_req,
+        self.num_bonus_tokens,
+        mask_stride,
     )
 
     # Asynchronously copy the mapping to GPU.
@@ -78,7 +79,8 @@ def apply_grammar_bitmask(
     # the exclusion mask in a half scratch tensor; retain every fp32 value.
     native_logits = (
         torch.zeros_like(logits, dtype=torch.float16)
-        if logits.dtype == torch.float32 else logits
+        if logits.dtype == torch.float32
+        else logits
     )
     torch.ops.xspeedgate_ops.apply_grammar_bitmask(
         native_logits,

@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import Optional
 
+import kunlun_ops
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
-
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -47,11 +49,6 @@ from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
 
-from typing import Optional
-import torch
-import torch.nn.functional as F
-import kunlun_ops
-
 logger = init_logger(__name__)
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
@@ -68,12 +65,13 @@ def a_log_weight_loader(
         start_idx = tp_rank * shard_size
 
         if loaded_weight.dim() == 4:
-            assert loaded_weight.shape[:2] == (1, 1), (
-                f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
-            )
-            assert loaded_weight.shape[-1] == 1, (
-                f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
-            )
+            assert loaded_weight.shape[:2] == (
+                1,
+                1,
+            ), f"Expected old A_log shape (1, 1, H, 1), got {loaded_weight.shape}"
+            assert (
+                loaded_weight.shape[-1] == 1
+            ), f"Expected old A_log last dim to be 1, got {loaded_weight.shape}"
             loaded_weight = loaded_weight.view(loaded_weight.shape[2])
 
         loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
@@ -293,9 +291,7 @@ def _prepare_xpu_kda_gate(
     lower_bound: Optional[float],
 ) -> torch.Tensor:
     if raw_g.ndim != 4:
-        raise ValueError(
-            f"raw_g must be [1, T, H, K], got {tuple(raw_g.shape)}"
-        )
+        raise ValueError(f"raw_g must be [1, T, H, K], got {tuple(raw_g.shape)}")
 
     batch_size, _, num_heads, head_dim = raw_g.shape
     if batch_size != 1:
@@ -309,14 +305,12 @@ def _prepare_xpu_kda_gate(
 
     if A_log.numel() != num_heads:
         raise ValueError(
-            f"A_log must contain {num_heads} values, "
-            f"got {A_log.numel()}"
+            f"A_log must contain {num_heads} values, " f"got {A_log.numel()}"
         )
 
     if tuple(dt_bias.shape) != (num_heads, head_dim):
         raise ValueError(
-            f"dt_bias must be {(num_heads, head_dim)}, "
-            f"got {tuple(dt_bias.shape)}"
+            f"dt_bias must be {(num_heads, head_dim)}, " f"got {tuple(dt_bias.shape)}"
         )
 
     raw_g_fp32 = raw_g.float()
@@ -324,21 +318,15 @@ def _prepare_xpu_kda_gate(
     dt_bias_fp32 = dt_bias.float()
 
     # [H] -> [1, 1, H, 1]
-    decay_rate = torch.exp(A_log_fp32).view(
-        1, 1, num_heads, 1
-    )
+    decay_rate = torch.exp(A_log_fp32).view(1, 1, num_heads, 1)
 
     # [H, K] -> [1, 1, H, K]
-    gate_bias = dt_bias_fp32.view(
-        1, 1, num_heads, head_dim
-    )
+    gate_bias = dt_bias_fp32.view(1, 1, num_heads, head_dim)
 
     gate_input = raw_g_fp32 + gate_bias
 
     if lower_bound is not None:
-        g_xpu = lower_bound * torch.sigmoid(
-            decay_rate * gate_input
-        )
+        g_xpu = lower_bound * torch.sigmoid(decay_rate * gate_input)
     else:
         g_xpu = -decay_rate * F.softplus(gate_input)
 
@@ -349,9 +337,7 @@ def _prepare_xpu_kda_beta(
     raw_beta: torch.Tensor,
 ) -> torch.Tensor:
     if raw_beta.ndim != 3:
-        raise ValueError(
-            f"raw_beta must be [1, T, H], got {tuple(raw_beta.shape)}"
-        )
+        raise ValueError(f"raw_beta must be [1, T, H], got {tuple(raw_beta.shape)}")
 
     return torch.sigmoid(raw_beta.float()).contiguous()
 
@@ -418,27 +404,20 @@ def _kimi_delta_attention_xpu_prefill(
 
     expected_g_shape = (1, token_num, v_head_num, head_dim)
     if tuple(g.shape) != expected_g_shape:
-        raise ValueError(
-            f"g must be {expected_g_shape}, got {tuple(g.shape)}"
-        )
+        raise ValueError(f"g must be {expected_g_shape}, got {tuple(g.shape)}")
 
     expected_beta_shape = (1, token_num, v_head_num)
     if tuple(beta.shape) != expected_beta_shape:
-        raise ValueError(
-            f"beta must be {expected_beta_shape}, got {tuple(beta.shape)}"
-        )
+        raise ValueError(f"beta must be {expected_beta_shape}, got {tuple(beta.shape)}")
 
     if initial_state.ndim != 4:
         raise ValueError(
-            "initial_state must be [B, Hv, K, V], "
-            f"got {tuple(initial_state.shape)}"
+            "initial_state must be [B, Hv, K, V], " f"got {tuple(initial_state.shape)}"
         )
 
     batch_num = cu_seqlens.numel() - 1
     if initial_state.shape[0] < batch_num:
-        raise ValueError(
-            "initial_state does not contain enough state slots"
-        )
+        raise ValueError("initial_state does not contain enough state slots")
 
     if tuple(initial_state.shape[1:]) != (
         v_head_num,
@@ -465,10 +444,14 @@ def _kimi_delta_attention_xpu_prefill(
             "sync per KDA layer. Check the KimiK3KDAMetadataBuilder.build hook "
             "in vllm_kunlun/__init__.py."
         )
-        cu_seqlens_cpu = cu_seqlens.detach().to(
-            device="cpu",
-            dtype=torch.int32,
-        ).contiguous()
+        cu_seqlens_cpu = (
+            cu_seqlens.detach()
+            .to(
+                device="cpu",
+                dtype=torch.int32,
+            )
+            .contiguous()
+        )
 
     # cu_seqlens_xpu = cu_seqlens.detach().to(
     #     device=q.device,
@@ -486,9 +469,7 @@ def _kimi_delta_attention_xpu_prefill(
 
     # FP32 and BF16 kernels use FP32 gate, beta, and recurrent state. The FP16
     # kernel uses FP16 for all of them.
-    kernel_aux_dtype = (
-        torch.float16 if q.dtype == torch.float16 else torch.float32
-    )
+    kernel_aux_dtype = torch.float16 if q.dtype == torch.float16 else torch.float32
     g_xpu = g_xpu.to(
         device=q.device,
         dtype=kernel_aux_dtype,
@@ -509,7 +490,7 @@ def _kimi_delta_attention_xpu_prefill(
     ht_xpu = torch.empty_like(h0_xpu)
     o_xpu = torch.empty_like(v_xpu)
 
-    scale = head_dim ** -0.5
+    scale = head_dim**-0.5
 
     ret = kunlun_ops.kimi_delta_attention(
         q_xpu,
@@ -527,11 +508,10 @@ def _kimi_delta_attention_xpu_prefill(
     )
 
     if ret != 0:
-        raise RuntimeError(
-            f"kunlun_ops.kimi_delta_attention failed with ret={ret}"
-        )
+        raise RuntimeError(f"kunlun_ops.kimi_delta_attention failed with ret={ret}")
 
     return o_xpu, ht_xpu
+
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -577,9 +557,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(self.projection_size, self.tp_size)
         self.conv_size = kda_config["short_conv_kernel_size"]
-        assert kda_config.get("use_full_rank_gate", False), (
-            "KimiK3DeltaAttention requires a full-rank gate"
-        )
+        assert kda_config.get(
+            "use_full_rank_gate", False
+        ), "KimiK3DeltaAttention requires a full-rank gate"
 
         # Keep f_a before the narrow beta shard, then pad each TP-local row
         # to select the aligned BF16 GEMM path.
@@ -787,9 +767,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # Host mirror attached by the KimiK3KDAMetadataBuilder.build hook in
         # vllm_kunlun/__init__.py; getattr because the framework dataclass does
         # not declare the field.
-        non_spec_query_start_loc_cpu = getattr(
-            m, "non_spec_query_start_loc_cpu", None
-        )
+        non_spec_query_start_loc_cpu = getattr(m, "non_spec_query_start_loc_cpu", None)
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
         spec_token_indx = m.spec_token_indx
         non_spec_token_indx = m.non_spec_token_indx
@@ -930,9 +908,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     query_start_loc=non_spec_query_start_loc,
                     metadata=m,
                 ).transpose(0, 1)
-                q_ns, k_ns, v_ns = conv_out.split(
-                    self.local_projection_size, dim=-1
-                )
+                q_ns, k_ns, v_ns = conv_out.split(self.local_projection_size, dim=-1)
                 q_ns, k_ns, v_ns = (
                     rearrange(x, "n (h d) -> 1 n h d", d=self.head_dim)
                     for x in (q_ns, k_ns, v_ns)

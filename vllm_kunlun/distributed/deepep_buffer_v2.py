@@ -96,9 +96,7 @@ def apply(mod) -> None:
     if getattr(deep_ep, "_kunlun_buffer_v2", False):
         return
     if not hasattr(deep_ep, "BufferV2"):
-        logger.warning(
-            "[KunlunPlugin] deep_ep has no BufferV2; leaving Buffer as is"
-        )
+        logger.warning("[KunlunPlugin] deep_ep has no BufferV2; leaving Buffer as is")
         return
 
     wrapped = SimpleNamespace(**deep_ep.__dict__)

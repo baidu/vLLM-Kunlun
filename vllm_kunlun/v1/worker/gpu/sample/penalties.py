@@ -16,7 +16,6 @@ Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` 
 import logging
 
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 
 logger = logging.getLogger("vllm_kunlun")

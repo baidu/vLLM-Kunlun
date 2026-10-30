@@ -1314,6 +1314,7 @@ def fake_moe_fc(
 
 moe_fc.register_fake(fake_moe_fc)
 
+
 @custom_op("_C::moe_fc_v3", mutates_args=())
 def moe_fc_v3(
     x: torch.Tensor,
@@ -1427,6 +1428,7 @@ def fake_moe_fc_v3(
 
 
 moe_fc_v3.register_fake(fake_moe_fc_v3)
+
 
 @custom_op("_C::moe_post", mutates_args=())
 def moe_post(
@@ -3069,6 +3071,7 @@ def gather_and_maybe_dequant_cache(
         scale=scale,
         seq_starts=seq_starts,
     )
+
 
 # ``_C_cache_ops::cp_gather_cache`` gathers THIS DCP rank's local context KV
 # shard into a contiguous bf16 workspace; upstream reaches it from

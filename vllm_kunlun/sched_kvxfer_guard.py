@@ -8,6 +8,7 @@ already been removed from ``self.requests`` and the assert kills EngineCore
 original method so the asserts never fire. Normal (present) req_ids are
 untouched; stale transfers are reclaimed by the Mooncake timeout GC.
 """
+
 import logging
 
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -39,6 +40,4 @@ if not getattr(_orig, "_kunlun_kvxfer_guard", False):
 
     _safe_update_from_kv_xfer_finished._kunlun_kvxfer_guard = True
     Scheduler._update_from_kv_xfer_finished = _safe_update_from_kv_xfer_finished
-    _logger.warning(
-        "[kvxfer_guard] patched Scheduler._update_from_kv_xfer_finished"
-    )
+    _logger.warning("[kvxfer_guard] patched Scheduler._update_from_kv_xfer_finished")

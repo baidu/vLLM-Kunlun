@@ -26,10 +26,10 @@ Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` 
 import logging
 
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 
 logger = logging.getLogger("vllm_kunlun")
+
 
 def _prepare_prefill_inputs_torch(
     input_ids: torch.Tensor,
@@ -70,6 +70,7 @@ def _prepare_prefill_inputs_torch(
             next_prefill_tokens[lookahead][req_state_idx] = (
                 row[pos] if pos < p_len else 0
             )
+
 
 def prepare_prefill_inputs(
     input_ids: torch.Tensor,
@@ -144,9 +145,10 @@ def combine_sampled_and_draft_tokens(
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
 ) -> torch.Tensor:
-    assert num_new_sampled_tokens in (0, 1), (
-        f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
-    )
+    assert num_new_sampled_tokens in (
+        0,
+        1,
+    ), f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
     # The op needs int32 token tensors and allocates + returns logits_indices.
     return torch.ops.xspeedgate_ops.combine_sampled_and_draft_tokens(
         input_ids,

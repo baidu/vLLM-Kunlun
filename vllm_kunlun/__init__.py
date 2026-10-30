@@ -202,10 +202,7 @@ def _kda_ops_apply(mod):
 
 
 def _kda_norm_apply(mod):
-    from vllm_kunlun.ops.kda import (
-        patch_rms_norm_gated,
-        register_oot_rms_norm_gated,
-    )
+    from vllm_kunlun.ops.kda import patch_rms_norm_gated, register_oot_rms_norm_gated
 
     patch_rms_norm_gated(mod)
     register_oot_rms_norm_gated(mod)
@@ -237,7 +234,7 @@ def _activation_applied(mod):
 
 
 def _activation_apply(mod):
-    import vllm_kunlun.ops.activation 
+    import vllm_kunlun.ops.activation
 
 
 _register_post_import_hook(
@@ -463,7 +460,10 @@ def _kda_qsl_cpu_apply(mod):
             fast_build,
         )
         dev = getattr(md, "non_spec_query_start_loc", None)
-        if dev is not None and getattr(md, "non_spec_query_start_loc_cpu", None) is None:
+        if (
+            dev is not None
+            and getattr(md, "non_spec_query_start_loc_cpu", None) is None
+        ):
             cpu = _derive(md, common_attn_metadata, num_decode_draft_tokens_cpu, dev)
             if cpu is not None:
                 md.non_spec_query_start_loc_cpu = cpu
@@ -505,14 +505,15 @@ def _mla_qsl_cpu_apply(mod):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         md = _orig_build(self, common_prefix_len, common_attn_metadata, fast_build)
         prefill = getattr(md, "prefill", None)
-        if prefill is not None and getattr(prefill, "query_start_loc_cpu", None) is None:
+        if (
+            prefill is not None
+            and getattr(prefill, "query_start_loc_cpu", None) is None
+        ):
             full_cpu = common_attn_metadata.query_start_loc_cpu
             # prefill slice starts at reqs_start = num_decodes; recover it from
             # the (num_prefills + 1)-length prefill query_start_loc.
             reqs_start = full_cpu.numel() - prefill.query_start_loc.numel()
-            prefill.query_start_loc_cpu = (
-                full_cpu[reqs_start:] - full_cpu[reqs_start]
-            )
+            prefill.query_start_loc_cpu = full_cpu[reqs_start:] - full_cpu[reqs_start]
         # Precompute the chunked-context key/value cu_seq_lens CPU copy once per
         # build (shared across all layers/chunks) so run_prefill_context_chunk
         # does not do a per-layer .cpu() for context_kvlen_lod_cpu.
@@ -570,16 +571,12 @@ def _concat_k_supported(k_nope, k_pe) -> bool:
     # nope_dim, pe_dim and the output row must each be 64-byte aligned.
     width = k_nope.element_size()
     nope_dim, pe_dim = k_nope.shape[-1], k_pe.shape[-1]
-    return all(
-        (dim * width) % 64 == 0 for dim in (nope_dim, pe_dim, nope_dim + pe_dim)
-    )
+    return all((dim * width) % 64 == 0 for dim in (nope_dim, pe_dim, nope_dim + pe_dim))
 
 
 def _mla_concat_k_applied(mod):
     cls = getattr(mod, "MLACommonBaseImpl", None)
-    return cls is None or getattr(
-        cls._concat_k_nope_k_pe, "_kunlun_concat_k", False
-    )
+    return cls is None or getattr(cls._concat_k_nope_k_pe, "_kunlun_concat_k", False)
 
 
 def _mla_concat_k_apply(mod):
@@ -614,9 +611,7 @@ def _mla_concat_k_apply(mod):
 
     _concat_k_nope_k_pe._kunlun_concat_k = True
     cls._concat_k_nope_k_pe = _concat_k_nope_k_pe
-    log.info(
-        "[KunlunPlugin] MLACommonBaseImpl._concat_k_nope_k_pe -> xspeedgate_ops"
-    )
+    log.info("[KunlunPlugin] MLACommonBaseImpl._concat_k_nope_k_pe -> xspeedgate_ops")
 
 
 _register_post_import_hook(
@@ -766,6 +761,7 @@ def _attn_res_apply(mod):
     if not hasattr(mod, "attn_res"):
         return
     from vllm_kunlun.models.kimi_k3.nvidia.ops.attn_res import attn_res
+
     mod.attn_res = attn_res
 
 
@@ -774,22 +770,19 @@ for _attn_res_target in (
     "vllm.models.kimi_k3.nvidia.ops",
     "vllm.models.kimi_k3.nvidia.model",
 ):
-    _register_post_import_hook(
-        _attn_res_target, _attn_res_applied, _attn_res_apply
-    )
+    _register_post_import_hook(_attn_res_target, _attn_res_applied, _attn_res_apply)
 
 
 def _kimi_mla_applied(mod):
     cls = getattr(mod, "MultiHeadLatentAttention", None)
-    return getattr(cls, "__module__", "") == (
-        "vllm_kunlun.models.kimi_k3.nvidia.mla"
-    )
+    return getattr(cls, "__module__", "") == ("vllm_kunlun.models.kimi_k3.nvidia.mla")
 
 
 def _kimi_mla_apply(mod):
     if not hasattr(mod, "MultiHeadLatentAttention"):
         return
     from vllm_kunlun.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+
     mod.MultiHeadLatentAttention = MultiHeadLatentAttention
 
 
@@ -797,9 +790,7 @@ for _kimi_mla_target in (
     "vllm.models.kimi_k3.nvidia.mla",
     "vllm.models.kimi_k3.nvidia.model",
 ):
-    _register_post_import_hook(
-        _kimi_mla_target, _kimi_mla_applied, _kimi_mla_apply
-    )
+    _register_post_import_hook(_kimi_mla_target, _kimi_mla_applied, _kimi_mla_apply)
 
 
 # --- hook: route DeepEP all2all managers to Kunlun's BufferV2 --------------
@@ -863,7 +854,6 @@ _register_post_import_hook(
     _deepep_ll_dtype_applied,
     _deepep_ll_dtype_apply,
 )
-
 
 
 # --- hooks: Model Runner V2 Triton kernels -> xspeedgate_ops ----------------
@@ -1013,6 +1003,7 @@ _mrv2_hook(
     "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
 )
 
+
 # --- hook: DCP local seq_lens Triton kernel -> torch (P800) ----------------
 # vllm.v1.worker.gpu.cp_utils.prepare_dcp_local_seq_lens launches the Triton
 # kernel _dcp_local_seq_lens_kernel via `kernel[(grid,)](...)`. Kunlun XPU
@@ -1051,6 +1042,7 @@ def _dcp_local_seqlens_apply(mod):
     mod.prepare_dcp_local_seq_lens = prepare_dcp_local_seq_lens
     # Rebind in modules that did `from cp_utils import prepare_dcp_local_seq_lens`.
     import sys as _sys
+
     for importer in (
         "vllm.v1.worker.gpu.cudagraph_utils",
         "vllm.v1.worker.gpu.pcp_manager",
@@ -1206,9 +1198,7 @@ def _batchreqstate_i32_apply(mod):
         if batch_state is not None:
             im = batch_state.idx_mapping_np
             if im is not None and im.dtype != np.int32:
-                batch_state = batch_state._replace(
-                    idx_mapping_np=im.astype(np.int32)
-                )
+                batch_state = batch_state._replace(idx_mapping_np=im.astype(np.int32))
         return batch_state, count
 
     gather_batch_req_state._kunlun_i32 = True

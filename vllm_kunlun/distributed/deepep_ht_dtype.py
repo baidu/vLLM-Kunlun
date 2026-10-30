@@ -57,9 +57,7 @@ def _strip_bf16_assert(cls) -> bool:
             return False
         lo, hi = spans[0]
         lines = src.splitlines()
-        kept = [
-            line for i, line in enumerate(lines, 1) if not lo <= i <= (hi or lo)
-        ]
+        kept = [line for i, line in enumerate(lines, 1) if not lo <= i <= (hi or lo)]
         new_src = "\n".join(kept) + "\n"
         if "bfloat16" in new_src:
             return False

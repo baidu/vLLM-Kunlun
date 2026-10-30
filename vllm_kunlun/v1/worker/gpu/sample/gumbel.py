@@ -27,7 +27,6 @@ Triggering: post-import hook from ``vllm_kunlun.__init__``; ``_kunlun_patched`` 
 import logging
 
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 
 logger = logging.getLogger("vllm_kunlun")
@@ -58,10 +57,7 @@ def gumbel_sample(
         logits = logits.to(torch.float32)
     if not logits.is_contiguous():
         logits = logits.contiguous()
-    if (
-        logits_cache_col is not None
-        and logits_cache_col.dtype != torch.int64
-    ):
+    if logits_cache_col is not None and logits_cache_col.dtype != torch.int64:
         logits_cache_col = logits_cache_col.to(torch.int64)
     sampled = torch.ops.xspeedgate_ops.gumbel_sample(
         logits,

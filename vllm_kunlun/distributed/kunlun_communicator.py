@@ -2,13 +2,14 @@
 
 import logging
 from contextlib import contextmanager
-from torch.distributed import ProcessGroup
+
 import torch
+from torch.distributed import ProcessGroup
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
-from vllm.distributed.utils import StatelessProcessGroup
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger("vllm_kunlun")
 
@@ -161,9 +162,7 @@ class KunlunCommunicator(CudaCommunicator):
                 sizes[rank],
             )
             pad_len = max(sizes)
-            padded = torch.zeros(
-                (pad_len,) + tail, dtype=inp.dtype, device=inp.device
-            )
+            padded = torch.zeros((pad_len,) + tail, dtype=inp.dtype, device=inp.device)
             padded[: sizes[rank]] = inp
             gathered = torch.empty(
                 (pad_len * world_size,) + tail,

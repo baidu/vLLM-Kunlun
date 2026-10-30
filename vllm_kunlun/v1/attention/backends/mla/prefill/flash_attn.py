@@ -19,15 +19,12 @@ from typing import TYPE_CHECKING
 
 import kunlun_ops
 import torch
-
-from vllm.v1.attention.backends.mla.prefill.base import (
-    MLADimensions,
-    MLAPrefillBackend,
-)
+from vllm.v1.attention.backends.mla.prefill.base import MLADimensions, MLAPrefillBackend
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
+
 
 # ``kunlun_ops.attention`` divides QK^T by sqrt(q.shape[-1]) internally, so its
 # ``alpha`` is an ADDITIONAL multiplier: effective_scale = alpha / sqrt(d). vLLM
@@ -97,6 +94,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
 
     def supports_quant_output(self, quant_key: "QuantKey") -> bool:
         return False
+
     def _query_start_loc_cpu(self) -> torch.Tensor:
         # MLACommonPrefillMetadata has no query_start_loc_cpu field in this vllm
         # version; derive it (enforce-eager, so no cudagraph capture concerns).

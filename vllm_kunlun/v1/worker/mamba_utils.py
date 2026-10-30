@@ -74,6 +74,7 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
 #        dst = _make_uint8_view_from_ptr(dst_ptr, size, device)
 #        dst.copy_(src, non_blocking=True)
 
+
 @dataclasses.dataclass
 class MambaSpecDecodeGPUContext:
     """Stub for the GPU spec-decode fused path on hybrid Mamba models.

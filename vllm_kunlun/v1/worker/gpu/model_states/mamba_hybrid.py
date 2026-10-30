@@ -13,7 +13,6 @@ import logging
 from typing import NamedTuple
 
 import torch
-
 import xspeedgate_ops  # noqa: F401  (registers torch.ops.xspeedgate_ops)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
@@ -185,15 +184,20 @@ def preprocess_state(
     # batch rather than reusing the most recently prepared batch rows.
     if getattr(self, "_mamba_slot_tables", None) is None:
         self._mamba_slot_tables = [
-            torch.zeros((self.max_num_reqs, t.shape[1]), dtype=t.dtype,
-                        device=self.device) for t in self._mamba_block_tables
+            torch.zeros(
+                (self.max_num_reqs, t.shape[1]), dtype=t.dtype, device=self.device
+            )
+            for t in self._mamba_block_tables
         ]
         self._mamba_post_tables = [torch.zeros_like(t) for t in self._mamba_slot_tables]
         self._mamba_post_table_ptrs = torch.tensor(
             [t.data_ptr() for t in self._mamba_post_tables],
-            dtype=torch.int64, device=self.device,
+            dtype=torch.int64,
+            device=self.device,
         )
-    for slot_table, batch_table in zip(self._mamba_slot_tables, self._mamba_block_tables):
+    for slot_table, batch_table in zip(
+        self._mamba_slot_tables, self._mamba_block_tables
+    ):
         # preprocess receives distinct live request slots; PP -1 filtering only
         # happens in the later postprocess batch.
         slot_table.index_copy_(0, req_idx.to(torch.int64), batch_table[:num_reqs])
@@ -214,18 +218,28 @@ def preprocess_state(
             self._mamba_state_idx_gpu,
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
-            layout["table_ptrs"], layout["stride"], *layout["temporal"],
+            layout["table_ptrs"],
+            layout["stride"],
+            *layout["temporal"],
             idx_mapping.to(torch.int32).contiguous(),
-            num_reqs, 1024, False, 1,
+            num_reqs,
+            1024,
+            False,
+            1,
         )
     for inner_size, conv_metadata in layout["conv_flat"]:
         torch.ops.xspeedgate_ops.precopy_mamba_align_fused_kernel(
             self._mamba_state_idx_gpu,
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu * inner_size,
-            layout["table_ptrs"], layout["stride"], *conv_metadata,
+            layout["table_ptrs"],
+            layout["stride"],
+            *conv_metadata,
             idx_mapping.to(torch.int32).contiguous(),
-            num_reqs, 1024, True, 1,
+            num_reqs,
+            1024,
+            True,
+            1,
         )
     if layout["conv_flat"] and not getattr(self, "_native_sd_precopy_logged", False):
         logger.info(
@@ -241,8 +255,12 @@ def _native_align_layout(self):
     """Build native byte-copy metadata; retain every referenced state tensor."""
     tables = self._mamba_block_tables
     strides = {table.stride(0) for table in tables}
-    if len(strides) != 1 or any(table.dtype != torch.int32 or table.stride(1) != 1 for table in tables):
-        raise ValueError("native Mamba copy requires int32 tables with a shared row stride")
+    if len(strides) != 1 or any(
+        table.dtype != torch.int32 or table.stride(1) != 1 for table in tables
+    ):
+        raise ValueError(
+            "native Mamba copy requires int32 tables with a shared row stride"
+        )
     signature = tuple((t.data_ptr(), t.stride(0)) for t in tables)
     cached = getattr(self, "_native_align_cached", None)
     if cached is not None and cached[0] == signature:
@@ -254,11 +272,22 @@ def _native_align_layout(self):
     for group_id, group in enumerate(self._align_groups):
         for i, state in enumerate(group.states):
             conv = copy_funcs[i % len(copy_funcs)] is get_conv_copy_spec
-            row = [state.data_ptr(), state.stride(0) * state.element_size(),
-                   state.element_size(), state.stride(1) if conv else state[0].numel(),
-                   state.size(1) if conv else 0, group_id, 0, 0]
+            row = [
+                state.data_ptr(),
+                state.stride(0) * state.element_size(),
+                state.element_size(),
+                state.stride(1) if conv else state[0].numel(),
+                state.size(1) if conv else 0,
+                group_id,
+                0,
+                0,
+            ]
             if conv:
-                if state.dim() != 3 or state.stride(2) != 1 or state.stride(1) != state.size(2):
+                if (
+                    state.dim() != 3
+                    or state.stride(2) != 1
+                    or state.stride(1) != state.size(2)
+                ):
                     raise ValueError("native SD precopy requires contiguous token rows")
                 conv_groups.setdefault(state.size(2), []).append(len(values[0]))
             else:
@@ -267,9 +296,19 @@ def _native_align_layout(self):
                 target.append(value)
     if len(values[0]) > 512 or len(tables) > 16:
         raise ValueError("native Mamba metadata exceeds the installed op limits")
-    dtypes = (torch.int64, torch.int64, torch.int32, torch.int64,
-              torch.int32, torch.int32, torch.int32, torch.int64)
-    metadata = [torch.tensor(v, dtype=dt, device=self.device) for v, dt in zip(values, dtypes)]
+    dtypes = (
+        torch.int64,
+        torch.int64,
+        torch.int32,
+        torch.int64,
+        torch.int32,
+        torch.int32,
+        torch.int32,
+        torch.int64,
+    )
+    metadata = [
+        torch.tensor(v, dtype=dt, device=self.device) for v, dt in zip(values, dtypes)
+    ]
     temporal_metadata = [m[temporal].contiguous() for m in metadata] if temporal else []
     if temporal_metadata:
         temporal_metadata[2] = temporal_metadata[2].to(torch.int64)
@@ -285,14 +324,24 @@ def _native_align_layout(self):
         flat_values[4] = [values[4][i] * inner_size for i in indices]
         flat_values[6] = [1] * len(indices)
         flat_values[7] = [values[4][i] * inner_size * values[2][i] for i in indices]
-        conv_flat.append((inner_size, [
-            torch.tensor(v, dtype=dt, device=self.device)
-            for v, dt in zip(flat_values, precopy_dtypes)
-        ]))
-    layout = dict(table_ptrs=torch.tensor([t.data_ptr() for t in tables], dtype=torch.int64,
-                                         device=self.device),
-                  stride=next(iter(strides)), all=metadata, temporal=temporal_metadata,
-                  conv_flat=conv_flat)
+        conv_flat.append(
+            (
+                inner_size,
+                [
+                    torch.tensor(v, dtype=dt, device=self.device)
+                    for v, dt in zip(flat_values, precopy_dtypes)
+                ],
+            )
+        )
+    layout = dict(
+        table_ptrs=torch.tensor(
+            [t.data_ptr() for t in tables], dtype=torch.int64, device=self.device
+        ),
+        stride=next(iter(strides)),
+        all=metadata,
+        temporal=temporal_metadata,
+        conv_flat=conv_flat,
+    )
     self._native_align_cached = (signature, layout)
     return layout
 
@@ -313,7 +362,8 @@ def _align_postprocess(self, idx_mapping, num_computed_tokens):
     state_idx = self._mamba_state_idx_gpu.index_select(0, req_idx)
     computed = num_computed_tokens.index_select(0, req_idx)
     native_mapping = torch.where(
-        idx_mapping >= 0, self._align_rows[:num_reqs].to(torch.int32),
+        idx_mapping >= 0,
+        self._align_rows[:num_reqs].to(torch.int32),
         self._align_skip[:num_reqs],
     )
     for slot_table, post_table in zip(self._mamba_slot_tables, self._mamba_post_tables):
@@ -326,13 +376,25 @@ def _align_postprocess(self, idx_mapping, num_computed_tokens):
         )
         self._native_postprocess_logged = True
     torch.ops.xspeedgate_ops.postprocess_mamba(
-        accepted, state_idx, computed, computed, computed,
-        self._mamba_post_table_ptrs, self._mamba_post_tables[0].stride(0),
-        *layout["all"], accepted_out, native_mapping, num_reqs,
-        self._align_spec.block_size, True, False,
+        accepted,
+        state_idx,
+        computed,
+        computed,
+        computed,
+        self._mamba_post_table_ptrs,
+        self._mamba_post_tables[0].stride(0),
+        *layout["all"],
+        accepted_out,
+        native_mapping,
+        num_reqs,
+        self._align_spec.block_size,
+        True,
+        False,
     )
     torch.ops.xspeedgate_ops.scatter_num_accepted_kernel(
-        idx_mapping, accepted_out, self.num_accepted_tokens_gpu,
+        idx_mapping,
+        accepted_out,
+        self.num_accepted_tokens_gpu,
     )
 
 

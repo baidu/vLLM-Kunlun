@@ -70,9 +70,7 @@ def _get_open_port() -> int:
                     return port
             except OSError:
                 port += 1
-        raise RuntimeError(
-            "no free port found after 1000 attempts from %d" % vllm_port
-        )
+        raise RuntimeError("no free port found after 1000 attempts from %d" % vllm_port)
     for family in (socket.AF_INET, socket.AF_INET6):
         try:
             with socket.socket(family, socket.SOCK_STREAM) as s:

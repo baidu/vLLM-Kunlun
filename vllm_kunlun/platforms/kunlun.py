@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Optional
 
 import psutil
 import torch
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -220,6 +219,7 @@ class KunlunPlatform(Platform):
                 "setting in %%USERPROFILE%%\\.wslconfig and run "
                 "`wsl --shutdown`."
             )
+
     # def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
     #     """
     #     TODO Update here for v0.15.1
