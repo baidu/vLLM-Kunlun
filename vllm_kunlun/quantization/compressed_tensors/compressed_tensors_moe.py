@@ -20,6 +20,7 @@ from typing import Callable, Optional, Union
 
 import torch
 from compressed_tensors import CompressionFormat
+from torch.library import custom_op
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -35,9 +36,18 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
+from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.quantization.kernels.quant_ops import dequant_int4_native
+from vllm_kunlun.quantization.kernels.quant_ops import (
+    convert_packed_int4,
+    dequant_int4_native,
+)
+
+from .compressed_tensors import validate_int4_format, validate_w4a8_int
 
 logger = init_logger(__name__)
 
@@ -67,6 +77,22 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         all_scheme_dicts = [
             quant_config.get_scheme_dict(layer, name) for name in unfused_names
         ]
+        # Qwen3.5 checkpoints can target fused expert tensors explicitly,
+        # without the per-expert '.0.gate_proj' names used above.
+        if (ckpt_gate, ckpt_up) == ("gate_proj", "up_proj"):
+            fused_names = ["gate_up_proj", "gate_up_proj", ckpt_down]
+            for i, (scheme, name, projection) in enumerate(
+                zip(all_scheme_dicts, unfused_names, fused_names)
+            ):
+                # None also means explicitly ignored; retry only unmatched names.
+                if scheme is None and not should_ignore_layer(
+                    name,
+                    ignore=quant_config.ignore,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                ):
+                    all_scheme_dicts[i] = quant_config.get_scheme_dict(
+                        layer, f"{layer_name}.{projection}"
+                    )
         scheme_dict = all_scheme_dicts.pop()
 
         # multiple schemes found
@@ -82,6 +108,8 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
         format = scheme_dict.get("format")
+        quant_format = quant_config.quant_format if format is None else format
+        validate_int4_format(weight_quant, quant_format)
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             valid_format_and_bits = (
@@ -106,15 +134,240 @@ class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
             return KunlunCompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        # TODO: @liwei support w4a8
-        # elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
-        #     return CompressedTensorsW4A8Int8MoEMethod(
-        #         weight_quant, input_quant, layer.moe_config
-        #     )
+        elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+            validate_w4a8_int(
+                weight_quant,
+                input_quant,
+                scheme_dict.get("output_activations"),
+            )
+            return KunlunCompressedTensorsW4A8IntMoEMethod(
+                weight_quant, input_quant, layer.moe_config
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
+
+
+@custom_op("vllm::kunlun_w4a8_int_moe", mutates_args=())
+def w4a8_int_moe(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    s13: torch.Tensor,
+    s2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    m, hidden = x.shape
+    top_k = topk_ids.shape[1]
+    experts = w13.shape[0]
+    if m == 0:
+        return torch.empty_like(x)
+    ids = topk_ids.to(torch.int32).contiguous()
+    if m * top_k <= 768:
+        indices, lod, expanded = torch.ops.xspeedgate_ops.moe_pre_small(
+            ids,
+            experts,
+            index_have_neg=False,
+            sort_mode=True,
+            x=x.contiguous(),
+        )
+    else:
+        stats = torch.zeros(12, experts, dtype=torch.int32, device=x.device)
+        counts = torch.empty(experts, dtype=torch.int32, device=x.device)
+        lod = torch.empty(experts + 1, dtype=torch.int32, device=x.device)
+        indices = torch.empty(m * top_k, dtype=torch.int32, device=x.device)
+        expanded = torch.empty(m * top_k, hidden, dtype=x.dtype, device=x.device)
+        torch.ops._C.gen_block_statistic(ids, stats)
+        torch.ops._C.moe_pre_sorted(
+            x.contiguous(), ids, stats, expanded, indices, counts, lod
+        )
+    expanded = expanded.reshape(m * top_k, hidden)
+
+    def gemm(inputs, weight, scales):
+        q = torch.empty_like(inputs, dtype=torch.int8)
+        maxima = torch.empty(inputs.shape[0], 1, dtype=torch.float32, device=x.device)
+        torch.ops._C.quant2d(inputs, q, maxima, force_sdnn=True)
+        output = torch.empty(m, top_k, weight.shape[1], dtype=x.dtype, device=x.device)
+        if scales.shape[-1] > 1:
+            import kunlun_ops
+
+            kunlun_ops.moe_fc_v3(
+                x=q,
+                weight=weight,
+                sorted_tokens_num_lod=lod,
+                # moe_pre already expanded and sorted every token/expert pair.
+                # V3 contiguous mode consumes and emits those rows directly;
+                # moe_post below restores token order and applies router weights.
+                sorted_tokens_idx=torch.arange(
+                    m * top_k, dtype=torch.int32, device=x.device
+                ),
+                moe_topk=1,
+                y=output.view(m * top_k, -1),
+                x_perchannel_max=maxima.expand(-1, scales.shape[-1]).contiguous(),
+                w_perchannel_max=scales,
+                tgemm_type="int8_wo_t",
+                scale_n=1,
+                scale_k=2 * weight.shape[-1] // scales.shape[-1],
+                use_pack_int4=True,
+            )
+            return output
+        torch.ops._C.moe_fc(
+            x=q,
+            weight=weight,
+            sorted_tokens_num_lod=lod,
+            sorted_tokens_idx=indices,
+            moe_topk=top_k,
+            y=output,
+            x_perchannel_max=maxima,
+            w_perchannel_max=scales,
+            topk_ids=ids,
+            use_pack_int4=True,
+        )
+        return output
+
+    gate_up = gemm(expanded, w13, s13)
+    activated = torch.empty(m, top_k, w13.shape[1] // 2, dtype=x.dtype, device=x.device)
+    torch.ops._C.silu_and_mul(activated, gate_up)
+    down = gemm(activated.reshape(m * top_k, -1), w2, s2)
+    output = torch.empty_like(x)
+    torch.ops._C.moe_post(
+        x=down,
+        moe_index=indices.reshape(m, top_k),
+        normed_scale=topk_weights.float().contiguous(),
+        dequant_scale=torch.ones(m, top_k, dtype=torch.float32, device=x.device),
+        y=output,
+    )
+    return output
+
+
+@w4a8_int_moe.register_fake
+def _fake_w4a8_int_moe(x, w13, w2, s13, s2, topk_weights, topk_ids):
+    return torch.empty_like(x)
+
+
+class KunlunCompressedTensorsW4A8IntMoEMethod(FusedMoEMethodBase):
+    def __init__(self, weight_quant, input_quant, moe):
+        super().__init__(moe)
+        activation = getattr(moe.activation, "value", moe.activation)
+        if moe.use_ep or activation != "silu" or moe.has_bias or moe.is_lora_enabled:
+            raise ValueError(
+                "Kunlun W4A8 MoE supports SiLU gated experts without EP, bias or LoRA"
+            )
+        if any(
+            getattr(moe, name, None) is not None
+            for name in (
+                "swiglu_limit",
+                "swiglu_alpha",
+                "swiglu_beta",
+            )
+        ):
+            raise ValueError("Kunlun W4A8 MoE does not support modified SwiGLU")
+        if moe.in_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("Kunlun W4A8 MoE requires FP16 or BF16 activations")
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.group_size = (
+            weight_quant.group_size if weight_quant.strategy == "group" else -1
+        )
+        # Two INT4 values share each byte; groups must end on byte boundaries.
+        if self.group_size != -1 and (
+            self.group_size % 2
+            or moe.hidden_dim % self.group_size
+            or moe.intermediate_size_per_partition % self.group_size
+        ):
+            raise ValueError(
+                "Kunlun packed W4A8 requires even group sizes "
+                "aligned with TP partitions"
+            )
+
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if hidden_size % 8 or intermediate_size_per_partition % 8:
+            raise ValueError("Packed W4A8 requires K partitions divisible by 8")
+        # Allocate directly in checkpoint layout [E, N, K/8]. This also
+        # lets the expert loader shard without transposing or unpacking.
+        for name, n, k in (
+            ("w13_weight", 2 * intermediate_size_per_partition, hidden_size),
+            ("w2_weight", hidden_size, intermediate_size_per_partition),
+        ):
+            groups = 1 if self.group_size == -1 else k // self.group_size
+            for suffix, shape, dtype in (
+                ("_packed", (num_experts, n, k // 8), torch.int32),
+                ("_scale", (num_experts, n, groups), torch.float32),
+                ("_shape", (num_experts, 2), torch.int64),
+            ):
+                param = torch.nn.Parameter(
+                    torch.empty(shape, dtype=dtype), requires_grad=False
+                )
+                set_weight_attrs(param, extra_weight_attrs)
+                if suffix == "_scale":
+                    set_weight_attrs(
+                        param, {"quant_method": self.weight_quant.strategy}
+                    )
+                layer.register_parameter(name + suffix, param)
+
+    @property
+    def is_monolithic(self):
+        # Let vLLM's router preserve top-k, renormalization and scoring semantics.
+        return False
+
+    def maybe_make_prepare_finalize(self, routing_tables=None):
+        return None
+
+    def get_fused_moe_quant_config(self, layer):
+        # This method owns quantization and the packed GEMMs.
+        return None
+
+    def process_weights_after_loading(self, layer):
+        for name in ("w13_weight", "w2_weight"):
+            loaded_name = name + "_packed"
+            weight = getattr(layer, loaded_name)
+            setattr(
+                layer,
+                loaded_name,
+                torch.nn.Parameter(convert_packed_int4(weight), requires_grad=False),
+            )
+            delattr(layer, name + "_shape")
+            scales = getattr(layer, name + "_scale")
+            setattr(
+                layer,
+                name + "_scale",
+                torch.nn.Parameter(
+                    scales.float().mul(7.0).contiguous(), requires_grad=False
+                ),
+            )
+
+    def apply(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    ):
+        if getattr(layer, "apply_router_weight_on_input", False):
+            raise ValueError(
+                "Kunlun W4A8 MoE applies routing weights to expert outputs only"
+            )
+        return w4a8_int_moe(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+        )
 
 
 class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMethod):

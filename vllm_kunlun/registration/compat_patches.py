@@ -38,7 +38,7 @@ from types import ModuleType
 
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
-# Kunlun swaps the V2 Triton kernels for torch-native / kunlun_ops equivalents
+# Kunlun swaps the V2 Triton kernels for torch-native / XSpeedGate / kunlun_ops equivalents
 # (the ``vllm.v1.worker.gpu.*`` patches below), and ``vllm.config.vllm`` reads
 # ``HAS_TRITON`` only to veto V2, so forcing it True has no other side effect.
 # It has to be a post-import patch: ``check_and_update_config`` runs only from
@@ -65,33 +65,28 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     @functools.wraps(orig_unsupported)
     def _kunlun_mrv2_unsupported_features(self) -> list[str]:
         # These paths still depend on unsupported Triton kernels.
-        import vllm.envs as envs
-
         unsupported = orig_unsupported(self)
 
-        if self.speculative_config is not None:
-            unsupported.append(
-                "speculative decoding (Kunlun XPU P800 has no Triton and the "
-                "V2 rejection-sampler kernels are not replaced yet)"
+        spec = self.speculative_config
+        if spec is not None:
+            model_type = self.model_config.hf_text_config.model_type
+            mtp_ok = (
+                spec.method == "mtp"
+                and model_type
+                in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+                and spec.rejection_sample_method == "standard"
+                and self.parallel_config.pipeline_parallel_size == 1
+                and not self.parallel_config.enable_expert_parallel
             )
+            if not mtp_ok:
+                unsupported.append(
+                    "Kunlun MRV2 supports Qwen3.5 Dense/MoE MTP "
+                    "with PP1, no EP and standard rejection"
+                )
 
         if self.parallel_config.decode_context_parallel_size > 1:
             unsupported.append(
                 "decode context parallelism (not replaced on Kunlun XPU P800)"
-            )
-
-        if (
-            self.cache_config is not None
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            unsupported.append(
-                "mamba align cache mode (its Triton launch sites are not "
-                "replaced on Kunlun XPU P800)"
-            )
-
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            unsupported.append(
-                "VLLM_COMPUTE_NANS_IN_LOGITS (not replaced on Kunlun XPU P800)"
             )
 
         return unsupported
@@ -99,6 +94,7 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
     module.VllmConfig._get_v2_model_runner_unsupported_features = (
         _kunlun_mrv2_unsupported_features
     )
+
     module._kunlun_v2_gate_installed = True
     logging.getLogger("vllm_kunlun").info(
         "[KunlunPlugin] Opened the Model Runner V2 Triton gate and installed "
@@ -524,9 +520,41 @@ def _v2_hook(kunlun_module: str, *paths: str):
 
 
 # Upstream V2 module -> (Kunlun replacement, sentinel attribute paths).
-# Spec-decode (rejection_sampler_utils) is a deferred milestone: its Triton
-# kernels are left alone and the V2 spec-decode path stays unsupported.
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm_kunlun.v1.worker.gpu.model_runner",
+        ("GPUModelRunner.add_requests",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.autoregressive.speculator",
+        (
+            "prepare_prefill_inputs",
+            "prepare_decode_inputs",
+            "update_draft_inputs",
+        ),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.rejection_sampler_utils",
+        ("rejection_sample",),
+    ),
+    (
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler",
+        "vllm_kunlun.v1.worker.gpu.spec_decode.rejection_sampler",
+        ("RejectionSampler.__call__", "_flatten_sampled_kernel"),
+    ),
+    (
+        "vllm.model_executor.models.qwen3_5_mtp",
+        "vllm_kunlun.models.qwen3_5_mtp",
+        ("Qwen3_5DecoderLayer",),
+    ),
+    (
+        "vllm.v1.worker.gpu.metrics.logits",
+        "vllm_kunlun.v1.worker.gpu.metrics.logits",
+        ("get_num_nans",),
+    ),
     (
         "vllm.v1.worker.gpu.buffer_utils",
         "vllm_kunlun.v1.worker.gpu.buffer_utils",
@@ -558,6 +586,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "vllm.v1.worker.gpu.structured_outputs",
         "vllm_kunlun.v1.worker.gpu.structured_outputs",
         ("StructuredOutputsWorker.apply_grammar_bitmask",),
+    ),
+    (
+        "vllm.v1.worker.gpu.sample.sampler",
+        "vllm_kunlun.v1.worker.gpu.sample.sampler",
+        ("Sampler.sample",),
     ),
     (
         "vllm.v1.worker.gpu.sample.gumbel",
@@ -607,7 +640,7 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "vllm.v1.worker.gpu.model_states.mamba_hybrid",
         "vllm_kunlun.v1.worker.gpu.model_states.mamba_hybrid",
-        ("_scatter_num_accepted_kernel",),
+        ("_scatter_num_accepted_kernel", "MambaHybridModelState.add_request"),
     ),
     # Shared by V1 and V2: xspeedgate batch_memcpy + int64 copy buffers.
     (
@@ -621,6 +654,7 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
+    ("vllm.v1.worker.gpu.attn_utils", _bind_kv_cache_applied, _apply_bind_kv_cache),
     (
         "vllm.utils.import_utils",
         _optional_dep_probe_applied,

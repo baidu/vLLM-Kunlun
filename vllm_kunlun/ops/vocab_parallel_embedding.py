@@ -64,7 +64,7 @@ def get_masked_input_and_mask(
     added_vocab_end_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_, vocab_mask = torch.ops.xspeedgate_ops.get_masked_input_and_mask(
-        input_,
+        input_.to(dtype=torch.int32),
         org_vocab_start_index,
         org_vocab_end_index,
         num_org_vocab_padding,

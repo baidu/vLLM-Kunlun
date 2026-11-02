@@ -5,7 +5,10 @@ import torch  # noqa: E402
 from torch.library import custom_op, impl, register_fake  # noqa: E402
 
 
-@custom_op("_moe_C::topk_softmax", mutates_args=())
+@custom_op(
+    "_moe_C::topk_softmax",
+    mutates_args=("topk_weights", "topk_ids", "token_expert_indices"),
+)
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -14,7 +17,26 @@ def topk_softmax(
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> None:
-    pass
+    torch.ops.xspeedgate_ops.moe_softmax_topk(
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        gating_output.contiguous(),
+        renormalize,
+        e_score_correction_bias,
+    )
+
+
+@topk_softmax.register_fake
+def _fake_topk_softmax(
+    topk_weights,
+    topk_ids,
+    token_expert_indices,
+    gating_output,
+    renormalize=False,
+    e_score_correction_bias=None,
+):
+    return None
 
 
 @custom_op("_C::rms_norm", mutates_args=())

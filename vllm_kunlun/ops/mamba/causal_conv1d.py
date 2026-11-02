@@ -68,47 +68,6 @@ def causal_conv1d_fn(
     return out
 
 
-def torch_causal_conv1d_update_spec(
-    hidden_states,
-    conv_state,
-    weight,
-    bias=None,
-    activation=None,
-    conv_state_indices=None,
-    num_accepted_tokens=None,
-):
-    out = torch.empty_like(hidden_states)
-    _, seq_len, hidden_size = hidden_states.shape
-    for i in range(hidden_states.shape[0]):
-        tmp_conv_state = conv_state[conv_state_indices[i]]
-        state_len = tmp_conv_state.shape[-2]
-        hidden_states_i = hidden_states[i]
-        hidden_states_new = torch.cat(
-            [tmp_conv_state[: (2 + num_accepted_tokens[i]), :], hidden_states_i], dim=0
-        ).to(weight.dtype)
-
-        hidden_states_new = hidden_states_new.unsqueeze(0)
-
-        conv_state[conv_state_indices[i]] = hidden_states_new[:, -state_len:, :]
-        for j in range(seq_len):
-            if j == seq_len - 1:
-                hidden_states_new_j = hidden_states_new
-            else:
-                hidden_states_new_j = hidden_states_new[:, : (1 - seq_len + j)]
-            hidden_states_new_j = hidden_states_new_j.transpose(-1, -2).contiguous()
-            out_i = F.conv1d(
-                hidden_states_new_j,
-                weight.unsqueeze(1),
-                bias,
-                padding=0,
-                groups=hidden_size,
-            )
-            out_i = F.silu(out_i[:, :, -1:])
-            out_i = out_i.to(hidden_states.dtype).squeeze(-1).unsqueeze(0)
-            out[i, j] = out_i
-    return out.view(-1, hidden_size)
-
-
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -205,12 +164,29 @@ def causal_conv1d_update(
         )
         return x.squeeze(1)
     else:
-        return torch_causal_conv1d_update_spec(
+        # kunlun_ops 原地写输入，保留调用者的张量。
+        x = x.clone(memory_format=torch.contiguous_format)
+        if x.size(0) == 0:
+            return x.reshape(-1, dim)
+        # NULL block 和 padding 都映射到 slot 0。
+        indices = conv_state_indices.clamp_min(0)
+        status = kunlun_ops.causal_conv1d_update(
             x,
             conv_state,
             weight,
-            bias,
-            activation,
-            conv_state_indices=conv_state_indices,
+            bias=None if bias is None else bias.float(),
+            silu_activation=False,
+            cache_seqlens=None,
+            conv_state_indices=indices,
+            intermediate_conv_window=None,
+            is_ncw=False,
+            pad_slot_id=0,
             num_accepted_tokens=num_accepted_tokens,
         )
+        if status != 0:
+            raise RuntimeError(f"kunlun causal_conv1d_update failed: {status}")
+        # 卷积先按输出 dtype 舍入，再做 SiLU。
+        if activation in ("silu", "swish"):
+            x = F.silu(x)
+        x.masked_fill_((conv_state_indices <= 0).view(-1, 1, 1), 0)
+        return x.reshape(-1, dim)

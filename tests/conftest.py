@@ -1,10 +1,8 @@
 """Shared fixtures for the vllm_kunlun unit tests.
 
-The suite is deliberately hardware-free: it runs on a plain CPython 3.10 with
-only pytest installed, without torch, vllm, torch_xmlir, xspeedgate_ops or a
-Kunlun device.  That is possible because the modules under test either use
-the standard library only, or defer their vendor imports into function
-bodies, which lets a test install a stub in ``sys.modules`` first.
+The suite checks Python logic and CPU tensor adaptation without a device or
+vendor operator packages. Tests install upstream module and operator stubs
+before loading the real override modules.
 
 Fixtures provided here:
 
@@ -193,3 +191,57 @@ def envs_module():
 def logger():
     """Logger for helpers that take one; assert on records via ``caplog``."""
     return logging.getLogger("vllm_kunlun.tests")
+
+
+@pytest.fixture
+def native_ops(monkeypatch):
+    """Replace device operators without registering global Torch schemas."""
+    import torch
+
+    operators = SimpleNamespace()
+    monkeypatch.setattr(torch.ops, "xspeedgate_ops", operators)
+    return operators
+
+
+@pytest.fixture
+def stub_module_tree(stub_module, monkeypatch):
+    """Build importable module hierarchies and restore them after each test."""
+    from vllm_kunlun.registration import import_hooks
+
+    modules = {}
+    # Keep installed import hooks from rebinding the test stubs.
+    monkeypatch.setattr(import_hooks, "dispatch_hooks", lambda: None)
+
+    def make(name, **attributes):
+        parts = name.split(".")
+        for index in range(1, len(parts) + 1):
+            current = ".".join(parts[:index])
+            if current not in modules:
+                modules[current] = stub_module(current, __path__=[])
+                if index > 1:
+                    setattr(
+                        modules[".".join(parts[: index - 1])],
+                        parts[index - 1],
+                        modules[current],
+                    )
+        for key, value in attributes.items():
+            setattr(modules[name], key, value)
+        return modules[name]
+
+    return make
+
+
+@pytest.fixture
+def load_kunlun_override(stub_module_tree):
+    """Load a real override against a stub upstream module."""
+
+    def load(relative_path, upstream_name, **attributes):
+        upstream = stub_module_tree(upstream_name, **attributes)
+        path = REPO_ROOT / "vllm_kunlun" / relative_path
+        name = "kunlun_ut_" + relative_path.replace("/", "_").replace(".py", "")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module, upstream
+
+    return load

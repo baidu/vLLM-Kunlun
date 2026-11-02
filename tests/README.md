@@ -2,26 +2,28 @@
 
 ## `tests/ut` — unit tests
 
-Hardware-free unit tests for the plugin's Python logic.  They run on a plain
-CPython 3.10 with only `pytest` installed: no torch, vllm, torch_xmlir,
-xspeedgate_ops or Kunlun device, which is what lets them run in CI on every
-pull request.
+Unit tests cover Python logic and CPU tensor adaptation. They do not require
+Kunlun devices, torch_xmlir, xspeedgate_ops or kunlun_ops. Tensor tests use CPU
+PyTorch and NumPy; upstream vLLM modules and device operators are stubbed.
 
 ```bash
-pip install pytest
-pytest                 # configuration lives in pyproject.toml
-pytest tests/ut/test_bootstrap.py -v
+pip install pytest numpy
+pip install "torch==2.9.0" --index-url https://download.pytorch.org/whl/cpu
+pytest
 ```
 
 ## Adding a test
 
-Keep the suite hardware-free.  Two patterns make that possible:
+Use the shared fixtures in `tests/conftest.py`:
 
-- Modules under test import torch (or any vendor package) inside function
-  bodies, so a test can install a stub in `sys.modules` first.  Use the
-  `fake_torch` / `stub_module` fixtures from `tests/conftest.py`.
-- Patch functions receive the target module as an argument, so a plain
-  `ModuleType` stand-in is enough.  Use `module_factory`.
+- `fake_torch` and `module_factory` for pure Python patches.
+- `stub_module_tree` and `load_kunlun_override` to load a real override against
+  isolated upstream modules.
+- `native_ops` to replace device operators without global schema registration.
 
-If a change can only be verified on a device, it belongs in the CI accuracy or
-performance jobs under `ci/scripts/tests/`, not here.
+Check argument forwarding, dtype/shape conversion, output writeback, empty
+inputs and registration where applicable. Do not require an operator package
+to be installed before a mock can be created.
+
+Device accuracy, Graph replay and performance checks belong in dedicated
+jobs under `ci/scripts/tests/`. Temporary experiments belong outside the repo.

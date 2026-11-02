@@ -420,33 +420,55 @@ class Qwen3_5Model(Qwen3NextModel):
                 break
             else:
                 is_expert_weight = False
-                # gate_up_proj 是 gate+up 两部分合并存储的，需要先切成两半分别加载
-                if "experts.gate_up_proj" in name:
-                    # 找到对应的 w13_weight param 路径
-                    w13_name = name.replace(
-                        "experts.gate_up_proj", "experts.routed_experts.w13_weight"
+                # Fused INT4 checkpoints store both weights and group scales
+                # as [E, N, K/groups]. Split gate/up along N for either tensor,
+                # then let the upstream expert loader perform TP slicing.
+                fused_projection = next(
+                    (
+                        p
+                        for p in ("gate_up_proj", "down_proj")
+                        if f"experts.{p}" in name
+                    ),
+                    None,
+                )
+                if fused_projection is not None and (
+                    loaded_weight.ndim == 3 or name.endswith(".weight_shape")
+                ):
+                    prefix, suffix = name.split(f"experts.{fused_projection}", 1)
+                    suffix = {
+                        "": "",
+                        ".weight": "",
+                        ".weight_scale": "_scale",
+                        ".weight_packed": "_packed",
+                        ".weight_shape": "_shape",
+                    }.get(suffix, suffix)
+                    param_name = (
+                        "w13_weight"
+                        if fused_projection == "gate_up_proj"
+                        else "w2_weight"
                     )
-                    if is_pp_missing_parameter(w13_name, self):
+                    fused_name = f"{prefix}experts.routed_experts.{param_name}{suffix}"
+                    if is_pp_missing_parameter(fused_name, self):
                         continue
-                    if w13_name not in params_dict:
-                        logger.warning_once(
-                            f"Parameter {w13_name} not found in params_dict, skip loading"
-                        )
+                    if suffix == "_shape":
+                        # Fused checkpoint metadata describes [E, N, K]; the
+                        # expert loader stores each projection's [N, K].
+                        shape = loaded_weight[1:].clone()
+                        if fused_projection == "gate_up_proj":
+                            shape[0] //= 2
+                        params_dict[fused_name].data.copy_(shape)
+                        loaded_params.add(fused_name)
                         continue
-                    # 沿 dim=-2 切成两半：w1=gate, w3=up
-                    w1_weight, w3_weight = loaded_weight.chunk(2, dim=-2)
-                    param = params_dict[w13_name]
-                    weight_loader = param.weight_loader
-                    # 加载 w1（gate）
-                    weight_loader(
-                        param, w1_weight, w13_name, shard_id="w1", expert_id=0
+                    shards = (
+                        zip(("w1", "w3"), loaded_weight.chunk(2, dim=1))
+                        if fused_projection == "gate_up_proj"
+                        else (("w2", loaded_weight),)
                     )
-                    # 加载 w3（up）
-                    weight_loader(
-                        param, w3_weight, w13_name, shard_id="w3", expert_id=0
-                    )
-                    name = w13_name
-                    loaded_params.add(name)
+                    for shard_id, tensor in shards:
+                        if self.load_fused_expert_weights(
+                            fused_name, params_dict, tensor, shard_id, tensor.shape[0]
+                        ):
+                            loaded_params.add(fused_name)
                     continue
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
