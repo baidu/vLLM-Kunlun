@@ -68,6 +68,10 @@ class GDNAttentionMetadata:
     # [Kunlun] bool mask used by qwen3_next.py to split spec / non-spec tokens
     # via mixed_qkv[spec_token_masks] / g[:, spec_token_masks] etc.
     spec_token_masks: torch.Tensor | None = None
+    # [Kunlun] gather/unpad indices for non-uniform spec query lengths
+    # (None when every spec request has exactly num_spec + 1 tokens)
+    spec_pad_gather_idx: torch.Tensor | None = None
+    spec_unpad_idx: torch.Tensor | None = None
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
 
@@ -81,6 +85,33 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+
+
+def build_spec_pad_indices(
+    spec_query_lens_cpu: torch.Tensor,
+    spec_width: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Map variable-length spec tokens to fixed-width rows and back."""
+    num_spec_decodes = spec_query_lens_cpu.size(0)
+    lens = spec_query_lens_cpu.to(torch.int64)
+    if int(lens.sum().item()) == num_spec_decodes * spec_width:
+        return None
+
+    cu = torch.zeros(num_spec_decodes + 1, dtype=torch.int64)
+    torch.cumsum(lens, dim=0, out=cu[1:])
+    starts = cu[:-1].unsqueeze(1)
+    pos = torch.arange(spec_width, dtype=torch.int64).unsqueeze(0)
+    last_real = (lens - 1).clamp_(min=0).unsqueeze(1)
+
+    # Replicate the final real token so the conv input stays finite. These tail
+    # outputs are removed before the recurrent kernel and cannot be accepted.
+    pad_gather_idx = (starts + torch.minimum(pos, last_real)).reshape(-1)
+    real_mask = pos < lens.unsqueeze(1)
+    unpad_idx = (
+        torch.arange(num_spec_decodes, dtype=torch.int64).unsqueeze(1) * spec_width
+        + pos
+    )[real_mask]
+    return pad_gather_idx.to(torch.int32), unpad_idx.to(torch.int32)
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -374,12 +405,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # Note: m.num_actual_tokens is already padded by the model runner for CUDAGraph
         batch_size = m.num_actual_tokens
 
+        # [Kunlun] Speculative tokens can be clipped for a step (for example the
+        # last steps before max_model_len), which makes the per-request query
+        # lengths non-uniform. Pad them to the fixed conv width and drop the
+        # padded tail afterwards instead of assuming a uniform width.
+        spec_pad_gather_idx = None
+        spec_unpad_idx = None
+        if spec_sequence_masks_cpu is not None:
+            _pad_indices = build_spec_pad_indices(
+                query_lens_cpu[spec_sequence_masks_cpu], self.num_spec + 1
+            )
+            if _pad_indices is not None:
+                spec_pad_gather_idx = _pad_indices[0].to(
+                    query_start_loc.device, non_blocking=True
+                )
+                spec_unpad_idx = _pad_indices[1].to(
+                    query_start_loc.device, non_blocking=True
+                )
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
             and num_decodes == 0
             and num_spec_decodes <= self.decode_cudagraph_max_bs
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+            and spec_pad_gather_idx is None
         ):
             assert spec_sequence_masks is not None
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
@@ -470,6 +520,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            spec_pad_gather_idx=spec_pad_gather_idx,
+            spec_unpad_idx=spec_unpad_idx,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
