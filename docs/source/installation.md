@@ -68,11 +68,6 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
 ::::
 :::::
 ## Install vLLM-kunlun
-### Install PyTorch
-
-```{code-block} bash
-uv pip install torch==2.9.0 torchvision torchaudio
-```
 
 ### Install vLLM
 
@@ -96,6 +91,11 @@ git checkout |vllm_kunlun_version|
 
 uv pip install -r requirements.txt
 uv pip install --no-build-isolation --no-deps .
+```
+### Install PyTorch
+
+```{code-block} bash
+uv pip install torch==2.9.0 torchvision torchaudio
 ```
 
 ## Choose to download customized xpytorch
