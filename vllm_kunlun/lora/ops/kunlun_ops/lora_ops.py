@@ -2,6 +2,54 @@
 
 import torch
 
+_KERNEL_DTYPE = torch.float16
+
+# Pooled fp16 scratch for ``_accumulate`` (bf16-output path), keyed by
+# (width, device); ``_ACC_RETIRED`` holds replaced blocks alive because a
+# captured cudagraph may still reference their addresses.
+_ACC_POOL: dict[tuple, torch.Tensor] = {}
+_ACC_RETIRED: list[torch.Tensor] = []
+
+
+def _to_kernel_dtype(tensor: torch.Tensor) -> torch.Tensor:
+    """Cast to the dtype the xspeedgate LoRA kernels accept."""
+    if tensor.dtype == _KERNEL_DTYPE:
+        return tensor
+    return tensor.to(_KERNEL_DTYPE)
+
+
+def _kernel_weights(weights: torch.Tensor) -> torch.Tensor:
+    """Stacked LoRA weights in the layout the kernels expect, in kernel dtype."""
+    if weights.dim() == 4 and weights.size(1) == 1:
+        weights = weights.squeeze(1)
+    return _to_kernel_dtype(weights)
+
+
+def _safe_indices(lora_indices_tensor: torch.Tensor) -> torch.Tensor:
+    """Return int32 adapter indices that are always in range."""
+    return lora_indices_tensor.to(torch.int32).clamp_min(0)
+
+
+def _accumulate(output_tensor: torch.Tensor, launch) -> None:
+    """Run ``launch(y)`` and accumulate the float16 result into ``output_tensor``."""
+    if output_tensor.dtype == _KERNEL_DTYPE:
+        launch(output_tensor)
+        return
+    width = output_tensor.shape[-1]
+    rows = output_tensor.numel() // width
+    key = (width, output_tensor.device)
+    buf = _ACC_POOL.get(key)
+    if buf is None or buf.shape[0] < rows:
+        bucket = 1 << (rows - 1).bit_length() if rows > 1 else rows
+        if buf is not None:
+            _ACC_RETIRED.append(buf)
+        buf = torch.empty((bucket, width), dtype=_KERNEL_DTYPE, device=key[1])
+        _ACC_POOL[key] = buf
+    scratch = buf[:rows].view(output_tensor.shape)
+    scratch.zero_()
+    launch(scratch)
+    output_tensor.add_(scratch.to(output_tensor.dtype))
+
 
 def sgmv_shrink(
     inputs: torch.Tensor,
@@ -22,13 +70,16 @@ def sgmv_shrink(
     """
     sgmv_shrink
     """
-    return torch.ops.xspeedgate_ops.sgmv_shrink_sdnn(
-        inputs,
-        lora_a_weights,
-        seq_len_tensor.to(torch.int32),
-        lora_indices_tensor.to(torch.int32),
+    _accumulate(
         output_tensor,
-        scaling,
+        lambda y: torch.ops.xspeedgate_ops.sgmv_shrink_sdnn(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_a_weights),
+            seq_len_tensor.to(torch.int32),
+            _safe_indices(lora_indices_tensor),
+            y,
+            scaling,
+        ),
     )
 
 
@@ -50,13 +101,16 @@ def sgmv_expand(
     """
     sgmv_expand
     """
-    return torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
-        inputs,
-        lora_b_weights,
-        seq_len_tensor.to(torch.int32),
-        lora_indices_tensor.to(torch.int32),
+    _accumulate(
         output_tensor,
-        0,
+        lambda y: torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_b_weights),
+            seq_len_tensor.to(torch.int32),
+            _safe_indices(lora_indices_tensor),
+            y,
+            0,
+        ),
     )
 
 
@@ -81,13 +135,16 @@ def sgmv_expand_slice(
     """
     sgmv_expand_slice
     """
-    return torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
-        inputs,
-        lora_b_weights,
-        seq_len_tensor.to(torch.int32),
-        lora_indices_tensor.to(torch.int32),
+    _accumulate(
         output_tensor,
-        slice_offset,
+        lambda y: torch.ops.xspeedgate_ops.sgmv_expand_sdnn(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_b_weights),
+            seq_len_tensor.to(torch.int32),
+            _safe_indices(lora_indices_tensor),
+            y,
+            slice_offset,
+        ),
     )
 
 
@@ -105,8 +162,15 @@ def bgmv_shrink(
     """
     bgmv_shrink
     """
-    return torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
-        inputs, lora_a_weights, lora_indices_tensor, output_tensor, scaling
+    _accumulate(
+        output_tensor,
+        lambda y: torch.ops.xspeedgate_ops.bgmv_shrink_cluster(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_a_weights),
+            _safe_indices(lora_indices_tensor),
+            y,
+            scaling,
+        ),
     )
 
 
@@ -123,8 +187,15 @@ def bgmv_expand(
     """ "
     bgmv_expand
     """
-    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
-        inputs, lora_b_weights, lora_indices_tensor, output_tensor, 0
+    _accumulate(
+        output_tensor,
+        lambda y: torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_b_weights),
+            _safe_indices(lora_indices_tensor),
+            y,
+            0,
+        ),
     )
 
 
@@ -144,6 +215,13 @@ def bgmv_expand_slice(
     """
     bgmv_expand_slice
     """
-    return torch.ops.xspeedgate_ops.bgmv_expand_cluster(
-        inputs, lora_b_weights, lora_indices_tensor, output_tensor, slice_offset
+    _accumulate(
+        output_tensor,
+        lambda y: torch.ops.xspeedgate_ops.bgmv_expand_cluster(
+            _to_kernel_dtype(inputs),
+            _kernel_weights(lora_b_weights),
+            _safe_indices(lora_indices_tensor),
+            y,
+            slice_offset,
+        ),
     )
