@@ -311,6 +311,39 @@ def _apply_grammar_bitmask_patch(module: ModuleType) -> None:
         import vllm_kunlun.v1.structured_output.utils  # noqa: F401
 
 
+# --- vllm.v1.engine.utils: keep the CUDA-compatible DP device namespace ---
+
+
+def _dp_device_mapping_applied(module: ModuleType) -> bool:
+    """Return whether the DP mapping helper is absent or patched."""
+    fn = getattr(module, "set_assigned_physical_gpu_ids_for_dp_rank", None)
+    return fn is None or getattr(fn, "_kunlun_patched", False)
+
+
+def _apply_dp_device_mapping(module: ModuleType) -> None:
+    """Keep the full device namespace for local Kunlun workers."""
+    original = module.set_assigned_physical_gpu_ids_for_dp_rank
+
+    @functools.wraps(original)
+    def patched(vllm_config, local_dp_rank, user_assigned_gpu_ids=None):
+        from vllm.platforms import current_platform
+
+        parallel = vllm_config.parallel_config
+        if (
+            type(current_platform).__name__ != "KunlunPlatform"
+            or parallel.distributed_executor_backend in ("ray", "external_launcher")
+            or parallel.data_parallel_backend == "ray"
+            or parallel.nnodes_within_dp != 1
+        ):
+            return original(vllm_config, local_dp_rank, user_assigned_gpu_ids)
+
+        # Worker.init_device already applies the local DP offset.
+        parallel.assigned_physical_gpu_ids = user_assigned_gpu_ids
+
+    patched._kunlun_patched = True
+    module.set_assigned_physical_gpu_ids_for_dp_rank = patched
+
+
 # --- vllm.v1.worker.gpu_worker: skip the CUDA memory-pool context ----------
 
 
@@ -699,6 +732,7 @@ DEFAULT_HOOKS = (
         _apply_grammar_bitmask_patch,
     ),
     ("vllm.v1.worker.gpu_worker", _memory_pool_applied, _apply_memory_pool_patch),
+    ("vllm.v1.engine.utils", _dp_device_mapping_applied, _apply_dp_device_mapping),
     (
         "vllm.model_executor.warmup.kernel_warmup",
         _warmup_applied,
