@@ -274,7 +274,7 @@ import torch  # noqa: E402
 from torch.library import custom_op, impl  # noqa: E402
 
 
-@custom_op("_C::add_rmsnorm", mutates_args=())
+@custom_op("_C::add_rmsnorm", mutates_args={"output", "residual_output"})
 def add_rmsnorm(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -322,7 +322,7 @@ def add_rmsnorm_cuda(
     )
 
 
-@custom_op("_C::rmsnorm", mutates_args=())
+@custom_op("_C::rmsnorm", mutates_args={"output"})
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1012,11 +1012,11 @@ def _fake_moe_ffn_per_token_block(
 moe_ffn_per_token_block.register_fake(_fake_moe_ffn_per_token_block)
 
 
-@custom_op("_C::rotary_embedding", mutates_args=())
+@custom_op("_C::rotary_embedding", mutates_args={"query", "key"})
 def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
@@ -1035,7 +1035,7 @@ def rotary_embedding(
 def rotary_embedding_cuda(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
@@ -1053,7 +1053,7 @@ def rotary_embedding_cuda(
 def _fake_rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
