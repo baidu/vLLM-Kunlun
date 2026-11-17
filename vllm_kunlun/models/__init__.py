@@ -37,3 +37,8 @@ def register_model():
         "Qwen3_5ForConditionalGeneration",
         "vllm_kunlun.models.qwen3_5:Qwen3_5ForConditionalGeneration",
     )
+
+    ModelRegistry.register_model(
+        "DFlash2DraftModel",
+        "vllm_kunlun.models.qwen3_dflash2:DFlash2Qwen3ForCausalLM",
+    )

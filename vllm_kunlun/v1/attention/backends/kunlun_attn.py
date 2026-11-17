@@ -63,6 +63,10 @@ class KunlunAttentionBackend(AttentionBackend):
     # crucial to cuda graph
     accept_output_buffer = True
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         """get_name attention backend name
@@ -155,6 +159,11 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
 
     slot_mapping: torch.Tensor
     block_tables: torch.Tensor
+
+    causal: bool = True
+    # Host LoDs provide fixed launch bounds; device LoDs remain exact
+    # and are updated in place during graph replay.
+    use_static_lod_bounds: bool = False
 
     multi_modal_placeholder_index_maps: Optional[torch.Tensor] = None
     # (batch_size,). The sequence length per sequence. Sequence length means
@@ -259,6 +268,11 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         """prefill_metadata"""
         if self.num_prefills == 0:
             return None
+
+        # Static-bound batches contain only prefills. Reuse the metadata to
+        # preserve device LoD buffers updated in place during graph replay.
+        if self.use_static_lod_bounds:
+            return self
 
         if self._cached_prefill_metadata is not None:
             # Recover cached prefill-phase attention
@@ -365,6 +379,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             enable_kv_scales_calculation=False,
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
+            causal=self.causal,
         )
         return self._cached_prefill_metadata
 
@@ -438,6 +453,7 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             enable_kv_scales_calculation=False,
             use_cascade=self.use_cascade,
             is_speculative=self.is_speculative,
+            causal=self.causal,
             max_model_len=self.max_model_len,
         )
         return self._cached_decode_metadata
@@ -617,6 +633,13 @@ class KunlunAttentionMetadataBuilder:
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu
 
+        # The speculative decode kernel has no noncausal mode. Route DFlash
+        # query blocks through cache-backed prefill even when their width is
+        # the same as a target speculative verification batch.
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=common_attn_metadata.causal is not False
+        )
+
         (
             num_decodes,
             num_prefills,
@@ -679,6 +702,7 @@ class KunlunAttentionMetadataBuilder:
             use_cascade=use_cascade,
             is_speculative=self.reorder_batch_threshold > 1,
             max_model_len=self.vllm_config.model_config.max_model_len,
+            causal=common_attn_metadata.causal,
         )
         return attn_metadata
 
@@ -881,8 +905,24 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             # KV sharing layers receive raw (un-normed, un-roped) k/v from the
             # model, so they must always read the target layer's cache.
             is_kv_sharing = self.kv_sharing_target_layer_name is not None
+            swa_left, swa_right = -1, -1
+            if self.sliding_window is not None:
+                swa_left, swa_right = self.sliding_window, 0
+            if not prefill_meta.causal:
+                max_kv_len = int(torch.diff(prefill_meta.kv_lod_cpu).max())
+                page_size = key_cache.shape[2]
+                num_pages = max(1, (max_kv_len + page_size - 1) // page_size)
+                # XFA infers page bounds from width and requires dense rows.
+                tmp_block_tables = tmp_block_tables[:, :num_pages].contiguous()
+                swa_right = swa_left
+                if (
+                    self.sliding_window is not None
+                    and max_kv_len <= self.sliding_window
+                ):
+                    swa_left, swa_right = -1, -1
             if (
                 is_kv_sharing
+                or not prefill_meta.causal
                 or prefill_meta.query_start_loc_host[-1] != prefill_meta.kv_lod_cpu[-1]
             ):
                 kunlun_ops.prefill_attention(
@@ -890,7 +930,7 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     k=key_cache,  # Key Cache [block_num, head, block_size, dim]
                     v=value_cache,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
+                    is_causal=prefill_meta.causal,
                     is_prefix_cache=True,
                     alpha=self.prefill_alpha,
                     block_table=tmp_block_tables,
@@ -900,11 +940,17 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     context_kvlen_lod_xpu=prefill_meta.kv_lod_xpu,
                     alibi_slopes=self.alibi_slopes,
                     softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
+                    swa_left=swa_left,
+                    swa_right=swa_right,
                     sink=self._get_sinks_fp32(),
+                    **(
+                        dict(
+                            max_query_len=prefill_meta.max_query_len,
+                            max_context_len=prefill_meta.max_kv_len,
+                        )
+                        if prefill_meta.use_static_lod_bounds
+                        else {}
+                    ),
                 )
             else:
                 kunlun_ops.prefill_attention(
@@ -912,16 +958,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     k=prefill_key,
                     v=prefill_value,
                     out=output[num_decode_tokens : attn_metadata.num_actual_tokens],
-                    is_causal=True,
+                    is_causal=prefill_meta.causal,
                     alpha=self.prefill_alpha,
                     context_qlen_lod_cpu=prefill_meta.query_start_loc_host,
                     context_qlen_lod_xpu=prefill_meta.query_start_loc,
                     alibi_slopes=self.alibi_slopes,
                     softmax_lse=None,
-                    swa_left=(
-                        self.sliding_window if self.sliding_window is not None else -1
-                    ),
-                    swa_right=0 if self.sliding_window is not None else -1,
+                    swa_left=swa_left,
+                    swa_right=swa_right,
                     sink=self._get_sinks_fp32(),
                 )
 

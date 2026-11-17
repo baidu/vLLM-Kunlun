@@ -70,17 +70,23 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
         spec = self.speculative_config
         if spec is not None:
             model_type = self.model_config.hf_text_config.model_type
-            mtp_ok = (
-                spec.method == "mtp"
-                and model_type
-                in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+            mtp_ok = spec.method == "mtp" and model_type in (
+                "qwen3_5",
+                "qwen3_5_text",
+                "qwen3_5_moe",
+                "qwen3_5_moe_text",
+            )
+            dflash2_ok = spec.method == "dflash" and "DFlash2DraftModel" in (
+                spec.draft_model_config.architectures or []
+            )
+            if not (
+                (mtp_ok or dflash2_ok)
                 and spec.rejection_sample_method == "standard"
                 and self.parallel_config.pipeline_parallel_size == 1
                 and not self.parallel_config.enable_expert_parallel
-            )
-            if not mtp_ok:
+            ):
                 unsupported.append(
-                    "Kunlun MRV2 supports Qwen3.5 Dense/MoE MTP "
+                    "Kunlun MRV2 supports Qwen3.5 Dense/MoE MTP and DFlash2 "
                     "with PP1, no EP and standard rejection"
                 )
 
@@ -521,6 +527,11 @@ def _v2_hook(kunlun_module: str, *paths: str):
 
 # Upstream V2 module -> (Kunlun replacement, sentinel attribute paths).
 _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "vllm.v1.worker.gpu.spec_decode",
+        "vllm_kunlun.v1.worker.gpu.spec_decode",
+        ("init_speculator",),
+    ),
     (
         "vllm.v1.worker.gpu.model_runner",
         "vllm_kunlun.v1.worker.gpu.model_runner",
