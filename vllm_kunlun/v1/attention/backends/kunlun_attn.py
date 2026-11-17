@@ -161,6 +161,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     block_tables: torch.Tensor
 
     causal: bool = True
+    # Host LoDs provide fixed launch bounds; device LoDs remain exact
+    # and are updated in place during graph replay.
+    use_static_lod_bounds: bool = False
 
     multi_modal_placeholder_index_maps: Optional[torch.Tensor] = None
     # (batch_size,). The sequence length per sequence. Sequence length means
@@ -265,6 +268,11 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
         """prefill_metadata"""
         if self.num_prefills == 0:
             return None
+
+        # Static-bound batches contain only prefills. Reuse the metadata to
+        # preserve device LoD buffers updated in place during graph replay.
+        if self.use_static_lod_bounds:
+            return self
 
         if self._cached_prefill_metadata is not None:
             # Recover cached prefill-phase attention
@@ -935,6 +943,14 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
                     swa_left=swa_left,
                     swa_right=swa_right,
                     sink=self._get_sinks_fp32(),
+                    **(
+                        dict(
+                            max_query_len=prefill_meta.max_query_len,
+                            max_context_len=prefill_meta.max_kv_len,
+                        )
+                        if prefill_meta.use_static_lod_bounds
+                        else {}
+                    ),
                 )
             else:
                 kunlun_ops.prefill_attention(

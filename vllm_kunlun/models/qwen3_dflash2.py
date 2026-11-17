@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""DFlash2 draft model backport for the vLLM 0.25.1 model runner V2 (eager execution)."""
+"""DFlash2 draft model backport for the vLLM 0.25.1 model runner V2."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -156,7 +157,25 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
             k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
         ).view(k_shape)
         q, k = self.rotary_emb(positions.flatten(), q, k)
-        attn_output = self.attn(q, k, v)
+        layer = self.attn
+        buffers = getattr(layer, "_kunlun_dflash_graph_buffers", None)
+        if buffers is None:
+            attn_output = layer(q, k, v)
+        else:
+            # Descriptor-owned handoff buffers match the MRV1 proposal path.
+            output, handoff = buffers
+            metadata = get_forward_context().attn_metadata[layer.layer_name]
+            layer.impl.forward(
+                layer,
+                q.view(-1, layer.num_heads, layer.head_size),
+                k.view(-1, layer.num_kv_heads, layer.head_size),
+                v.view(-1, layer.num_kv_heads, layer.head_size_v),
+                layer.kv_cache,
+                metadata,
+                output=output,
+            )
+            handoff.copy_(output)
+            attn_output = handoff.view(-1, layer.num_heads * layer.head_size_v)
         output, _ = self.o_proj(attn_output)
         return output
 
