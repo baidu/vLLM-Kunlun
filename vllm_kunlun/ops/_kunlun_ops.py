@@ -375,39 +375,25 @@ class KunlunOps:
         return (type(x), x)
 
     @staticmethod
-    def fused_moe(
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
+    def _route_topk(
         router_logits: torch.Tensor,
-        ep_rank: int,
         moe_top_k: int,
-        renormalize: bool,
-        inplace: bool = False,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        w1_bias: Optional[torch.Tensor] = None,
-        w2_bias: Optional[torch.Tensor] = None,
+        global_num_experts: int,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """fused_moe"""
-        global_num_experts, up_gate_size, _ = w1.shape
-        M, N = hidden_states.shape
-        hidden_dim = w2.shape[1]
-        normed_score = torch.empty(
-            M, moe_top_k, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(
-            M, moe_top_k, dtype=torch.int32, device=hidden_states.device
-        )
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+    ):
+        """Routing: compute top_k normalized weights and **global** expert ids,
+        plus the block_statistic buffer.
+        """
+        M = router_logits.shape[0]
+        device = router_logits.device
+        normed_score = torch.empty(M, moe_top_k, dtype=torch.float32, device=device)
+        topk_ids = torch.empty(M, moe_top_k, dtype=torch.int32, device=device)
         num_blocks = 12
         block_statistic = torch.zeros(
-            num_blocks,
-            global_num_experts,
-            dtype=torch.int32,
-            device=hidden_states.device,
+            num_blocks, global_num_experts, dtype=torch.int32, device=device
         )
         router_logits = router_logits.to(torch.float)
         if scoring_func == "softmax":
@@ -429,10 +415,55 @@ class KunlunOps:
                 n_group=num_expert_group,
                 topk_group=topk_group,
             )
+        else:
+            raise NotImplementedError(f"Unsupported scoring_func: {scoring_func!r}")
+        return normed_score, topk_ids, block_statistic
+
+    @staticmethod
+    def fused_moe(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        ep_rank: int,
+        moe_top_k: int,
+        renormalize: bool,
+        inplace: bool = False,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        w1_bias: Optional[torch.Tensor] = None,
+        w2_bias: Optional[torch.Tensor] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        expert_lora: Optional[object] = None,
+    ) -> torch.Tensor:
+        """fused_moe
+        Must run before the ``moe_post`` un-sorting step, because the indices
+        are in sorted order.
+        """
+        global_num_experts, up_gate_size, _ = w1.shape
+        M, N = hidden_states.shape
+        hidden_dim = w2.shape[1]
+        normed_score, topk_ids, block_statistic = KunlunOps._route_topk(
+            router_logits,
+            moe_top_k,
+            global_num_experts,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
 
         if w1_bias is not None or w2_bias is not None:
             # Rignt now this branch is for gpt oss
             # TODO (@xyDong23): faster here using moe_fc kernel
+            if expert_lora is not None:
+                raise NotImplementedError(
+                    "MoE with bias (gpt-oss) goes through a per-expert python "
+                    "loop with no sorted-order seam available; expert LoRA "
+                    "would be silently dropped."
+                )
             normed_score = normed_score.to(hidden_states.dtype)
             out = torch.zeros(
                 M * moe_top_k, N, dtype=hidden_states.dtype, device=hidden_states.device
@@ -569,6 +600,21 @@ class KunlunOps:
             moe_expand = moe_expand.reshape(M * moe_top_k, hidden_dim)
             y = workspace_b[:y_numel].view(M, moe_top_k, w1.shape[1])
 
+            # Per-row (adapter, expert) indices for expert LoRA: shared by
+            # both seams. When no adapter is attached, rows_for_seam returns
+            # None and both seam blocks below are skipped entirely.
+            lora_rows = None
+            if expert_lora is not None:
+                from vllm_kunlun.lora.moe_lora import apply_seam, rows_for_seam
+
+                lora_rows = rows_for_seam(
+                    expert_lora,
+                    topk_ids,
+                    sorted_tokens_idx,
+                    sorted_tokens_num_lod,
+                    global_num_experts,
+                )
+
             # W1 GEMM (no fused activation; the fused SWISH_GLU kernel is
             # buggy at large M -- see note above).
             torch.ops._C.moe_fc(
@@ -581,6 +627,17 @@ class KunlunOps:
                 topk_ids=topk_ids,
                 act=None,
             )
+            # w13 seam: must complete before `out1` takes over workspace_a,
+            # because its input `moe_expand` lives in workspace_a. The gate /
+            # up slices land on the first / second half of y's columns.
+            if lora_rows is not None:
+                apply_seam(
+                    y,
+                    moe_expand,
+                    expert_lora.w13_lora_a_stacked,
+                    expert_lora.w13_lora_b_stacked,
+                    lora_rows,
+                )
             # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
             # needed.
             out1 = workspace_a[:out1_numel].view(M, moe_top_k, w1.shape[1] // 2)
@@ -604,6 +661,18 @@ class KunlunOps:
                 topk_ids=topk_ids,
                 act=None,
             )
+            # w2 seam: input out1 is in workspace_a and output out is in
+            # workspace_b, so both are still live at this point. Must complete
+            # before the moe_post un-sorting step -- only sorted order matches
+            # the indices.
+            if lora_rows is not None:
+                apply_seam(
+                    out,
+                    out1,
+                    expert_lora.w2_lora_a_stacked,
+                    expert_lora.w2_lora_b_stacked,
+                    lora_rows,
+                )
 
             output = torch.empty(
                 [M, N], dtype=hidden_states.dtype, device=hidden_states.device
@@ -635,48 +704,152 @@ class KunlunOps:
         topk_group: Optional[int] = None,
         w1_bias: Optional[torch.Tensor] = None,
         w2_bias: Optional[torch.Tensor] = None,
+        ep_size: int = 1,
+        global_num_experts: Optional[int] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        expert_lora: Optional[object] = None,
     ) -> torch.Tensor:
+        """MoE under EP, using the sorted path.
+        Path:
+            _route_topk -> gen_block_statistic -> moe_ep_pre_sorted
+            -> moe_fc(w13_local) -> [w13 seam] -> silu_and_mul
+            -> moe_fc(w2_local)  -> [w2 seam]  -> moe_ep_post
+        """
         x = hidden_states
-        batch, hidden_size = x.shape
-        num_local_experts, up_gate_size, _ = w13_weight.shape
+        M, N = x.shape
+        local_num_experts, up_gate_size, _ = w13_weight.shape
+        hidden_dim = w2_weight.shape[1]
+        rows = M * top_k
 
-        topk_weights = torch.empty(
-            batch, top_k, dtype=router_logits.dtype, device=router_logits.device
-        )
-        topk_ids = torch.empty(
-            batch, top_k, dtype=torch.int32, device=router_logits.device
-        )
-        block_static = torch.empty(0, dtype=torch.int32, device=router_logits.device)
-        torch.ops._C.moe_softmax_topk(
-            router_logits, topk_weights, topk_ids, block_static
-        )
+        if global_num_experts is None:
+            global_num_experts = local_num_experts * ep_size
+        if global_num_experts != local_num_experts * ep_size:
+            raise NotImplementedError(
+                f"The EP sorted path requires an even split of experts: "
+                f"global={global_num_experts} "
+                f"local={local_num_experts} ep_size={ep_size}"
+            )
 
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(1, keepdim=True)
+        if w1_bias is not None or w2_bias is not None:
+            raise NotImplementedError(
+                "The EP sorted path does not yet support MoE with bias "
+                "(gpt-oss): moe_fc has no bias input, and the activation is "
+                "plain silu rather than swigluoai."
+            )
+        if expert_lora is not None:
+            from vllm_kunlun.lora.moe_lora import apply_seam, rows_for_seam
 
-        topk_weights = topk_weights.to(x.dtype)
-        out = torch.zeros(batch * top_k, hidden_size, dtype=x.dtype, device=x.device)
-        repeat_x = x.repeat_interleave(top_k, dim=0)
-        topk_ids_flat = topk_ids.flatten()
-        for i in range(num_local_experts):
-            experts_id = ep_rank * num_local_experts + i
-            selected_token = topk_ids_flat == experts_id
-            if selected_token.sum():
-                cur_token = repeat_x[selected_token]
-                up_gate = torch.empty(
-                    selected_token.sum(),
-                    up_gate_size // 2,
-                    dtype=cur_token.dtype,
-                    device=cur_token.device,
-                )
-                torch.ops._C.silu_and_mul(up_gate, cur_token @ w13_weight[i].T)
-                out[selected_token] = up_gate @ w2_weight[i].T
-        output = (
-            (out.view(batch, top_k, hidden_size) * topk_weights.unsqueeze(2))
-            .sum(dim=1)
-            .to(x.dtype)
+        normed_score, topk_ids, block_statistic = KunlunOps._route_topk(
+            router_logits,
+            top_k,
+            global_num_experts,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
         )
 
+        y_numel = rows * up_gate_size
+        out_numel = rows * hidden_dim
+        out1_numel = rows * (up_gate_size // 2)
+        moe_expand_numel = rows * N
+        workspace_a_numel = max(out1_numel, out_numel, moe_expand_numel)
+        workspace_b_numel = max(y_numel, out_numel)
+
+        workspace_a, workspace_b = current_workspace_manager().get_simultaneous(
+            ((workspace_a_numel,), x.dtype),
+            ((workspace_b_numel,), x.dtype),
+        )
+
+        moe_expand = workspace_a[:moe_expand_numel].view(rows, N)
+        moe_index = torch.zeros(rows, dtype=torch.int32, device=x.device)
+        expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=x.device)
+        sorted_tokens_num_lod = torch.zeros(
+            local_num_experts + 1, dtype=torch.int32, device=x.device
+        )
+
+        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+        kunlun_ops.moe_ep_pre_sorted(
+            x,
+            topk_ids,
+            block_statistic,
+            ep_size,
+            ep_rank,
+            moe_expand,
+            moe_index,
+            expert_m,
+            sorted_tokens_num_lod,
+        )
+
+        y = workspace_b[:y_numel].view(M, top_k, up_gate_size)
+        lora_rows = None
+        if expert_lora is not None:
+            lora_rows = rows_for_seam(
+                expert_lora,
+                topk_ids,
+                moe_index,
+                sorted_tokens_num_lod,
+                local_num_experts,
+                local_expert_base=ep_rank * local_num_experts,
+            )
+
+        torch.ops._C.moe_fc(
+            x=moe_expand,
+            weight=w13_weight,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=moe_index,
+            moe_topk=top_k,
+            y=y,
+            topk_ids=topk_ids,
+            act=None,
+        )
+        # w13 seam: must complete before out1 takes over workspace_a -- its
+        # input moe_expand lives in workspace_a.
+        if lora_rows is not None:
+            apply_seam(
+                y,
+                moe_expand,
+                expert_lora.w13_lora_a_stacked,
+                expert_lora.w13_lora_b_stacked,
+                lora_rows,
+            )
+
+        out1 = workspace_a[:out1_numel].view(M, top_k, up_gate_size // 2)
+        torch.ops._C.silu_and_mul(out1, y)
+        out1 = out1.reshape(-1, out1.shape[-1])
+
+        out = workspace_b[:out_numel].view(M, top_k, hidden_dim)
+        torch.ops._C.moe_fc(
+            x=out1,
+            weight=w2_weight,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=moe_index,
+            moe_topk=top_k,
+            y=out,
+            topk_ids=topk_ids,
+            act=None,
+        )
+        # w2 seam: must complete before the moe_ep_post un-sorting step --
+        # the indices are in sorted order.
+        if lora_rows is not None:
+            apply_seam(
+                out,
+                out1,
+                expert_lora.w2_lora_a_stacked,
+                expert_lora.w2_lora_b_stacked,
+                lora_rows,
+            )
+
+        output = torch.zeros([M, N], dtype=x.dtype, device=x.device)
+        dequant_scale = torch.ones((M, top_k), dtype=torch.float32, device=x.device)
+        kunlun_ops.moe_ep_post(
+            out.view(rows, hidden_dim),
+            moe_index.view(M, top_k),
+            normed_score,
+            dequant_scale,
+            output,
+        )
         return output
 
     @staticmethod
