@@ -1,0 +1,2 @@
+# Additional dependency for the separately installed LMCache MP source tree.
+msgspec>=0.20.0
