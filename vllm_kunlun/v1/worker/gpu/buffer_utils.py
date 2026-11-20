@@ -35,6 +35,7 @@ deliberately not the multi-GB ``uva_instead_of_gpu`` ones -- see
 import ctypes
 import logging
 import math
+from functools import cache
 from types import SimpleNamespace
 
 import numpy as np
@@ -72,9 +73,11 @@ def _apply_write(self) -> None:
         # Long Python lists are expensive for torch.tensor to unpack. NumPy
         # creates the same typed CPU payload without scalar Torch conversion.
         cpu = torch.from_numpy(np.asarray(values, dtype=_NUMPY_DTYPES[self.dtype]))
-        if _PINNED_OK:
-            cpu = cpu.pin_memory()
-        contents = cpu.to(self.device, non_blocking=_PINNED_OK)
+        with torch.cuda.device(self.device):
+            pinned_ok, _ = _buffer_capabilities(torch.cuda.current_device())
+            if pinned_ok:
+                cpu = cpu.pin_memory()
+            contents = cpu.to(self.device, non_blocking=pinned_ok)
     else:
         contents = _up.async_tensor_h2d(values, device=self.device, dtype=self.dtype)
     # XSpeedGate requires 2D, including scalar-per-request state buffers.
@@ -110,10 +113,7 @@ def _pinned_alloc_supported() -> bool:
     return True
 
 
-_PINNED_OK = _pinned_alloc_supported()
-
-
-def _uva_view_supported() -> bool:
+def _uva_view_supported(pinned_ok: bool) -> bool:
     """Probe whether a real UVA accelerator view can be built on this platform.
 
     ``is_uva_available()`` only checks for pinned memory, which is True on
@@ -124,7 +124,7 @@ def _uva_view_supported() -> bool:
     ``vllm._C`` is not built), so the call raises. Probe it once instead of
     trusting ``is_uva_available()``.
     """
-    if not is_uva_available() or not _PINNED_OK:
+    if not is_uva_available() or not pinned_ok:
         return False
     try:
         probe = torch.zeros(1, dtype=torch.int32, device="cpu", pin_memory=True)
@@ -140,77 +140,103 @@ def _uva_view_supported() -> bool:
 _BUILDING_POOL = False
 
 
-if not _uva_view_supported():
-    # Device-tensor fallback: keep a plain CPU source of truth and a real
-    # device tensor as the ``.uva`` view, synced with explicit H2D copies.
-    logger.warning(
-        "[KunlunPlugin] UVA unavailable; using device-tensor fallback for "
-        "Model Runner V2 buffers (extra H2D copies per step; staging buffers "
-        "%s).",
-        "pinned" if _PINNED_OK else "pageable, so H2D copies stay synchronous",
-    )
+@cache
+def _buffer_capabilities(device_index: int) -> tuple[bool, bool]:
+    """Probe only after the worker selects its device, once per device.
 
-    def _uvabuffer_init(self, size, dtype):
-        """Device-tensor stand-in for the upstream UVA-backed buffer.
+    Import-time probes leave pinned blocks associated with default device 0
+    in the host allocator cache. Reusing them on another XPU can make a
+    nonblocking D2H call wait for the stream.
+    """
+    with torch.cuda.device(device_index):
+        pinned_ok = _pinned_alloc_supported()
+        uva_ok = _uva_view_supported(pinned_ok)
+    if not uva_ok:
+        logger.warning(
+            "[KunlunPlugin] UVA unavailable on device %s; using device-tensor "
+            "fallback for Model Runner V2 buffers (extra H2D copies per step; "
+            "staging buffers %s).",
+            device_index,
+            "pinned" if pinned_ok else "pageable, so H2D copies stay synchronous",
+        )
+    return pinned_ok, uva_ok
 
-        Upstream pins unconditionally because its ``.uva`` *is* the pinned host
-        memory. Here ``.uva`` is a separate device tensor, so pinning is only
-        worth it for one of ``UvaBuffer``'s two upstream roles:
 
-        * ``UvaBufferPool.__init__`` (upstream buffer_utils.py:67) builds the
-          per-step H2D staging buffers, sized by ``max_num_reqs`` -- kilobytes.
-          Pinning these is what makes the ``non_blocking=True`` copy in
-          ``_pool_copy_to_uva`` genuinely asynchronous: a copy out of pageable
-          memory has to be staged through a driver buffer before the call
-          returns, which blocks the host and makes the pool's round-robin
-          pointless.
-        * ``StagedWriteTensor.__init__`` with ``uva_instead_of_gpu=True``
-          (upstream buffer_utils.py:141) allocates bulk storage that upstream
-          documents as "extremely large (e.g., several GBs)" -- ``all_token_ids``
-          is ``max_num_reqs x max_model_len``. Pinning that would lock GBs of
-          unswappable host memory, and nothing ever reads its ``.cpu`` side
-          anyway; only ``.uva`` is used.
+_orig_uvabuffer_init = _up.UvaBuffer.__init__
 
-        ``UvaBuffer``'s own arguments do not say which role it is being built
-        for, so ``_BUILDING_POOL`` carries it. Pools are only ever constructed
-        during single-threaded worker init, so a module-level flag is enough.
-        """
-        pin = _BUILDING_POOL and _PINNED_OK
-        self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=pin)
-        self.np = self.cpu.numpy()
-        dev = torch.device("cuda", torch.cuda.current_device())
-        self.uva = torch.zeros(size, dtype=dtype, device=dev)
 
-    _orig_pool_init = _up.UvaBufferPool.__init__
+def _uvabuffer_init(self, size, dtype):
+    """Device-tensor stand-in for the upstream UVA-backed buffer.
 
-    def _pool_init(self, *args, **kwargs):
-        """Run the upstream pool constructor with the staging role marked.
+    Upstream pins unconditionally because its ``.uva`` *is* the pinned host
+    memory. Here ``.uva`` is a separate device tensor, so pinning is only
+    worth it for one of ``UvaBuffer``'s two upstream roles:
 
-        Wrapping rather than reimplementing keeps this immune to upstream
-        changing what else the pool sets up.
-        """
-        global _BUILDING_POOL
-        _BUILDING_POOL = True
-        try:
-            _orig_pool_init(self, *args, **kwargs)
-        finally:
-            _BUILDING_POOL = False
+    * ``UvaBufferPool.__init__`` (upstream buffer_utils.py:67) builds the
+      per-step H2D staging buffers, sized by ``max_num_reqs`` -- kilobytes.
+      Pinning these is what makes the ``non_blocking=True`` copy in
+      ``_pool_copy_to_uva`` genuinely asynchronous: a copy out of pageable
+      memory has to be staged through a driver buffer before the call
+      returns, which blocks the host and makes the pool's round-robin
+      pointless.
+    * ``StagedWriteTensor.__init__`` with ``uva_instead_of_gpu=True``
+      (upstream buffer_utils.py:141) allocates bulk storage that upstream
+      documents as "extremely large (e.g., several GBs)" -- ``all_token_ids``
+      is ``max_num_reqs x max_model_len``. Pinning that would lock GBs of
+      unswappable host memory, and nothing ever reads its ``.cpu`` side
+      anyway; only ``.uva`` is used.
 
-    def _pool_copy_to_uva(self, x):
-        self._curr = (self._curr + 1) % self.max_concurrency
-        buf = self._uva_bufs[self._curr]
-        dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
-        n = len(x)
-        dst[:n] = x
-        # Safe to issue asynchronously: the round-robin means this buffer is
-        # not rewritten for another ``max_concurrency`` steps, and the copy is
-        # queued ahead of the forward that consumes it.
+    ``UvaBuffer``'s own arguments do not say which role it is being built
+    for, so ``_BUILDING_POOL`` carries it. Pools are only ever constructed
+    during single-threaded worker init, so a module-level flag is enough.
+    """
+    pinned_ok, uva_ok = _buffer_capabilities(torch.cuda.current_device())
+    self._kunlun_uva_supported = uva_ok
+    if uva_ok:
+        _orig_uvabuffer_init(self, size, dtype)
+        return
+    pin = _BUILDING_POOL and pinned_ok
+    self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=pin)
+    self.np = self.cpu.numpy()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    self.uva = torch.zeros(size, dtype=dtype, device=dev)
+
+
+_orig_pool_init = _up.UvaBufferPool.__init__
+
+
+def _pool_init(self, *args, **kwargs):
+    """Run the upstream pool constructor with the staging role marked.
+
+    Wrapping rather than reimplementing keeps this immune to upstream
+    changing what else the pool sets up.
+    """
+    global _BUILDING_POOL
+    previous = _BUILDING_POOL
+    _BUILDING_POOL = True
+    try:
+        _orig_pool_init(self, *args, **kwargs)
+    finally:
+        _BUILDING_POOL = previous
+
+
+def _pool_copy_to_uva(self, x):
+    self._curr = (self._curr + 1) % self.max_concurrency
+    buf = self._uva_bufs[self._curr]
+    dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+    n = len(x)
+    dst[:n] = x
+    # Safe to issue asynchronously: the round-robin means this buffer is
+    # not rewritten for another ``max_concurrency`` steps, and the copy is
+    # queued ahead of the forward that consumes it.
+    if not buf._kunlun_uva_supported:
         buf.uva[:n].copy_(buf.cpu[:n], non_blocking=True)
-        return buf.uva[:n]
+    return buf.uva[:n]
 
-    _up.UvaBuffer.__init__ = _uvabuffer_init
-    _up.UvaBufferPool.__init__ = _pool_init
-    _up.UvaBufferPool.copy_to_uva = _pool_copy_to_uva
+
+_up.UvaBuffer.__init__ = _uvabuffer_init
+_up.UvaBufferPool.__init__ = _pool_init
+_up.UvaBufferPool.copy_to_uva = _pool_copy_to_uva
 
 
 class _Device(ctypes.Structure):
