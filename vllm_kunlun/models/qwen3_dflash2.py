@@ -143,6 +143,9 @@ class DFlashGroupedConv(nn.Module):
 
 
 class DFlash2Qwen3Attention(DFlashQwen3Attention):
+    def attend(self, q, k, v):
+        return self.attn(q, k, v)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -161,7 +164,7 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
         layer = self.attn
         buffers = getattr(layer, "_kunlun_dflash_graph_buffers", None)
         if buffers is None:
-            attn_output = layer(q, k, v)
+            attn_output = self.attend(q, k, v)
         else:
             # Descriptor-owned handoff buffers match the MRV1 proposal path.
             output, handoff = buffers
@@ -184,6 +187,9 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
 
 
 class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
+    attention_cls = DFlash2Qwen3Attention
+    draft_block_size: int | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -194,7 +200,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        with _use_dflash_class("DFlashQwen3Attention", DFlash2Qwen3Attention):
+        with _use_dflash_class("DFlashQwen3Attention", self.attention_cls):
             super().__init__(
                 vllm_config,
                 config=config,
@@ -222,7 +228,8 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             "hidden_size": config.hidden_size,
             "taps": int(draft_config["conv_kernel_size"]),
             "group_size": int(draft_config["conv_group_size"]),
-            "block_size": 1 + speculative_config.num_speculative_tokens,
+            "block_size": self.draft_block_size
+            or (1 + speculative_config.num_speculative_tokens),
             "params_dtype": vllm_config.model_config.dtype,
         }
         self.attention_conv = DFlashGroupedConv(
@@ -471,7 +478,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
     def compute_candidates(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, apply_draft_transform: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global-vocabulary candidate IDs and their unary logits."""
         if not isinstance(self.lm_head.quant_method, UnquantizedEmbeddingMethod):
@@ -513,7 +520,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, selected = torch.topk(values, selector.top_k, dim=-1)
             ids = ids.gather(-1, selected)
 
-        values = values.float() * self.output_multiplier
+        values = values.float()
+        if not apply_draft_transform:
+            return ids, values
+        values = values * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
             values = torch.tanh(values / cap) * cap

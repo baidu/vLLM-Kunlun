@@ -76,8 +76,10 @@ def _apply_mrv2_gate(module: ModuleType) -> None:
                 "qwen3_5_moe",
                 "qwen3_5_moe_text",
             )
-            dflash2_ok = spec.method == "dflash" and "DFlash2DraftModel" in (
-                spec.draft_model_config.architectures or []
+            dflash2_ok = spec.method == "dflash" and bool(
+                {"DFlash2DraftModel", "DFlash2T1ResidualDraftModel"}.intersection(
+                    spec.draft_model_config.architectures or []
+                )
             )
             if not (
                 (mtp_ok or dflash2_ok)

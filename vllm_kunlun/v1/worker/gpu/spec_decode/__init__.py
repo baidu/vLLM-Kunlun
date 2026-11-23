@@ -16,7 +16,16 @@ def is_dflash2(speculative_config) -> bool:
 
 
 def init_speculator(vllm_config, device):
-    if is_dflash2(vllm_config.speculative_config):
+    spec = vllm_config.speculative_config
+    if (
+        spec
+        and spec.method == "dflash"
+        and ("DFlash2T1ResidualDraftModel" in spec.draft_model_config.architectures)
+    ):
+        from .dmtp import DMTPSpeculator
+
+        return DMTPSpeculator(vllm_config, device)
+    if is_dflash2(spec):
         from vllm_kunlun.v1.worker.gpu.spec_decode.dflash2.speculator import (
             DFlash2Speculator,
         )
