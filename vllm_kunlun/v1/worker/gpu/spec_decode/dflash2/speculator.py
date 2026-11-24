@@ -26,6 +26,9 @@ class DFlash2Speculator(DFlashSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_config(vllm_config)
         super().__init__(vllm_config, device)
+        if self.dtype == torch.float16:
+            # Keep the auxiliary projection finite until context RMSNorm.
+            self.hidden_states = self.hidden_states.float()
         self.selector_top_k = int(
             self.draft_model_config.hf_config.dflash_config["selector_top_k"]
         )
