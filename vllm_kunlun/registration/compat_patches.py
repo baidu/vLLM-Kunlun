@@ -36,6 +36,81 @@ import logging
 import sys
 from types import ModuleType
 
+# --- vllm.v1.core.sched.scheduler: protect DMTP prefix boundaries --------
+
+
+def _is_dmtp_speculative_config(spec) -> bool:
+    draft = getattr(spec, "draft_model_config", None)
+    return getattr(spec, "method", None) == "dflash" and (
+        "DFlash2T1ResidualDraftModel" in (getattr(draft, "architectures", None) or [])
+    )
+
+
+def _dmtp_scheduler_applied(module: ModuleType) -> bool:
+    cls = getattr(module, "Scheduler", None)
+    return cls is None or getattr(cls.__init__, "_kunlun_dmtp_patched", False)
+
+
+def _apply_dmtp_scheduler_patch(module: ModuleType) -> None:
+    if _dmtp_scheduler_applied(module):
+        return
+    original = module.Scheduler.__init__
+
+    @functools.wraps(original)
+    def _kunlun_dmtp_init(self, vllm_config, *args, **kwargs):
+        spec = vllm_config.speculative_config
+        if not (
+            _is_dmtp_speculative_config(spec)
+            and vllm_config.cache_config.enable_prefix_caching
+        ):
+            return original(self, vllm_config, *args, **kwargs)
+
+        kv_config = kwargs.get("kv_cache_config", args[0] if args else None)
+        groups = getattr(kv_config, "kv_cache_groups", ())
+        if groups and hasattr(groups[0], "is_eagle_group"):
+            native_groups = [
+                group
+                for group in groups
+                if any(name.startswith("dmtp_native.") for name in group.layer_names)
+            ]
+            if not native_groups:
+                raise ValueError("DMTP prefix caching requires its native MTP KV group")
+            # An unannotated config makes vLLM flag every group, including
+            # Mamba. Mamba does not pop an EAGLE block, so its lookahead can
+            # grow the hit beyond the full-attention blocks actually returned.
+            # Only native MTP KV depends on the successor token at the fork.
+            for group in groups:
+                group.is_eagle_group = any(group is native for native in native_groups)
+
+        # Native MTP KV at p depends on E(token[p+1]). Recompute the last
+        # matching block and move the Mamba snapshot boundary with it.
+        # Only this config instance during Scheduler.__init__ sees EAGLE;
+        # DFlash still supplies K+1 lookahead slots, and workers keep DFlash.
+        had_override = "use_eagle" in vars(spec)
+        previous = vars(spec).get("use_eagle")
+        try:
+            spec.use_eagle = lambda: True
+            original(self, vllm_config, *args, **kwargs)
+        finally:
+            if had_override:
+                spec.use_eagle = previous
+            else:
+                del spec.use_eagle
+
+        if not self.use_eagle or self.num_lookahead_tokens != self.num_spec_tokens + 1:
+            raise RuntimeError(
+                "DMTP prefix caching requires EAGLE KV protection and K+1 lookahead"
+            )
+        logging.getLogger("vllm_kunlun").info(
+            "DMTP prefix caching: use_eagle=True (drop last block, Mamba align), "
+            "num_lookahead_tokens=%d",
+            self.num_lookahead_tokens,
+        )
+
+    _kunlun_dmtp_init._kunlun_dmtp_patched = True
+    module.Scheduler.__init__ = _kunlun_dmtp_init
+
+
 # --- vllm.config.vllm: lift the Model Runner V2 Triton veto ---------------
 #
 # Kunlun swaps the V2 Triton kernels for torch-native / XSpeedGate / kunlun_ops equivalents
@@ -700,6 +775,11 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
+    (
+        "vllm.v1.core.sched.scheduler",
+        _dmtp_scheduler_applied,
+        _apply_dmtp_scheduler_patch,
+    ),
     ("vllm.v1.worker.gpu.attn_utils", _bind_kv_cache_applied, _apply_bind_kv_cache),
     (
         "vllm.utils.import_utils",

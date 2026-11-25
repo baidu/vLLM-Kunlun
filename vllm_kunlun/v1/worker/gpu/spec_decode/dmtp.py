@@ -194,6 +194,9 @@ class NativeMTPGraphs(CudaGraphManager):
         self.hidden[:count].copy_(hidden[:count])
         self.anchors[:n].copy_(anchors)
         self.rejected[:n].copy_(rejected[:n])
+        # Keep the padded verifier length: causal attention starts at
+        # seq_len - verify_width, matching eager's accepted_len - query_len.
+        # This also holds for an eight-row prefill after a prefix cache hit.
         self.lens[:n].copy_(batch.seq_lens[:n])
         self.target_slots[:n].copy_(
             self.spec.block_tables.slot_mappings[self.group, :count].view(n, -1)
@@ -253,9 +256,10 @@ class DMTPSpeculator(DFlash2Speculator):
             raise ValueError(
                 "Expected the Qwen3.6-27B target and its matching DMTP draft"
             )
-        if vllm_config.cache_config.enable_prefix_caching:
+        if vllm_config.cache_config.kv_sharing_fast_prefill:
             raise ValueError(
-                "Use --no-enable-prefix-caching for private MTP successor KV"
+                "DMTP is incompatible with kv_sharing_fast_prefill: "
+                "native MTP requires correct hidden states for every prompt token"
             )
 
     def __init__(self, vllm_config, device):
