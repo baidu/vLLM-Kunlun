@@ -23,14 +23,122 @@ and the align branch -- completely untouched.
 """
 
 import logging
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.v1.worker.gpu.model_states.mamba_hybrid as _up
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.utils import AttentionGroup
 
 import vllm_kunlun.v1.worker.mamba_utils as _kunlun_mamba_utils
 from vllm_kunlun.v1.worker.gpu._kernels import TorchKernel
 
+if TYPE_CHECKING:
+    from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
 logger = logging.getLogger("vllm_kunlun")
+
+
+def build_hybrid_attn_metadata(
+    attn_groups: list[list[AttentionGroup]],
+    num_reqs: int,
+    num_tokens: int,
+    query_start_loc_gpu: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    max_query_len: int,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_tables: Sequence[torch.Tensor],
+    slot_mappings: torch.Tensor,
+    kv_cache_config: KVCacheConfig,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    dcp_local_seq_lens: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+    for_cudagraph_capture: bool = False,
+    rswa_prefix_lens: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Build GDN batch tensors once per compatible KV spec and forward step."""
+    seq_lens = seq_lens[:num_reqs]
+    if dcp_local_seq_lens is not None:
+        dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
+    if seq_lens_cpu_upper_bound is not None:
+        seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
+
+    attn_metadata: dict[str, Any] = {}
+    cached_metadata: dict[MambaSpec, GDNAttentionMetadata] = {}
+    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    for i in range(num_kv_cache_groups):
+        groups = attn_groups[i]
+        if not groups:
+            continue
+        block_table = block_tables[i]
+        slot_mapping = slot_mappings[i]
+        common_attn_metadata_extra_kwargs = (
+            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
+            if model_specific_attn_metadata is not None
+            else {}
+        )
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len=max_seq_len,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=max_query_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            positions=positions,
+            rswa_prefix_lens=rswa_prefix_lens,
+            **common_attn_metadata_extra_kwargs,
+        )
+        for attn_group in groups:
+            attn_metadata_builder = attn_group.get_metadata_builder(0)
+            reuse_key = None
+            source_metadata = None
+            # GDN subclasses may own additional per-group metadata.
+            if type(attn_metadata_builder) is _KunlunGDNBuilder:
+                reuse_key = attn_metadata_builder.kv_cache_spec
+                source_metadata = cached_metadata.get(reuse_key)
+            else:
+                # Other builders can change shared device lengths at capture.
+                # Keep the same GDN buffer ownership boundaries at replay.
+                cached_metadata.clear()
+
+            if source_metadata is not None:
+                metadata = attn_metadata_builder.reuse_metadata(
+                    source_metadata,
+                    common_attn_metadata,
+                )
+            elif for_cudagraph_capture:
+                metadata = attn_metadata_builder.build_for_cudagraph_capture(
+                    common_attn_metadata
+                )
+            else:
+                attn_metadata_extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        attn_metadata_builder, num_reqs
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
+                metadata = attn_metadata_builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    **attn_metadata_extra_kwargs,
+                )
+
+            if reuse_key is not None and source_metadata is None:
+                cached_metadata[reuse_key] = metadata
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = metadata
+    return attn_metadata
 
 
 def _scatter_num_accepted(idx_mapping, num_sampled, num_accepted) -> None:
@@ -68,10 +176,11 @@ from vllm_kunlun.v1.attention.backends.gdn_attn import (  # noqa: E402
 # drops speculative-decode metadata. Let import-hook dispatch report and retry
 # an installation failure instead of continuing with potentially wrong results.
 _up.GDNAttentionMetadataBuilder = _KunlunGDNBuilder
+_up.build_attn_metadata = build_hybrid_attn_metadata
 
 logger.info(
     "[KunlunPlugin] V2 MambaHybridModelState patched "
-    "(XSpeedGate scatter_num_accepted and mamba align)"
+    "(XSpeedGate scatter_num_accepted, mamba align and GDN metadata reuse)"
 )
 
 # Request slots can be reused in cache mode "none" as well as "align".
