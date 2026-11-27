@@ -13,6 +13,7 @@ import torch
 def mamba(load_kunlun_override, stub_module_tree, native_ops):
     class Context:
         def initialize_from_forward_context(self, *args, **kwargs):
+            self.upstream_init = args
             self.is_initialized = True
 
     layout = stub_module_tree(
@@ -43,8 +44,97 @@ def make_context(mamba, capacity=8):
     context.block_table_ptrs = torch.tensor([3000], dtype=torch.int64)
     context.block_table_stride_req = 12
     context.block_size = 128
-    context.initialize_from_forward_context()
+    context.mamba_group_ids = [0]
+    group = SimpleNamespace(kv_cache_spec=SimpleNamespace(shapes=((), ())))
+    context.init_args = SimpleNamespace(kv_cache_groups=[group]), {}, (), []
+    context.initialize_from_forward_context(*context.init_args)
     return context
+
+
+def test_compact_layers_keep_conv_and_recurrent_state_in_order(
+    mamba, stub_module, native_ops
+):
+    ops = stub_module(
+        "kunlun_ops", gdn_align_precopy=Mock(), gdn_align_postprocess=Mock()
+    )
+    context = make_context(mamba)
+    context.is_initialized = False
+    context.num_layers = 2
+    context.mamba_group_ids = [1, 0]
+    groups = [
+        SimpleNamespace(
+            layer_names=[name],
+            kv_cache_spec=SimpleNamespace(shapes=((),) * 6, num_speculative_blocks=0),
+        )
+        for name in ("a", "b")
+    ]
+
+    def cache():
+        return (
+            torch.empty(5, 3, 2),
+            torch.empty(5, 4, 128, 128, dtype=torch.float16),
+            torch.empty(5, 2, 4, 128, dtype=torch.float16),
+            torch.empty(5, 4, 4, 128, dtype=torch.float16),
+            torch.empty(5, 4, 4),
+            torch.empty(5, 1, dtype=torch.int32),
+        )
+
+    forward = {name: SimpleNamespace(kv_cache=cache()) for name in ("a", "b")}
+    tables = [torch.zeros(8, 12, dtype=torch.int32) for _ in groups]
+    args = (
+        SimpleNamespace(kv_cache_groups=groups),
+        forward,
+        ("conv", "temporal"),
+        tables,
+    )
+    context.initialize_from_forward_context(*args)
+    _, conv, funcs, _ = context.upstream_init
+    assert funcs == ("conv",) and context.num_state_types == 1
+    for name in forward:
+        assert len(conv[name].kv_cache) == 1
+        assert conv[name].kv_cache[0] is forward[name].kv_cache[0]
+        assert len(forward[name].kv_cache) == 6
+    pointers = context._kunlun_gdn_layers
+    assert pointers.shape == (2, 15)
+    for group, name in enumerate(("b", "a")):
+        buffers = forward[name].kv_cache[1:]
+        assert pointers[group].tolist() == [
+            *(t.data_ptr() for t in buffers),
+            *(t.stride(0) for t in buffers),
+            group,
+            5,
+            2,
+            4,
+            4,
+        ]
+    context.initialize_from_forward_context(*args)
+    assert context._kunlun_gdn_layers is pointers
+
+    calls = []
+    mapping = torch.tensor([2, -1, 0], dtype=torch.int32)
+    accepted = torch.tensor([3, 1, 4, 1, 1, 1, 1, 1], dtype=torch.int32)
+    state = torch.zeros_like(accepted)
+    computed = torch.full_like(accepted, 513)
+    native_ops.precopy_mamba_align_fused_kernel = Mock(
+        side_effect=lambda *args: calls.append("conv pre")
+    )
+    ops.gdn_align_precopy.side_effect = lambda *args: calls.append("gdn pre")
+
+    def gdn_post(*args):
+        assert args[5] is accepted and args[5][2] == 4
+        assert torch.equal(args[2], mapping)
+        calls.append("gdn post")
+
+    def conv_post(*args):
+        calls.append("conv post")
+        args[15].fill_(1)
+
+    ops.gdn_align_postprocess.side_effect = gdn_post
+    native_ops.postprocess_mamba = Mock(side_effect=conv_post)
+    context.run_fused_precopy(3, state, computed, accepted, mapping)
+    context.run_fused_postprocess_align(3, accepted, state, computed, mapping)
+    assert calls == ["conv pre", "gdn pre", "gdn post", "conv post"]
+    assert accepted.tolist() == [1] * 8
 
 
 def test_real_module_registers_existing_entry_points_once(mamba):
@@ -84,14 +174,14 @@ def test_layout_cache_preserves_original_metadata_and_rebuilds(mamba, dim_first)
     assert context.state_dim_row_count.tolist() == [67, 0]
     assert context.state_dim_row_stride.tolist() == [20, 0]
     buffers = context._kunlun_align_buffers
-    context.initialize_from_forward_context()
+    context.initialize_from_forward_context(*context.init_args)
     assert (
         context._kunlun_precopy_metadata is pre
         and context._kunlun_align_buffers is buffers
     )
     context.is_initialized = False
     context.state_elem_sizes[0] = 4
-    context.initialize_from_forward_context()
+    context.initialize_from_forward_context(*context.init_args)
     assert context._kunlun_precopy_metadata is not pre
     assert context._kunlun_precopy_metadata[0].tolist() == (
         [4, 4] if dim_first else [268, 4]

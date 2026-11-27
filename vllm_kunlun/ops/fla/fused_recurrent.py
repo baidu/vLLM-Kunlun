@@ -13,7 +13,7 @@ import torch
 import xspeedgate_ops  # noqa: F401 - registers the XSG torch operator
 
 
-def gdn_sdnn_is_available() -> bool:
+def gdn_sdnn_is_available(*, align: bool = False) -> bool:
     """Check the optional single-slot operators on the current device."""
     try:
         import kunlun_ops
@@ -21,6 +21,14 @@ def gdn_sdnn_is_available() -> bool:
         return (
             callable(kunlun_ops.fused_gdn_commit_chunk_verify)
             and callable(kunlun_ops.gdn_commit_accepted)
+            and callable(kunlun_ops.gdn_clear_pending)
+            and (
+                not align
+                or (
+                    callable(kunlun_ops.gdn_align_precopy)
+                    and callable(kunlun_ops.gdn_align_postprocess)
+                )
+            )
             and kunlun_ops.gdn_sdnn_supports_current_device()
         )
     except (ImportError, OSError, AttributeError, RuntimeError):

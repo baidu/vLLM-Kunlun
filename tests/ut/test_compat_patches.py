@@ -12,6 +12,46 @@ import pytest
 from vllm_kunlun.registration import compat_patches
 
 
+@pytest.mark.parametrize(
+    "states, physical, optimistic, expected",
+    [
+        (6, 0, 518, 511),
+        (6, 0, 1, 0),
+        (6, 0, 520, 513),
+        (2, 7, 518, 518),
+        (2, 0, 518, 518),
+    ],
+)
+def test_mamba_margin_protects_unconfirmed_boundary(
+    module_factory, states, physical, optimistic, expected
+):
+    from types import SimpleNamespace
+
+    seen = []
+
+    class Manager:
+        def remove_skipped_blocks(
+            self, request_id, num_computed_tokens, num_prompt_tokens=None
+        ):
+            seen.append(
+                (
+                    request_id,
+                    num_computed_tokens,
+                    num_prompt_tokens,
+                    self.num_speculative_blocks,
+                )
+            )
+
+    module = module_factory(MambaManager=Manager)
+    compat_patches._apply_mamba_margin(module)
+    assert compat_patches._mamba_margin_applied(module)
+    obj = Manager()
+    obj.kv_cache_spec = SimpleNamespace(shapes=((1, 8, 128),) * states)
+    obj.num_speculative_blocks = physical
+    obj.remove_skipped_blocks("r", optimistic, 495)
+    assert seen == [("r", expected, 495, physical)]
+
+
 class TestDefaultHooks:
     def test_every_entry_is_a_usable_registration(self):
         for entry in compat_patches.DEFAULT_HOOKS:

@@ -826,6 +826,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 cast_ssm_state,
                 non_spec_state_indices_tensor,
             )
+            if compact:
+                # Prefill materializes H, even on a dirty page recycled after
+                # preemption. Factors left by the previous owner are obsolete.
+                kunlun_ops.gdn_clear_pending(non_spec_state_indices_tensor, pending)
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_recurrent_gated_delta_rule(

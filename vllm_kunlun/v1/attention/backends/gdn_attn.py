@@ -50,7 +50,7 @@ def get_gdn_sdnn_cache_spec(
             return spec
     else:
         return spec
-    if spec.mamba_cache_mode != "none":
+    if spec.mamba_cache_mode not in ("none", "align"):
         logger.info_once(
             "GDN SDNN single-slot fallback for Mamba cache mode %s.",
             spec.mamba_cache_mode,
@@ -91,12 +91,13 @@ def get_gdn_sdnn_cache_spec(
 
     from vllm_kunlun.ops.fla.fused_recurrent import gdn_sdnn_is_available
 
-    if not gdn_sdnn_is_available():
+    if not gdn_sdnn_is_available(align=spec.mamba_cache_mode == "align"):
         return spec
     logger.info_once(
-        "GDN SDNN single-slot verification enabled (proposer=%s, K=%d).",
+        "GDN SDNN single-slot verification enabled (proposer=%s, K=%d, mode=%s).",
         proposer,
         num_spec,
+        spec.mamba_cache_mode,
     )
     return replace(spec, shapes=shapes, dtypes=dtypes, num_speculative_blocks=0)
 
@@ -582,7 +583,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     )
                 if batch_accepted is not None:
                     if not all_history:
-                        prefill_history_rows = history_rows.to(device, non_blocking=True)
+                        prefill_history_rows = history_rows.to(
+                            device, non_blocking=True
+                        )
                     if all_history and spec_sequence_masks_cpu is None:
                         non_spec_accepted = batch_accepted
                     elif spec_sequence_masks_cpu is None:
@@ -590,12 +593,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                             0, prefill_history_rows
                         )
                     else:
-                        batch_rows = history_rows
-                        if spec_sequence_masks_cpu is not None:
-                            non_spec_rows = (~spec_sequence_masks_cpu).nonzero(
-                                as_tuple=True
-                            )[0]
-                            batch_rows = non_spec_rows[history_rows]
+                        non_spec_rows = (~spec_sequence_masks_cpu).nonzero(
+                            as_tuple=True
+                        )[0]
+                        batch_rows = non_spec_rows[history_rows]
                         non_spec_accepted = batch_accepted.index_select(
                             0, batch_rows.to(device, non_blocking=True)
                         )
