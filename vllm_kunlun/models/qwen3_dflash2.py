@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -142,6 +143,9 @@ class DFlashGroupedConv(nn.Module):
 
 
 class DFlash2Qwen3Attention(DFlashQwen3Attention):
+    def attend(self, q, k, v):
+        return self.attn(q, k, v)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -160,7 +164,7 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
         layer = self.attn
         buffers = getattr(layer, "_kunlun_dflash_graph_buffers", None)
         if buffers is None:
-            attn_output = layer(q, k, v)
+            attn_output = self.attend(q, k, v)
         else:
             # Descriptor-owned handoff buffers match the MRV1 proposal path.
             output, handoff = buffers
@@ -176,11 +180,16 @@ class DFlash2Qwen3Attention(DFlashQwen3Attention):
             )
             handoff.copy_(output)
             attn_output = handoff.view(-1, layer.num_heads * layer.head_size_v)
+        if hidden_states.dtype == torch.float16:
+            attn_output = attn_output.float()
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
+    attention_cls = DFlash2Qwen3Attention
+    draft_block_size: int | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -191,7 +200,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        with _use_dflash_class("DFlashQwen3Attention", DFlash2Qwen3Attention):
+        with _use_dflash_class("DFlashQwen3Attention", self.attention_cls):
             super().__init__(
                 vllm_config,
                 config=config,
@@ -206,6 +215,10 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         )
         if self.model_dtype == torch.float16 and quant_config is not None:
             raise ValueError("FP16 DFlash2 requires an unquantized draft MLP")
+        if self.model_dtype == torch.float16:
+            # Both residual branches can exceed FP16 before convolution and RMSNorm.
+            self.self_attn.o_proj.to(torch.float32)
+            self.mlp.down_proj.to(torch.float32)
         self.input_layernorm.to(self.norm_dtype)
         self.post_attention_layernorm.to(self.norm_dtype)
         draft_config = config.dflash_config
@@ -215,7 +228,8 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             "hidden_size": config.hidden_size,
             "taps": int(draft_config["conv_kernel_size"]),
             "group_size": int(draft_config["conv_group_size"]),
-            "block_size": 1 + speculative_config.num_speculative_tokens,
+            "block_size": self.draft_block_size
+            or (1 + speculative_config.num_speculative_tokens),
             "params_dtype": vllm_config.model_config.dtype,
         }
         self.attention_conv = DFlashGroupedConv(
@@ -246,7 +260,12 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = hidden_states.to(self.model_dtype)
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.model_dtype == torch.float16:
+            gate_up, _ = self.mlp.gate_up_proj(hidden_states)
+            activated = self.mlp.act_fn(gate_up.float())
+            hidden_states, _ = self.mlp.down_proj(activated)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
         return hidden_states, residual
 
@@ -331,6 +350,11 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             )
         self.model_dtype = vllm_config.model_config.dtype
         self.norm.to(self.layers[0].norm_dtype)
+        if self.model_dtype == torch.float16:
+            # Auxiliary projection can exceed FP16 before context RMSNorm.
+            if self.use_aux_hidden_state:
+                self.fc.to(torch.float32)
+            self.hidden_norm.to(torch.float32)
 
         draft_config = self.config.dflash_config
         self.input_embedding_scale = float(
@@ -366,7 +390,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         head_dim = self._head_dim
         num_kv_heads = self._num_kv_heads
 
-        normed_context_states = self.hidden_norm(context_states)
+        normed_context_states = self.hidden_norm(context_states).to(self.model_dtype)
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
@@ -444,12 +468,17 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
 
+    def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.model.use_aux_hidden_state:
+            hidden_states = hidden_states.to(self.model.fc.weight.dtype)
+        return super().combine_hidden_states(hidden_states)
+
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         """Let V2 route precomputed context K/V to each layer's cache group."""
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
     def compute_candidates(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, apply_draft_transform: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return global-vocabulary candidate IDs and their unary logits."""
         if not isinstance(self.lm_head.quant_method, UnquantizedEmbeddingMethod):
@@ -458,7 +487,27 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
-        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
+        if hidden_states.dtype == torch.float16:
+            weight = self.lm_head.weight
+            if hidden_states.is_cuda and weight.dtype == torch.float16:
+                # Write FP32 logits without copying the shared vocabulary weights.
+                logits = hidden_states.new_empty(
+                    (hidden_states.shape[0], weight.shape[0]), dtype=torch.float32
+                )
+                kunlun_ops.matmul(
+                    hidden_states.contiguous(),
+                    weight,
+                    logits,
+                    **({"stable": True} if envs.VLLM_BATCH_INVARIANT else {}),
+                )
+            else:
+                logits = F.linear(hidden_states.float(), weight.float())
+        else:
+            logits = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states, bias=None
+            )
+        # Kunlun TopK can return out-of-vocabulary indices for NaN logits.
+        logits.nan_to_num_(nan=torch.finfo(logits.dtype).min)
         num_padding = self.lm_head.shard_indices.num_org_vocab_padding
         if num_padding > 0:
             logits = logits[..., :-num_padding]
@@ -471,7 +520,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, selected = torch.topk(values, selector.top_k, dim=-1)
             ids = ids.gather(-1, selected)
 
-        values = values.float() * self.output_multiplier
+        values = values.float()
+        if not apply_draft_transform:
+            return ids, values
+        values = values * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
             values = torch.tanh(values / cap) * cap

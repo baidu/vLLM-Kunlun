@@ -2,7 +2,6 @@ from vllm import ModelRegistry
 
 
 def register_model():
-
     # TODO Remove all of models registration below
 
     # from .demo_model import DemoModel  # noqa: F401
@@ -41,4 +40,9 @@ def register_model():
     ModelRegistry.register_model(
         "DFlash2DraftModel",
         "vllm_kunlun.models.qwen3_dflash2:DFlash2Qwen3ForCausalLM",
+    )
+
+    ModelRegistry.register_model(
+        "DFlash2T1ResidualDraftModel",
+        "vllm_kunlun.models.qwen3_dmtp:DMTPDraft",
     )

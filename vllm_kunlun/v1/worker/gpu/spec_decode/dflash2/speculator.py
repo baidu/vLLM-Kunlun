@@ -22,14 +22,30 @@ from .cudagraph import DFlash2CudaGraphManager
 
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
+    _draft_sample_methods = ("greedy",)
+    _fixed_draft_query_len: int | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self._validate_config(vllm_config)
         super().__init__(vllm_config, device)
+        if self.dtype == torch.float16:
+            # Keep the auxiliary projection finite until context RMSNorm.
+            self.hidden_states = self.hidden_states.float()
         self.selector_top_k = int(
             self.draft_model_config.hf_config.dflash_config["selector_top_k"]
         )
+        if self._fixed_draft_query_len is not None:
+            self.num_query_per_req = self._fixed_draft_query_len
+        # prepare_dflash_inputs treats every non-anchor query row as a sample
+        # row, even when only the prefix will be sent to the target verifier.
         width = self.num_query_per_req
+        self._draft_sample_steps = width - 1
+        sample_capacity = self.max_num_reqs * self._draft_sample_steps
+        if self.sample_indices.numel() != sample_capacity:
+            size = (sample_capacity,)
+            self.sample_indices = self.sample_indices.new_empty(size)
+            self.sample_pos = self.sample_pos.new_empty(size)
+            self.sample_idx_mapping = self.sample_idx_mapping.new_empty(size)
         self._query_capacity = max(self.max_num_tokens, self.max_num_reqs * width)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -46,13 +62,15 @@ class DFlash2Speculator(DFlashSpeculator):
         self.sample_indices.copy_(samples)
         self._aux_staging: torch.Tensor | None = None
 
-    @staticmethod
-    def _validate_config(vllm_config: VllmConfig) -> None:
+    @classmethod
+    def _validate_config(cls, vllm_config: VllmConfig) -> None:
         spec = vllm_config.speculative_config
         parallel = vllm_config.parallel_config
         unsupported = []
-        if spec.draft_sample_method != "greedy":
-            unsupported.append("greedy draft sampling is required")
+        if spec.draft_sample_method not in cls._draft_sample_methods:
+            unsupported.append(
+                f"draft_sample_method must be one of {cls._draft_sample_methods}"
+            )
         if spec.rejection_sample_method != "standard":
             unsupported.append("standard rejection sampling is required")
         if not 1 <= spec.num_speculative_tokens <= 31:
@@ -79,6 +97,9 @@ class DFlash2Speculator(DFlashSpeculator):
         if unsupported:
             raise ValueError("Kunlun MRV2 DFlash2: " + "; ".join(unsupported))
 
+    def _can_replay_query(self):
+        return True
+
     def init_cudagraph_manager(self, cudagraph_mode):
         self.query_cudagraph_manager = DFlash2CudaGraphManager(self, cudagraph_mode)
 
@@ -103,7 +124,7 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         # Reuse a real hidden row for discarded candidates, even if the padded
         # model rows overflow in FP16. Candidate selection is per request.
-        steps = self.num_speculative_steps
+        steps = self._draft_sample_steps
         self.sample_indices[num_reqs * steps : num_reqs_padded * steps].zero_()
 
     def _precompute_context_kv(self, start, end, dummy_run=False):
@@ -216,6 +237,7 @@ class DFlash2Speculator(DFlashSpeculator):
         slot_mappings,
         num_tokens_across_dp,
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        inputs_embeds=None,
     ):
         # FULL capture records eager native ops; never compile a new model path
         # inside capture or invoke nested piecewise graph wrappers.
@@ -227,16 +249,19 @@ class DFlash2Speculator(DFlashSpeculator):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
             slot_mapping=slot_mappings,
-            skip_compiled=bool(attn_metadata)
-            and any(
-                getattr(md, "use_static_lod_bounds", False)
-                for md in attn_metadata.values()
+            skip_compiled=not self._can_replay_query()
+            or (
+                bool(attn_metadata)
+                and any(
+                    getattr(md, "use_static_lod_bounds", False)
+                    for md in attn_metadata.values()
+                )
             ),
         ):
             return self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
+                inputs_embeds=inputs_embeds,
             )
 
     def load_draft_model(self, target_model, target_attn_layer_names):
@@ -382,7 +407,7 @@ class DFlash2Speculator(DFlashSpeculator):
                 seeds_out=self.seeds,
                 block_size=self.block_tables.kernel_block_sizes[gid],
                 num_query_per_req=self.num_query_per_req,
-                num_speculative_steps=self.num_speculative_steps,
+                num_speculative_steps=self._draft_sample_steps,
                 max_num_reqs=self.max_num_reqs,
                 max_num_tokens=self._query_capacity,
                 max_model_len=self.max_model_len,
@@ -393,7 +418,11 @@ class DFlash2Speculator(DFlashSpeculator):
                 sample_from_anchor=self.sample_from_anchor,
             )
         manager = self.query_cudagraph_manager
-        if manager is not None and not (dummy_run or is_profile):
+        if (
+            manager is not None
+            and not (dummy_run or is_profile)
+            and self._can_replay_query()
+        ):
             desc = manager.dispatch(batch, query_count, self.num_query_per_req, 0)
             if desc.cg_mode == CUDAGraphMode.FULL:
                 self._prepare_graph_replay(
