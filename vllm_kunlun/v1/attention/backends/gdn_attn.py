@@ -3,9 +3,11 @@
 """Backend for GatedDeltaNet attention."""
 
 from dataclasses import dataclass, replace
+from math import prod
 
 import torch
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -20,6 +22,83 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+logger = init_logger(__name__)
+
+
+def get_gdn_sdnn_cache_spec(
+    spec: MambaSpec,
+    config: VllmConfig,
+    num_spec: int,
+    key_heads: int,
+    value_heads: int,
+    head_dims: tuple[int, int],
+) -> MambaSpec:
+    speculative = config.speculative_config
+    if speculative is None or not config.use_v2_model_runner:
+        return spec
+    if speculative.method == "mtp":
+        proposer = "mtp"
+    elif speculative.method == "dflash":
+        draft = getattr(speculative, "draft_model_config", None)
+        architectures = getattr(draft, "architectures", None) or ()
+        if "DFlash2T1ResidualDraftModel" in architectures:
+            proposer = "dmtp"
+        elif "DFlash2DraftModel" in architectures:
+            proposer = "dflash2"
+        else:
+            return spec
+    else:
+        return spec
+    if spec.mamba_cache_mode != "none":
+        logger.info_once(
+            "GDN SDNN single-slot fallback for Mamba cache mode %s.",
+            spec.mamba_cache_mode,
+        )
+        return spec
+
+    # A tree needs a state per branch. This verifier commits one linear prefix.
+    backend = config.attention_config.backend
+    if (
+        getattr(speculative, "speculative_token_tree", None)
+        or getattr(speculative, "tree_choices", None)
+        or getattr(speculative, "use_tree_attention", False)
+        or getattr(backend, "name", backend) == "TREE_ATTN"
+        or not 1 <= num_spec <= 7
+        or config.model_config.dtype != torch.float16
+        or spec.dtypes[1] != torch.float16
+        or head_dims != (128, 128)
+        or not (0 < key_heads <= value_heads <= 48 and value_heads % key_heads == 0)
+        or spec.page_size_padded is None
+    ):
+        return spec
+
+    width = num_spec + 1
+    # Put the factors in the same physical page as the recurrent state and
+    # convolution window so allocation and zeroing cover the whole cache.
+    shapes = spec.shapes + (
+        (key_heads, width, 128),
+        (value_heads, width, 128),
+        (value_heads, width),
+        (1,),
+    )
+    dtypes = spec.dtypes + (torch.float16, torch.float16, torch.float32, torch.int32)
+    raw_bytes = sum(
+        prod(shape) * dtype.itemsize for shape, dtype in zip(shapes, dtypes)
+    )
+    if raw_bytes > spec.page_size_padded:
+        return spec
+
+    from vllm_kunlun.ops.fla.fused_recurrent import gdn_sdnn_is_available
+
+    if not gdn_sdnn_is_available():
+        return spec
+    logger.info_once(
+        "GDN SDNN single-slot verification enabled (proposer=%s, K=%d).",
+        proposer,
+        num_spec,
+    )
+    return replace(spec, shapes=shapes, dtypes=dtypes, num_speculative_blocks=0)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -77,6 +156,15 @@ class GDNAttentionMetadata:
     non_spec_token_indx: torch.Tensor | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
+    non_spec_accepted: torch.Tensor | None = None
+    non_spec_commit_slots: torch.Tensor | None = None
+    # Batch-level handoff data shared by compatible GDN cache groups.
+    non_spec_commit_live: int | None = None
+    # Compact prefill only. A missing slot vector means all rows start at zero.
+    prefill_state_slots: torch.Tensor | None = None
+    prefill_fresh_mask: torch.Tensor | None = None
+    prefill_zero_state: torch.Tensor | None = None
+    prefill_history_rows: torch.Tensor | None = None
 
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
@@ -139,6 +227,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
+        self.compact_gdn = len(kv_cache_spec.shapes) == 6
+        self._prefill_zeros: dict[torch.cuda.Stream | None, torch.Tensor] = {}
+        self.state_columns = 1 if self.compact_gdn else self.num_spec + 1
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
         self.use_full_cuda_graph: bool = (
@@ -155,7 +246,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.state_columns),
             dtype=torch.int32,
             device=device,
         )
@@ -192,8 +283,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        accepted_rows = self.decode_cudagraph_max_bs
+        if self.compact_gdn:
+            # MRV2 hands off speculative state on ordinary eager steps as well.
+            # The graph capture capacity can be zero when eager mode is forced.
+            accepted_rows = max(
+                accepted_rows, self.vllm_config.scheduler_config.max_num_seqs
+            )
+            self._non_spec_commit_slots = torch.empty(
+                accepted_rows, dtype=torch.int32, device=device
+            )
         self.num_accepted_tokens: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs,),
+            (accepted_rows,),
             dtype=torch.int32,
             device=device,
         )
@@ -236,6 +337,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     query_start_loc.device, non_blocking=True
                 )
 
+        batch_accepted = num_accepted_tokens
         if spec_sequence_masks is None:
             (
                 num_decodes,
@@ -391,6 +493,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             has_initial_state = None
 
+        has_initial_state_cpu = (
+            has_initial_state.cpu() if has_initial_state is not None else None
+        )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (
@@ -442,14 +548,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
-        if (
+        ordinary_decode_graph = (
             self.use_full_cuda_graph
             and num_prefills == 0
             and num_spec_decodes == 0
-            and num_decodes <= self.decode_cudagraph_max_bs
-        ):
+            and batch_size <= self.decode_cudagraph_max_bs
+        )
+        if ordinary_decode_graph:
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                non_spec_query_start_loc, non_blocking=True
+                non_spec_query_start_loc[: num_decodes + 1], non_blocking=True
             )
             # fill_ with a device scalar extracts its value on the host. The
             # matching CPU query boundaries are already available here.
@@ -457,7 +564,74 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        non_spec_accepted = non_spec_commit_live = None
+        prefill_fresh_mask = prefill_zero_state = prefill_history_rows = None
+        if self.compact_gdn and num_prefills:
+            # This CPU mirror is also required by causal_conv1d_fn. Decide once
+            # for all layers, excluding graph padding with no input tokens.
+            history = has_initial_state_cpu.bool() & (
+                non_spec_query_start_loc_cpu.diff() > 0
+            )
+            history_rows = history.nonzero(as_tuple=True)[0]
+            if history_rows.numel():
+                device = query_start_loc.device
+                all_history = history_rows.numel() == history.numel()
+                if not all_history:
+                    prefill_fresh_mask = (
+                        (~history).to(device, non_blocking=True).view(-1, 1, 1, 1)
+                    )
+                if batch_accepted is not None:
+                    if not all_history:
+                        prefill_history_rows = history_rows.to(device, non_blocking=True)
+                    if all_history and spec_sequence_masks_cpu is None:
+                        non_spec_accepted = batch_accepted
+                    elif spec_sequence_masks_cpu is None:
+                        non_spec_accepted = batch_accepted.index_select(
+                            0, prefill_history_rows
+                        )
+                    else:
+                        batch_rows = history_rows
+                        if spec_sequence_masks_cpu is not None:
+                            non_spec_rows = (~spec_sequence_masks_cpu).nonzero(
+                                as_tuple=True
+                            )[0]
+                            batch_rows = non_spec_rows[history_rows]
+                        non_spec_accepted = batch_accepted.index_select(
+                            0, batch_rows.to(device, non_blocking=True)
+                        )
+            else:
+                # The XPU chunk kernel requires an explicit h0 to return the
+                # final state. All layers can read the same immutable zeros.
+                device = query_start_loc.device
+                stream = (
+                    torch.cuda.current_stream(device) if device.type == "cuda" else None
+                )
+                zeros = self._prefill_zeros.get(stream)
+                rows = history.numel()
+                if zeros is None or zeros.size(0) < rows:
+                    heads, v_dim, k_dim = self.kv_cache_spec.shapes[1]
+                    zeros = torch.zeros(
+                        (rows, heads, k_dim, v_dim),
+                        device=device,
+                        dtype=self.kv_cache_spec.dtypes[1],
+                    )
+                    self._prefill_zeros[stream] = zeros
+                prefill_zero_state = zeros[:rows]
+        elif self.compact_gdn and num_decodes and batch_accepted is not None:
+            # Ordinary FULL decode replays with different slots and accept
+            # counts at the same addresses.
+            live = min(num_decodes, batch_accepted.numel())
+            rows = batch_size if ordinary_decode_graph else live
+            non_spec_commit_live = live
+            non_spec_accepted = self.num_accepted_tokens[:rows]
+            non_spec_accepted[:live].copy_(batch_accepted[:live], non_blocking=True)
+            non_spec_accepted[live:].zero_()
         attn_metadata = GDNAttentionMetadata(
+            non_spec_accepted=non_spec_accepted,
+            non_spec_commit_live=non_spec_commit_live,
+            prefill_fresh_mask=prefill_fresh_mask,
+            prefill_zero_state=prefill_zero_state,
+            prefill_history_rows=prefill_history_rows,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -466,9 +640,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
             has_initial_state=has_initial_state,
-            has_initial_state_cpu=(
-                has_initial_state.cpu() if has_initial_state is not None else None
-            ),
+            has_initial_state_cpu=has_initial_state_cpu,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             spec_query_start_loc=spec_query_start_loc,
@@ -508,12 +680,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_indices = blk_table[:, 0].contiguous()
         else:
             if m.num_prefills == 0 and m.num_decodes == 0:
-                spec_indices = blk_table[: m.num_spec_decodes, : self.num_spec + 1]
+                spec_indices = blk_table[: m.num_spec_decodes, : self.state_columns]
                 spec_indices = spec_indices.contiguous()
             else:
-                spec_indices = blk_table[spec_masks, : self.num_spec + 1]
+                spec_indices = blk_table[spec_masks, : self.state_columns]
                 non_spec_indices = blk_table[~spec_masks, 0]
             spec_conv_indices = spec_indices[:, 0].contiguous()
+            if self.compact_gdn:
+                spec_conv_indices = spec_conv_indices.masked_fill(
+                    spec_conv_indices == NULL_BLOCK_ID, -1
+                )
 
         # CUDA Graph replay uses this group's state buffers.
         batch_size = m.num_actual_tokens
@@ -537,24 +713,57 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_conv_indices, non_blocking=True
             )
             spec_conv_indices = self.spec_conv_state_indices_tensor[:batch_size]
-            spec_conv_indices[num_spec_decodes:].fill_(NULL_BLOCK_ID)
+            spec_conv_indices[num_spec_decodes:].fill_(
+                -1 if self.compact_gdn else NULL_BLOCK_ID
+            )
         elif (
             self.use_full_cuda_graph
             and m.num_prefills == 0
             and m.num_spec_decodes == 0
-            and m.num_decodes <= self.decode_cudagraph_max_bs
+            and batch_size <= self.decode_cudagraph_max_bs
         ):
             assert non_spec_indices is not None
             self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
-                non_spec_indices, non_blocking=True
+                non_spec_indices[: m.num_decodes], non_blocking=True
             )
             non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
             non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
+
+        non_spec_commit_slots = prefill_state_slots = None
+        if self.compact_gdn and m.num_prefills:
+            assert non_spec_indices is not None
+            non_spec_indices = non_spec_indices.contiguous()
+            if m.prefill_zero_state is None:
+                prefill_state_slots = non_spec_indices.long()
+                if m.non_spec_accepted is not None:
+                    non_spec_commit_slots = non_spec_indices
+                    if m.prefill_history_rows is not None:
+                        non_spec_commit_slots = non_spec_commit_slots.index_select(
+                            0, m.prefill_history_rows
+                        )
+                    non_spec_commit_slots = non_spec_commit_slots.masked_fill(
+                        non_spec_commit_slots == NULL_BLOCK_ID, -1
+                    )
+        elif self.compact_gdn and m.num_decodes and m.non_spec_accepted is not None:
+            assert non_spec_indices is not None
+            rows = m.non_spec_accepted.numel()
+            live = (
+                m.non_spec_commit_live
+                if m.non_spec_commit_live is not None
+                else min(m.num_decodes, rows)
+            )
+            non_spec_commit_slots = self._non_spec_commit_slots[:rows]
+            live_slots = non_spec_commit_slots[:live]
+            live_slots.copy_(non_spec_indices[:live], non_blocking=True)
+            live_slots.masked_fill_(live_slots == NULL_BLOCK_ID, -1)
+            non_spec_commit_slots[live:].fill_(-1)
 
         return replace(
             m,
             spec_state_indices_tensor=spec_indices,
             spec_conv_state_indices_tensor=spec_conv_indices,
+            non_spec_commit_slots=non_spec_commit_slots,
+            prefill_state_slots=prefill_state_slots,
             non_spec_state_indices_tensor=non_spec_indices,
             non_spec_state_indices_tensor_cpu=(
                 non_spec_indices.cpu()

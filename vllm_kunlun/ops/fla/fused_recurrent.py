@@ -13,6 +13,20 @@ import torch
 import xspeedgate_ops  # noqa: F401 - registers the XSG torch operator
 
 
+def gdn_sdnn_is_available() -> bool:
+    """Check the optional single-slot operators on the current device."""
+    try:
+        import kunlun_ops
+
+        return (
+            callable(kunlun_ops.fused_gdn_commit_chunk_verify)
+            and callable(kunlun_ops.gdn_commit_accepted)
+            and kunlun_ops.gdn_sdnn_supports_current_device()
+        )
+    except (ImportError, OSError, AttributeError, RuntimeError):
+        return False
+
+
 class FusedRecurrentFunction(torch.autograd.Function):
 
     @staticmethod

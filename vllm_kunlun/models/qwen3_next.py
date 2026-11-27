@@ -100,7 +100,10 @@ from vllm_kunlun.ops.fla import (
     fused_recurrent_gated_delta_rule,
 )
 from vllm_kunlun.ops.mamba.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm_kunlun.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    get_gdn_sdnn_cache_spec,
+)
 
 logger = init_logger(__name__)
 
@@ -262,6 +265,19 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.GDN_ATTN
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.model_config is not vllm_config.model_config:
+            return spec
+        return get_gdn_sdnn_cache_spec(
+            spec,
+            vllm_config,
+            self.num_spec,
+            self.num_k_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            (self.head_k_dim, self.head_v_dim),
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
@@ -581,6 +597,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self_kv_cache = self.kv_cache
         conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
+        compact = len(self_kv_cache) == 6
+        if compact:
+            keys, values, decay, pending_rows = self_kv_cache[2:]
+            pending = pending_rows.squeeze(-1)
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
@@ -624,7 +644,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     : attn_metadata.num_spec_decodes
                 ],
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=(self.num_spec + 1 if compact else spec_state_indices_tensor.size(-1)),
                 validate_data=False,
             )
 
@@ -665,7 +685,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        if not compact:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
             mixed_qkv_non_spec
         )
@@ -695,7 +716,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if compact and spec_sequence_masks is not None:
+            ns = attn_metadata.num_spec_decodes
+            core_attn_out_spec = kunlun_ops.fused_gdn_commit_chunk_verify(
+                mixed_qkv_spec, g_spec.squeeze(0), beta_spec.squeeze(0),
+                spec_query_start_loc[:ns + 1], attn_metadata.spec_conv_state_indices_tensor[:ns],
+                num_accepted_tokens[:ns], ssm_state, keys, values, decay, pending, self.num_spec + 1,
+            ).unsqueeze(0)
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
                 q=query_spec,
                 k=key_spec,
@@ -712,43 +740,54 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process the remaining part
+        # Commit only rows carrying a previous speculative prefix.
+        if compact and attn_metadata.non_spec_accepted is not None:
+            kunlun_ops.gdn_commit_accepted(
+                attn_metadata.non_spec_commit_slots, attn_metadata.non_spec_accepted,
+                ssm_state, keys, values, decay, pending, self.num_spec + 1,
+            )
         if attn_metadata.num_prefills > 0:
-            # initial_state = ssm_state[non_spec_state_indices_tensor]
-            # initial_state[~has_initial_state] = 0
-            # initial_state = initial_state.transpose(-1, -2).contiguous()
-            slot_mapping = torch.full(
-                (ssm_state.shape[0],), -1, dtype=torch.int32, device=ssm_state.device,
-            )
-            slot_mapping[non_spec_state_indices_tensor] = torch.arange(
-                len(non_spec_state_indices_tensor), dtype=torch.int32, device=ssm_state.device,
-            )
+            if compact:
+                initial_state = attn_metadata.prefill_zero_state
+                if attn_metadata.prefill_state_slots is not None:
+                    initial_state = ssm_state.index_select(0, attn_metadata.prefill_state_slots)
+                    if attn_metadata.prefill_fresh_mask is not None:
+                        # A recycled slot can contain NaN or Inf.
+                        initial_state.masked_fill_(attn_metadata.prefill_fresh_mask, 0)
+                    initial_state = initial_state.transpose(-1, -2).contiguous()
+            else:
+                slot_mapping = torch.full(
+                    (ssm_state.shape[0],), -1, dtype=torch.int32, device=ssm_state.device,
+                )
+                slot_mapping[non_spec_state_indices_tensor] = torch.arange(
+                    len(non_spec_state_indices_tensor), dtype=torch.int32, device=ssm_state.device,
+                )
 
-            initial_state_shape = (
-                non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
-            )
-            initial_state = torch.empty(
-                initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
-            )
-            initial_state = initial_state.view(
-                initial_state.shape[0], 1, -1, initial_state.shape[-1]
-            )
-            cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
+                initial_state_shape = (
+                    non_spec_state_indices_tensor.shape + ssm_state.shape[1:]
+                )
+                initial_state = torch.empty(
+                    initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device
+                )
+                initial_state = initial_state.view(
+                    initial_state.shape[0], 1, -1, initial_state.shape[-1]
+                )
+                cast_ssm_state = ssm_state.view(ssm_state.shape[0], -1, ssm_state.shape[-1])
 
-            kunlun_ops.reshape_and_cache_flash(
-                cast_ssm_state,
-                cast_ssm_state,
-                initial_state,
-                initial_state,
-                slot_mapping,
-            )
-            initial_state = initial_state.view(initial_state_shape)
+                kunlun_ops.reshape_and_cache_flash(
+                    cast_ssm_state,
+                    cast_ssm_state,
+                    initial_state,
+                    initial_state,
+                    slot_mapping,
+                )
+                initial_state = initial_state.view(initial_state_shape)
 
-            # Uninitialized/reused cache slots may contain NaN or Inf; * 0
-            # does not clear those values for requests without prior state.
-            fresh_mask = has_initial_state.view(-1, 1, 1, 1) == 0
-            initial_state = initial_state.masked_fill(fresh_mask, 0)
-            initial_state = initial_state.transpose(-1, -2).contiguous()
+                # Uninitialized/reused cache slots may contain NaN or Inf; * 0
+                # does not clear those values for requests without prior state.
+                fresh_mask = has_initial_state.view(-1, 1, 1, 1) == 0
+                initial_state = initial_state.masked_fill(fresh_mask, 0)
+                initial_state = initial_state.transpose(-1, -2).contiguous()
 
             (
                 core_attn_out_non_spec,
