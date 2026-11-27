@@ -54,12 +54,72 @@ def _preprocess_mamba_align(
     )
 
 
+def _conv_only_context(self, kv_cache_config, forward_context, block_tables):
+    """Capture compact pages once; the generic Mamba copier only moves convolution."""
+    from types import SimpleNamespace
+
+    import kunlun_ops
+
+    layers = []
+    conv_context = {}
+    for group_idx, gid in enumerate(self.mamba_group_ids):
+        for name in kv_cache_config.kv_cache_groups[gid].layer_names:
+            conv, state, keys, values, decay, pending = forward_context[name].kv_cache
+            buffers = (state, keys, values, decay, pending)
+            # The compact ABI uses padded page strides but contiguous rows.
+            for buf in buffers:
+                if buf.device != state.device or not buf[0].is_contiguous():
+                    raise ValueError(f"Invalid compact GDN cache row for {name}")
+            layers.append(
+                [
+                    *(buf.data_ptr() for buf in buffers),
+                    *(buf.stride(0) for buf in buffers),
+                    group_idx,
+                    state.size(0),
+                    keys.size(1),
+                    state.size(1),
+                    keys.size(2),
+                ]
+            )
+            conv_context[name] = SimpleNamespace(kv_cache=(conv,))
+    if any(bt.stride(1) != 1 for bt in block_tables):
+        raise ValueError("Expected contiguous columns in Mamba block tables")
+    self._kunlun_gdn_layers = torch.tensor(
+        layers, dtype=torch.int64, device=self.num_accepted_tokens_out.device
+    )
+    self._kunlun_gdn_ops = kunlun_ops
+    self._kunlun_table_columns = min(bt.size(1) for bt in block_tables)
+    self.num_state_types = 1
+    for name in (
+        "state_base_addrs",
+        "state_block_strides",
+        "state_elem_sizes",
+        "state_inner_sizes",
+        "state_conv_widths",
+        "state_group_indices",
+        "state_dim_row_count",
+        "state_dim_row_stride",
+    ):
+        setattr(self, name, getattr(self, name)[: self.num_layers])
+    return conv_context
+
+
 def _initialize_from_forward_context(original):
-    def initialize(self, *args, **kwargs):
-        initialized = self.is_initialized
-        original(self, *args, **kwargs)
-        if initialized and hasattr(self, "_kunlun_align_buffers"):
+    def initialize(
+        self, kv_cache_config, forward_context, mamba_state_copy_funcs, block_tables
+    ):
+        if self.is_initialized and hasattr(self, "_kunlun_align_buffers"):
             return
+        self._kunlun_gdn_ops = None
+        spec = kv_cache_config.kv_cache_groups[self.mamba_group_ids[0]].kv_cache_spec
+        if len(spec.shapes) == 6 and spec.num_speculative_blocks == 0:
+            forward_context = _conv_only_context(
+                self, kv_cache_config, forward_context, block_tables
+            )
+            mamba_state_copy_funcs = mamba_state_copy_funcs[:1]
+        original(
+            self, kv_cache_config, forward_context, mamba_state_copy_funcs, block_tables
+        )
         from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 
         elem_sizes = self.state_elem_sizes.long()
@@ -119,6 +179,17 @@ def _run_fused_precopy(
         True,
         1,
     )
+    if self._kunlun_gdn_ops is not None:
+        self._kunlun_gdn_ops.gdn_align_precopy(
+            self._kunlun_gdn_layers,
+            self.block_table_ptrs,
+            idx_mapping[:num_reqs],
+            state_idx_gpu,
+            src_col_gpu,
+            token_bias_gpu,
+            self.block_table_stride_req,
+            self._kunlun_table_columns,
+        )
 
 
 def _run_fused_postprocess_align(
@@ -132,6 +203,20 @@ def _run_fused_postprocess_align(
     if num_reqs == 0 or not self.is_initialized or num_accepted_tokens_gpu.numel() == 0:
         return
     mapping = idx_mapping[:num_reqs]
+    if self._kunlun_gdn_ops is not None:
+        # XSpeedGate resets in-place boundary accepts to one; capture the
+        # recurrent prefix on the same stream before that reset.
+        self._kunlun_gdn_ops.gdn_align_postprocess(
+            self._kunlun_gdn_layers,
+            self.block_table_ptrs,
+            mapping,
+            state_idx_gpu,
+            new_num_computed_tokens_gpu,
+            num_accepted_tokens_gpu,
+            self.block_table_stride_req,
+            self._kunlun_table_columns,
+            self.block_size,
+        )
     valid = mapping >= 0
     slots = mapping.clamp_min(0).long()
     accepted, state, computed, accepted_out = self._kunlun_align_buffers[:, :num_reqs]

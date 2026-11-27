@@ -695,8 +695,36 @@ _V2_PATCHES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
+def _mamba_margin_applied(module: ModuleType) -> bool:
+    return getattr(module, "_kunlun_compact_gdn_margin", False)
+
+
+def _apply_mamba_margin(module: ModuleType) -> None:
+    original = module.MambaManager.remove_skipped_blocks
+
+    @functools.wraps(original)
+    def remove_skipped_blocks(
+        self, request_id, num_computed_tokens, num_prompt_tokens=None
+    ):
+        spec = self.kv_cache_spec
+        if self.num_speculative_blocks == 0 and len(spec.shapes) == 6:
+            # Compact pages remove the K physical lookahead blocks. The async
+            # scheduler still advances its optimistic token count by K.
+            k = spec.shapes[2][1] - 1
+            num_computed_tokens = max(0, num_computed_tokens - k)
+        return original(self, request_id, num_computed_tokens, num_prompt_tokens)
+
+    module.MambaManager.remove_skipped_blocks = remove_skipped_blocks
+    module._kunlun_compact_gdn_margin = True
+
+
 # (target module, is_applied, apply_patch) triples registered by import_hooks.
 DEFAULT_HOOKS = (
+    (
+        "vllm.v1.core.single_type_kv_cache_manager",
+        _mamba_margin_applied,
+        _apply_mamba_margin,
+    ),
     ("vllm.config.vllm", _mrv2_gate_applied, _apply_mrv2_gate),
     ("vllm.v1.worker.gpu.attn_utils", _bind_kv_cache_applied, _apply_bind_kv_cache),
     (
