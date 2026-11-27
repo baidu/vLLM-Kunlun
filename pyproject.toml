@@ -26,6 +26,9 @@ kunlun_model = "vllm_kunlun:register_model"
 kunlun_reasoning_parser = "vllm_kunlun:register_reasoning_parser"
 kunlun_tool_parser = "vllm_kunlun:register_tool_parser"
 
+[project.entry-points."lmcache.device_plugins"]
+kunlun = "vllm_kunlun.distributed.lmcache.device:KunlunDeviceSpec"
+
 [tool.setuptools.packages.find]
 include = ["vllm_kunlun*"]
 
